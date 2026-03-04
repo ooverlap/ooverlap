@@ -36,6 +36,11 @@ target_include_directories(ooverlap_pybinding PRIVATE
   ${NCCL_INCLUDE_DIR}
 )
 
+find_package(Python3 REQUIRED COMPONENTS Development)
+
+target_include_directories(ooverlap_pybinding PRIVATE ${Python3_INCLUDE_DIRS})
+target_link_libraries(ooverlap_pybinding PRIVATE Python3::Python)
+
 target_link_libraries(ooverlap_pybinding PRIVATE
   ${TORCH_LIBRARIES}
   CUDA::cudart
