@@ -8,13 +8,19 @@
 #pragma once
 
 #include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <utility>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/memory.h"
 #include "cutlass/numeric_conversion.h"
+#include "cutlass/kernel_hardware_info.h"
+
+// (Optional) forward-decls for collective builder
+#include "cutlass/gemm/collective/collective_builder_decl.hpp"
 
 // GEMM (CUTLASS 3.x)
 #include "cutlass/gemm/gemm.h"
@@ -27,6 +33,7 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 
+// CuTe
 #include "cute/tensor.hpp"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -48,7 +55,7 @@ namespace cutlass {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Parameters needed for reorder + signaling inside epilogue.
 struct SignalingEpilogueParams {
-  int  *ptr_Monitored_Matrix;   // Atomic counter array (size >= num_segments + ... optional monitor space)
+  int  *ptr_Monitored_Matrix;
   int  *ptr_Reorder_Array;      // logical tile idx -> reordered tile idx
   int   kMonitoredColumn;       // original tile-cols (N / TileN)
   int   kReorderedColumn;       // reordered tile-cols (ReLDN)
@@ -58,7 +65,7 @@ struct SignalingEpilogueParams {
   int   ThreadblockM;
   int   ThreadblockN;
 
-  void *ptr_D;                  // base ptr of FINAL output buffer (interpreted as reshaped row-major)
+  void *ptr_D;                  // base ptr of FINAL output buffer (reshaped row-major)
   int   ld_D;                   // leading dim (elements) of reshaped output: kReorderedColumn * ThreadblockN
 
   CUTLASS_HOST_DEVICE
@@ -77,7 +84,12 @@ struct SignalingEpilogueParams {
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// Helper: CuTe stride for RowMajor / ColumnMajor (A/B)
+// Helper: CuTe stride for RowMajor / ColumnMajor (A/B/C/D)
+//
+// IMPORTANT NOTE (why ColumnMajor looks "weird"):
+// The SM90 CollectiveBuilder / MainloopArguments in your CUTLASS version expects the stride type
+// for B to be cute::tuple<int64_t, C<1>, int64_t> (ld in slot 0), even when LayoutB is ColumnMajor.
+// So we must produce that exact type to compile.
 template <typename LayoutTag>
 struct CuteStride2D;
 
@@ -93,22 +105,38 @@ template <>
 struct CuteStride2D<cutlass::layout::ColumnMajor> {
   CUTLASS_HOST_DEVICE
   static auto make(int64_t ld) {
-    return cute::make_stride(cute::Int<1>{}, ld, int64_t{0});
+    // NOTE: This returns tuple<int64_t, C<1>, int64_t> (matches what the SM90 mainloop expects).
+    // If you later switch to a CUTLASS version where ColumnMajor expects (C<1>, ld, 0),
+    // this is the one place to change.
+    return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
   }
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Reorder + signal epilogue wrapper.
-/// This wraps a Base SM90 collective epilogue and *remaps the CTA tile coordinate* to the
-/// reordered location (in the reshaped output space), then emits atomic signals.
+/// Must satisfy SM90 GemmUniversal "CollectiveEpilogue" interface.
 template <class BaseEpilogue, class ThreadblockShape>
 struct ReorderSignalEpilogue {
 
-  // Base types expected by GemmUniversal
-  using SharedStorage = typename BaseEpilogue::SharedStorage;
+  // -----------------------------
+  // Required nested aliases (forward from BaseEpilogue)
+  // -----------------------------
+  using ElementC          = typename BaseEpilogue::ElementC;
+  using ElementD          = typename BaseEpilogue::ElementD;
+  using StrideC           = typename BaseEpilogue::StrideC;
+  using StrideD           = typename BaseEpilogue::StrideD;
+  using ThreadEpilogueOp  = typename BaseEpilogue::ThreadEpilogueOp;
+  using DispatchPolicy    = typename BaseEpilogue::DispatchPolicy;
 
-  // --- Arguments/Params ---
-  // BaseEpilogue::Arguments usually contains { {alpha,beta}, ptr_C, stride_C, ptr_D, stride_D }.
+  // These are required by sm90_gemm_tma_warpspecialized.hpp in your error log
+  using TensorStorage     = typename BaseEpilogue::TensorStorage;
+  using PipelineStorage   = typename BaseEpilogue::PipelineStorage;
+
+  using SharedStorage     = typename BaseEpilogue::SharedStorage;
+
+  // -----------------------------
+  // Arguments / Params
+  // -----------------------------
   struct Arguments {
     typename BaseEpilogue::Arguments base;
     SignalingEpilogueParams signal;
@@ -123,14 +151,41 @@ struct ReorderSignalEpilogue {
 
     CUTLASS_HOST_DEVICE
     Params(Arguments const &args) : base(args.base), signal(args.signal) {}
+
+    CUTLASS_HOST_DEVICE
+    Params(typename BaseEpilogue::Params const& base_, SignalingEpilogueParams const& sig_)
+      : base(base_), signal(sig_) {}
   };
 
-  // --- Device call operator ---
-  // IMPORTANT: this signature matches the common CUTLASS 3.x collective epilogue call pattern:
-  //   operator()(Params, SharedStorage, problem_shape, cta_coord, thread_idx, ...rest...)
-  //
-  // If your CUTLASS version uses a slightly different signature, this is the one place that may
-  // need a tiny adjustment.
+  // -----------------------------
+  // Required static hooks (forward / adapt)
+  // -----------------------------
+  template <class ProblemShape>
+  static bool can_implement(ProblemShape const& problem_shape, Arguments const& args) {
+    return BaseEpilogue::can_implement(problem_shape, args.base);
+  }
+
+  template <class ProblemShape>
+  static size_t get_workspace_size(ProblemShape const& problem_shape, Arguments const& args) {
+    return BaseEpilogue::get_workspace_size(problem_shape, args.base);
+  }
+
+  static size_t get_workspace_alignment() {
+    // Forward if you have it; otherwise keep a safe default.
+    return 16;
+  }
+
+  // REQUIRED by sm90_gemm_tma_warpspecialized.hpp(220) in your log:
+  //   CollectiveEpilogue::to_underlying_arguments(transformed_problem_shape, args.epilogue, workspace)
+  template <class ProblemShape>
+  static Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args, void* workspace) {
+    auto base_params = BaseEpilogue::to_underlying_arguments(problem_shape, args.base, workspace);
+    return Params{base_params, args.signal};
+  }
+
+  // -----------------------------
+  // Device call operator (wrap + remap + signal)
+  // -----------------------------
   template <class ProblemShape, class CtaCoord, class... Rest>
   CUTLASS_DEVICE
   void operator()(
@@ -139,64 +194,55 @@ struct ReorderSignalEpilogue {
       ProblemShape const &problem_shape,
       CtaCoord const &cta_coord,
       int thread_idx,
-      Rest&&... rest) const {
-
-    // Extract original CTA tile coordinate (m,n). In SM90 kernels this is typically a cute coord.
+      Rest&&... rest) const
+  {
+    // CTA tile coordinate is typically (m, n, l)
     int cta_m = int(cute::get<0>(cta_coord));
     int cta_n = int(cute::get<1>(cta_coord));
-    int cta_l = int(cute::get<3>(problem_shape)) == 0 ? 0 : 0; // L is usually 1; keep simple.
+    int cta_l = int(cute::get<2>(cta_coord));
 
-    // Original problem dimensions
     int M = int(cute::get<0>(problem_shape));
     int N = int(cute::get<1>(problem_shape));
     int K = int(cute::get<2>(problem_shape));
     int L = int(cute::get<3>(problem_shape));
 
-    // Logical tile index in the ORIGINAL tile grid
-    // tile_cols_original = kMonitoredColumn = N / TileN
-    int tile_cols_original = params.signal.kMonitoredColumn;
+    // Logical tile in original layout
+    int tile_cols_original = params.signal.kMonitoredColumn; // N / TileN
     int logical_tile = cta_m * tile_cols_original + cta_n;
 
-    // Look up reordered linear tile index
+    // Map to reordered tile id
     int reordered_tile = params.signal.ptr_Reorder_Array[logical_tile];
 
-    // Map to destination tile (row,col) in the RESHAPED layout
     int reordered_cols = params.signal.kReorderedColumn;
     int dst_tile_row = reordered_tile / reordered_cols;
     int dst_tile_col = reordered_tile % reordered_cols;
 
-    // Build the reshaped output problem (same total elements, different 2D shape)
-    // new_N = reordered_cols * TileN
-    // new_M = (M*N) / new_N
+    // Reshape output: new_N = reordered_cols * TileN, new_M = (M*N)/new_N
     int TileN = params.signal.ThreadblockN;
     int new_N = reordered_cols * TileN;
 
-    // Use 64-bit to avoid overflow in M*N
     int64_t total_elems = int64_t(M) * int64_t(N);
     int new_M = int(total_elems / int64_t(new_N));
 
-    // Construct the mapped CTA coord in the reshaped space
-    auto mapped_cta = cute::make_coord(dst_tile_row, dst_tile_col, cute::Int<0>{});
-
-    // Construct the reshaped problem shape <M,N,K,L>
+    auto mapped_cta = cute::make_coord(dst_tile_row, dst_tile_col, cta_l);
     auto reshaped_problem = cute::make_shape(new_M, new_N, K, L);
 
-    // Call the base epilogue to do the real store/convert.
-    // The base epilogue will store into D using mapped_cta + reshaped_problem.
+    // Call base epilogue to store into FINAL D at mapped location
     BaseEpilogue base_epilogue;
-    base_epilogue(params.base,
-                 shared_storage,
-                 reshaped_problem,
-                 mapped_cta,
-                 thread_idx,
-                 cutlass::forward<Rest>(rest)...);
+    base_epilogue(
+      params.base,
+      shared_storage,
+      reshaped_problem,
+      mapped_cta,
+      thread_idx,
+      std::forward<Rest>(rest)...
+    );
 
-    // Ensure the output tile is visible before we signal (extra safety for cross-stream consumer)
+    // Signal after store
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if (thread_idx == 0) {
       __threadfence();
 
-      // Segment classification (segment sizes array; sum == total tiles)
       int idx_bound = params.signal.kCommu_Seg_Array[0];
       int seg = 0;
       while (idx_bound <= reordered_tile) {
@@ -207,12 +253,14 @@ struct ReorderSignalEpilogue {
       atomicAdd(&params.signal.ptr_Monitored_Matrix[seg], 1);
 
       if (params.signal.if_monitor) {
-        // Optional global ordering info (same spirit as FlashOverlap)
-        int global_order = atomicAdd(&params.signal.ptr_Monitored_Matrix[params.signal.kMonitoredColumn - 1], 1);
+        int global_order = atomicAdd(
+          &params.signal.ptr_Monitored_Matrix[params.signal.kMonitoredColumn - 1], 1);
 
         cutlass::arch::global_store<int, sizeof(int)>(
           global_order,
-          (void *)(params.signal.ptr_Monitored_Matrix + params.signal.kMonitoredColumn + reordered_tile),
+          (void *)(params.signal.ptr_Monitored_Matrix +
+                   params.signal.kMonitoredColumn +
+                   reordered_tile),
           true
         );
       }
@@ -254,7 +302,6 @@ public:
   static int const kStages  = Stages;
   static int const kSwizzle = SwizzleSize;
 
-  // Output buffer is treated as RowMajor for reshaped storage.
   static_assert(cutlass::platform::is_same<LayoutOutput, cutlass::layout::RowMajor>::value,
                 "Route-A fused reorder expects RowMajor output buffer interpretation.");
 
@@ -266,7 +313,7 @@ public:
   static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementOutput>::value;
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementOutput>::value;
 
-  // Mainloop (TMA warp-specialized)
+  // Mainloop (SM90 TMA warp-specialized)
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag,
     OperatorClass,
@@ -276,12 +323,12 @@ public:
     cute::Shape<cute::Int<ThreadblockShape::kM>,
                 cute::Int<ThreadblockShape::kN>,
                 cute::Int<ThreadblockShape::kK>>,
-    cute::Shape<cute::_1, cute::_1, cute::_1>, // ClusterShape 1x1x1
-    cutlass::gemm::collective::StageCountAutoWithMinStages<kStages>,
+    cute::Shape<cute::_1, cute::_1, cute::_1>,
+    cutlass::gemm::collective::StageCountAuto,
     cutlass::gemm::KernelTmaWarpSpecialized
   >::CollectiveOp;
 
-  // Base epilogue (linear combination)
+  // Base epilogue
   using BaseCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag,
     OperatorClass,
@@ -290,24 +337,21 @@ public:
                 cute::Int<ThreadblockShape::kK>>,
     cute::Shape<cute::_1, cute::_1, cute::_1>,
     cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementCompute,   // accumulator
-    ElementCompute,   // compute
-    ElementOutput,    // C
-    LayoutOutput,     // C layout
+    ElementCompute,
+    ElementCompute,
+    ElementOutput,
+    LayoutOutput,
     AlignmentC,
-    ElementOutput,    // D
-    LayoutOutput,     // D layout
+    ElementOutput,
+    LayoutOutput,
     AlignmentD,
     cutlass::epilogue::collective::EpilogueScheduleAuto
   >::CollectiveOp;
 
-  // Our wrapped epilogue that reorders + signals inside GEMM
-  using CollectiveEpilogue =
-    ReorderSignalEpilogue<BaseCollectiveEpilogue, ThreadblockShape>;
+  using CollectiveEpilogue = ReorderSignalEpilogue<BaseCollectiveEpilogue, ThreadblockShape>;
 
-  // Kernel type
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    cute::Shape<int, int, int, int>,   // <M, N, K, L>
+    cute::Shape<int, int, int, int>,
     CollectiveMainloop,
     CollectiveEpilogue
   >;
@@ -319,12 +363,12 @@ public:
     cutlass::gemm::GemmCoord   problem_size;
     ElementInputA             *ptr_A;
     ElementInputB             *ptr_B;
-    ElementOutput             *ptr_C;       // (only used if beta != 0)
-    ElementOutput             *ptr_D;       // FINAL reordered/reshaped output buffer
+    ElementOutput             *ptr_C;
+    ElementOutput             *ptr_D;  // FINAL reordered/reshaped output buffer
     int64_t                    ldm_A;
     int64_t                    ldm_B;
     int64_t                    ldm_C;
-    int64_t                    ldm_D;       // reshaped leading dim = ReLDN*TileN
+    int64_t                    ldm_D;
     ElementCompute             alpha;
     ElementCompute             beta;
     SignalingEpilogueParams    signal_params;
@@ -380,49 +424,64 @@ public:
   }
 
   Status run(cudaStream_t stream) {
+
     int M = args_.problem_size.m();
     int N = args_.problem_size.n();
     int K = args_.problem_size.k();
 
-    // Build epilogue args:
-    // - ptr_D points to FINAL buffer
-    // - stride_D uses reshaped leading dimension (ldm_D)
-    typename CollectiveEpilogue::Arguments epi_args;
-    epi_args.base = typename BaseCollectiveEpilogue::Arguments{
+    using Kernel              = GemmKernel;
+    using KernelArguments     = typename Kernel::Arguments;
+    using ProblemShape        = typename Kernel::ProblemShape;
+    using MainloopArguments   = typename Kernel::MainloopArguments;
+    using EpilogueArguments   = typename Kernel::EpilogueArguments;
+    using TileSchedArguments  = typename Kernel::TileSchedulerArguments;
+
+    ProblemShape problem_shape = cute::make_shape(M, N, K, 1);
+
+    MainloopArguments mainloop_args{
+      reinterpret_cast<ElementInputA const*>(args_.ptr_A),
+      CuteStride2D<LayoutInputA>::make(args_.ldm_A),
+      reinterpret_cast<ElementInputB const*>(args_.ptr_B),
+      CuteStride2D<LayoutInputB>::make(args_.ldm_B)
+    };
+
+    EpilogueArguments epilogue_args;
+    epilogue_args.base = typename BaseCollectiveEpilogue::Arguments{
       {args_.alpha, args_.beta},
       reinterpret_cast<ElementOutput const*>(args_.ptr_C),
       CuteStride2D<LayoutOutput>::make(args_.ldm_C),
       reinterpret_cast<ElementOutput*>(args_.ptr_D),
       CuteStride2D<LayoutOutput>::make(args_.ldm_D)
     };
-    epi_args.signal = args_.signal_params;
+    epilogue_args.signal = args_.signal_params;
 
-    typename GemmDevice::Arguments gemm_args{
+    cutlass::KernelHardwareInfo hw_info;
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, device_id);
+    hw_info.device_id = device_id;
+    hw_info.sm_count  = prop.multiProcessorCount;
+
+    TileSchedArguments sched_args{};
+
+    KernelArguments gemm_args(
       cutlass::gemm::GemmUniversalMode::kGemm,
-      {M, N, K, 1},
-      {
-        reinterpret_cast<ElementInputA const*>(args_.ptr_A),
-        CuteStride2D<LayoutInputA>::make(args_.ldm_A),
-        reinterpret_cast<ElementInputB const*>(args_.ptr_B),
-        CuteStride2D<LayoutInputB>::make(args_.ldm_B)
-      },
-      epi_args
-    };
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info,
+      sched_args
+    );
 
     Status status = gemm_device_.can_implement(gemm_args);
-    if (status != Status::kSuccess) {
-      return status;
-    }
+    if (status != Status::kSuccess) return status;
 
     status = gemm_device_.initialize(gemm_args, nullptr, stream);
-    if (status != Status::kSuccess) {
-      return status;
-    }
+    if (status != Status::kSuccess) return status;
 
     status = gemm_device_.run(stream);
-    if (status != Status::kSuccess) {
-      return status;
-    }
+    if (status != Status::kSuccess) return status;
 
     return cutlass::Status::kSuccess;
   }

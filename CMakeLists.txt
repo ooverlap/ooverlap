@@ -36,28 +36,4 @@ if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
   message(FATAL_ERROR "NCCL not found. Set NCCL_ROOT to your NCCL install.")
 endif()
 
-add_library(ooverlap_pybinding SHARED
-  src/pybind.cpp
-  src/baseline_impl.cu
-  src/nccl_utils.cu
-)
-
-target_include_directories(ooverlap_pybinding PRIVATE
-  ${NCCL_INCLUDE_DIR}
-)
-
-find_package(Python3 REQUIRED COMPONENTS Development)
-target_include_directories(ooverlap_pybinding PRIVATE ${Python3_INCLUDE_DIRS})
-target_link_libraries(ooverlap_pybinding PRIVATE Python3::Python)
-
-target_link_libraries(ooverlap_pybinding PRIVATE
-  cutlass
-  ${TORCH_LIBRARIES}
-  CUDA::cudart
-  CUDA::cublas
-  ${NCCL_LIBRARY}
-)
-
-# For Hopper/TMA later use 90 (or 80;90 for fatbin)
-set_property(TARGET ooverlap_pybinding PROPERTY CUDA_ARCHITECTURES 80)
-set_property(TARGET ooverlap_pybinding PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+add_subdirectory(src)

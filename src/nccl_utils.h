@@ -1,7 +1,7 @@
 #pragma once
 
 #include <nccl.h>
-#include <torch/extension.h>
+#include <torch/torch.h>              // torch::Tensor / at::Tensor without Python binding
 #include <cuda_runtime.h>
 #include <stdlib.h>
 #include <stdio.h>
