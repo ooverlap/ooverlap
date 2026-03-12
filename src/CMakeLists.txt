@@ -27,6 +27,24 @@ if(Python3_EXECUTABLE)
   )
 endif()
 
+# Torch lib dir + libtorch_python path (needed for at::Tensor pybind caster)
+set(TORCH_PY_LIBDIR "")
+set(TORCH_PYTHON_SO "")
+if(Python3_EXECUTABLE)
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c
+      "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
+    OUTPUT_VARIABLE TORCH_PY_LIBDIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c
+      "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib', 'libtorch_python.so'))"
+    OUTPUT_VARIABLE TORCH_PYTHON_SO
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+endif()
+
 function(ooverlap_apply_torch target)
   if(DEFINED TORCH_INCLUDE_DIRS)
     target_include_directories(${target} PRIVATE ${TORCH_INCLUDE_DIRS})
@@ -77,6 +95,20 @@ endif()
 
 set(OOVERLAP_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+set(OOVERLAP_SM90A_GENCODE "--generate-code=arch=compute_90a,code=sm_90a")
+
+function(ooverlap_force_sm90a target)
+  if(TARGET ${target})
+    target_compile_options(${target} PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_GENCODE}>
+    )
+    # Helps for device-link steps on some toolchains
+    target_link_options(${target} PRIVATE
+      $<$<LINK_LANGUAGE:CUDA>:${OOVERLAP_SM90A_GENCODE}>
+    )
+  endif()
+endfunction()
+
 # -------------------------
 # gemm library
 # -------------------------
@@ -88,6 +120,8 @@ file(GLOB gemm_files CONFIGURE_DEPENDS
 
 if(gemm_files)
   add_library(ooverlap_gemm STATIC ${gemm_files})
+  ooverlap_force_sm90a(ooverlap_gemm)
+
   set_property(TARGET ooverlap_gemm PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ooverlap_gemm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
@@ -112,6 +146,8 @@ file(GLOB overlap_files CONFIGURE_DEPENDS
 
 if(overlap_files)
   add_library(ooverlap_overlap STATIC ${overlap_files})
+  ooverlap_force_sm90a(ooverlap_overlap)
+  
   set_property(TARGET ooverlap_overlap PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ooverlap_overlap PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
@@ -134,6 +170,8 @@ file(GLOB norm_files CONFIGURE_DEPENDS
 
 if(norm_files)
   add_library(ooverlap_norm STATIC ${norm_files})
+  ooverlap_force_sm90a(ooverlap_norm)
+  
   set_property(TARGET ooverlap_norm PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ooverlap_norm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
@@ -145,12 +183,10 @@ if(norm_files)
 endif()
 
 # -------------------------
-# baseline_impl  (compile as CXX to avoid NVCC+ATen issues)
+# baseline_impl (compile as CXX to avoid NVCC+ATen issues)
 # -------------------------
 if(EXISTS ${OOVERLAP_SRC_DIR}/baseline_impl.cu)
   add_library(ooverlap_baseline_impl STATIC ${OOVERLAP_SRC_DIR}/baseline_impl.cu)
-
-  # >>> KEY FIX: treat this .cu as C++ (no NVCC parsing of ATen headers)
   set_source_files_properties(${OOVERLAP_SRC_DIR}/baseline_impl.cu PROPERTIES LANGUAGE CXX)
 
   set_property(TARGET ooverlap_baseline_impl PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -172,43 +208,14 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/baseline_impl.cu)
     target_link_libraries(ooverlap_baseline_impl PUBLIC ooverlap_norm)
   endif()
 
-  # For host-compiled code calling CUDA/NCCL/cuBLAS
   target_link_libraries(ooverlap_baseline_impl PUBLIC CUDA::cudart CUDA::cublas ${NCCL_LIBRARY})
 endif()
 
 # -------------------------
-# overlap_impl (optional)
-# -------------------------
-if(EXISTS ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
-  add_library(ooverlap_overlap_impl STATIC ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
-  set_property(TARGET ooverlap_overlap_impl PROPERTY POSITION_INDEPENDENT_CODE ON)
-  set_property(TARGET ooverlap_overlap_impl PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-
-  target_include_directories(ooverlap_overlap_impl PUBLIC
-    ${OOVERLAP_SRC_DIR}
-    ${NCCL_INCLUDE_DIR}
-  )
-
-  ooverlap_apply_torch(ooverlap_overlap_impl)
-
-  if(TARGET ooverlap_gemm)
-    target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_gemm)
-  endif()
-  if(TARGET ooverlap_overlap)
-    target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_overlap)
-  endif()
-  if(TARGET ooverlap_norm)
-    target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_norm)
-  endif()
-endif()
-
-# -------------------------
-# nccl_tool  (compile as CXX to avoid NVCC+ATen issues)
+# nccl_tool (compile as CXX to avoid NVCC+ATen issues)
 # -------------------------
 if(EXISTS ${OOVERLAP_SRC_DIR}/nccl_utils.cu)
   add_library(ooverlap_nccl_tool STATIC ${OOVERLAP_SRC_DIR}/nccl_utils.cu)
-
-  # >>> KEY FIX: treat this .cu as C++ (no NVCC parsing of ATen headers)
   set_source_files_properties(${OOVERLAP_SRC_DIR}/nccl_utils.cu PROPERTIES LANGUAGE CXX)
 
   set_property(TARGET ooverlap_nccl_tool PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -219,42 +226,57 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/nccl_utils.cu)
   )
 
   ooverlap_apply_torch(ooverlap_nccl_tool)
-
   target_link_libraries(ooverlap_nccl_tool PUBLIC CUDA::cudart ${NCCL_LIBRARY})
 endif()
 
 # -------------------------
-# Shared pybinding library
+# Python extension module: ooverlap_ext.so
+#   (this is what your test imports)
 # -------------------------
 if(NOT EXISTS ${OOVERLAP_SRC_DIR}/pybind.cpp)
   message(FATAL_ERROR "src/pybind.cpp not found")
 endif()
 
-add_library(ooverlap_pybinding SHARED ${OOVERLAP_SRC_DIR}/pybind.cpp)
-set_property(TARGET ooverlap_pybinding PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET ooverlap_pybinding PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+add_library(ooverlap_ext MODULE ${OOVERLAP_SRC_DIR}/pybind.cpp)
 
-target_include_directories(ooverlap_pybinding PRIVATE
+set_target_properties(ooverlap_ext PROPERTIES
+  PREFIX ""
+  LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib
+  POSITION_INDEPENDENT_CODE ON
+)
+
+target_include_directories(ooverlap_ext PRIVATE
   ${OOVERLAP_SRC_DIR}
   ${NCCL_INCLUDE_DIR}
   ${Python3_INCLUDE_DIRS}
 )
 
-target_link_libraries(ooverlap_pybinding PRIVATE Python3::Python)
-
-if(TARGET ooverlap_baseline_impl)
-  target_link_libraries(ooverlap_pybinding PRIVATE ooverlap_baseline_impl)
+# Link internal libs
+if(TARGET ooverlap_overlap)
+  target_link_libraries(ooverlap_ext PRIVATE ooverlap_overlap)
 endif()
-if(TARGET ooverlap_overlap_impl)
-  target_link_libraries(ooverlap_pybinding PRIVATE ooverlap_overlap_impl)
+if(TARGET ooverlap_baseline_impl)
+  target_link_libraries(ooverlap_ext PRIVATE ooverlap_baseline_impl)
 endif()
 if(TARGET ooverlap_nccl_tool)
-  target_link_libraries(ooverlap_pybinding PRIVATE ooverlap_nccl_tool)
+  target_link_libraries(ooverlap_ext PRIVATE ooverlap_nccl_tool)
 endif()
 
-ooverlap_apply_torch(ooverlap_pybinding)
+# Torch + Python includes/flags/libs
+ooverlap_apply_torch(ooverlap_ext)
+target_link_libraries(ooverlap_ext PRIVATE Python3::Python)
 
-target_link_libraries(ooverlap_pybinding PRIVATE
+# >>> KEY FIX: link libtorch_python so at::Tensor pybind caster is available
+if(EXISTS "${TORCH_PYTHON_SO}")
+  message(STATUS "Linking libtorch_python: ${TORCH_PYTHON_SO}")
+  target_link_options(ooverlap_ext PRIVATE "-Wl,--no-as-needed")
+  target_link_libraries(ooverlap_ext PRIVATE "${TORCH_PYTHON_SO}")
+else()
+  message(FATAL_ERROR "libtorch_python.so not found at: ${TORCH_PYTHON_SO}")
+endif()
+
+# External deps
+target_link_libraries(ooverlap_ext PRIVATE
   cutlass
   ${TORCH_LIBRARIES}
   CUDA::cudart
@@ -262,6 +284,12 @@ target_link_libraries(ooverlap_pybinding PRIVATE
   ${NCCL_LIBRARY}
 )
 
-set_target_properties(ooverlap_pybinding PROPERTIES
-  LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib
-)
+# RPATH to torch/lib for runtime
+if(TORCH_PY_LIBDIR)
+  message(STATUS "Torch libdir (RPATH): ${TORCH_PY_LIBDIR}")
+  set_target_properties(ooverlap_ext PROPERTIES
+    BUILD_RPATH "${TORCH_PY_LIBDIR}"
+    INSTALL_RPATH "${TORCH_PY_LIBDIR};\$ORIGIN"
+  )
+  target_link_options(ooverlap_ext PRIVATE "-Wl,-rpath,${TORCH_PY_LIBDIR}")
+endif()

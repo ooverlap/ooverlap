@@ -2,6 +2,116 @@
 #include "nccl_utils.h"
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+#include "overlap/gemm_signal_sm90_dispatch.h"
+
+// --------------------------------------------
+// SM90 1-GPU signal GEMM wrapper (for testing)
+// --------------------------------------------
+static void gemm_signal_sm90(
+    torch::Tensor A,
+    torch::Tensor B_packed,   // (N,K) contiguous; interpreted by kernel as ColumnMajor(K,N)
+    torch::Tensor D,
+    torch::Tensor MM,
+    torch::Tensor RA,
+    torch::Tensor CommThr,
+    int64_t ReLDN,
+    int64_t algo,
+    bool monitor) {
+
+  TORCH_CHECK(A.is_cuda() && B_packed.is_cuda() && D.is_cuda(), "A/B/D must be CUDA");
+  TORCH_CHECK(MM.is_cuda() && RA.is_cuda() && CommThr.is_cuda(), "MM/RA/CommThr must be CUDA");
+
+  TORCH_CHECK(A.scalar_type() == torch::kFloat16, "A must be float16");
+  TORCH_CHECK(B_packed.scalar_type() == torch::kFloat16, "B_packed must be float16");
+  TORCH_CHECK(D.scalar_type() == torch::kFloat16, "D must be float16");
+
+  TORCH_CHECK(MM.scalar_type() == torch::kInt32, "MM must be int32");
+  TORCH_CHECK(RA.scalar_type() == torch::kInt32, "RA must be int32");
+  TORCH_CHECK(CommThr.scalar_type() == torch::kInt32, "CommThr must be int32");
+
+  TORCH_CHECK(A.dim() == 2 && B_packed.dim() == 2 && D.dim() == 2, "A/B/D must be 2D");
+  TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+  TORCH_CHECK(B_packed.is_contiguous(), "B_packed must be contiguous");
+  TORCH_CHECK(D.is_contiguous(), "D must be contiguous");
+
+  const int64_t M = A.size(0);
+  const int64_t K = A.size(1);
+  const int64_t N = B_packed.size(0);
+  TORCH_CHECK(B_packed.size(1) == K, "B_packed must be (N,K) where K matches A");
+  TORCH_CHECK(ReLDN > 0, "ReLDN must be > 0");
+
+  // For algo=0 hardcoded tile sizes (matches your dispatch case 0)
+  constexpr int64_t TileM = 128;
+  constexpr int64_t TileN = 128;
+
+  TORCH_CHECK(algo == 0, "Only algo=0 supported in bring-up");
+  TORCH_CHECK(M % TileM == 0, "M must be multiple of 128 for algo=0");
+  TORCH_CHECK(N % TileN == 0, "N must be multiple of 128 for algo=0");
+
+  const int64_t tile_rows = M / TileM;
+  const int64_t tile_cols = N / TileN;
+  const int64_t num_tiles = tile_rows * tile_cols;
+
+  TORCH_CHECK(RA.numel() == num_tiles, "RA must have length num_tiles=", num_tiles);
+  TORCH_CHECK(CommThr.numel() >= 1, "CommThr must have >= 1 element");
+  TORCH_CHECK(MM.numel() >= 1, "MM must have >= 1 element");
+
+  // D is interpreted as "reshaped row-major" with leading dimension ldD = ReLDN*TileN.
+  const int64_t ldD = ReLDN * TileN;
+  TORCH_CHECK(D.size(0) >= M, "D.size(0) must be >= M");
+  TORCH_CHECK(D.size(1) >= ldD, "D.size(1) must be >= ReLDN*TileN (", ldD, ")");
+
+  // Avoid c10::cuda::SetDevice ABI issues: call CUDA runtime directly
+  const int dev = A.get_device();
+  cudaError_t err = cudaSetDevice(dev);
+  TORCH_CHECK(err == cudaSuccess, "cudaSetDevice failed: ", cudaGetErrorString(err));
+
+  cudaStream_t stream = at::cuda::getDefaultCUDAStream().stream();
+
+  bool ok = ooverlap::gemm_signal_sm90_dispatch(
+      (int)algo,
+      (int)M, (int)N, (int)K,
+      (int)ReLDN,
+      (int32_t*)CommThr.data_ptr<int32_t>(),
+      (void*)A.data_ptr<at::Half>(),
+      (void*)B_packed.data_ptr<at::Half>(),
+      (void*)D.data_ptr<at::Half>(),
+      (int32_t*)MM.data_ptr<int32_t>(),
+      (int32_t*)RA.data_ptr<int32_t>(),
+      monitor,
+      stream);
+
+  TORCH_CHECK(ok, "Unsupported algo=", algo);
+}
+
+// --------------------------------------------
+// Python module (this is what we use for tests)
+// --------------------------------------------
+PYBIND11_MODULE(ooverlap_ext, m) {
+  m.def("gemm_signal_sm90", &gemm_signal_sm90,
+        "SM90 fused reorder+signal GEMM (bring-up: algo=0 only)");
+
+  // You can expose generate_nccl_id here too if you want later,
+  // but not needed for 1-GPU signal test.
+}
+
+// --------------------------------------------
+// Torch dispatcher registrations (KEEP, but OFF by default)
+//
+// These are what cause the undefined symbol:
+//   torch::Library::_def(...)
+//
+// Enable ONLY when you are sure your build torch == runtime torch ABI.
+// --------------------------------------------
+#ifndef OOVERLAP_ENABLE_TORCH_LIBRARY
+#define OOVERLAP_ENABLE_TORCH_LIBRARY 0
+#endif
+
+#if OOVERLAP_ENABLE_TORCH_LIBRARY
+
 #include <torch/script.h>
 
 // Wrappers to match torch custom class calling convention (intrusive_ptr)
@@ -61,3 +171,5 @@ TORCH_LIBRARY(ooverlap_class, m) {
 TORCH_LIBRARY(ooverlap_op, m) {
   m.def("generate_nccl_id", &generate_nccl_id);
 }
+
+#endif  // OOVERLAP_ENABLE_TORCH_LIBRARY

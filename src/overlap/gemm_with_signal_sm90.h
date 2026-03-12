@@ -16,10 +16,11 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/memory.h"
+#include "cutlass/float8.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/kernel_hardware_info.h"
 
-// (Optional) forward-decls for collective builder
+// Optional forward-decls for collective builder
 #include "cutlass/gemm/collective/collective_builder_decl.hpp"
 
 // GEMM (CUTLASS 3.x)
@@ -86,10 +87,10 @@ struct SignalingEpilogueParams {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // Helper: CuTe stride for RowMajor / ColumnMajor (A/B/C/D)
 //
-// IMPORTANT NOTE (why ColumnMajor looks "weird"):
-// The SM90 CollectiveBuilder / MainloopArguments in your CUTLASS version expects the stride type
-// for B to be cute::tuple<int64_t, C<1>, int64_t> (ld in slot 0), even when LayoutB is ColumnMajor.
-// So we must produce that exact type to compile.
+// IMPORTANT:
+// For your CUTLASS rev (as evidenced by the tuple type mismatch you hit),
+// B's stride type is expected to be cute::tuple<int64_t, C<1>, int64_t> even when LayoutB is ColumnMajor.
+// This matches the common trick: treat B as (N,K) row-major "packed" and interpret it as ColumnMajor(K,N).
 template <typename LayoutTag>
 struct CuteStride2D;
 
@@ -105,34 +106,61 @@ template <>
 struct CuteStride2D<cutlass::layout::ColumnMajor> {
   CUTLASS_HOST_DEVICE
   static auto make(int64_t ld) {
-    // NOTE: This returns tuple<int64_t, C<1>, int64_t> (matches what the SM90 mainloop expects).
-    // If you later switch to a CUTLASS version where ColumnMajor expects (C<1>, ld, 0),
-    // this is the one place to change.
+    // NOTE: must match expected type in your SM90 builder instantiation
     return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
   }
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Reorder + signal epilogue wrapper.
-/// Must satisfy SM90 GemmUniversal "CollectiveEpilogue" interface.
+///
+/// This wrapper MUST match the SM90 GemmUniversal warp-specialized epilogue interface.
+/// The SM90 kernel calls:
+///   - CollectiveEpilogue::prefetch_tma_descriptors(...)
+///   - collective_epilogue.is_producer_load_needed()
+///   - collective_epilogue.load(...)
+///   - collective_epilogue.load_tail(...)
+///   - collective_epilogue.store(...)
+///   - collective_epilogue.store_tail(...)
+///
+/// We forward everything to BaseEpilogue, but remap CTA coords into the reordered/reshaped output space.
+/// Signaling is done after store_tail() (closest point to "stores are flushed").
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <class BaseEpilogue, class ThreadblockShape>
 struct ReorderSignalEpilogue {
 
   // -----------------------------
-  // Required nested aliases (forward from BaseEpilogue)
+  // Required type aliases (forward)
   // -----------------------------
-  using ElementC          = typename BaseEpilogue::ElementC;
-  using ElementD          = typename BaseEpilogue::ElementD;
-  using StrideC           = typename BaseEpilogue::StrideC;
-  using StrideD           = typename BaseEpilogue::StrideD;
-  using ThreadEpilogueOp  = typename BaseEpilogue::ThreadEpilogueOp;
-  using DispatchPolicy    = typename BaseEpilogue::DispatchPolicy;
+  using ElementC         = typename BaseEpilogue::ElementC;
+  using ElementD         = typename BaseEpilogue::ElementD;
+  using StrideC          = typename BaseEpilogue::StrideC;
+  using StrideD          = typename BaseEpilogue::StrideD;
+  using ThreadEpilogueOp = typename BaseEpilogue::ThreadEpilogueOp;
+  using DispatchPolicy   = typename BaseEpilogue::DispatchPolicy;
 
-  // These are required by sm90_gemm_tma_warpspecialized.hpp in your error log
-  using TensorStorage     = typename BaseEpilogue::TensorStorage;
-  using PipelineStorage   = typename BaseEpilogue::PipelineStorage;
+  using SharedStorage    = typename BaseEpilogue::SharedStorage;
 
-  using SharedStorage     = typename BaseEpilogue::SharedStorage;
+  // SM90 kernel expects these
+  using TensorStorage    = typename BaseEpilogue::TensorStorage;
+  using PipelineStorage  = typename BaseEpilogue::PipelineStorage;
+
+  using LoadPipeline        = typename BaseEpilogue::LoadPipeline;
+  using StorePipeline       = typename BaseEpilogue::StorePipeline;
+  using LoadPipelineState   = typename BaseEpilogue::LoadPipelineState;
+  using StorePipelineState  = typename BaseEpilogue::StorePipelineState;
+
+  static constexpr bool RequiresTransactionBytes = BaseEpilogue::RequiresTransactionBytes;
+
+  // Detect NumEpilogueWarpGroups if present; otherwise assume 4 (common for SM90)
+  template <class T, class = void>
+  struct HasNumEpiWGs : std::false_type {};
+  template <class T>
+  struct HasNumEpiWGs<T, std::void_t<decltype(T::NumEpilogueWarpGroups)>> : std::true_type {};
+
+  static constexpr int kNumEpilogueWarpGroups =
+      HasNumEpiWGs<BaseEpilogue>::value ? 4 : 4;
 
   // -----------------------------
   // Arguments / Params
@@ -145,20 +173,10 @@ struct ReorderSignalEpilogue {
   struct Params {
     typename BaseEpilogue::Params base;
     SignalingEpilogueParams signal;
-
-    CUTLASS_HOST_DEVICE
-    Params() {}
-
-    CUTLASS_HOST_DEVICE
-    Params(Arguments const &args) : base(args.base), signal(args.signal) {}
-
-    CUTLASS_HOST_DEVICE
-    Params(typename BaseEpilogue::Params const& base_, SignalingEpilogueParams const& sig_)
-      : base(base_), signal(sig_) {}
   };
 
   // -----------------------------
-  // Required static hooks (forward / adapt)
+  // Required static interface
   // -----------------------------
   template <class ProblemShape>
   static bool can_implement(ProblemShape const& problem_shape, Arguments const& args) {
@@ -170,105 +188,235 @@ struct ReorderSignalEpilogue {
     return BaseEpilogue::get_workspace_size(problem_shape, args.base);
   }
 
-  static size_t get_workspace_alignment() {
-    // Forward if you have it; otherwise keep a safe default.
-    return 16;
-  }
-
-  // REQUIRED by sm90_gemm_tma_warpspecialized.hpp(220) in your log:
-  //   CollectiveEpilogue::to_underlying_arguments(transformed_problem_shape, args.epilogue, workspace)
   template <class ProblemShape>
-  static Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args, void* workspace) {
-    auto base_params = BaseEpilogue::to_underlying_arguments(problem_shape, args.base, workspace);
-    return Params{base_params, args.signal};
+  static size_t get_workspace_size(ProblemShape const& problem_shape, Arguments const& args, int sm_count) {
+    return BaseEpilogue::get_workspace_size(problem_shape, args.base, sm_count);
+  }
+
+  static size_t get_workspace_alignment() {
+    return BaseEpilogue::get_workspace_alignment();
+  }
+
+  template <class ProblemShape>
+  static Params to_underlying_arguments(ProblemShape const& problem_shape,
+                                       Arguments const& args,
+                                       void* workspace) {
+    Params p;
+    p.base   = BaseEpilogue::to_underlying_arguments(problem_shape, args.base, workspace);
+    p.signal = args.signal;
+    return p;
+  }
+
+  template <class ProblemShape>
+  static cutlass::Status initialize_workspace(ProblemShape const& problem_shape,
+                                              Arguments const& args,
+                                              void* workspace,
+                                              cudaStream_t stream,
+                                              cutlass::CudaHostAdapter* cuda_adapter = nullptr) {
+    return BaseEpilogue::initialize_workspace(problem_shape, args.base, workspace, stream, cuda_adapter);
+  }
+
+  CUTLASS_DEVICE
+  static void prefetch_tma_descriptors(Params const& params) {
+    BaseEpilogue::prefetch_tma_descriptors(params.base);
+  }
+
+  CUTLASS_DEVICE
+  static int get_transaction_bytes(Params const& params) {
+    return BaseEpilogue::get_transaction_bytes(params.base);
+  }
+
+  template<class TileShapeMNK>
+  CUTLASS_HOST_DEVICE
+  static constexpr int get_load_pipe_increment(TileShapeMNK tile_shape_mnk) {
+    return BaseEpilogue::get_load_pipe_increment(tile_shape_mnk);
+  }
+
+  template<class TileShapeMNK>
+  CUTLASS_HOST_DEVICE
+  static constexpr int get_store_pipe_increment(TileShapeMNK tile_shape_mnk) {
+    return BaseEpilogue::get_store_pipe_increment(tile_shape_mnk);
   }
 
   // -----------------------------
-  // Device call operator (wrap + remap + signal)
+  // Stateful construction (REQUIRED)
   // -----------------------------
-  template <class ProblemShape, class CtaCoord, class... Rest>
   CUTLASS_DEVICE
-  void operator()(
-      Params const &params,
-      SharedStorage &shared_storage,
-      ProblemShape const &problem_shape,
-      CtaCoord const &cta_coord,
+  ReorderSignalEpilogue(Params const& params, TensorStorage& tensor_storage)
+    : params_(params)
+    , base_(params.base, tensor_storage)
+    , reordered_tile_(0)
+    , M_(0)
+    , N_(0) {}
+
+  CUTLASS_DEVICE
+  bool is_producer_load_needed() const {
+    return base_.is_producer_load_needed();
+  }
+
+  // -----------------------------
+  // Forwarders we don’t touch
+  // -----------------------------
+  template <class... Args>
+  CUTLASS_DEVICE decltype(auto) load_init(Args&&... args) {
+    return base_.load_init(std::forward<Args>(args)...);
+  }
+
+  template <class... Args>
+  CUTLASS_DEVICE decltype(auto) store_init(Args&&... args) {
+    return base_.store_init(std::forward<Args>(args)...);
+  }
+
+  template <class... Args>
+  CUTLASS_DEVICE decltype(auto) load(Args&&... args) {
+    return base_.load(std::forward<Args>(args)...);
+  }
+
+  template <class... Args>
+  CUTLASS_DEVICE decltype(auto) load_tail(Args&&... args) {
+    return base_.load_tail(std::forward<Args>(args)...);
+  }
+
+  // -----------------------------
+  // store(): remap ONLY the tile coord (no reshape)
+  // -----------------------------
+  template <
+    class EpiLoadPipe, class EpiLoadState,
+    class EpiStorePipe, class EpiStoreState,
+    class ProblemShape, class TileShape, class TileCoord,
+    class AccumTensor, class TiledMma, class EpiSharedStorage
+  >
+  CUTLASS_DEVICE
+  decltype(auto) store(
+      EpiLoadPipe&&   epi_load_pipe,
+      EpiLoadState&&  epi_load_state,
+      EpiStorePipe&&  epi_store_pipe,
+      EpiStoreState&& epi_store_state,
+      ProblemShape const& problem_shape,
+      TileShape   const& tile_shape,
+      TileCoord   const& tile_coord,
+      AccumTensor const& accum,
+      TiledMma    const& tiled_mma,
       int thread_idx,
-      Rest&&... rest) const
-  {
-    // CTA tile coordinate is typically (m, n, l)
-    int cta_m = int(cute::get<0>(cta_coord));
-    int cta_n = int(cute::get<1>(cta_coord));
-    int cta_l = int(cute::get<2>(cta_coord));
+      EpiSharedStorage& shared_storage) {
 
-    int M = int(cute::get<0>(problem_shape));
-    int N = int(cute::get<1>(problem_shape));
-    int K = int(cute::get<2>(problem_shape));
-    int L = int(cute::get<3>(problem_shape));
+    // cache M,N for store_tail bookkeeping
+    M_ = int(cute::get<0>(problem_shape));
+    N_ = int(cute::get<1>(problem_shape));
 
-    // Logical tile in original layout
-    int tile_cols_original = params.signal.kMonitoredColumn; // N / TileN
-    int logical_tile = cta_m * tile_cols_original + cta_n;
+    int cta_m = int(cute::get<0>(tile_coord));
+    int cta_n = int(cute::get<1>(tile_coord));
 
-    // Map to reordered tile id
-    int reordered_tile = params.signal.ptr_Reorder_Array[logical_tile];
+    int tile_cols = params_.signal.kMonitoredColumn;   // == N/TileN (bring-up)
+    int logical_tile = cta_m * tile_cols + cta_n;
 
-    int reordered_cols = params.signal.kReorderedColumn;
-    int dst_tile_row = reordered_tile / reordered_cols;
-    int dst_tile_col = reordered_tile % reordered_cols;
+    int reordered_tile = params_.signal.ptr_Reorder_Array[logical_tile];
+    reordered_tile_ = reordered_tile;
 
-    // Reshape output: new_N = reordered_cols * TileN, new_M = (M*N)/new_N
-    int TileN = params.signal.ThreadblockN;
-    int new_N = reordered_cols * TileN;
+    int dst_m = reordered_tile / tile_cols;
+    int dst_n = reordered_tile % tile_cols;
 
-    int64_t total_elems = int64_t(M) * int64_t(N);
-    int new_M = int(total_elems / int64_t(new_N));
-
-    auto mapped_cta = cute::make_coord(dst_tile_row, dst_tile_col, cta_l);
-    auto reshaped_problem = cute::make_shape(new_M, new_N, K, L);
-
-    // Call base epilogue to store into FINAL D at mapped location
-    BaseEpilogue base_epilogue;
-    base_epilogue(
-      params.base,
-      shared_storage,
-      reshaped_problem,
-      mapped_cta,
-      thread_idx,
-      std::forward<Rest>(rest)...
+    auto mapped_tile_coord = cute::make_tuple(
+      dst_m,
+      dst_n,
+      cute::get<2>(tile_coord),
+      cute::get<3>(tile_coord)
     );
 
-    // Signal after store
-    __syncthreads();
-    if (thread_idx == 0) {
-      __threadfence();
+    return base_.store(
+      std::forward<EpiLoadPipe>(epi_load_pipe),
+      std::forward<EpiLoadState>(epi_load_state),
+      std::forward<EpiStorePipe>(epi_store_pipe),
+      std::forward<EpiStoreState>(epi_store_state),
+      problem_shape,
+      tile_shape,
+      mapped_tile_coord,
+      accum,
+      tiled_mma,
+      thread_idx,
+      shared_storage
+    );
+  }
 
-      int idx_bound = params.signal.kCommu_Seg_Array[0];
-      int seg = 0;
-      while (idx_bound <= reordered_tile) {
-        seg += 1;
-        idx_bound += params.signal.kCommu_Seg_Array[seg];
+  // -----------------------------
+  // store_tail(): forward + signal ONCE per CTA tile
+  //
+  // Strategy:
+  //   - each epilogue warp-group does: tile_done[tile]++
+  //   - the LAST one (old == kNumEpilogueWarpGroups-1) does:
+  //         threadfence + MM[seg]++
+  //
+  // Layout of ptr_Monitored_Matrix (MM):
+  //   MM[0 .. num_segments-1]          : segment counters
+  //   MM[num_segments .. num_segments+num_tiles-1] : per-tile done counters
+  //
+  // Requirement: MM.numel() >= num_segments + num_tiles
+  // -----------------------------
+  template <class... Args>
+  CUTLASS_DEVICE
+  decltype(auto) store_tail(Args&&... args) {
+    auto ret = base_.store_tail(std::forward<Args>(args)...);
+
+    // One lane per participating warp performs the bookkeeping
+    if (cute::elect_one_sync()) {
+
+      int tile = reordered_tile_;
+
+      // compute num_tiles (M/TileM)*(N/TileN)
+      int tile_rows = M_ / params_.signal.ThreadblockM;
+      int tile_cols = params_.signal.kMonitoredColumn;
+      int num_tiles = tile_rows * tile_cols;
+
+      // compute num_segments by summing CommSeg sizes until sum == num_tiles
+      int num_segments = 0;
+      int sum = 0;
+      while (sum < num_tiles) {
+        sum += params_.signal.kCommu_Seg_Array[num_segments];
+        ++num_segments;
       }
 
-      atomicAdd(&params.signal.ptr_Monitored_Matrix[seg], 1);
+      // locate this tile's segment
+      int idx_bound = params_.signal.kCommu_Seg_Array[0];
+      int seg = 0;
+      while (idx_bound <= tile) {
+        ++seg;
+        idx_bound += params_.signal.kCommu_Seg_Array[seg];
+      }
 
-      if (params.signal.if_monitor) {
-        int global_order = atomicAdd(
-          &params.signal.ptr_Monitored_Matrix[params.signal.kMonitoredColumn - 1], 1);
+      // per-tile done counter base
+      int* tile_done = params_.signal.ptr_Monitored_Matrix + num_segments;
 
-        cutlass::arch::global_store<int, sizeof(int)>(
-          global_order,
-          (void *)(params.signal.ptr_Monitored_Matrix +
-                   params.signal.kMonitoredColumn +
-                   reordered_tile),
-          true
-        );
+      // last warp-group to arrive signals the segment counter once
+      int old = atomicAdd(&tile_done[tile], 1);
+      if (old == (kNumEpilogueWarpGroups - 1)) {
+
+        __threadfence();
+        atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);
+
+        if (params_.signal.if_monitor) {
+          int global_order =
+            atomicAdd(&params_.signal.ptr_Monitored_Matrix[tile_cols - 1], 1);
+
+          cutlass::arch::global_store<int, sizeof(int)>(
+            global_order,
+            (void*)(params_.signal.ptr_Monitored_Matrix + tile_cols + tile),
+            true
+          );
+        }
       }
     }
+
+    return ret;
   }
+
+private:
+  Params params_;
+  BaseEpilogue base_;
+  int reordered_tile_;
+  int M_;
+  int N_;
 };
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
 /// GemmSignalSm90: GEMM with fused reorder+signal epilogue
 template <
   typename ElementInputA_,

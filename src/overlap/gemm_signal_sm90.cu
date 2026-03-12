@@ -10,6 +10,7 @@
 #include "cutlass/fast_math.h"
 
 #include "gemm_with_signal_sm90.h"   // Route-A header below
+#include "gemm_signal_sm90_dispatch.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -111,3 +112,45 @@ void cutlass_gemm_signal_sm90(
 #include "../inc/signal_instances_sm90.inc"
 
 #undef CUTLASS_GEMM_SIGNAL_SM90_INIT
+
+// -------------------------------------------------------------------------------------------------
+// Simple runtime dispatch for testing (1-GPU)
+// -------------------------------------------------------------------------------------------------
+namespace ooverlap {
+
+bool gemm_signal_sm90_dispatch(
+    int algo,
+    int M, int N, int K,
+    int ReLDN,
+    int32_t* CommThr,
+    void* A, void* B, void* D,
+    int32_t* MM, int32_t* RA,
+    bool Monitor,
+    cudaStream_t stream) {
+
+  // NOTE: for now we support one known-good instance (the first line in signal_instances_sm90.inc)
+  //   (128,128,32) TB, (64,64,32) Warp, (16,8,16) Inst, stages=3, swizzle=1, splitk=1
+  switch (algo) {
+    case 0:
+      cutlass_gemm_signal_sm90<
+          128, 128, 32,
+          64,  64,  32,
+          16,  8,   16,
+          3,   1,   1>(
+          M, N, K,
+          ReLDN, reinterpret_cast<int*>(CommThr),
+          reinterpret_cast<half*>(A),
+          reinterpret_cast<half*>(B),
+          reinterpret_cast<half*>(D),
+          reinterpret_cast<int*>(MM),
+          reinterpret_cast<int*>(RA),
+          Monitor,
+          stream);
+      return true;
+
+    default:
+      return false;
+  }
+}
+
+} // namespace ooverlap
