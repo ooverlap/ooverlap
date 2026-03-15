@@ -166,20 +166,26 @@ endif()
 file(GLOB norm_files CONFIGURE_DEPENDS
   ${OOVERLAP_SRC_DIR}/rmsnorm/*.cu
   ${OOVERLAP_SRC_DIR}/rmsnorm/*.cpp
+  ${OOVERLAP_SRC_DIR}/rmsnorm/*.cc
 )
 
 if(norm_files)
   add_library(ooverlap_norm STATIC ${norm_files})
   ooverlap_force_sm90a(ooverlap_norm)
-  
+
   set_property(TARGET ooverlap_norm PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ooverlap_norm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
   target_include_directories(ooverlap_norm PUBLIC
     ${OOVERLAP_SRC_DIR}
+    ${NCCL_INCLUDE_DIR}
   )
 
-  target_link_libraries(ooverlap_norm PUBLIC CUDA::cudart)
+  ooverlap_apply_torch(ooverlap_norm)
+
+  target_link_libraries(ooverlap_norm PUBLIC
+    CUDA::cudart
+  )
 endif()
 
 # -------------------------
@@ -260,6 +266,9 @@ if(TARGET ooverlap_baseline_impl)
 endif()
 if(TARGET ooverlap_nccl_tool)
   target_link_libraries(ooverlap_ext PRIVATE ooverlap_nccl_tool)
+endif()
+if(TARGET ooverlap_norm)
+  target_link_libraries(ooverlap_ext PRIVATE ooverlap_norm)
 endif()
 
 # Torch + Python includes/flags/libs
