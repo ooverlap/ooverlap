@@ -218,6 +218,33 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/baseline_impl.cu)
 endif()
 
 # -------------------------
+# overlap_impl (needs CUDA because it launches wait/remap kernels)
+# -------------------------
+if(EXISTS ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
+  add_library(ooverlap_overlap_impl STATIC ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
+  ooverlap_force_sm90a(ooverlap_overlap_impl)
+
+  set_property(TARGET ooverlap_overlap_impl PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set_property(TARGET ooverlap_overlap_impl PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+
+  target_include_directories(ooverlap_overlap_impl PUBLIC
+    ${OOVERLAP_SRC_DIR}
+    ${NCCL_INCLUDE_DIR}
+  )
+
+  ooverlap_apply_torch(ooverlap_overlap_impl)
+
+  if(TARGET ooverlap_overlap)
+    target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_overlap)
+  endif()
+  if(TARGET ooverlap_norm)
+    target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_norm)
+  endif()
+
+  target_link_libraries(ooverlap_overlap_impl PUBLIC CUDA::cudart ${NCCL_LIBRARY})
+endif()
+
+# -------------------------
 # nccl_tool (compile as CXX to avoid NVCC+ATen issues)
 # -------------------------
 if(EXISTS ${OOVERLAP_SRC_DIR}/nccl_utils.cu)
@@ -269,6 +296,9 @@ if(TARGET ooverlap_nccl_tool)
 endif()
 if(TARGET ooverlap_norm)
   target_link_libraries(ooverlap_ext PRIVATE ooverlap_norm)
+endif()
+if(TARGET ooverlap_overlap_impl)
+  target_link_libraries(ooverlap_ext PRIVATE ooverlap_overlap_impl)
 endif()
 
 # Torch + Python includes/flags/libs

@@ -6,8 +6,11 @@
 #include <cuda_runtime.h>
 
 #include "overlap/gemm_signal_sm90_dispatch.h"
-#include "overlap/gemm_scatter_sm90_dispatch.h"
 #include "rmsnorm/rmsnorm.h"
+#include "overlap_impl.h"
+#include "overlap/gemm_scatter_sm90_dispatch.h"
+
+namespace py = pybind11;
 
 // --------------------------------------------
 // SM90 1-GPU signal GEMM wrapper (for testing)
@@ -175,14 +178,18 @@ PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("gemm_signal_sm90", &gemm_signal_sm90,
         "SM90 fused reorder+signal GEMM (bring-up: algo=0 only)");
 
-  m.def("gemm_scatter_sm90", &gemm_scatter_sm90,
-        "SM90 scatter bring-up GEMM dispatch (RE is consumed later in overlap path)");
+  m.def("generate_nccl_id", &generate_nccl_id,
+        "Generate an NCCL unique ID as a Python list[int]");
 
-  m.def("rmsnorm", &ooverlap::rmsnorm,
-        "RMSNorm on current CUDA stream");
-
-  m.def("reorder_rmsnorm", &ooverlap::reorder_rmsnorm,
-        "RMSNorm that reads from RA/rldn tile-reordered layout");
+  py::class_<OverlapImpl>(m, "OverlapImpl")
+      .def(py::init<>())
+      .def("cutlass_init", &OverlapImpl::CutlassInit)
+      .def("nccl_init", &OverlapImpl::NcclInit)
+      .def("overlap_init", &OverlapImpl::OverlapInit)
+      .def("gemm_allreduce_overlap", &OverlapImpl::GemmAllReduceOverlap)
+      .def("gemm_reducescatter_overlap", &OverlapImpl::GemmReduceScatterOverlap)
+      .def("nccl_allreduce", &OverlapImpl::NcclAllReduce)
+      .def("nccl_reducescatter", &OverlapImpl::NcclReduceScatter);
 }
 
 
