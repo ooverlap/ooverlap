@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <utility>
+#include <type_traits>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/memory.h"
@@ -29,6 +30,7 @@
 
 // CuTe
 #include "cute/tensor.hpp"
+#include "epilogue/helper.h"
 
 namespace cutlass {
 
@@ -46,7 +48,18 @@ struct SignalingEpilogueParams {
   int   ThreadblockN;
 
   void *ptr_D;                  // base ptr of FINAL output buffer (reshaped row-major)
-  int   ld_D;                   // leading dim (elements) of reshaped output: kReorderedColumn * ThreadblockN
+  int   ld_D;                   // leading dim (elements) of reshaped output:
+                                //   kReorderedColumn * ThreadblockN
+
+  // Optional override/debug:
+  // If > 0, use this as the expected number of elected arrivals per tile in store_tail().
+  // Otherwise fall back to the compile-time trait extracted from CUTLASS.
+  int   kEpilogueArrivalsPerTile;
+
+  // Optional debug buffer of length >= num_tiles.
+  // If non-null, each elected arrival does:
+  //   atomicAdd(ptr_Debug_Arrivals + reordered_tile, 1)
+  int  *ptr_Debug_Arrivals;
 
   CUTLASS_HOST_DEVICE
   SignalingEpilogueParams() :
@@ -59,32 +72,25 @@ struct SignalingEpilogueParams {
     ThreadblockM(0),
     ThreadblockN(0),
     ptr_D(nullptr),
-    ld_D(0)
+    ld_D(0),
+    kEpilogueArrivalsPerTile(0),
+    ptr_Debug_Arrivals(nullptr)
   {}
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Reorder + signal epilogue wrapper.
 ///
-/// This wrapper MUST match the SM90 GemmUniversal warp-specialized epilogue interface.
-/// The SM90 kernel calls:
-///   - CollectiveEpilogue::prefetch_tma_descriptors(...)
-///   - collective_epilogue.is_producer_load_needed()
-///   - collective_epilogue.load(...)
-///   - collective_epilogue.load_tail(...)
-///   - collective_epilogue.store(...)
-///   - collective_epilogue.store_tail(...)
-///
-/// We forward everything to BaseEpilogue, but remap CTA coords into the reordered/reshaped output space.
-/// Signaling is done after store_tail() (closest point to "stores are flushed").
+/// This wrapper matches the SM90 GemmUniversal warp-specialized epilogue interface.
+/// We forward almost everything to BaseEpilogue, but:
+///   1) remap CTA tile coords into the reordered packed output space
+///   2) emit one segment-ready signal when the last participating epilogue subgroup
+///      for that tile reaches store_tail()
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <class BaseEpilogue, class ThreadblockShape>
 struct ReorderSignalEpilogue {
 
-  // -----------------------------
-  // Required type aliases (forward)
-  // -----------------------------
   using ElementC         = typename BaseEpilogue::ElementC;
   using ElementD         = typename BaseEpilogue::ElementD;
   using StrideC          = typename BaseEpilogue::StrideC;
@@ -93,8 +99,6 @@ struct ReorderSignalEpilogue {
   using DispatchPolicy   = typename BaseEpilogue::DispatchPolicy;
 
   using SharedStorage    = typename BaseEpilogue::SharedStorage;
-
-  // SM90 kernel expects these
   using TensorStorage    = typename BaseEpilogue::TensorStorage;
   using PipelineStorage  = typename BaseEpilogue::PipelineStorage;
 
@@ -105,18 +109,15 @@ struct ReorderSignalEpilogue {
 
   static constexpr bool RequiresTransactionBytes = BaseEpilogue::RequiresTransactionBytes;
 
-  // Detect NumEpilogueWarpGroups if present; otherwise assume 4 (common for SM90)
-  template <class T, class = void>
-  struct HasNumEpiWGs : std::false_type {};
-  template <class T>
-  struct HasNumEpiWGs<T, std::void_t<decltype(T::NumEpilogueWarpGroups)>> : std::true_type {};
-
   static constexpr int kNumEpilogueWarpGroups =
-      HasNumEpiWGs<BaseEpilogue>::value ? 4 : 4;
+      EpiWGsFromBase<BaseEpilogue>::value ?
+        EpiWGsFromBase<BaseEpilogue>::value :
+      EpiWGsFromDispatchPolicy<BaseEpilogue>::value ?
+        EpiWGsFromDispatchPolicy<BaseEpilogue>::value :
+      EpiWGsFromSchedule<BaseEpilogue>::value ?
+        EpiWGsFromSchedule<BaseEpilogue>::value :
+        0;
 
-  // -----------------------------
-  // Arguments / Params
-  // -----------------------------
   struct Arguments {
     typename BaseEpilogue::Arguments base;
     SignalingEpilogueParams signal;
@@ -127,9 +128,6 @@ struct ReorderSignalEpilogue {
     SignalingEpilogueParams signal;
   };
 
-  // -----------------------------
-  // Required static interface
-  // -----------------------------
   template <class ProblemShape>
   static bool can_implement(ProblemShape const& problem_shape, Arguments const& args) {
     return BaseEpilogue::can_implement(problem_shape, args.base);
@@ -151,8 +149,8 @@ struct ReorderSignalEpilogue {
 
   template <class ProblemShape>
   static Params to_underlying_arguments(ProblemShape const& problem_shape,
-                                       Arguments const& args,
-                                       void* workspace) {
+                                        Arguments const& args,
+                                        void* workspace) {
     Params p;
     p.base   = BaseEpilogue::to_underlying_arguments(problem_shape, args.base, workspace);
     p.signal = args.signal;
@@ -190,9 +188,6 @@ struct ReorderSignalEpilogue {
     return BaseEpilogue::get_store_pipe_increment(tile_shape_mnk);
   }
 
-  // -----------------------------
-  // Stateful construction (REQUIRED)
-  // -----------------------------
   CUTLASS_DEVICE
   ReorderSignalEpilogue(Params const& params, TensorStorage& tensor_storage)
     : params_(params)
@@ -206,9 +201,6 @@ struct ReorderSignalEpilogue {
     return base_.is_producer_load_needed();
   }
 
-  // -----------------------------
-  // Forwarders we don’t touch
-  // -----------------------------
   template <class... Args>
   CUTLASS_DEVICE decltype(auto) load_init(Args&&... args) {
     return base_.load_init(std::forward<Args>(args)...);
@@ -229,9 +221,13 @@ struct ReorderSignalEpilogue {
     return base_.load_tail(std::forward<Args>(args)...);
   }
 
-  // -----------------------------
-  // store(): remap ONLY the tile coord (no reshape)
-  // -----------------------------
+  // --------------------------------------------------------------------------
+  // store():
+  //   - logical tile id is flattened with kMonitoredColumn
+  //   - reordered tile id is unflattened with kReorderedColumn
+  //   - base epilogue receives a PACKED problem shape so its predicates match
+  //     the reordered packed D layout
+  // --------------------------------------------------------------------------
   template <
     class EpiLoadPipe, class EpiLoadState,
     class EpiStorePipe, class EpiStoreState,
@@ -252,21 +248,25 @@ struct ReorderSignalEpilogue {
       int thread_idx,
       EpiSharedStorage& shared_storage) {
 
-    // cache M,N for store_tail bookkeeping
+    // Cache ORIGINAL logical M,N for segment bookkeeping in store_tail()
     M_ = int(cute::get<0>(problem_shape));
     N_ = int(cute::get<1>(problem_shape));
 
-    int cta_m = int(cute::get<0>(tile_coord));
-    int cta_n = int(cute::get<1>(tile_coord));
+    const int cta_m = int(cute::get<0>(tile_coord));
+    const int cta_n = int(cute::get<1>(tile_coord));
 
-    int tile_cols = params_.signal.kMonitoredColumn;   // == N/TileN (bring-up)
-    int logical_tile = cta_m * tile_cols + cta_n;
+    // Flatten logical tile in ORIGINAL tile grid
+    const int logical_tile_cols = params_.signal.kMonitoredColumn;
+    const int logical_tile = cta_m * logical_tile_cols + cta_n;
 
-    int reordered_tile = params_.signal.ptr_Reorder_Array[logical_tile];
+    // Reordered linear tile id
+    const int reordered_tile = params_.signal.ptr_Reorder_Array[logical_tile];
     reordered_tile_ = reordered_tile;
 
-    int dst_m = reordered_tile / tile_cols;
-    int dst_n = reordered_tile % tile_cols;
+    // Unflatten reordered tile id in PACKED tile grid
+    const int packed_tile_cols = params_.signal.kReorderedColumn;
+    const int dst_m = reordered_tile / packed_tile_cols;
+    const int dst_n = reordered_tile % packed_tile_cols;
 
     auto mapped_tile_coord = cute::make_tuple(
       dst_m,
@@ -275,12 +275,25 @@ struct ReorderSignalEpilogue {
       cute::get<3>(tile_coord)
     );
 
+    // Base epilogue predicates should see the PACKED output extent
+    const int64_t packed_cols_elems =
+        int64_t(params_.signal.kReorderedColumn) * int64_t(params_.signal.ThreadblockN);
+    const int64_t packed_rows =
+        (int64_t(M_) * int64_t(N_)) / packed_cols_elems;
+
+    auto packed_problem_shape = cute::make_shape(
+      int(packed_rows),
+      int(packed_cols_elems),
+      int(cute::get<2>(problem_shape)),
+      int(cute::get<3>(problem_shape))
+    );
+
     return base_.store(
       std::forward<EpiLoadPipe>(epi_load_pipe),
       std::forward<EpiLoadState>(epi_load_state),
       std::forward<EpiStorePipe>(epi_store_pipe),
       std::forward<EpiStoreState>(epi_store_state),
-      problem_shape,
+      packed_problem_shape,
       tile_shape,
       mapped_tile_coord,
       accum,
@@ -290,37 +303,48 @@ struct ReorderSignalEpilogue {
     );
   }
 
-  // -----------------------------
-  // store_tail(): forward + signal ONCE per CTA tile
+  // --------------------------------------------------------------------------
+  // store_tail():
   //
-  // Strategy:
-  //   - each epilogue warp-group does: tile_done[tile]++
-  //   - the LAST one (old == kNumEpilogueWarpGroups-1) does:
-  //         threadfence + MM[seg]++
+  // MM layout expected here:
+  //   MM[0 .. num_segments-1]                     : segment counters
+  //   MM[num_segments .. num_segments+num_tiles-1]: per-tile done counters
   //
-  // Layout of ptr_Monitored_Matrix (MM):
-  //   MM[0 .. num_segments-1]          : segment counters
-  //   MM[num_segments .. num_segments+num_tiles-1] : per-tile done counters
+  // Optional:
+  //   ptr_Debug_Arrivals[tile] counts actual elected arrivals for diagnosis.
   //
-  // Requirement: MM.numel() >= num_segments + num_tiles
-  // -----------------------------
+  // For correctness, the "expected arrivals per tile" must match the number of
+  // times cute::elect_one_sync() fires for one CTA tile on this compiled kernel.
+  // By default we use the CUTLASS trait above; if that mismatches reality, set
+  // signal.kEpilogueArrivalsPerTile from the host after measuring.
+  // --------------------------------------------------------------------------
   template <class... Args>
   CUTLASS_DEVICE
   decltype(auto) store_tail(Args&&... args) {
     auto ret = base_.store_tail(std::forward<Args>(args)...);
 
-    // One lane per participating warp performs the bookkeeping
-    // TODO: this might be wrong because it is per wrap.
-    if (cute::elect_one_sync()) {
+    int linear_tid =
+      int(threadIdx.x) +
+      int(blockDim.x) * (int(threadIdx.y) + int(blockDim.y) * int(threadIdx.z));
+
+    int lane_idx = linear_tid & 31;
+    int warp_idx = linear_tid >> 5;
+
+    constexpr int kWarpsPerWarpGroup = 4;
+    int warp_idx_in_wg = warp_idx & (kWarpsPerWarpGroup - 1);
+
+    bool one_thread_per_warpgroup = (lane_idx == 0) && (warp_idx_in_wg == 0);
+
+    if (one_thread_per_warpgroup) {
 
       int tile = reordered_tile_;
 
-      // compute num_tiles (M/TileM)*(N/TileN)
-      int tile_rows = M_ / params_.signal.ThreadblockM;
-      int tile_cols = params_.signal.kMonitoredColumn;
+      // Total logical tile count
+      int tile_rows = (M_ + params_.signal.ThreadblockM - 1) / params_.signal.ThreadblockM;
+      int tile_cols = (N_ + params_.signal.ThreadblockN - 1) / params_.signal.ThreadblockN;
       int num_tiles = tile_rows * tile_cols;
 
-      // compute num_segments by summing CommSeg sizes until sum == num_tiles
+      // Number of segments
       int num_segments = 0;
       int sum = 0;
       while (sum < num_tiles) {
@@ -328,7 +352,7 @@ struct ReorderSignalEpilogue {
         ++num_segments;
       }
 
-      // locate this tile's segment
+      // Which segment contains this reordered tile?
       int idx_bound = params_.signal.kCommu_Seg_Array[0];
       int seg = 0;
       while (idx_bound <= tile) {
@@ -336,13 +360,27 @@ struct ReorderSignalEpilogue {
         idx_bound += params_.signal.kCommu_Seg_Array[seg];
       }
 
-      // per-tile done counter base
+      // Optional debug: count actual bookkeeping arrivals per tile
+      if (params_.signal.ptr_Debug_Arrivals) {
+        atomicAdd(&params_.signal.ptr_Debug_Arrivals[tile], 1);
+      }
+
+      // Count one arrival per warp-group, not per warp
       int* tile_done = params_.signal.ptr_Monitored_Matrix + num_segments;
 
-      // last warp-group to arrive signals the segment counter once
-      int old = atomicAdd(&tile_done[tile], 1);
-      if (old == (kNumEpilogueWarpGroups - 1)) {
+      int expected_arrivals =
+          (params_.signal.kEpilogueArrivalsPerTile > 0)
+              ? params_.signal.kEpilogueArrivalsPerTile
+              : kNumEpilogueWarpGroups;
 
+      if (expected_arrivals <= 0) {
+        expected_arrivals = 1;
+      }
+
+      int old = atomicAdd(&tile_done[tile], 1);
+
+      // Last warp-group to finish this tile signals its segment exactly once
+      if (old == (expected_arrivals - 1)) {
         __threadfence();
         atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);
 
@@ -358,7 +396,7 @@ struct ReorderSignalEpilogue {
         }
       }
     }
-
+    
     return ret;
   }
 
@@ -370,4 +408,4 @@ private:
   int N_;
 };
 
-}
+} // namespace cutlass
