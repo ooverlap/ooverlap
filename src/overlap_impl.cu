@@ -24,9 +24,17 @@ inline void check_common_gemm_inputs(at::Tensor A, at::Tensor B) {
     TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "A/B must be contiguous");
 }
 
-inline void ensure_streams_ready(cudaStream_t gemm_stream, cudaStream_t comm_stream) {
-    TORCH_CHECK(gemm_stream != nullptr, "Call cutlass_init() before overlap ops");
-    TORCH_CHECK(comm_stream != nullptr, "Call overlap_init() before overlap ops");
+inline void ensure_streams_ready(cudaStream_t& gemm_stream, cudaStream_t& comm_stream, bool& overlap_init_done) {
+    if (gemm_stream == nullptr) {
+        gemm_stream = at::cuda::getCurrentCUDAStream().stream();
+    }
+
+    if (comm_stream == nullptr) {
+        cudaError_t err = cudaStreamCreateWithPriority(&comm_stream, cudaStreamNonBlocking, -5);
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaStreamCreateWithPriority failed: ", cudaGetErrorString(err));
+        overlap_init_done = true;
+    }
 }
 
 inline size_t tensor_nbytes(const at::Tensor& t) {
@@ -66,8 +74,11 @@ void OverlapImpl::NcclInit(const int64_t tp_rank, const int64_t tp_size, const s
     my_rank_ = tp_rank;
     my_size_ = tp_size;
 
-    TORCH_CHECK(static_cast<int64_t>(tp_id.size()) == NCCL_UNIQUE_ID_BYTES,
-                "tp_id must have NCCL_UNIQUE_ID_BYTES elements");
+    TORCH_CHECK(
+        static_cast<int64_t>(tp_id.size() * sizeof(int64_t)) == NCCL_UNIQUE_ID_BYTES,
+        "tp_id must contain exactly NCCL_UNIQUE_ID_BYTES bytes; got ",
+        tp_id.size(), " int64 values (", tp_id.size() * sizeof(int64_t), " bytes)"
+    );
 
     ncclUniqueId uid;
     std::memcpy(uid.internal, tp_id.data(), NCCL_UNIQUE_ID_BYTES);
@@ -167,7 +178,7 @@ void OverlapImpl::GemmAllReduceOverlap(
                 "cSEG tensors must be int32");
     TORCH_CHECK(rLDN > 0, "rLDN must be > 0");
     TORCH_CHECK(Algo == 0, "Only algo=0 is currently supported");
-    ensure_streams_ready(gemm_stream_, comm_stream_);
+    ensure_streams_ready(gemm_stream_, comm_stream_, overlap_init_done_);
 
     const int M = static_cast<int>(A.size(0));
     const int K = static_cast<int>(A.size(1));
@@ -274,7 +285,7 @@ void OverlapImpl::GemmReduceScatterOverlap(
                 "cSEG tensors must be int32");
     TORCH_CHECK(rLDN > 0, "rLDN must be > 0");
     TORCH_CHECK(Algo == 0, "Only algo=0 is currently supported");
-    ensure_streams_ready(gemm_stream_, comm_stream_);
+    ensure_streams_ready(gemm_stream_, comm_stream_, overlap_init_done_);
 
     const int M = static_cast<int>(A.size(0));
     const int K = static_cast<int>(A.size(1));
