@@ -228,80 +228,55 @@ struct ReorderSignalEpilogue {
   //   - base epilogue receives a PACKED problem shape so its predicates match
   //     the reordered packed D layout
   // --------------------------------------------------------------------------
-  template <
-    class EpiLoadPipe, class EpiLoadState,
-    class EpiStorePipe, class EpiStoreState,
-    class ProblemShape, class TileShape, class TileCoord,
-    class AccumTensor, class TiledMma, class EpiSharedStorage
-  >
-  CUTLASS_DEVICE
-  decltype(auto) store(
-      EpiLoadPipe&&   epi_load_pipe,
-      EpiLoadState&&  epi_load_state,
-      EpiStorePipe&&  epi_store_pipe,
-      EpiStoreState&& epi_store_state,
-      ProblemShape const& problem_shape,
-      TileShape   const& tile_shape,
-      TileCoord   const& tile_coord,
-      AccumTensor const& accum,
-      TiledMma    const& tiled_mma,
-      int thread_idx,
-      EpiSharedStorage& shared_storage) {
+ template <
+  class EpiLoadPipe, class EpiLoadState,
+  class EpiStorePipe, class EpiStoreState,
+  class ProblemShape, class TileShape, class TileCoord,
+  class AccumTensor, class TiledMma, class EpiSharedStorage
+>
+CUTLASS_DEVICE
+decltype(auto) store(
+    EpiLoadPipe&&   epi_load_pipe,
+    EpiLoadState&&  epi_load_state,
+    EpiStorePipe&&  epi_store_pipe,
+    EpiStoreState&& epi_store_state,
+    ProblemShape const& problem_shape,
+    TileShape   const& tile_shape,
+    TileCoord   const& tile_coord,
+    AccumTensor const& accum,
+    TiledMma    const& tiled_mma,
+    int thread_idx,
+    EpiSharedStorage& shared_storage) {
 
-    // Cache ORIGINAL logical M,N for segment bookkeeping in store_tail()
-    M_ = int(cute::get<0>(problem_shape));
-    N_ = int(cute::get<1>(problem_shape));
+  // Cache ORIGINAL logical M,N for store_tail bookkeeping
+  M_ = int(cute::get<0>(problem_shape));
+  N_ = int(cute::get<1>(problem_shape));
 
-    const int cta_m = int(cute::get<0>(tile_coord));
-    const int cta_n = int(cute::get<1>(tile_coord));
+  // No physical reorder for bring-up:
+  // store into the original tile position
+  int cta_m = int(cute::get<0>(tile_coord));
+  int cta_n = int(cute::get<1>(tile_coord));
 
-    // Flatten logical tile in ORIGINAL tile grid
-    const int logical_tile_cols = params_.signal.kMonitoredColumn;
-    const int logical_tile = cta_m * logical_tile_cols + cta_n;
+  int tile_cols = params_.signal.kMonitoredColumn;
+  int logical_tile = cta_m * tile_cols + cta_n;
 
-    // Reordered linear tile id
-    const int reordered_tile = params_.signal.ptr_Reorder_Array[logical_tile];
-    reordered_tile_ = reordered_tile;
+  // For bring-up, use logical tile id directly for signaling/segment bookkeeping.
+  reordered_tile_ = logical_tile;
 
-    // Unflatten reordered tile id in PACKED tile grid
-    const int packed_tile_cols = params_.signal.kReorderedColumn;
-    const int dst_m = reordered_tile / packed_tile_cols;
-    const int dst_n = reordered_tile % packed_tile_cols;
-
-    auto mapped_tile_coord = cute::make_tuple(
-      dst_m,
-      dst_n,
-      cute::get<2>(tile_coord),
-      cute::get<3>(tile_coord)
-    );
-
-    // Base epilogue predicates should see the PACKED output extent
-    const int64_t packed_cols_elems =
-        int64_t(params_.signal.kReorderedColumn) * int64_t(params_.signal.ThreadblockN);
-    const int64_t packed_rows =
-        (int64_t(M_) * int64_t(N_)) / packed_cols_elems;
-
-    auto packed_problem_shape = cute::make_shape(
-      int(packed_rows),
-      int(packed_cols_elems),
-      int(cute::get<2>(problem_shape)),
-      int(cute::get<3>(problem_shape))
-    );
-
-    return base_.store(
-      std::forward<EpiLoadPipe>(epi_load_pipe),
-      std::forward<EpiLoadState>(epi_load_state),
-      std::forward<EpiStorePipe>(epi_store_pipe),
-      std::forward<EpiStoreState>(epi_store_state),
-      packed_problem_shape,
-      tile_shape,
-      mapped_tile_coord,
-      accum,
-      tiled_mma,
-      thread_idx,
-      shared_storage
-    );
-  }
+  return base_.store(
+    std::forward<EpiLoadPipe>(epi_load_pipe),
+    std::forward<EpiLoadState>(epi_load_state),
+    std::forward<EpiStorePipe>(epi_store_pipe),
+    std::forward<EpiStoreState>(epi_store_state),
+    problem_shape,
+    tile_shape,
+    tile_coord,
+    accum,
+    tiled_mma,
+    thread_idx,
+    shared_storage
+  );
+} 
 
   // --------------------------------------------------------------------------
   // store_tail():
