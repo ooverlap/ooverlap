@@ -16,6 +16,10 @@ namespace {
 constexpr int kTileM = 128;
 constexpr int kTileN = 128;
 
+inline void refresh_gemm_stream(cudaStream_t& gemm_stream) {
+    gemm_stream = at::cuda::getCurrentCUDAStream().stream();
+}
+
 inline void check_common_gemm_inputs(at::Tensor A, at::Tensor B) {
     TORCH_CHECK(A.is_cuda() && B.is_cuda(), "A/B must be CUDA tensors");
     TORCH_CHECK(A.scalar_type() == torch::kFloat16, "A must be float16");
@@ -25,9 +29,9 @@ inline void check_common_gemm_inputs(at::Tensor A, at::Tensor B) {
 }
 
 inline void ensure_streams_ready(cudaStream_t& gemm_stream, cudaStream_t& comm_stream, bool& overlap_init_done) {
-    if (gemm_stream == nullptr) {
-        gemm_stream = at::cuda::getCurrentCUDAStream().stream();
-    }
+    // Always use the current PyTorch CUDA stream for GEMM/NCCL-on-gemm-stream work.
+    // Note: the default stream is a valid CUDA stream and may be represented as 0.
+    refresh_gemm_stream(gemm_stream);
 
     if (comm_stream == nullptr) {
         cudaError_t err = cudaStreamCreateWithPriority(&comm_stream, cudaStreamNonBlocking, -5);
@@ -67,7 +71,7 @@ OverlapImpl::~OverlapImpl() {
 }
 
 void OverlapImpl::CutlassInit() {
-    gemm_stream_ = at::cuda::getCurrentCUDAStream().stream();
+    refresh_gemm_stream(gemm_stream_);
 }
 
 void OverlapImpl::NcclInit(const int64_t tp_rank, const int64_t tp_size, const std::vector<int64_t> tp_id) {
@@ -104,7 +108,8 @@ void OverlapImpl::NcclAllReduce(at::Tensor C) {
     TORCH_CHECK(C.is_cuda(), "C must be CUDA");
     TORCH_CHECK(C.scalar_type() == torch::kFloat16, "C must be float16");
     TORCH_CHECK(C.is_contiguous(), "C must be contiguous");
-    TORCH_CHECK(gemm_stream_ != nullptr, "Call cutlass_init() before nccl_allreduce");
+    
+    refresh_gemm_stream(gemm_stream_);
 
     if (my_size_ == 1 || comm_ == nullptr) {
         return;
@@ -126,7 +131,8 @@ void OverlapImpl::NcclReduceScatter(at::Tensor C, at::Tensor D) {
     TORCH_CHECK(C.scalar_type() == torch::kFloat16 && D.scalar_type() == torch::kFloat16,
                 "C/D must be float16");
     TORCH_CHECK(C.is_contiguous() && D.is_contiguous(), "C/D must be contiguous");
-    TORCH_CHECK(gemm_stream_ != nullptr, "Call cutlass_init() before nccl_reducescatter");
+
+    refresh_gemm_stream(gemm_stream_);
 
     half* c_ptr = reinterpret_cast<half*>(C.data_ptr<at::Half>());
     half* d_ptr = reinterpret_cast<half*>(D.data_ptr<at::Half>());
