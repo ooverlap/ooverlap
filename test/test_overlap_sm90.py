@@ -32,7 +32,7 @@ def make_identity_row_map(M, N, tile_n=128, device="cuda"):
 
 def worker(rank, world, op, nccl_id, M, N, K, reldn, cseg):
     torch.cuda.set_device(rank)
-    torch.manual_seed(1234)
+    torch.manual_seed(1234 + rank)
 
     ext = load_ooverlap_ext()
 
@@ -67,7 +67,7 @@ def worker(rank, world, op, nccl_id, M, N, K, reldn, cseg):
     B_ref = torch.randn((K, N), device="cuda", dtype=torch.float16)
     B_packed = B_ref.t().contiguous()
 
-    # Identity reorder and identity row-map make the overlap path easy to verify
+    # For signal-only bring-up, keep these as identity
     RA = make_identity_reorder(M, N, tile_m, tile_n, device="cuda")
     RE = make_identity_row_map(M, N, tile_n, device="cuda")
 
@@ -75,14 +75,17 @@ def worker(rank, world, op, nccl_id, M, N, K, reldn, cseg):
     cseg_cpu = torch.tensor(cseg, dtype=torch.int32)
     cseg_gpu = cseg_cpu.cuda(rank)
 
-    # For if_monitor=False, the first len(cseg) entries are the only required counters
-    MM = torch.zeros((len(cseg),), device="cuda", dtype=torch.int32)
+    # IMPORTANT:
+    # MM layout expected by current store_tail():
+    #   MM[0 : num_segments]                  -> segment counters
+    #   MM[num_segments : num_segments+tiles] -> per-tile done counters
+    MM = torch.zeros((len(cseg) + num_tiles,), device="cuda", dtype=torch.int32)
 
     algo = 0
     monitor = False
 
     if op == "allreduce":
-        # Use ReLDN = tile_cols so the output layout matches ordinary MxN row-major
+        # For signal-only bring-up, use ordinary MxN layout
         C = torch.empty((M, N), device="cuda", dtype=torch.float16)
 
         ov.gemm_allreduce_overlap(
@@ -95,17 +98,23 @@ def worker(rank, world, op, nccl_id, M, N, K, reldn, cseg):
         torch.cuda.synchronize()
 
         max_err = (C - Cref).abs().max().item()
-        counters = MM.cpu().tolist()
+
+        mm_host = MM.cpu().tolist()
+        seg_counters = mm_host[:len(cseg)]
+        tile_done = mm_host[len(cseg):]
 
         if rank == 0:
             print(f"[overlap allreduce] max_abs_err={max_err}")
-            print(f"[overlap allreduce] MM={counters}, expected={cseg}")
+            print(f"[overlap allreduce] MM(seg)={seg_counters}, expected={cseg}")
+            print(f"[overlap allreduce] MM(tile_done)={tile_done}")
 
         assert max_err < 0.75, f"allreduce overlap max_err too large: {max_err}"
-        assert counters == cseg, f"segment counters mismatch: got {counters}, expected {cseg}"
+        assert seg_counters == cseg, (
+            f"segment counters mismatch: got {seg_counters}, expected {cseg}"
+        )
 
     elif op == "reducescatter":
-        # Keep identity layout so RS output corresponds to contiguous row shards.
+        # For signal-only bring-up, keep layout ordinary and RE = identity
         Ctmp = torch.empty((M, N), device="cuda", dtype=torch.float16)
         Dout = torch.empty((M // world, N), device="cuda", dtype=torch.float16)
 
@@ -120,14 +129,20 @@ def worker(rank, world, op, nccl_id, M, N, K, reldn, cseg):
         torch.cuda.synchronize()
 
         max_err = (Dout - Dref).abs().max().item()
-        counters = MM.cpu().tolist()
+
+        mm_host = MM.cpu().tolist()
+        seg_counters = mm_host[:len(cseg)]
+        tile_done = mm_host[len(cseg):]
 
         if rank == 0:
             print(f"[overlap reducescatter] max_abs_err={max_err}")
-            print(f"[overlap reducescatter] MM={counters}, expected={cseg}")
+            print(f"[overlap reducescatter] MM(seg)={seg_counters}, expected={cseg}")
+            print(f"[overlap reducescatter] MM(tile_done)={tile_done}")
 
         assert max_err < 0.75, f"reducescatter overlap max_err too large: {max_err}"
-        assert counters == cseg, f"segment counters mismatch: got {counters}, expected {cseg}"
+        assert seg_counters == cseg, (
+            f"segment counters mismatch: got {seg_counters}, expected {cseg}"
+        )
 
     else:
         raise ValueError(f"Unsupported op: {op}")
@@ -144,7 +159,7 @@ def main():
         "--reldn",
         type=int,
         default=None,
-        help="Reordered tile-grid width. Default is tile_cols (= N/128) for identity layout.",
+        help="For signal-only bring-up, keep this equal to tile_cols (= N/128).",
     )
     ap.add_argument(
         "--cseg",
@@ -166,10 +181,11 @@ def main():
     tile_cols = args.n // tile_n
     num_tiles = tile_rows * tile_cols
 
+    # For signal-only bring-up, keep reldn equal to the original tile-grid width
     reldn = args.reldn if args.reldn is not None else tile_cols
 
     if args.cseg is None:
-        # Default: one segment per tile to exercise the overlap machinery maximally
+        # Default: one segment per tile to exercise signaling/overlap maximally
         cseg = [1] * num_tiles
     else:
         cseg = [int(x) for x in args.cseg.split(",") if x.strip()]
