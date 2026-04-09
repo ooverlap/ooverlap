@@ -12,7 +12,7 @@ namespace ooverlap {
 namespace {
 
 constexpr int kThreads = 128;
-constexpr uint32_t kChunkBytes = 16 * 1024; // 16 KB, simple first bring-up
+constexpr uint32_t kChunkBytes = 16 * 1024;
 
 __global__ void bulk_tma_copy_kernel_sm90(
     const half* __restrict__ src,
@@ -20,45 +20,35 @@ __global__ void bulk_tma_copy_kernel_sm90(
     size_t total_bytes) {
 
     extern __shared__ __align__(16) unsigned char smem[];
-    __shared__ sync::semaphore bar;
 
-    const size_t chunk_base = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(kChunkBytes);
+    const size_t chunk_base =
+        static_cast<size_t>(blockIdx.x) * static_cast<size_t>(kChunkBytes);
+
     if (chunk_base >= total_bytes) {
         return;
     }
 
     const uint32_t this_bytes = static_cast<uint32_t>(
-        min(static_cast<size_t>(kChunkBytes), total_bytes - chunk_base));
+        std::min(static_cast<size_t>(kChunkBytes), total_bytes - chunk_base));
 
-    char* gsrc = reinterpret_cast<char*>(const_cast<half*>(src)) + chunk_base;
+    const char* gsrc = reinterpret_cast<const char*>(src) + chunk_base;
     char* gdst = reinterpret_cast<char*>(dst) + chunk_base;
 
-    if (threadIdx.x == 0) {
-        sync::init_semaphore(bar, 1, 0);
-        tma::expect_bytes(bar, this_bytes);
-        tma::load_async(
-            reinterpret_cast<void*>(smem),
-            reinterpret_cast<void*>(gsrc),
-            this_bytes,
-            bar);
+    // Stage from global into shared with a normal cooperative copy.
+    for (uint32_t i = threadIdx.x; i < this_bytes; i += blockDim.x) {
+        smem[i] = gsrc[i];
     }
 
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-        sync::wait(bar, 0);
-    }
-
-    __syncthreads();
-
+    // One thread issues the bulk TMA store from shared -> global.
     if (threadIdx.x == 0) {
         tma::store_async(
             reinterpret_cast<void*>(gdst),
             reinterpret_cast<void*>(smem),
             this_bytes);
 
-        // Wait until the TMA store has finished reading from shared memory
-        // before the CTA exits / reuses smem.
+        // Wait until the TMA store has finished reading shared memory.
         tma::store_async_read_wait<0>();
     }
 }
