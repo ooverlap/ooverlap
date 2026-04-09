@@ -3,7 +3,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-#include "sync/sync.cuh"
+#include "ooverlap/sync/sync.cuh"
 
 namespace ooverlap {
 namespace tma {
@@ -40,9 +40,10 @@ __device__ __forceinline__ void store_async_read_wait() {
 
 __device__ __forceinline__ void load_async(
     void* dst_smem,
-    const void* src_gmem,
+    void* src_gmem,
     uint32_t size_bytes,
     sync::semaphore& bar) {
+
     asm volatile(
         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
         "[%0], [%1], %2, [%3];\n"
@@ -56,8 +57,9 @@ __device__ __forceinline__ void load_async(
 
 __device__ __forceinline__ void store_async(
     void* dst_gmem,
-    const void* src_smem,
+    void* src_smem,
     uint32_t size_bytes) {
+
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     asm volatile(
         "cp.async.bulk.global.shared::cta.bulk_group "

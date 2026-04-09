@@ -96,15 +96,22 @@ endif()
 set(OOVERLAP_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 set(OOVERLAP_SM90A_GENCODE "--generate-code=arch=compute_90a,code=sm_90a")
+set(OOVERLAP_SM90A_PTX     "--generate-code=arch=compute_90a,code=compute_90a")
 
 function(ooverlap_force_sm90a target)
   if(TARGET ${target})
+    # Important: disable any default CMake/NVCC architecture selection
+    # (for example sm_89 coming from cache/toolchain/default GPU detection).
+    set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES OFF)
+
     target_compile_options(${target} PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_GENCODE}>
+      $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_PTX}>
     )
-    # Helps for device-link steps on some toolchains
+
     target_link_options(${target} PRIVATE
       $<$<LINK_LANGUAGE:CUDA>:${OOVERLAP_SM90A_GENCODE}>
+      $<$<LINK_LANGUAGE:CUDA>:${OOVERLAP_SM90A_PTX}>
     )
   endif()
 endfunction()
@@ -126,6 +133,7 @@ if(gemm_files)
   set_property(TARGET ooverlap_gemm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
   target_include_directories(ooverlap_gemm PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
     ${OOVERLAP_SRC_DIR}
     ${PROJECT_SOURCE_DIR}/src/third-party/cutlass/include
     ${PROJECT_SOURCE_DIR}/src/third-party/cutlass/tools/util/include
@@ -152,6 +160,7 @@ if(overlap_files)
   set_property(TARGET ooverlap_overlap PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
   target_include_directories(ooverlap_overlap PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
     ${OOVERLAP_SRC_DIR}
     ${PROJECT_SOURCE_DIR}/src/third-party/cutlass/include
     ${PROJECT_SOURCE_DIR}/src/third-party/cutlass/tools/util/include
@@ -179,6 +188,7 @@ if(norm_files)
   target_include_directories(ooverlap_norm PUBLIC
     ${OOVERLAP_SRC_DIR}
     ${NCCL_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/include
   )
 
   ooverlap_apply_torch(ooverlap_norm)
@@ -200,6 +210,7 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/baseline_impl.cu)
   target_include_directories(ooverlap_baseline_impl PUBLIC
     ${OOVERLAP_SRC_DIR}
     ${NCCL_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/include
   )
 
   ooverlap_apply_torch(ooverlap_baseline_impl)
@@ -230,6 +241,7 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
   target_include_directories(ooverlap_overlap_impl PUBLIC
     ${OOVERLAP_SRC_DIR}
     ${NCCL_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/include
   )
 
   ooverlap_apply_torch(ooverlap_overlap_impl)
@@ -256,6 +268,7 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/nccl_utils.cu)
   target_include_directories(ooverlap_nccl_tool PUBLIC
     ${OOVERLAP_SRC_DIR}
     ${NCCL_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/include
   )
 
   ooverlap_apply_torch(ooverlap_nccl_tool)
@@ -282,6 +295,7 @@ target_include_directories(ooverlap_ext PRIVATE
   ${OOVERLAP_SRC_DIR}
   ${NCCL_INCLUDE_DIR}
   ${Python3_INCLUDE_DIRS}
+  ${PROJECT_SOURCE_DIR}/include
 )
 
 # Link internal libs

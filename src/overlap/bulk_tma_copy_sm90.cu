@@ -1,6 +1,6 @@
 #include "overlap/bulk_tma_copy_sm90.cuh"
-#include "sync/sync.cuh"
-#include "tma/tma.cuh"
+#include "ooverlap/sync/sync.cuh"
+#include "ooverlap/tma/tma.cuh"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -19,7 +19,7 @@ __global__ void bulk_tma_copy_kernel_sm90(
     half* __restrict__ dst,
     size_t total_bytes) {
 
-    extern __shared__ unsigned char smem[];
+    extern __shared__ __align__(16) unsigned char smem[];
     __shared__ sync::semaphore bar;
 
     const size_t chunk_base = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(kChunkBytes);
@@ -30,7 +30,7 @@ __global__ void bulk_tma_copy_kernel_sm90(
     const uint32_t this_bytes = static_cast<uint32_t>(
         min(static_cast<size_t>(kChunkBytes), total_bytes - chunk_base));
 
-    const char* gsrc = reinterpret_cast<const char*>(src) + chunk_base;
+    char* gsrc = reinterpret_cast<char*>(const_cast<half*>(src)) + chunk_base;
     char* gdst = reinterpret_cast<char*>(dst) + chunk_base;
 
     if (threadIdx.x == 0) {
@@ -38,7 +38,7 @@ __global__ void bulk_tma_copy_kernel_sm90(
         tma::expect_bytes(bar, this_bytes);
         tma::load_async(
             reinterpret_cast<void*>(smem),
-            reinterpret_cast<const void*>(gsrc),
+            reinterpret_cast<void*>(gsrc),
             this_bytes,
             bar);
     }
@@ -54,7 +54,7 @@ __global__ void bulk_tma_copy_kernel_sm90(
     if (threadIdx.x == 0) {
         tma::store_async(
             reinterpret_cast<void*>(gdst),
-            reinterpret_cast<const void*>(smem),
+            reinterpret_cast<void*>(smem),
             this_bytes);
 
         // Wait until the TMA store has finished reading from shared memory
