@@ -166,7 +166,11 @@ if(overlap_files)
     ${PROJECT_SOURCE_DIR}/src/third-party/cutlass/tools/util/include
   )
 
-  target_link_libraries(ooverlap_overlap PUBLIC cutlass CUDA::cudart)
+  target_link_libraries(ooverlap_overlap PUBLIC
+  cutlass
+  CUDA::cudart
+  CUDA::cuda_driver
+)
 endif()
 
 # -------------------------
@@ -253,7 +257,11 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
     target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_norm)
   endif()
 
-  target_link_libraries(ooverlap_overlap_impl PUBLIC CUDA::cudart ${NCCL_LIBRARY})
+  target_link_libraries(ooverlap_overlap_impl PUBLIC
+    CUDA::cudart
+    CUDA::cuda_driver
+    ${NCCL_LIBRARY}
+  )
 endif()
 
 # -------------------------
@@ -333,6 +341,7 @@ target_link_libraries(ooverlap_ext PRIVATE
   cutlass
   ${TORCH_LIBRARIES}
   CUDA::cudart
+  CUDA::cuda_driver
   CUDA::cublas
   ${NCCL_LIBRARY}
 )

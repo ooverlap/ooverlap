@@ -9,6 +9,7 @@
 #include "rmsnorm/rmsnorm.h"
 #include "overlap_impl.h"
 #include "overlap/gemm_scatter_sm90_dispatch.h"
+#include "overlap/tma_vmm_smoke_test.h"
 
 namespace py = pybind11;
 
@@ -180,6 +181,13 @@ PYBIND11_MODULE(ooverlap_ext, m) {
 
   m.def("generate_nccl_id", &generate_nccl_id,
         "Generate an NCCL unique ID as a Python list[int]");
+
+  m.def("tma_vmm_smoke_test",
+        &ooverlap::tma_vmm_smoke_test,
+        py::arg("num_elements"),
+        py::arg("src_device") = 0,
+        py::arg("dst_device") = 1,
+        "Smoke test: allocate GPU-dst with VMM and copy into it from src GPU using bulk TMA");
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
