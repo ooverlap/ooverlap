@@ -9,7 +9,7 @@
 #include "rmsnorm/rmsnorm.h"
 #include "overlap_impl.h"
 #include "overlap/gemm_scatter_sm90_dispatch.h"
-#include "overlap/tma_vmm_smoke_test.h"
+#include "overlap/tma_collective_sm90.h"
 
 namespace py = pybind11;
 
@@ -70,7 +70,6 @@ static void gemm_signal_sm90(
   TORCH_CHECK(D.size(0) >= M, "D.size(0) must be >= M");
   TORCH_CHECK(D.size(1) >= ldD, "D.size(1) must be >= ReLDN*TileN (", ldD, ")");
 
-  // Avoid c10::cuda::SetDevice ABI issues: call CUDA runtime directly
   const int dev = A.get_device();
   cudaError_t err = cudaSetDevice(dev);
   TORCH_CHECK(err == cudaSuccess, "cudaSetDevice failed: ", cudaGetErrorString(err));
@@ -173,21 +172,31 @@ static void gemm_scatter_sm90(
 }
 
 // --------------------------------------------
-// Python module (this is what we use for tests)
+// Python module
 // --------------------------------------------
 PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("gemm_signal_sm90", &gemm_signal_sm90,
         "SM90 fused reorder+signal GEMM (bring-up: algo=0 only)");
 
+  m.def("gemm_scatter_sm90", &gemm_scatter_sm90,
+        "SM90 fused reorder+scatter GEMM (bring-up: algo=0 only)");
+
   m.def("generate_nccl_id", &generate_nccl_id,
         "Generate an NCCL unique ID as a Python list[int]");
 
-  m.def("tma_vmm_smoke_test",
-        &ooverlap::tma_vmm_smoke_test,
-        py::arg("num_elements"),
-        py::arg("src_device") = 0,
-        py::arg("dst_device") = 1,
-        "Smoke test: allocate GPU-dst with VMM and copy into it from src GPU using bulk TMA");
+  m.def("tma_two_gpu_all_reduce_smoke_test",
+        &ooverlap::tma_two_gpu_all_reduce_smoke_test,
+        py::arg("numel"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        "2-GPU same-process all-reduce smoke test above bulk-TMA");
+
+  m.def("tma_two_gpu_all_gather_smoke_test",
+        &ooverlap::tma_two_gpu_all_gather_smoke_test,
+        py::arg("shard_numel"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        "2-GPU same-process all-gather smoke test above bulk-TMA");
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
@@ -200,14 +209,8 @@ PYBIND11_MODULE(ooverlap_ext, m) {
       .def("nccl_reducescatter", &OverlapImpl::NcclReduceScatter);
 }
 
-
 // --------------------------------------------
 // Torch dispatcher registrations (KEEP, but OFF by default)
-//
-// These are what cause the undefined symbol:
-//   torch::Library::_def(...)
-//
-// Enable ONLY when you are sure your build torch == runtime torch ABI.
 // --------------------------------------------
 #ifndef OOVERLAP_ENABLE_TORCH_LIBRARY
 #define OOVERLAP_ENABLE_TORCH_LIBRARY 0
@@ -217,7 +220,6 @@ PYBIND11_MODULE(ooverlap_ext, m) {
 
 #include <torch/script.h>
 
-// Wrappers to match torch custom class calling convention (intrusive_ptr)
 template<typename T>
 void NcclInitWrapper(const c10::intrusive_ptr<T>& self,
                      const int64_t tp_rank,
