@@ -5,6 +5,7 @@
 #include "overlap/gemm_signal_sm90_dispatch.h"
 #include "overlap/gemm_scatter_sm90_dispatch.h"
 #include "overlap/scatter_row_remap_sm90.cuh"
+#include "ooverlap/torch/torch_utils.h"
 
 #include <torch/extension.h>
 #include <cuda.h>
@@ -15,35 +16,6 @@
 namespace {
 constexpr int kTileM = 128;
 constexpr int kTileN = 128;
-
-inline void refresh_gemm_stream(cudaStream_t& gemm_stream) {
-    gemm_stream = at::cuda::getCurrentCUDAStream().stream();
-}
-
-inline void check_common_gemm_inputs(at::Tensor A, at::Tensor B) {
-    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "A/B must be CUDA tensors");
-    TORCH_CHECK(A.scalar_type() == torch::kFloat16, "A must be float16");
-    TORCH_CHECK(B.scalar_type() == torch::kFloat16, "B must be float16");
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A/B must be 2D");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "A/B must be contiguous");
-}
-
-inline void ensure_streams_ready(cudaStream_t& gemm_stream, cudaStream_t& comm_stream, bool& overlap_init_done) {
-    // Always use the current PyTorch CUDA stream for GEMM/NCCL-on-gemm-stream work.
-    // Note: the default stream is a valid CUDA stream and may be represented as 0.
-    refresh_gemm_stream(gemm_stream);
-
-    if (comm_stream == nullptr) {
-        cudaError_t err = cudaStreamCreateWithPriority(&comm_stream, cudaStreamNonBlocking, -5);
-        TORCH_CHECK(err == cudaSuccess,
-                    "cudaStreamCreateWithPriority failed: ", cudaGetErrorString(err));
-        overlap_init_done = true;
-    }
-}
-
-inline size_t tensor_nbytes(const at::Tensor& t) {
-    return static_cast<size_t>(t.numel()) * static_cast<size_t>(t.element_size());
-}
 } // namespace
 
 OverlapImpl::OverlapImpl()
@@ -71,7 +43,7 @@ OverlapImpl::~OverlapImpl() {
 }
 
 void OverlapImpl::CutlassInit() {
-    refresh_gemm_stream(gemm_stream_);
+    ooverlap::torch_utils::refresh_gemm_stream(gemm_stream_);
 }
 
 void OverlapImpl::NcclInit(const int64_t tp_rank, const int64_t tp_size, const std::vector<int64_t> tp_id) {
@@ -108,8 +80,8 @@ void OverlapImpl::NcclAllReduce(at::Tensor C) {
     TORCH_CHECK(C.is_cuda(), "C must be CUDA");
     TORCH_CHECK(C.scalar_type() == torch::kFloat16, "C must be float16");
     TORCH_CHECK(C.is_contiguous(), "C must be contiguous");
-    
-    refresh_gemm_stream(gemm_stream_);
+
+    ooverlap::torch_utils::refresh_gemm_stream(gemm_stream_);
 
     if (my_size_ == 1 || comm_ == nullptr) {
         return;
@@ -132,14 +104,15 @@ void OverlapImpl::NcclReduceScatter(at::Tensor C, at::Tensor D) {
                 "C/D must be float16");
     TORCH_CHECK(C.is_contiguous() && D.is_contiguous(), "C/D must be contiguous");
 
-    refresh_gemm_stream(gemm_stream_);
+    ooverlap::torch_utils::refresh_gemm_stream(gemm_stream_);
 
     half* c_ptr = reinterpret_cast<half*>(C.data_ptr<at::Half>());
     half* d_ptr = reinterpret_cast<half*>(D.data_ptr<at::Half>());
 
     if (my_size_ == 1 || comm_ == nullptr) {
         cudaError_t err = cudaMemcpyAsync(
-            d_ptr, c_ptr, tensor_nbytes(D), cudaMemcpyDeviceToDevice, gemm_stream_);
+            d_ptr, c_ptr, ooverlap::torch_utils::tensor_nbytes(D),
+            cudaMemcpyDeviceToDevice, gemm_stream_);
         TORCH_CHECK(err == cudaSuccess, "cudaMemcpyAsync failed: ", cudaGetErrorString(err));
         return;
     }
@@ -170,7 +143,7 @@ void OverlapImpl::GemmAllReduceOverlap(
     int64_t Algo,
     bool if_monitor) {
 
-    check_common_gemm_inputs(A, B);
+    ooverlap::torch_utils::check_common_gemm_inputs(A, B);
     TORCH_CHECK(C.is_cuda(), "C must be CUDA");
     TORCH_CHECK(C.scalar_type() == torch::kFloat16, "C must be float16");
     TORCH_CHECK(C.is_contiguous(), "C must be contiguous");
@@ -184,7 +157,7 @@ void OverlapImpl::GemmAllReduceOverlap(
                 "cSEG tensors must be int32");
     TORCH_CHECK(rLDN > 0, "rLDN must be > 0");
     TORCH_CHECK(Algo == 0, "Only algo=0 is currently supported");
-    ensure_streams_ready(gemm_stream_, comm_stream_, overlap_init_done_);
+    ooverlap::torch_utils::ensure_streams_ready(gemm_stream_, comm_stream_, overlap_init_done_);
 
     const int M = static_cast<int>(A.size(0));
     const int K = static_cast<int>(A.size(1));
@@ -274,7 +247,7 @@ void OverlapImpl::GemmReduceScatterOverlap(
     int64_t Algo,
     bool if_monitor) {
 
-    check_common_gemm_inputs(A, B);
+    ooverlap::torch_utils::check_common_gemm_inputs(A, B);
     TORCH_CHECK(C.is_cuda() && D.is_cuda(), "C/D must be CUDA");
     TORCH_CHECK(C.scalar_type() == torch::kFloat16 &&
                 D.scalar_type() == torch::kFloat16,
@@ -291,7 +264,7 @@ void OverlapImpl::GemmReduceScatterOverlap(
                 "cSEG tensors must be int32");
     TORCH_CHECK(rLDN > 0, "rLDN must be > 0");
     TORCH_CHECK(Algo == 0, "Only algo=0 is currently supported");
-    ensure_streams_ready(gemm_stream_, comm_stream_, overlap_init_done_);
+    ooverlap::torch_utils::ensure_streams_ready(gemm_stream_, comm_stream_, overlap_init_done_);
 
     const int M = static_cast<int>(A.size(0));
     const int K = static_cast<int>(A.size(1));
@@ -345,7 +318,8 @@ void OverlapImpl::GemmReduceScatterOverlap(
 
     if (my_size_ == 1 || comm_ == nullptr) {
         cudaError_t err = cudaMemcpyAsync(
-            d_ptr, c_ptr, tensor_nbytes(D), cudaMemcpyDeviceToDevice, gemm_stream_);
+            d_ptr, c_ptr, ooverlap::torch_utils::tensor_nbytes(D),
+            cudaMemcpyDeviceToDevice, gemm_stream_);
         TORCH_CHECK(err == cudaSuccess, "cudaMemcpyAsync failed: ", cudaGetErrorString(err));
         return;
     }
