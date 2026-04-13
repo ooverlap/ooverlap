@@ -3,7 +3,6 @@
 #include "overlap/bulk_tma_copy_sm90.cuh"
 #include "overlap/tma_basic_collective_sm90.h"
 #include "ooverlap/system/runtime_utils.cuh"
-#include "ooverlap/testing/test_utils.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -12,18 +11,19 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#define OOVERLAP_BENCH_NCCL_CHECK(cmd)                                                          \
-    do {                                                                                        \
-        ncclResult_t result__ = (cmd);                                                          \
-        if (result__ != ncclSuccess) {                                                          \
-            throw std::runtime_error(std::string("NCCL error: ") + ncclGetErrorString(result__)); \
-        }                                                                                       \
+#define OOVERLAP_BENCH_NCCL_CHECK(cmd)                                                              \
+    do {                                                                                            \
+        ncclResult_t result__ = (cmd);                                                              \
+        if (result__ != ncclSuccess) {                                                              \
+            throw std::runtime_error(std::string("NCCL error: ") + ncclGetErrorString(result__));  \
+        }                                                                                           \
     } while (0)
 
 namespace ooverlap {
@@ -88,20 +88,48 @@ void free_local_buffers(
     }
 }
 
+std::vector<uint16_t> make_host_pattern(
+    size_t numel,
+    uint16_t seed) {
+    std::vector<uint16_t> host(numel);
+    for (size_t i = 0; i < numel; ++i) {
+        host[i] = static_cast<uint16_t>((seed + 17 * i) & 0xffffu);
+    }
+    return host;
+}
+
+void fill_one_buffer_from_host_pattern(
+    int dev,
+    cudaStream_t stream,
+    half* dst,
+    size_t numel,
+    uint16_t seed) {
+    std::vector<uint16_t> host = make_host_pattern(numel, seed);
+    system::runtime::set_device(dev);
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(
+            dst,
+            host.data(),
+            numel * sizeof(uint16_t),
+            cudaMemcpyHostToDevice,
+            stream),
+        "cudaMemcpyAsync(host pattern -> device)");
+}
+
 void fill_local_buffers(
     const std::vector<int>& devices,
     const std::vector<cudaStream_t>& streams,
     std::vector<half*>& bufs,
     size_t numel) {
     for (size_t i = 0; i < devices.size(); ++i) {
-        system::runtime::set_device(devices[i]);
-        testing::fill_pattern(
+        fill_one_buffer_from_host_pattern(
+            devices[i],
+            streams[i],
             bufs[i],
-            static_cast<int64_t>(numel),
-            0.10f * static_cast<float>(i + 1),
-            10.0f * static_cast<float>(i + 1),
-            streams[i]);
+            numel,
+            static_cast<uint16_t>(0x100u + i * 0x31u));
     }
+
     for (size_t i = 0; i < devices.size(); ++i) {
         system::runtime::sync_stream_on_device(devices[i], streams[i], "sync fill");
     }
@@ -273,7 +301,7 @@ std::map<std::string, double> benchmark_2gpu_copy_sm90(
 
     system::runtime::set_device(dev0);
     system::runtime::check_cuda(cudaMalloc(&src, bytes), "cudaMalloc(src)");
-    testing::fill_pattern(src, numel, 1.0f, 1.0f, stream0);
+    fill_one_buffer_from_host_pattern(dev0, stream0, src, numel_sz, static_cast<uint16_t>(0x1234u));
     system::runtime::sync_stream_on_device(dev0, stream0, "sync fill src");
 
     peer_dst = system::alloc_peer_visible_buffer(bytes, dev1, {dev0, dev1});
