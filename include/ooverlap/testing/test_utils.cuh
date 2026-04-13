@@ -14,7 +14,7 @@
 namespace ooverlap {
 namespace testing {
 
-__global__ void fill_pattern_kernel(
+static __global__ void fill_pattern_kernel(
     half* ptr,
     int64_t n,
     float scale,

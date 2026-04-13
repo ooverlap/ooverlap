@@ -4,12 +4,14 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <pybind11/stl.h>
 
 #include "overlap/gemm_signal_sm90_dispatch.h"
 #include "rmsnorm/rmsnorm.h"
 #include "overlap_impl.h"
 #include "overlap/gemm_scatter_sm90_dispatch.h"
 #include "overlap/tma_collective_sm90.h"
+#include "overlap/tma_basic_collective_sm90.h"
 
 namespace py = pybind11;
 
@@ -18,7 +20,7 @@ namespace py = pybind11;
 // --------------------------------------------
 static void gemm_signal_sm90(
     torch::Tensor A,
-    torch::Tensor B_packed,   // (N,K) contiguous; interpreted by kernel as ColumnMajor(K,N)
+    torch::Tensor B_packed,
     torch::Tensor D,
     torch::Tensor MM,
     torch::Tensor RA,
@@ -49,7 +51,6 @@ static void gemm_signal_sm90(
   TORCH_CHECK(B_packed.size(1) == K, "B_packed must be (N,K) where K matches A");
   TORCH_CHECK(ReLDN > 0, "ReLDN must be > 0");
 
-  // For algo=0 hardcoded tile sizes (matches your dispatch case 0)
   constexpr int64_t TileM = 128;
   constexpr int64_t TileN = 128;
 
@@ -65,7 +66,6 @@ static void gemm_signal_sm90(
   TORCH_CHECK(CommThr.numel() >= 1, "CommThr must have >= 1 element");
   TORCH_CHECK(MM.numel() >= 1, "MM must have >= 1 element");
 
-  // D is interpreted as "reshaped row-major" with leading dimension ldD = ReLDN*TileN.
   const int64_t ldD = ReLDN * TileN;
   TORCH_CHECK(D.size(0) >= M, "D.size(0) must be >= M");
   TORCH_CHECK(D.size(1) >= ldD, "D.size(1) must be >= ReLDN*TileN (", ldD, ")");
@@ -171,9 +171,6 @@ static void gemm_scatter_sm90(
   TORCH_CHECK(ok, "Unsupported algo=", algo);
 }
 
-// --------------------------------------------
-// Python module
-// --------------------------------------------
 PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("gemm_signal_sm90", &gemm_signal_sm90,
         "SM90 fused reorder+signal GEMM (bring-up: algo=0 only)");
@@ -184,6 +181,7 @@ PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("generate_nccl_id", &generate_nccl_id,
         "Generate an NCCL unique ID as a Python list[int]");
 
+  // Existing 2-GPU tests
   m.def("tma_two_gpu_all_reduce_smoke_test",
         &ooverlap::tma_two_gpu_all_reduce_smoke_test,
         py::arg("numel"),
@@ -197,6 +195,25 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev0") = 0,
         py::arg("dev1") = 1,
         "2-GPU same-process all-gather smoke test above bulk-TMA");
+
+  // New basic N-GPU tests
+  m.def("tma_basic_ngpu_reduce_scatter_smoke_test",
+        &ooverlap::tma_basic_ngpu_reduce_scatter_smoke_test,
+        py::arg("full_numel"),
+        py::arg("devices") = std::vector<int64_t>{},
+        "Basic same-process N-GPU reduce-scatter smoke test above bulk-TMA");
+
+  m.def("tma_basic_ngpu_all_gather_smoke_test",
+        &ooverlap::tma_basic_ngpu_all_gather_smoke_test,
+        py::arg("shard_numel"),
+        py::arg("devices") = std::vector<int64_t>{},
+        "Basic same-process N-GPU all-gather smoke test above bulk-TMA");
+
+  m.def("tma_basic_ngpu_all_reduce_smoke_test",
+        &ooverlap::tma_basic_ngpu_all_reduce_smoke_test,
+        py::arg("full_numel"),
+        py::arg("devices") = std::vector<int64_t>{},
+        "Basic same-process N-GPU all-reduce smoke test above bulk-TMA");
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
