@@ -13,6 +13,7 @@
 #include "overlap/tma_collective_sm90.h"
 #include "overlap/tma_basic_collective_sm90.h"
 #include "overlap/tma_vmm_smoke_test.h"
+#include "overlap/tma_benchmark_sm90.h"
 
 namespace py = pybind11;
 
@@ -221,6 +222,24 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("devices") = std::vector<int64_t>{},
         "Basic same-process N-GPU all-reduce smoke test above bulk-TMA");
 
+  m.def("benchmark_2gpu_copy_sm90",
+        &ooverlap::benchmark_2gpu_copy_sm90,
+        py::arg("numel"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        "Benchmark 2-GPU bulk-TMA copy vs cudaMemcpyPeerAsync");
+
+  m.def("benchmark_basic_ngpu_collective_sm90",
+        &ooverlap::benchmark_basic_ngpu_collective_sm90,
+        py::arg("op"),
+        py::arg("numel"),
+        py::arg("devices"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        "Benchmark basic same-process N-GPU collective vs NCCL");
+
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
       .def("cutlass_init", &OverlapImpl::CutlassInit)
@@ -232,9 +251,6 @@ PYBIND11_MODULE(ooverlap_ext, m) {
       .def("nccl_reducescatter", &OverlapImpl::NcclReduceScatter);
 }
 
-// --------------------------------------------
-// Torch dispatcher registrations (KEEP, but OFF by default)
-// --------------------------------------------
 #ifndef OOVERLAP_ENABLE_TORCH_LIBRARY
 #define OOVERLAP_ENABLE_TORCH_LIBRARY 0
 #endif

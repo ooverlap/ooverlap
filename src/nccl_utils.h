@@ -1,18 +1,19 @@
 #pragma once
 
 #include <nccl.h>
-#include <torch/torch.h>              // torch::Tensor / at::Tensor without Python binding
 #include <cuda_runtime.h>
-#include <stdlib.h>
-#include <stdio.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #define NCCL_CHECK(cmd)                                                                                           \
     do {                                                                                                          \
         ncclResult_t result = cmd;                                                                                \
         if (result != ncclSuccess) {                                                                              \
-            printf("[ERROR] NCCL error %s:%d '%s' : %s\n", __FILE__, __LINE__, #cmd, ncclGetErrorString(result)); \
-            exit(-1);                                                                                             \
+            std::printf("[ERROR] NCCL error %s:%d '%s' : %s\n", __FILE__, __LINE__, #cmd, ncclGetErrorString(result)); \
+            std::exit(-1);                                                                                        \
         }                                                                                                         \
     } while (0)
 
