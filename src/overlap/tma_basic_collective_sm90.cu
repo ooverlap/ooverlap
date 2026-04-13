@@ -110,14 +110,14 @@ inline void free_local_buffers(
     }
 }
 
-inline std::vector<float> reference_full_sum(
+inline std::vector<float> reference_full_sum_fp16(
     size_t full_numel,
     int world_size) {
     std::vector<std::vector<float>> refs;
     refs.reserve(static_cast<size_t>(world_size));
     for (int r = 0; r < world_size; ++r) {
         refs.push_back(
-            testing::host_reference_pattern(
+            testing::host_reference_pattern_fp16(
                 static_cast<int64_t>(full_numel),
                 0.10f * static_cast<float>(r + 1),
                 10.0f * static_cast<float>(r + 1)));
@@ -125,19 +125,21 @@ inline std::vector<float> reference_full_sum(
 
     std::vector<float> sum(full_numel, 0.0f);
     for (size_t i = 0; i < full_numel; ++i) {
-        for (int r = 0; r < world_size; ++r) {
-            sum[i] += refs[static_cast<size_t>(r)][i];
+        float acc = refs[0][i];
+        for (int r = 1; r < world_size; ++r) {
+            acc = testing::round_to_half(acc + refs[static_cast<size_t>(r)][i]);
         }
+        sum[i] = acc;
     }
     return sum;
 }
 
-inline std::vector<float> reference_all_gather_full(
+inline std::vector<float> reference_all_gather_full_fp16(
     size_t shard_numel,
     int world_size) {
     std::vector<float> full(shard_numel * static_cast<size_t>(world_size), 0.0f);
     for (int r = 0; r < world_size; ++r) {
-        auto ref = testing::host_reference_pattern(
+        auto ref = testing::host_reference_pattern_fp16(
             static_cast<int64_t>(shard_numel),
             1.0f,
             100.0f * static_cast<float>(r + 1));
@@ -191,13 +193,11 @@ bool init_basic_collective_same_process(
     for (int r = 0; r < st->world_size; ++r) {
         st->streams[r] = system::runtime::create_stream_on_device(st->devices[r]);
 
-        // RS inbox has one shard-sized slot per sender rank.
         st->rs_inboxes[r] = system::alloc_peer_visible_buffer(
             shard_bytes * static_cast<size_t>(st->world_size),
             st->devices[r],
             access_devices);
 
-        // Final full output for AG / AR.
         st->full_outputs[r] = system::alloc_peer_visible_buffer(
             full_bytes,
             st->devices[r],
@@ -282,8 +282,6 @@ cudaError_t enqueue_basic_reduce_scatter_tma_sm90(
     const size_t shard_numel = full_numel / static_cast<size_t>(st->world_size);
     const size_t shard_bytes = shard_numel * sizeof(half);
 
-    // Zero inboxes and copy the local contribution for each owner's shard
-    // into the owner's shard_output.
     for (int owner = 0; owner < st->world_size; ++owner) {
         zero_peer_buffer_on_owner(st->rs_inboxes[owner], st->devices[owner]);
 
@@ -299,7 +297,6 @@ cudaError_t enqueue_basic_reduce_scatter_tma_sm90(
             "cudaMemcpyAsync(local shard -> shard_output)");
     }
 
-    // Every sender sends shard[r] to owner r's inbox slot [sender].
     for (int sender = 0; sender < st->world_size; ++sender) {
         system::runtime::set_device(st->devices[sender]);
 
@@ -318,7 +315,6 @@ cudaError_t enqueue_basic_reduce_scatter_tma_sm90(
 
     sync_all_streams(st, "cudaStreamSynchronize(RS sends)");
 
-    // Each owner accumulates all received contributions into its shard_output.
     for (int owner = 0; owner < st->world_size; ++owner) {
         system::runtime::set_device(st->devices[owner]);
 
@@ -358,7 +354,6 @@ cudaError_t enqueue_basic_all_gather_tma_sm90(
 
     const size_t shard_bytes = shard_numel * sizeof(half);
 
-    // Zero full outputs and place local shard in local slot.
     for (int recv = 0; recv < st->world_size; ++recv) {
         zero_peer_buffer_on_owner(st->full_outputs[recv], st->devices[recv]);
 
@@ -376,7 +371,6 @@ cudaError_t enqueue_basic_all_gather_tma_sm90(
             "cudaMemcpyAsync(local shard -> full_output local slot)");
     }
 
-    // Each sender sends its local shard to every other receiver's output slot [sender].
     for (int sender = 0; sender < st->world_size; ++sender) {
         system::runtime::set_device(st->devices[sender]);
 
@@ -460,11 +454,12 @@ bool tma_basic_ngpu_reduce_scatter_smoke_test(
         enqueue_basic_reduce_scatter_tma_sm90(&st, local_full, full_numel_sz),
         "enqueue_basic_reduce_scatter_tma_sm90");
 
-    std::vector<float> full_ref = reference_full_sum(full_numel_sz, world_size);
+    std::vector<float> full_ref = reference_full_sum_fp16(full_numel_sz, world_size);
     const size_t shard_numel = full_numel_sz / static_cast<size_t>(world_size);
 
     for (int r = 0; r < world_size; ++r) {
-        auto got = testing::copy_half_device_to_host_float(st.shard_outputs[r], static_cast<int64_t>(shard_numel), devices[r]);
+        auto got = testing::copy_half_device_to_host_float(
+            st.shard_outputs[r], static_cast<int64_t>(shard_numel), devices[r]);
 
         std::vector<float> ref(shard_numel);
         for (size_t i = 0; i < shard_numel; ++i) {
@@ -513,7 +508,7 @@ bool tma_basic_ngpu_all_gather_smoke_test(
         enqueue_basic_all_gather_tma_sm90(&st, local_shards, shard_numel_sz),
         "enqueue_basic_all_gather_tma_sm90");
 
-    std::vector<float> ref_full = reference_all_gather_full(shard_numel_sz, world_size);
+    std::vector<float> ref_full = reference_all_gather_full_fp16(shard_numel_sz, world_size);
 
     for (int r = 0; r < world_size; ++r) {
         auto got = testing::copy_half_device_to_host_float(
@@ -566,7 +561,7 @@ bool tma_basic_ngpu_all_reduce_smoke_test(
         enqueue_basic_all_reduce_tma_sm90(&st, local_full, full_numel_sz),
         "enqueue_basic_all_reduce_tma_sm90");
 
-    std::vector<float> ref = reference_full_sum(full_numel_sz, world_size);
+    std::vector<float> ref = reference_full_sum_fp16(full_numel_sz, world_size);
 
     for (int r = 0; r < world_size; ++r) {
         auto got = testing::copy_half_device_to_host_float(

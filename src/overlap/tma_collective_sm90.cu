@@ -202,12 +202,13 @@ bool tma_two_gpu_all_reduce_smoke_test(
     auto got0 = testing::copy_half_device_to_host_float(rank0, numel, dev0);
     auto got1 = testing::copy_half_device_to_host_float(rank1, numel, dev1);
 
-    auto ref0 = testing::host_reference_pattern(numel, 0.25f, 1.0f);
-    auto ref1 = testing::host_reference_pattern(numel, 0.50f, 2.0f);
+    auto ref0 = testing::host_reference_pattern_fp16(numel, 0.25f, 1.0f);
+    auto ref1 = testing::host_reference_pattern_fp16(numel, 0.50f, 2.0f);
     std::vector<float> ref(static_cast<size_t>(numel));
     for (int64_t i = 0; i < numel; ++i) {
-        ref[static_cast<size_t>(i)] =
-            ref0[static_cast<size_t>(i)] + ref1[static_cast<size_t>(i)];
+        float acc = ref0[static_cast<size_t>(i)];
+        acc = testing::round_to_half(acc + ref1[static_cast<size_t>(i)]);
+        ref[static_cast<size_t>(i)] = acc;
     }
 
     testing::expect_allclose(got0, ref, "all_reduce rank0");
@@ -302,8 +303,8 @@ bool tma_two_gpu_all_gather_smoke_test(
     auto got1 = testing::copy_half_device_to_host_float(
         reinterpret_cast<half*>(out1.ptr), 2 * shard_numel, dev1);
 
-    auto ref_shard0 = testing::host_reference_pattern(shard_numel, 1.0f, 10.0f);
-    auto ref_shard1 = testing::host_reference_pattern(shard_numel, 1.0f, 100.0f);
+    auto ref_shard0 = testing::host_reference_pattern_fp16(shard_numel, 1.0f, 10.0f);
+    auto ref_shard1 = testing::host_reference_pattern_fp16(shard_numel, 1.0f, 100.0f);
     std::vector<float> ref_full(static_cast<size_t>(2 * shard_numel));
     for (int64_t i = 0; i < shard_numel; ++i) {
         ref_full[static_cast<size_t>(i)] = ref_shard0[static_cast<size_t>(i)];

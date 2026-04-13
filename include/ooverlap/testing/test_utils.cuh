@@ -26,6 +26,10 @@ static __global__ void fill_pattern_kernel(
     ptr[idx] = __float2half_rn(x);
 }
 
+inline float round_to_half(float x) {
+    return __half2float(__float2half_rn(x));
+}
+
 inline void fill_pattern(
     half* ptr,
     int64_t n,
@@ -46,6 +50,18 @@ inline std::vector<float> host_reference_pattern(
     std::vector<float> out(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) {
         out[static_cast<size_t>(i)] = bias + scale * static_cast<float>(i % 1024);
+    }
+    return out;
+}
+
+inline std::vector<float> host_reference_pattern_fp16(
+    int64_t n,
+    float scale,
+    float bias) {
+    std::vector<float> out(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        float x = bias + scale * static_cast<float>(i % 1024);
+        out[static_cast<size_t>(i)] = round_to_half(x);
     }
     return out;
 }

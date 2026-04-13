@@ -167,10 +167,10 @@ if(overlap_files)
   )
 
   target_link_libraries(ooverlap_overlap PUBLIC
-  cutlass
-  CUDA::cudart
-  CUDA::cuda_driver
-)
+    cutlass
+    CUDA::cudart
+    CUDA::cuda_driver
+  )
 endif()
 
 # -------------------------
@@ -298,6 +298,9 @@ set_target_properties(ooverlap_ext PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib
   POSITION_INDEPENDENT_CODE ON
 )
+
+set_property(TARGET ooverlap_ext PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+set_property(TARGET ooverlap_ext PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 target_include_directories(ooverlap_ext PRIVATE
   ${OOVERLAP_SRC_DIR}

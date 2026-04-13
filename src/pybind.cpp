@@ -12,6 +12,7 @@
 #include "overlap/gemm_scatter_sm90_dispatch.h"
 #include "overlap/tma_collective_sm90.h"
 #include "overlap/tma_basic_collective_sm90.h"
+#include "overlap/tma_vmm_smoke_test.h"
 
 namespace py = pybind11;
 
@@ -181,7 +182,13 @@ PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("generate_nccl_id", &generate_nccl_id,
         "Generate an NCCL unique ID as a Python list[int]");
 
-  // Existing 2-GPU tests
+  m.def("tma_vmm_smoke_test",
+        &ooverlap::tma_vmm_smoke_test,
+        py::arg("num_elements"),
+        py::arg("src_device") = 0,
+        py::arg("dst_device") = 1,
+        "2-GPU VMM + bulk-TMA smoke test");
+
   m.def("tma_two_gpu_all_reduce_smoke_test",
         &ooverlap::tma_two_gpu_all_reduce_smoke_test,
         py::arg("numel"),
@@ -196,7 +203,6 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev1") = 1,
         "2-GPU same-process all-gather smoke test above bulk-TMA");
 
-  // New basic N-GPU tests
   m.def("tma_basic_ngpu_reduce_scatter_smoke_test",
         &ooverlap::tma_basic_ngpu_reduce_scatter_smoke_test,
         py::arg("full_numel"),
