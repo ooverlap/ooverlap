@@ -222,6 +222,10 @@ cudaError_t enqueue_basic_reduce_scatter_tma_sm90(
             Buffer* slot_buf = channel_get_slot_buffer(st, sender, owner, 0);
             zero_buffer_on_owner(st, *slot_buf);
 
+            // IMPORTANT: zero_buffer_on_owner switched the current device to owner.
+            // Switch back to sender before using sender's stream for the TMA launch.
+            system::runtime::set_device(st->devices[static_cast<size_t>(sender)]);
+
             const half* src =
                 local_full_buffers[static_cast<size_t>(sender)] + static_cast<size_t>(owner) * shard_numel;
 
@@ -307,6 +311,10 @@ cudaError_t enqueue_basic_all_gather_tma_sm90(
 
             Buffer* slot_buf = channel_get_slot_buffer(st, sender, recv, 0);
             zero_buffer_on_owner(st, *slot_buf);
+
+            // IMPORTANT: zero_buffer_on_owner switched the current device to recv.
+            // Switch back to sender before using sender's stream for the TMA launch.
+            system::runtime::set_device(st->devices[static_cast<size_t>(sender)]);
 
             system::runtime::check_cuda(
                 channel_send_bulk_tma(

@@ -54,7 +54,7 @@ function(ooverlap_apply_torch target)
     target_include_directories(${target} PRIVATE ${TORCH_PY_INCLUDE_DIRS})
   endif()
 
-  # Python.h for torch headers that touch Python bits (safe to add always)
+  # Python.h for torch headers that touch Python bits
   if(TARGET Python3::Python)
     target_link_libraries(${target} PRIVATE Python3::Python)
   elseif(DEFINED Python3_INCLUDE_DIRS)
@@ -84,6 +84,37 @@ if(NOT DEFINED NCCL_INCLUDE_DIR OR NOT DEFINED NCCL_LIBRARY)
   endif()
 endif()
 
+# -------------------------
+# Optional cudadevrt lookup
+# -------------------------
+set(OOVERLAP_CUDADEVRT_LIBRARY "")
+find_library(OOVERLAP_CUDADEVRT_LIBRARY
+  NAMES cudadevrt libcudadevrt.a
+  HINTS
+    ${CUDAToolkit_LIBRARY_DIR}
+    ${CUDAToolkit_LIBRARY_ROOT}
+    ${CUDAToolkit_LIBRARY_ROOT}/lib64
+    ${CUDAToolkit_LIBRARY_ROOT}/lib
+    ${CUDAToolkit_ROOT_DIR}/targets/x86_64-linux/lib
+    ${CUDAToolkit_ROOT_DIR}/lib64
+    ${CUDAToolkit_ROOT_DIR}/lib
+    /usr/local/cuda/targets/x86_64-linux/lib
+    /usr/local/cuda/lib64
+    /usr/local/cuda/lib
+)
+
+if(OOVERLAP_CUDADEVRT_LIBRARY)
+  message(STATUS "Found cudadevrt: ${OOVERLAP_CUDADEVRT_LIBRARY}")
+else()
+  message(WARNING "libcudadevrt not found via find_library; continuing without explicit cudadevrt")
+endif()
+
+function(ooverlap_link_cudadevrt target visibility)
+  if(OOVERLAP_CUDADEVRT_LIBRARY)
+    target_link_libraries(${target} ${visibility} ${OOVERLAP_CUDADEVRT_LIBRARY})
+  endif()
+endfunction()
+
 # CUTLASS interface target fallback
 if(NOT TARGET cutlass)
   add_library(cutlass INTERFACE)
@@ -100,18 +131,13 @@ set(OOVERLAP_SM90A_PTX     "--generate-code=arch=compute_90a,code=compute_90a")
 
 function(ooverlap_force_sm90a target)
   if(TARGET ${target})
-    # Important: disable any default CMake/NVCC architecture selection
-    # (for example sm_89 coming from cache/toolchain/default GPU detection).
+    # Disable default CMake architecture selection.
     set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES OFF)
 
+    # Apply Hopper-only gencode at CUDA compile time only.
     target_compile_options(${target} PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_GENCODE}>
       $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_PTX}>
-    )
-
-    target_link_options(${target} PRIVATE
-      $<$<LINK_LANGUAGE:CUDA>:${OOVERLAP_SM90A_GENCODE}>
-      $<$<LINK_LANGUAGE:CUDA>:${OOVERLAP_SM90A_PTX}>
     )
   endif()
 endfunction()
@@ -139,7 +165,11 @@ if(gemm_files)
     ${PROJECT_SOURCE_DIR}/src/third-party/cutlass/tools/util/include
   )
 
-  target_link_libraries(ooverlap_gemm PUBLIC cutlass CUDA::cudart)
+  target_link_libraries(ooverlap_gemm PUBLIC
+    cutlass
+    CUDA::cudart
+    CUDA::cuda_driver
+  )
 endif()
 
 # -------------------------
@@ -155,9 +185,10 @@ file(GLOB overlap_files CONFIGURE_DEPENDS
 if(overlap_files)
   add_library(ooverlap_overlap STATIC ${overlap_files})
   ooverlap_force_sm90a(ooverlap_overlap)
-  
+
   set_property(TARGET ooverlap_overlap PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ooverlap_overlap PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+  set_property(TARGET ooverlap_overlap PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
   target_include_directories(ooverlap_overlap PUBLIC
     ${PROJECT_SOURCE_DIR}/include
@@ -166,11 +197,14 @@ if(overlap_files)
     ${PROJECT_SOURCE_DIR}/src/third-party/cutlass/tools/util/include
   )
 
+  ooverlap_apply_torch(ooverlap_overlap)
+
   target_link_libraries(ooverlap_overlap PUBLIC
     cutlass
     CUDA::cudart
     CUDA::cuda_driver
   )
+  ooverlap_link_cudadevrt(ooverlap_overlap PUBLIC)
 endif()
 
 # -------------------------
@@ -199,6 +233,7 @@ if(norm_files)
 
   target_link_libraries(ooverlap_norm PUBLIC
     CUDA::cudart
+    CUDA::cuda_driver
   )
 endif()
 
@@ -229,7 +264,12 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/baseline_impl.cu)
     target_link_libraries(ooverlap_baseline_impl PUBLIC ooverlap_norm)
   endif()
 
-  target_link_libraries(ooverlap_baseline_impl PUBLIC CUDA::cudart CUDA::cublas ${NCCL_LIBRARY})
+  target_link_libraries(ooverlap_baseline_impl PUBLIC
+    CUDA::cudart
+    CUDA::cuda_driver
+    CUDA::cublas
+    ${NCCL_LIBRARY}
+  )
 endif()
 
 # -------------------------
@@ -241,6 +281,7 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
 
   set_property(TARGET ooverlap_overlap_impl PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ooverlap_overlap_impl PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+  set_property(TARGET ooverlap_overlap_impl PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
   target_include_directories(ooverlap_overlap_impl PUBLIC
     ${OOVERLAP_SRC_DIR}
@@ -262,6 +303,7 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
     CUDA::cuda_driver
     ${NCCL_LIBRARY}
   )
+  ooverlap_link_cudadevrt(ooverlap_overlap_impl PUBLIC)
 endif()
 
 # -------------------------
@@ -280,12 +322,15 @@ if(EXISTS ${OOVERLAP_SRC_DIR}/nccl_utils.cu)
   )
 
   ooverlap_apply_torch(ooverlap_nccl_tool)
-  target_link_libraries(ooverlap_nccl_tool PUBLIC CUDA::cudart ${NCCL_LIBRARY})
+  target_link_libraries(ooverlap_nccl_tool PUBLIC
+    CUDA::cudart
+    CUDA::cuda_driver
+    ${NCCL_LIBRARY}
+  )
 endif()
 
 # -------------------------
 # Python extension module: ooverlap_ext.so
-#   (this is what your test imports)
 # -------------------------
 if(NOT EXISTS ${OOVERLAP_SRC_DIR}/pybind.cpp)
   message(FATAL_ERROR "src/pybind.cpp not found")
@@ -330,7 +375,7 @@ endif()
 ooverlap_apply_torch(ooverlap_ext)
 target_link_libraries(ooverlap_ext PRIVATE Python3::Python)
 
-# >>> KEY FIX: link libtorch_python so at::Tensor pybind caster is available
+# Link libtorch_python so at::Tensor pybind caster is available
 if(EXISTS "${TORCH_PYTHON_SO}")
   message(STATUS "Linking libtorch_python: ${TORCH_PYTHON_SO}")
   target_link_options(ooverlap_ext PRIVATE "-Wl,--no-as-needed")
@@ -348,6 +393,7 @@ target_link_libraries(ooverlap_ext PRIVATE
   CUDA::cublas
   ${NCCL_LIBRARY}
 )
+ooverlap_link_cudadevrt(ooverlap_ext PRIVATE)
 
 # RPATH to torch/lib for runtime
 if(TORCH_PY_LIBDIR)

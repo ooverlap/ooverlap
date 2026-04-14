@@ -18,6 +18,7 @@ struct Buffer {
 
 struct ChannelSlot {
     Buffer buffer;
+    Buffer signal_buffer;   // uint64_t flag/sequence storage, peer-visible
     uint64_t seq = 0;
 };
 
@@ -76,6 +77,18 @@ const Buffer* channel_get_slot_buffer(
     int dst_rank,
     int slot_idx);
 
+Buffer* channel_get_slot_signal_buffer(
+    TmaCommunicator* comm,
+    int src_rank,
+    int dst_rank,
+    int slot_idx);
+
+const Buffer* channel_get_slot_signal_buffer(
+    const TmaCommunicator* comm,
+    int src_rank,
+    int dst_rank,
+    int slot_idx);
+
 Buffer* communicator_get_local_shard_buffer(
     TmaCommunicator* comm,
     int rank);
@@ -98,6 +111,14 @@ inline half* buffer_as_half(Buffer* buf) {
 
 inline const half* buffer_as_half(const Buffer* buf) {
     return reinterpret_cast<const half*>(buf->ptr);
+}
+
+inline uint64_t* buffer_as_u64(Buffer* buf) {
+    return reinterpret_cast<uint64_t*>(buf->ptr);
+}
+
+inline const uint64_t* buffer_as_u64(const Buffer* buf) {
+    return reinterpret_cast<const uint64_t*>(buf->ptr);
 }
 
 cudaError_t channel_send_bulk_tma(

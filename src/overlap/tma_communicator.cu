@@ -121,6 +121,7 @@ bool communicator_init(
 
     const size_t full_bytes = comm->max_full_numel * sizeof(half);
     const size_t shard_bytes = comm->max_shard_numel * sizeof(half);
+    const size_t signal_bytes = sizeof(uint64_t);
 
     for (int rank = 0; rank < comm->world_size; ++rank) {
         system::runtime::ensure_context_on_device(comm->devices[rank]);
@@ -152,9 +153,17 @@ bool communicator_init(
             ch.slots.resize(static_cast<size_t>(num_channel_slots));
 
             for (int slot = 0; slot < num_channel_slots; ++slot) {
-                ch.slots[static_cast<size_t>(slot)].buffer =
+                ChannelSlot& slot_ref = ch.slots[static_cast<size_t>(slot)];
+                slot_ref.buffer =
                     alloc_peer_visible_buffer_for_rank(comm->devices, dst, shard_bytes);
-                ch.slots[static_cast<size_t>(slot)].seq = 0;
+                slot_ref.signal_buffer =
+                    alloc_peer_visible_buffer_for_rank(comm->devices, dst, signal_bytes);
+                slot_ref.seq = 0;
+
+                system::runtime::set_device(comm->devices[dst]);
+                system::runtime::check_cuda(
+                    cudaMemset(slot_ref.signal_buffer.ptr, 0, slot_ref.signal_buffer.bytes),
+                    "cudaMemset(channel slot signal)");
             }
         }
     }
@@ -170,6 +179,7 @@ void communicator_destroy(TmaCommunicator* comm) {
     for (auto& ch : comm->channels) {
         for (auto& slot : ch.slots) {
             free_buffer(comm->devices, slot.buffer);
+            free_buffer(comm->devices, slot.signal_buffer);
             slot.seq = 0;
         }
         ch.slots.clear();
@@ -255,6 +265,36 @@ const Buffer* channel_get_slot_buffer(
         throw std::invalid_argument("channel_get_slot_buffer: invalid slot_idx");
     }
     return &ch->slots[static_cast<size_t>(slot_idx)].buffer;
+}
+
+Buffer* channel_get_slot_signal_buffer(
+    TmaCommunicator* comm,
+    int src_rank,
+    int dst_rank,
+    int slot_idx) {
+    Channel* ch = communicator_get_channel(comm, src_rank, dst_rank);
+    if (ch == nullptr) {
+        return nullptr;
+    }
+    if (slot_idx < 0 || slot_idx >= ch->num_slots) {
+        throw std::invalid_argument("channel_get_slot_signal_buffer: invalid slot_idx");
+    }
+    return &ch->slots[static_cast<size_t>(slot_idx)].signal_buffer;
+}
+
+const Buffer* channel_get_slot_signal_buffer(
+    const TmaCommunicator* comm,
+    int src_rank,
+    int dst_rank,
+    int slot_idx) {
+    const Channel* ch = communicator_get_channel(comm, src_rank, dst_rank);
+    if (ch == nullptr) {
+        return nullptr;
+    }
+    if (slot_idx < 0 || slot_idx >= ch->num_slots) {
+        throw std::invalid_argument("channel_get_slot_signal_buffer: invalid slot_idx");
+    }
+    return &ch->slots[static_cast<size_t>(slot_idx)].signal_buffer;
 }
 
 Buffer* communicator_get_local_shard_buffer(
