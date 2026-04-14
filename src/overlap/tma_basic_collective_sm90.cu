@@ -1,14 +1,13 @@
 #include "overlap/tma_basic_collective_sm90.h"
-#include "overlap/bulk_tma_copy_sm90.cuh"
 #include "overlap/tma_collective_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
-#include "ooverlap/system/peer_buffer.cuh"
 #include "ooverlap/testing/test_utils.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -59,16 +58,18 @@ inline void validate_state(BasicCollectiveState* st) {
     }
 }
 
-inline void zero_peer_buffer_on_owner(
-    const system::mapped_peer_buffer& buf,
-    int owner_dev) {
-    system::runtime::set_device(owner_dev);
-    system::runtime::check_cuda(cudaMemset(buf.ptr, 0, buf.mapped_size), "cudaMemset(peer buffer)");
+inline void zero_buffer_on_owner(
+    const BasicCollectiveState* st,
+    const Buffer& buf) {
+    system::runtime::set_device(st->devices[static_cast<size_t>(buf.owner_rank)]);
+    system::runtime::check_cuda(cudaMemset(buf.ptr, 0, buf.bytes), "cudaMemset(buffer)");
 }
 
 inline void sync_all_streams(const BasicCollectiveState* st, const char* what) {
     for (int r = 0; r < st->world_size; ++r) {
-        system::runtime::sync_stream_on_device(st->devices[r], st->streams[r], what);
+        system::runtime::sync_stream_on_device(st->devices[static_cast<size_t>(r)],
+                                               st->streams[static_cast<size_t>(r)],
+                                               what);
     }
 }
 
@@ -156,110 +157,21 @@ bool init_basic_collective_same_process(
     BasicCollectiveState* st,
     const std::vector<int>& devices,
     size_t max_full_numel) {
-
-    if (st == nullptr) {
-        throw std::invalid_argument("BasicCollectiveState pointer is null");
-    }
-    if (devices.size() < 2) {
-        throw std::invalid_argument("Need at least 2 devices");
-    }
-    if (max_full_numel == 0) {
-        throw std::invalid_argument("max_full_numel must be > 0");
-    }
-    if (max_full_numel % devices.size() != 0) {
-        throw std::invalid_argument("max_full_numel must be divisible by world_size");
-    }
-
-    destroy_basic_collective_same_process(st);
-
-    st->world_size = static_cast<int>(devices.size());
-    st->devices = devices;
-    st->streams.resize(devices.size(), nullptr);
-    st->max_full_numel = max_full_numel;
-    st->max_shard_numel = max_full_numel / devices.size();
-    st->rs_inboxes.resize(devices.size());
-    st->full_outputs.resize(devices.size());
-    st->shard_outputs.resize(devices.size(), nullptr);
-
-    std::vector<int> access_devices = devices;
-
-    const size_t shard_bytes = st->max_shard_numel * sizeof(half);
-    const size_t full_bytes = st->max_full_numel * sizeof(half);
-
-    for (int r = 0; r < st->world_size; ++r) {
-        system::runtime::ensure_context_on_device(st->devices[r]);
-    }
-
-    for (int r = 0; r < st->world_size; ++r) {
-        st->streams[r] = system::runtime::create_stream_on_device(st->devices[r]);
-
-        st->rs_inboxes[r] = system::alloc_peer_visible_buffer(
-            shard_bytes * static_cast<size_t>(st->world_size),
-            st->devices[r],
-            access_devices);
-
-        st->full_outputs[r] = system::alloc_peer_visible_buffer(
-            full_bytes,
-            st->devices[r],
-            access_devices);
-
-        system::runtime::set_device(st->devices[r]);
-        system::runtime::check_cuda(
-            cudaMalloc(&st->shard_outputs[r], shard_bytes),
-            "cudaMalloc(shard_output)");
-    }
-
-    return true;
+    return communicator_init(st, devices, max_full_numel, 1);
 }
 
 void destroy_basic_collective_same_process(BasicCollectiveState* st) {
-    if (st == nullptr) return;
-
-    for (size_t r = 0; r < st->shard_outputs.size(); ++r) {
-        if (st->shard_outputs[r] != nullptr) {
-            system::runtime::set_device(st->devices[r]);
-            system::runtime::check_cuda(cudaFree(st->shard_outputs[r]), "cudaFree(shard_output)");
-            st->shard_outputs[r] = nullptr;
-        }
-    }
-
-    for (auto& buf : st->rs_inboxes) {
-        system::free_peer_visible_buffer(buf);
-    }
-    for (auto& buf : st->full_outputs) {
-        system::free_peer_visible_buffer(buf);
-    }
-
-    for (size_t r = 0; r < st->streams.size(); ++r) {
-        if (st->streams[r] != nullptr) {
-            system::runtime::destroy_stream_on_device(st->devices[r], st->streams[r]);
-        }
-    }
-
-    st->world_size = 0;
-    st->devices.clear();
-    st->streams.clear();
-    st->max_full_numel = 0;
-    st->max_shard_numel = 0;
-    st->rs_inboxes.clear();
-    st->full_outputs.clear();
-    st->shard_outputs.clear();
+    communicator_destroy(st);
 }
 
 half* basic_collective_shard_output_ptr(BasicCollectiveState* st, int rank) {
     validate_state(st);
-    if (rank < 0 || rank >= st->world_size) {
-        throw std::invalid_argument("Invalid rank in basic_collective_shard_output_ptr");
-    }
-    return st->shard_outputs[rank];
+    return buffer_as_half(communicator_get_local_shard_buffer(st, rank));
 }
 
 half* basic_collective_full_output_ptr(BasicCollectiveState* st, int rank) {
     validate_state(st);
-    if (rank < 0 || rank >= st->world_size) {
-        throw std::invalid_argument("Invalid rank in basic_collective_full_output_ptr");
-    }
-    return reinterpret_cast<half*>(st->full_outputs[rank].ptr);
+    return buffer_as_half(communicator_get_local_full_buffer(st, rank));
 }
 
 cudaError_t enqueue_basic_reduce_scatter_tma_sm90(
@@ -282,54 +194,68 @@ cudaError_t enqueue_basic_reduce_scatter_tma_sm90(
     const size_t shard_numel = full_numel / static_cast<size_t>(st->world_size);
     const size_t shard_bytes = shard_numel * sizeof(half);
 
+    // Each owner starts from its local shard contribution.
     for (int owner = 0; owner < st->world_size; ++owner) {
-        zero_peer_buffer_on_owner(st->rs_inboxes[owner], st->devices[owner]);
+        Buffer* shard_out = communicator_get_local_shard_buffer(st, owner);
 
-        system::runtime::set_device(st->devices[owner]);
-        const half* src_local_shard = local_full_buffers[owner] + static_cast<size_t>(owner) * shard_numel;
+        system::runtime::set_device(st->devices[static_cast<size_t>(owner)]);
+        const half* src_local_shard =
+            local_full_buffers[static_cast<size_t>(owner)] + static_cast<size_t>(owner) * shard_numel;
+
         system::runtime::check_cuda(
             cudaMemcpyAsync(
-                st->shard_outputs[owner],
+                shard_out->ptr,
                 src_local_shard,
                 shard_bytes,
                 cudaMemcpyDeviceToDevice,
-                st->streams[owner]),
-            "cudaMemcpyAsync(local shard -> shard_output)");
+                st->streams[static_cast<size_t>(owner)]),
+            "cudaMemcpyAsync(local shard -> local_shard_buffer)");
     }
 
+    // Each sender pushes shard[owner] into channel(sender -> owner, slot 0).
     for (int sender = 0; sender < st->world_size; ++sender) {
-        system::runtime::set_device(st->devices[sender]);
+        system::runtime::set_device(st->devices[static_cast<size_t>(sender)]);
 
         for (int owner = 0; owner < st->world_size; ++owner) {
             if (owner == sender) continue;
 
-            const half* src = local_full_buffers[sender] + static_cast<size_t>(owner) * shard_numel;
-            half* dst = reinterpret_cast<half*>(st->rs_inboxes[owner].ptr) +
-                        static_cast<size_t>(sender) * shard_numel;
+            Buffer* slot_buf = channel_get_slot_buffer(st, sender, owner, 0);
+            zero_buffer_on_owner(st, *slot_buf);
+
+            const half* src =
+                local_full_buffers[static_cast<size_t>(sender)] + static_cast<size_t>(owner) * shard_numel;
 
             system::runtime::check_cuda(
-                enqueue_bulk_tma_copy_sm90(src, dst, shard_numel, st->streams[sender]),
-                "enqueue_bulk_tma_copy_sm90 RS");
+                channel_send_bulk_tma(
+                    st,
+                    sender,
+                    owner,
+                    0,
+                    src,
+                    shard_numel,
+                    st->streams[static_cast<size_t>(sender)]),
+                "channel_send_bulk_tma RS");
         }
     }
 
     sync_all_streams(st, "cudaStreamSynchronize(RS sends)");
 
+    // Each owner accumulates received shards from channel(sender -> owner, slot 0).
     for (int owner = 0; owner < st->world_size; ++owner) {
-        system::runtime::set_device(st->devices[owner]);
+        Buffer* shard_out = communicator_get_local_shard_buffer(st, owner);
 
+        system::runtime::set_device(st->devices[static_cast<size_t>(owner)]);
         for (int sender = 0; sender < st->world_size; ++sender) {
             if (sender == owner) continue;
 
-            const half* src = reinterpret_cast<const half*>(st->rs_inboxes[owner].ptr) +
-                              static_cast<size_t>(sender) * shard_numel;
+            const Buffer* slot_buf = channel_get_slot_buffer(st, sender, owner, 0);
 
             system::runtime::check_cuda(
                 enqueue_fp16_add_inplace_sm90(
-                    st->shard_outputs[owner],
-                    src,
+                    buffer_as_half(shard_out),
+                    buffer_as_half(slot_buf),
                     shard_numel,
-                    st->streams[owner]),
+                    st->streams[static_cast<size_t>(owner)]),
                 "enqueue_fp16_add_inplace_sm90 RS");
         }
     }
@@ -354,43 +280,72 @@ cudaError_t enqueue_basic_all_gather_tma_sm90(
 
     const size_t shard_bytes = shard_numel * sizeof(half);
 
+    // Zero full outputs and place local shard into its local slot.
     for (int recv = 0; recv < st->world_size; ++recv) {
-        zero_peer_buffer_on_owner(st->full_outputs[recv], st->devices[recv]);
+        Buffer* full_out = communicator_get_local_full_buffer(st, recv);
+        zero_buffer_on_owner(st, *full_out);
 
-        system::runtime::set_device(st->devices[recv]);
-        half* local_slot = reinterpret_cast<half*>(st->full_outputs[recv].ptr) +
-                           static_cast<size_t>(recv) * shard_numel;
+        system::runtime::set_device(st->devices[static_cast<size_t>(recv)]);
+        half* local_slot = buffer_as_half(full_out) + static_cast<size_t>(recv) * shard_numel;
 
         system::runtime::check_cuda(
             cudaMemcpyAsync(
                 local_slot,
-                local_shard_buffers[recv],
+                local_shard_buffers[static_cast<size_t>(recv)],
                 shard_bytes,
                 cudaMemcpyDeviceToDevice,
-                st->streams[recv]),
+                st->streams[static_cast<size_t>(recv)]),
             "cudaMemcpyAsync(local shard -> full_output local slot)");
     }
 
+    // Each sender pushes its shard into channel(sender -> recv, slot 0).
     for (int sender = 0; sender < st->world_size; ++sender) {
-        system::runtime::set_device(st->devices[sender]);
+        system::runtime::set_device(st->devices[static_cast<size_t>(sender)]);
 
         for (int recv = 0; recv < st->world_size; ++recv) {
             if (recv == sender) continue;
 
-            half* dst = reinterpret_cast<half*>(st->full_outputs[recv].ptr) +
-                        static_cast<size_t>(sender) * shard_numel;
+            Buffer* slot_buf = channel_get_slot_buffer(st, sender, recv, 0);
+            zero_buffer_on_owner(st, *slot_buf);
 
             system::runtime::check_cuda(
-                enqueue_bulk_tma_copy_sm90(
-                    local_shard_buffers[sender],
-                    dst,
+                channel_send_bulk_tma(
+                    st,
+                    sender,
+                    recv,
+                    0,
+                    local_shard_buffers[static_cast<size_t>(sender)],
                     shard_numel,
-                    st->streams[sender]),
-                "enqueue_bulk_tma_copy_sm90 AG");
+                    st->streams[static_cast<size_t>(sender)]),
+                "channel_send_bulk_tma AG");
         }
     }
 
-    sync_all_streams(st, "cudaStreamSynchronize(AG)");
+    sync_all_streams(st, "cudaStreamSynchronize(AG sends)");
+
+    // Each receiver copies received shards into its full output slots.
+    for (int recv = 0; recv < st->world_size; ++recv) {
+        Buffer* full_out = communicator_get_local_full_buffer(st, recv);
+
+        system::runtime::set_device(st->devices[static_cast<size_t>(recv)]);
+        for (int sender = 0; sender < st->world_size; ++sender) {
+            if (sender == recv) continue;
+
+            const Buffer* slot_buf = channel_get_slot_buffer(st, sender, recv, 0);
+            half* dst_slot = buffer_as_half(full_out) + static_cast<size_t>(sender) * shard_numel;
+
+            system::runtime::check_cuda(
+                cudaMemcpyAsync(
+                    dst_slot,
+                    slot_buf->ptr,
+                    shard_bytes,
+                    cudaMemcpyDeviceToDevice,
+                    st->streams[static_cast<size_t>(recv)]),
+                "cudaMemcpyAsync(channel slot -> full_output slot)");
+        }
+    }
+
+    sync_all_streams(st, "cudaStreamSynchronize(AG assemble)");
     return cudaSuccess;
 }
 
@@ -408,7 +363,7 @@ cudaError_t enqueue_basic_all_reduce_tma_sm90(
 
     std::vector<half*> local_shards(static_cast<size_t>(st->world_size), nullptr);
     for (int r = 0; r < st->world_size; ++r) {
-        local_shards[static_cast<size_t>(r)] = st->shard_outputs[r];
+        local_shards[static_cast<size_t>(r)] = basic_collective_shard_output_ptr(st, r);
     }
 
     return enqueue_basic_all_gather_tma_sm90(
@@ -439,7 +394,7 @@ bool tma_basic_ngpu_reduce_scatter_smoke_test(
     auto local_full = allocate_local_full_buffers(devices, full_numel_sz);
 
     for (int r = 0; r < world_size; ++r) {
-        system::runtime::set_device(devices[r]);
+        system::runtime::set_device(devices[static_cast<size_t>(r)]);
         testing::fill_pattern(
             local_full[static_cast<size_t>(r)],
             static_cast<int64_t>(full_numel_sz),
@@ -459,7 +414,9 @@ bool tma_basic_ngpu_reduce_scatter_smoke_test(
 
     for (int r = 0; r < world_size; ++r) {
         auto got = testing::copy_half_device_to_host_float(
-            st.shard_outputs[r], static_cast<int64_t>(shard_numel), devices[r]);
+            basic_collective_shard_output_ptr(&st, r),
+            static_cast<int64_t>(shard_numel),
+            devices[static_cast<size_t>(r)]);
 
         std::vector<float> ref(shard_numel);
         for (size_t i = 0; i < shard_numel; ++i) {
@@ -493,7 +450,7 @@ bool tma_basic_ngpu_all_gather_smoke_test(
     auto local_shards = allocate_local_shard_buffers(devices, shard_numel_sz);
 
     for (int r = 0; r < world_size; ++r) {
-        system::runtime::set_device(devices[r]);
+        system::runtime::set_device(devices[static_cast<size_t>(r)]);
         testing::fill_pattern(
             local_shards[static_cast<size_t>(r)],
             static_cast<int64_t>(shard_numel_sz),
@@ -512,9 +469,9 @@ bool tma_basic_ngpu_all_gather_smoke_test(
 
     for (int r = 0; r < world_size; ++r) {
         auto got = testing::copy_half_device_to_host_float(
-            reinterpret_cast<half*>(st.full_outputs[static_cast<size_t>(r)].ptr),
+            basic_collective_full_output_ptr(&st, r),
             static_cast<int64_t>(full_numel_sz),
-            devices[r]);
+            devices[static_cast<size_t>(r)]);
 
         testing::expect_allclose(got, ref_full, "basic_ngpu_all_gather");
     }
@@ -546,7 +503,7 @@ bool tma_basic_ngpu_all_reduce_smoke_test(
     auto local_full = allocate_local_full_buffers(devices, full_numel_sz);
 
     for (int r = 0; r < world_size; ++r) {
-        system::runtime::set_device(devices[r]);
+        system::runtime::set_device(devices[static_cast<size_t>(r)]);
         testing::fill_pattern(
             local_full[static_cast<size_t>(r)],
             static_cast<int64_t>(full_numel_sz),
@@ -565,9 +522,9 @@ bool tma_basic_ngpu_all_reduce_smoke_test(
 
     for (int r = 0; r < world_size; ++r) {
         auto got = testing::copy_half_device_to_host_float(
-            reinterpret_cast<half*>(st.full_outputs[static_cast<size_t>(r)].ptr),
+            basic_collective_full_output_ptr(&st, r),
             static_cast<int64_t>(full_numel_sz),
-            devices[r]);
+            devices[static_cast<size_t>(r)]);
 
         testing::expect_allclose(got, ref, "basic_ngpu_all_reduce");
     }

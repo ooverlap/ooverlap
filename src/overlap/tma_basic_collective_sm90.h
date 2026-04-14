@@ -7,29 +7,12 @@
 #include <cstdint>
 #include <vector>
 
-#include "ooverlap/system/peer_buffer.cuh"
+#include "overlap/tma_communicator.h"
 
 namespace ooverlap {
 
-struct BasicCollectiveState {
-    int world_size = 0;
-    std::vector<int> devices;
-    std::vector<cudaStream_t> streams;
-
-    size_t max_full_numel = 0;
-    size_t max_shard_numel = 0;
-
-    // For reduce-scatter:
-    // rs_inboxes[r] is owned by devices[r] and has world_size shard-slots.
-    std::vector<system::mapped_peer_buffer> rs_inboxes;
-
-    // For all-gather / all-reduce final outputs:
-    // full_outputs[r] is owned by devices[r] and visible to all devices.
-    std::vector<system::mapped_peer_buffer> full_outputs;
-
-    // Local shard buffers (owned by each device, not peer-visible).
-    std::vector<half*> shard_outputs;
-};
+// Compatibility alias so current benchmark / code can keep using the old name.
+using BasicCollectiveState = TmaCommunicator;
 
 bool init_basic_collective_same_process(
     BasicCollectiveState* st,

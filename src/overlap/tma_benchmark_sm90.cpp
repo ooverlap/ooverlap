@@ -3,6 +3,7 @@
 #include "overlap/bulk_tma_copy_sm90.cuh"
 #include "overlap/tma_basic_collective_sm90.h"
 #include "ooverlap/system/runtime_utils.cuh"
+#include "ooverlap/system/peer_buffer.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
