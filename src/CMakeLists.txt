@@ -88,25 +88,35 @@ endif()
 # Optional cudadevrt lookup
 # -------------------------
 set(OOVERLAP_CUDADEVRT_LIBRARY "")
-find_library(OOVERLAP_CUDADEVRT_LIBRARY
-  NAMES cudadevrt libcudadevrt.a
-  HINTS
-    ${CUDAToolkit_LIBRARY_DIR}
-    ${CUDAToolkit_LIBRARY_ROOT}
-    ${CUDAToolkit_LIBRARY_ROOT}/lib64
-    ${CUDAToolkit_LIBRARY_ROOT}/lib
-    ${CUDAToolkit_ROOT_DIR}/targets/x86_64-linux/lib
-    ${CUDAToolkit_ROOT_DIR}/lib64
-    ${CUDAToolkit_ROOT_DIR}/lib
-    /usr/local/cuda/targets/x86_64-linux/lib
-    /usr/local/cuda/lib64
-    /usr/local/cuda/lib
-)
+
+# First try the exact path that exists on your cluster.
+if(EXISTS "/apps/Common/software/CUDA/12.4.0/targets/x86_64-linux/lib/libcudadevrt.a")
+  set(OOVERLAP_CUDADEVRT_LIBRARY
+      "/apps/Common/software/CUDA/12.4.0/targets/x86_64-linux/lib/libcudadevrt.a")
+endif()
+
+# If not found yet, try generic search locations.
+if(NOT OOVERLAP_CUDADEVRT_LIBRARY)
+  find_library(OOVERLAP_CUDADEVRT_LIBRARY
+    NAMES cudadevrt libcudadevrt.a
+    HINTS
+      ${CUDAToolkit_LIBRARY_DIR}
+      ${CUDAToolkit_LIBRARY_ROOT}
+      ${CUDAToolkit_LIBRARY_ROOT}/lib64
+      ${CUDAToolkit_LIBRARY_ROOT}/lib
+      ${CUDAToolkit_ROOT_DIR}/targets/x86_64-linux/lib
+      ${CUDAToolkit_ROOT_DIR}/lib64
+      ${CUDAToolkit_ROOT_DIR}/lib
+      /usr/local/cuda/targets/x86_64-linux/lib
+      /usr/local/cuda/lib64
+      /usr/local/cuda/lib
+  )
+endif()
 
 if(OOVERLAP_CUDADEVRT_LIBRARY)
   message(STATUS "Found cudadevrt: ${OOVERLAP_CUDADEVRT_LIBRARY}")
 else()
-  message(WARNING "libcudadevrt not found via find_library; continuing without explicit cudadevrt")
+  message(WARNING "libcudadevrt not found; continuing without explicit cudadevrt")
 endif()
 
 function(ooverlap_link_cudadevrt target visibility)
