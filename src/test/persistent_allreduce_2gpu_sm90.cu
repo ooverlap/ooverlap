@@ -32,8 +32,8 @@
 namespace ooverlap {
 
 static constexpr int kPersistentThreads = 256;
-static constexpr size_t kPersistentChunkBytes = 16 * 1024;
-static constexpr int kPersistentMaxBlocks = 64;
+static constexpr size_t kPersistentChunkBytes = 32 * 1024;
+static constexpr int kPersistentMaxBlocks = 128;
 
 namespace {
 
@@ -423,6 +423,8 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_with_state(
     return (err0 != cudaSuccess) ? err0 : err1;
 }
 
+}
+
 cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
     comm::Communicator* comm,
     half* rank0_in,
@@ -682,8 +684,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         {"speedup_basic_over_persistent", avg_basic_ms / avg_persistent_ms},
         {"speedup_nccl_over_persistent", avg_nccl_ms / avg_persistent_ms}
     };
-}
-
 }
 
 } // namespace ooverlap
