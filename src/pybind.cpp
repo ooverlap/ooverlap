@@ -16,6 +16,7 @@
 #include "test/tma_vmm_smoke_test.h"
 #include "test/tma_benchmark_sm90.h"
 #include "test/persistent_allreduce_2gpu_sm90.h"
+#include "test/persistent_allreduce_4gpu_sm90.h"
 
 namespace py = pybind11;
 
@@ -257,6 +258,26 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev0") = 0,
         py::arg("dev1") = 1,
         "Benchmark persistent 2-GPU all-reduce vs basic TMA vs NCCL");
+
+  m.def("tma_persistent_four_gpu_allreduce_smoke_test",
+        &ooverlap::tma_persistent_four_gpu_allreduce_smoke_test,
+        py::arg("numel"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        py::arg("dev2") = 2,
+        py::arg("dev3") = 3,
+        "Persistent 4-GPU all-reduce smoke test (measurement-only butterfly build on 2-GPU persistent primitive)");
+
+  m.def("benchmark_persistent_four_gpu_allreduce_sm90",
+        &ooverlap::benchmark_persistent_four_gpu_allreduce_sm90,
+        py::arg("numel"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        py::arg("dev2") = 2,
+        py::arg("dev3") = 3,
+        "Benchmark persistent 4-GPU all-reduce vs basic TMA vs NCCL");
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
