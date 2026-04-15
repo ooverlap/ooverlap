@@ -35,6 +35,7 @@ namespace ooverlap {
 static constexpr int kPersistentThreads = 16;
 static constexpr size_t kPersistentChunkBytes = 16 * 1024;
 static constexpr int kPersistentMaxBlocks = 16;
+static constexpr int kPersistentStageDepth = 3;
 
 namespace {
 
@@ -70,19 +71,22 @@ __global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
 
     extern __shared__ uint4 shared_storage_u4[];
     unsigned char* shared_raw = reinterpret_cast<unsigned char*>(shared_storage_u4);
-    unsigned char* smem0 = shared_raw;
-    unsigned char* smem1 = shared_raw + kPersistentChunkBytes;
 
-    __shared__ sync::semaphore load_barriers[2];
+    __shared__ sync::semaphore load_barriers[kPersistentStageDepth];
+
+    auto stage_ptr = [&](int stage) -> unsigned char* {
+        return shared_raw + static_cast<size_t>(stage) * kPersistentChunkBytes;
+    };
 
     const unsigned char* local_bytes = reinterpret_cast<const unsigned char*>(local_in);
     unsigned char* peer_bytes = reinterpret_cast<unsigned char*>(peer_out);
     const size_t total_bytes = numel * sizeof(half);
 
+    int local_iter = 0;
     int cur_chunk = start_chunk;
-    int next_chunk = cur_chunk + chunk_stride;
-    int cur_buf = 0;
+    int next_chunk_to_load = start_chunk + chunk_stride;
 
+    // Preload the very first stage only. Subsequent stages are loaded as the ring advances.
     {
         const size_t cur_offset = static_cast<size_t>(cur_chunk) * kPersistentChunkBytes;
         const size_t cur_bytes = min_sz(kPersistentChunkBytes, total_bytes - cur_offset);
@@ -91,23 +95,23 @@ __global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
             sync::init_semaphore(load_barriers[0], 1);
             tma::expect_bytes(load_barriers[0], static_cast<uint32_t>(cur_bytes));
             tma::load_async(
-                smem0,
+                stage_ptr(0),
                 local_bytes + cur_offset,
                 static_cast<uint32_t>(cur_bytes),
                 load_barriers[0]);
         }
         __syncthreads();
-
-        if (threadIdx.x == 0) {
-            sync::wait(load_barriers[0], 0);
-        }
-        __syncthreads();
     }
 
     while (cur_chunk < num_chunks) {
-        unsigned char* cur_smem = (cur_buf == 0) ? smem0 : smem1;
-        unsigned char* next_smem = (cur_buf == 0) ? smem1 : smem0;
-        const int next_stage = cur_buf ^ 1;
+        const int cur_stage = local_iter % kPersistentStageDepth;
+
+        if (threadIdx.x == 0) {
+            sync::wait(load_barriers[cur_stage], 0);
+        }
+        __syncthreads();
+
+        unsigned char* cur_smem = stage_ptr(cur_stage);
 
         const size_t cur_offset = static_cast<size_t>(cur_chunk) * kPersistentChunkBytes;
         const size_t cur_bytes = min_sz(kPersistentChunkBytes, total_bytes - cur_offset);
@@ -122,24 +126,30 @@ __global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
                 static_cast<uint32_t>(bulk_bytes));
         }
 
-        if (next_chunk < num_chunks) {
-            const size_t next_offset = static_cast<size_t>(next_chunk) * kPersistentChunkBytes;
-            const size_t next_bytes = min_sz(kPersistentChunkBytes, total_bytes - next_offset);
+        // Schedule the next load into the ring. Only wait when the stage is actually being reused.
+        if (next_chunk_to_load < num_chunks) {
+            const int next_stage = (local_iter + 1) % kPersistentStageDepth;
 
             if (threadIdx.x == 0) {
+                if ((local_iter + 1) >= kPersistentStageDepth) {
+                    tma::reduce_async_read_wait<kPersistentStageDepth - 1>();
+                }
+
+                const size_t next_offset =
+                    static_cast<size_t>(next_chunk_to_load) * kPersistentChunkBytes;
+                const size_t next_bytes =
+                    min_sz(kPersistentChunkBytes, total_bytes - next_offset);
+
                 sync::init_semaphore(load_barriers[next_stage], 1);
                 tma::expect_bytes(load_barriers[next_stage], static_cast<uint32_t>(next_bytes));
                 tma::load_async(
-                    next_smem,
+                    stage_ptr(next_stage),
                     local_bytes + next_offset,
                     static_cast<uint32_t>(next_bytes),
                     load_barriers[next_stage]);
             }
         }
 
-        if (threadIdx.x == 0 && bulk_bytes > 0) {
-            tma::reduce_async_read_wait<0>();
-        }
         __syncthreads();
 
         if (tail_bytes > 0) {
@@ -157,16 +167,9 @@ __global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
 
         __syncthreads();
 
-        cur_chunk = next_chunk;
-        next_chunk += chunk_stride;
-        cur_buf ^= 1;
-
-        if (cur_chunk < num_chunks) {
-            if (threadIdx.x == 0) {
-                sync::wait(load_barriers[cur_buf], 0);
-            }
-            __syncthreads();
-        }
+        cur_chunk = next_chunk_to_load;
+        next_chunk_to_load += chunk_stride;
+        ++local_iter;
     }
 }
 
@@ -404,7 +407,7 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_peer_outputs_with_state(
     }
 
     const int num_blocks = std::min(kPersistentMaxBlocks, num_chunks);
-    const size_t smem_bytes = 2 * kPersistentChunkBytes;
+    const size_t smem_bytes = static_cast<size_t>(kPersistentStageDepth) * kPersistentChunkBytes;
 
     // E2E path: initialize peer-visible outputs with local contribution.
     system::runtime::set_device(comm->devices[0]);
@@ -513,7 +516,7 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_peer_outputs_kernel_only
     }
 
     const int num_blocks = std::min(kPersistentMaxBlocks, num_chunks);
-    const size_t smem_bytes = 2 * kPersistentChunkBytes;
+    const size_t smem_bytes = static_cast<size_t>(kPersistentStageDepth) * kPersistentChunkBytes;
 
     system::runtime::set_device(comm->devices[0]);
     persistent_two_gpu_reduce_to_peer_kernel_sm90<<<num_blocks, kPersistentThreads, smem_bytes, comm->streams[0]>>>(
@@ -776,7 +779,7 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
     comm::Communicator comm{};
     communicator_init(&comm, {dev0, dev1}, static_cast<size_t>(numel), 1);
 
-    const size_t smem_bytes = 2 * kPersistentChunkBytes;
+    const size_t smem_bytes = static_cast<size_t>(kPersistentStageDepth) * kPersistentChunkBytes;
     configure_persistent_kernel_smem_once(dev0, smem_bytes);
     configure_persistent_kernel_smem_once(dev1, smem_bytes);
 
@@ -855,7 +858,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     comm::Communicator comm{};
     communicator_init(&comm, {dev0, dev1}, static_cast<size_t>(numel), 1);
 
-    const size_t smem_bytes = 2 * kPersistentChunkBytes;
+    const size_t smem_bytes = static_cast<size_t>(kPersistentStageDepth) * kPersistentChunkBytes;
     configure_persistent_kernel_smem_once(dev0, smem_bytes);
     configure_persistent_kernel_smem_once(dev1, smem_bytes);
 
