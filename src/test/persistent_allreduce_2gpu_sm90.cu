@@ -32,7 +32,7 @@
 namespace ooverlap {
 
 static constexpr int kPersistentThreads = 256;
-static constexpr size_t kPersistentChunkBytes = 64 * 1024;
+static constexpr size_t kPersistentChunkBytes = 16 * 1024;
 static constexpr int kPersistentMaxBlocks = 64;
 
 namespace {
@@ -48,15 +48,6 @@ struct PersistentTwoGpuPeerState {
 
 __host__ __device__ __forceinline__ size_t min_sz(size_t a, size_t b) {
     return (a < b) ? a : b;
-}
-
-__device__ __forceinline__ void load_chunk_to_smem(
-    unsigned char* dst_smem,
-    const unsigned char* src_gmem,
-    size_t bytes) {
-    for (size_t i = threadIdx.x; i < bytes; i += blockDim.x) {
-        dst_smem[i] = src_gmem[i];
-    }
 }
 
 __global__ void persistent_two_gpu_allreduce_kernel_sm90(
@@ -81,6 +72,8 @@ __global__ void persistent_two_gpu_allreduce_kernel_sm90(
     unsigned char* smem0 = shared_raw;
     unsigned char* smem1 = shared_raw + kPersistentChunkBytes;
 
+    __shared__ sync::semaphore load_barriers[2];
+
     const unsigned char* local_bytes = reinterpret_cast<const unsigned char*>(local_in);
     unsigned char* send_bytes = reinterpret_cast<unsigned char*>(send_buf);
     const size_t total_bytes = numel * sizeof(half);
@@ -89,34 +82,71 @@ __global__ void persistent_two_gpu_allreduce_kernel_sm90(
     int next_chunk = cur_chunk + chunk_stride;
     int cur_buf = 0;
 
+    // -------------------------------------------------------------------------
+    // Preload first local chunk with TMA load into smem0.
+    // We re-init the barrier every time a stage is reused, so we can always
+    // wait on phase 0 and avoid explicit parity bookkeeping.
+    // -------------------------------------------------------------------------
     {
         const size_t cur_offset = static_cast<size_t>(cur_chunk) * kPersistentChunkBytes;
         const size_t cur_bytes = min_sz(kPersistentChunkBytes, total_bytes - cur_offset);
-        load_chunk_to_smem(smem0, local_bytes + cur_offset, cur_bytes);
+
+        if (threadIdx.x == 0) {
+            sync::init_semaphore(load_barriers[0], 1);
+            tma::expect_bytes(load_barriers[0], static_cast<uint32_t>(cur_bytes));
+            tma::load_async(
+                smem0,
+                local_bytes + cur_offset,
+                static_cast<uint32_t>(cur_bytes),
+                load_barriers[0]);
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            sync::wait(load_barriers[0], 0);
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     while (cur_chunk < num_chunks) {
         unsigned char* cur_smem = (cur_buf == 0) ? smem0 : smem1;
         unsigned char* next_smem = (cur_buf == 0) ? smem1 : smem0;
+        const int next_stage = cur_buf ^ 1;
 
         const size_t cur_offset = static_cast<size_t>(cur_chunk) * kPersistentChunkBytes;
         const size_t cur_bytes = min_sz(kPersistentChunkBytes, total_bytes - cur_offset);
         const size_t cur_elem_offset = cur_offset / sizeof(half);
         const size_t cur_numel = cur_bytes / sizeof(half);
 
+        // Send current chunk to peer-owned mailbox buffer.
         if (threadIdx.x == 0) {
-            tma::store_async(send_bytes + cur_offset, cur_smem, static_cast<uint32_t>(cur_bytes));
+            tma::store_async(
+                send_bytes + cur_offset,
+                cur_smem,
+                static_cast<uint32_t>(cur_bytes));
         }
 
+        // Preload next local chunk in parallel with the current send/handshake.
         if (next_chunk < num_chunks) {
             const size_t next_offset = static_cast<size_t>(next_chunk) * kPersistentChunkBytes;
             const size_t next_bytes = min_sz(kPersistentChunkBytes, total_bytes - next_offset);
-            load_chunk_to_smem(next_smem, local_bytes + next_offset, next_bytes);
+
+            if (threadIdx.x == 0) {
+                sync::init_semaphore(load_barriers[next_stage], 1);
+                tma::expect_bytes(load_barriers[next_stage], static_cast<uint32_t>(next_bytes));
+                tma::load_async(
+                    next_smem,
+                    local_bytes + next_offset,
+                    static_cast<uint32_t>(next_bytes),
+                    load_barriers[next_stage]);
+            }
         }
 
         if (threadIdx.x == 0) {
+            // Make sure the async engine is done reading cur_smem before we ever
+            // reuse this stage.
             tma::store_async_read_wait<0>();
+
             __threadfence_system();
             send_chunk_signals[cur_chunk] = seq;
             __threadfence_system();
@@ -127,17 +157,30 @@ __global__ void persistent_two_gpu_allreduce_kernel_sm90(
         }
         __syncthreads();
 
+        // Reduce current chunk.
+        // Local operand comes from shared memory loaded by TMA.
+        const half* cur_local_half = reinterpret_cast<const half*>(cur_smem);
         for (size_t i = threadIdx.x; i < cur_numel; i += blockDim.x) {
             const size_t idx = cur_elem_offset + i;
-            float a = __half2float(local_in[idx]);
+            float a = __half2float(cur_local_half[i]);
             float b = __half2float(recv_buf[idx]);
             local_out[idx] = __float2half_rn(a + b);
         }
 
         __syncthreads();
+
         cur_chunk = next_chunk;
         next_chunk += chunk_stride;
         cur_buf ^= 1;
+
+        // Before the next iteration consumes the next stage, wait for its TMA load
+        // to complete into shared memory.
+        if (cur_chunk < num_chunks) {
+            if (threadIdx.x == 0) {
+                sync::wait(load_barriers[cur_buf], 0);
+            }
+            __syncthreads();
+        }
     }
 }
 
@@ -167,7 +210,6 @@ inline void configure_persistent_kernel_smem_once(int device, size_t smem_bytes)
             "persistent kernel requested dynamic shared memory exceeds device opt-in limit");
     }
 
-    // Only opt in if we actually exceed the normal per-block shared memory limit.
     if (smem_bytes > static_cast<size_t>(prop.sharedMemPerBlock)) {
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
@@ -176,7 +218,6 @@ inline void configure_persistent_kernel_smem_once(int device, size_t smem_bytes)
                 static_cast<int>(smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
 
-        // Only force carveout in the large-SMEM case where we actually need it.
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
                 persistent_two_gpu_allreduce_kernel_sm90,
@@ -381,8 +422,6 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_with_state(
     
     return (err0 != cudaSuccess) ? err0 : err1;
 }
-
-} // namespace
 
 cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
     comm::Communicator* comm,
@@ -643,6 +682,8 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         {"speedup_basic_over_persistent", avg_basic_ms / avg_persistent_ms},
         {"speedup_nccl_over_persistent", avg_nccl_ms / avg_persistent_ms}
     };
+}
+
 }
 
 } // namespace ooverlap

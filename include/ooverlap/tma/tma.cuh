@@ -21,17 +21,28 @@ __device__ __forceinline__ uint64_t cvta_to_global_u64(const void* ptr) {
 #endif
 }
 
+__device__ __forceinline__ uint32_t cvta_to_shared_u32(const void* ptr) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+}
+
 // -----------------------------------------------------------------------------
 // LOAD-SIDE HELPERS (global -> shared)
+// -----------------------------------------------------------------------------
+//
+// IMPORTANT:
+// Hopper bulk-TMA load uses shared::cluster on the destination side.
+// Using shared::cta here causes the "State space incorrect for instruction
+// 'cp.async.bulk'" ptxas error you just hit.
 // -----------------------------------------------------------------------------
 
 __device__ __forceinline__ void expect_bytes(sync::semaphore& bar, uint32_t bytes) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&bar));
+    const uint32_t bar_ptr = cvta_to_shared_u32(&bar);
     asm volatile(
         "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
         :
-        : "r"(bar_ptr), "r"(bytes));
+        : "r"(bar_ptr), "r"(bytes)
+        : "memory");
 #else
     (void)bar;
     (void)bytes;
@@ -44,15 +55,12 @@ __device__ __forceinline__ void load_async(
     uint32_t size_bytes,
     sync::semaphore& bar) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    const uint32_t dst_smem_addr =
-        static_cast<uint32_t>(__cvta_generic_to_shared(dst_smem));
-    const uint32_t bar_addr =
-        static_cast<uint32_t>(__cvta_generic_to_shared(&bar));
-    const uint64_t src_gmem_addr =
-        cvta_to_global_u64(src_gmem);
+    const uint32_t dst_smem_addr = cvta_to_shared_u32(dst_smem);
+    const uint32_t bar_addr = cvta_to_shared_u32(&bar);
+    const uint64_t src_gmem_addr = cvta_to_global_u64(src_gmem);
 
     asm volatile(
-        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
         "[%0], [%1], %2, [%3];\n"
         :
         : "r"(dst_smem_addr),
@@ -64,7 +72,9 @@ __device__ __forceinline__ void load_async(
     (void)bar;
     char* d = reinterpret_cast<char*>(dst_smem);
     const char* s = reinterpret_cast<const char*>(src_gmem);
-    for (uint32_t i = 0; i < size_bytes; ++i) d[i] = s[i];
+    for (uint32_t i = 0; i < size_bytes; ++i) {
+        d[i] = s[i];
+    }
 #endif
 }
 
@@ -110,15 +120,17 @@ __device__ __forceinline__ void store_async(
         "cp.async.bulk.global.shared::cta.bulk_group "
         "[%0], [%1], %2;\n"
         :
-        : "l"(dst_gmem),
-          "r"(static_cast<uint32_t>(__cvta_generic_to_shared(src_smem))),
+        : "l"(cvta_to_global_u64(dst_gmem)),
+          "r"(cvta_to_shared_u32(src_smem)),
           "r"(size_bytes)
         : "memory");
     store_commit_group();
 #else
     char* d = reinterpret_cast<char*>(dst_gmem);
     const char* s = reinterpret_cast<const char*>(src_smem);
-    for (uint32_t i = 0; i < size_bytes; ++i) d[i] = s[i];
+    for (uint32_t i = 0; i < size_bytes; ++i) {
+        d[i] = s[i];
+    }
 #endif
 }
 
