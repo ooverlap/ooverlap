@@ -8,6 +8,7 @@
 #include <vector>
 
 namespace ooverlap {
+namespace comm {
 
 struct Buffer {
     void* ptr = nullptr;
@@ -130,4 +131,5 @@ cudaError_t channel_send_bulk_tma(
     size_t numel,
     cudaStream_t stream);
 
+} // namespace comm
 } // namespace ooverlap

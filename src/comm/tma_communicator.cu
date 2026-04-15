@@ -1,4 +1,4 @@
-#include "overlap/tma_communicator.h"
+#include "overlap/comm/tma_communicator.h"
 
 #include "overlap/bulk_tma_copy_sm90.cuh"
 #include "ooverlap/system/runtime_utils.cuh"
@@ -13,8 +13,9 @@
 #include <vector>
 
 namespace ooverlap {
-namespace {
+namespace comm {
 
+namespace {
 inline int channel_index(const TmaCommunicator* comm, int src_rank, int dst_rank) {
     return src_rank * comm->world_size + dst_rank;
 }
@@ -351,4 +352,5 @@ cudaError_t channel_send_bulk_tma(
     return enqueue_bulk_tma_copy_sm90(src, buffer_as_half(dst_buf), numel, stream);
 }
 
+} // namespace comm
 } // namespace ooverlap
