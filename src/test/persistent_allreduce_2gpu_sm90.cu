@@ -2,6 +2,7 @@
 
 #include "test/tma_basic_collective_sm90.h"
 #include "ooverlap/tma/tma.cuh"
+#include "ooverlap/tma/tma_reduce.cuh"
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/system/peer_buffer.cuh"
 #include "ooverlap/testing/test_utils.cuh"
@@ -15,11 +16,11 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <vector>
-#include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #define OOVERLAP_PERSIST_NCCL_CHECK(cmd)                                                        \
     do {                                                                                        \
@@ -31,35 +32,32 @@
 
 namespace ooverlap {
 
-static constexpr int kPersistentThreads = 256;
-static constexpr size_t kPersistentChunkBytes = 32 * 1024;
-static constexpr int kPersistentMaxBlocks = 128;
+static constexpr int kPersistentThreads = 16;
+static constexpr size_t kPersistentChunkBytes = 16 * 1024;
+static constexpr int kPersistentMaxBlocks = 16;
 
 namespace {
 
 struct PersistentTwoGpuPeerState {
-    system::mapped_peer_buffer send01;       // owned by dev1, written by dev0, read by dev1
-    system::mapped_peer_buffer send10;       // owned by dev0, written by dev1, read by dev0
-    system::mapped_peer_buffer sig01_chunks; // owned by dev1, written by dev0, read by dev1
-    system::mapped_peer_buffer sig10_chunks; // owned by dev0, written by dev1, read by dev0
-    uint64_t seq = 0;
+    system::mapped_peer_buffer accum01;  // owned by dev1, visible to dev0/dev1
+    system::mapped_peer_buffer accum10;  // owned by dev0, visible to dev0/dev1
     int num_chunks = 0;
+
+    cudaEvent_t init_done0 = nullptr;
+    cudaEvent_t init_done1 = nullptr;
+    cudaEvent_t reduce_done0 = nullptr;
+    cudaEvent_t reduce_done1 = nullptr;
 };
 
 __host__ __device__ __forceinline__ size_t min_sz(size_t a, size_t b) {
     return (a < b) ? a : b;
 }
 
-__global__ void persistent_two_gpu_allreduce_kernel_sm90(
+__global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
     const half* local_in,
-    half* local_out,
-    half* send_buf,
-    const half* recv_buf,
-    volatile unsigned long long* send_chunk_signals,
-    const volatile unsigned long long* recv_chunk_signals,
+    half* peer_accum_out,
     size_t numel,
-    int num_chunks,
-    unsigned long long seq) {
+    int num_chunks) {
 
     const int start_chunk = static_cast<int>(blockIdx.x);
     const int chunk_stride = static_cast<int>(gridDim.x);
@@ -68,25 +66,22 @@ __global__ void persistent_two_gpu_allreduce_kernel_sm90(
         return;
     }
 
-    extern __shared__ unsigned char shared_raw[];
+    extern __shared__ uint4 shared_storage_u4[];
+    unsigned char* shared_raw = reinterpret_cast<unsigned char*>(shared_storage_u4);
     unsigned char* smem0 = shared_raw;
     unsigned char* smem1 = shared_raw + kPersistentChunkBytes;
 
     __shared__ sync::semaphore load_barriers[2];
 
     const unsigned char* local_bytes = reinterpret_cast<const unsigned char*>(local_in);
-    unsigned char* send_bytes = reinterpret_cast<unsigned char*>(send_buf);
+    unsigned char* peer_accum_bytes = reinterpret_cast<unsigned char*>(peer_accum_out);
     const size_t total_bytes = numel * sizeof(half);
 
     int cur_chunk = start_chunk;
     int next_chunk = cur_chunk + chunk_stride;
     int cur_buf = 0;
 
-    // -------------------------------------------------------------------------
     // Preload first local chunk with TMA load into smem0.
-    // We re-init the barrier every time a stage is reused, so we can always
-    // wait on phase 0 and avoid explicit parity bookkeeping.
-    // -------------------------------------------------------------------------
     {
         const size_t cur_offset = static_cast<size_t>(cur_chunk) * kPersistentChunkBytes;
         const size_t cur_bytes = min_sz(kPersistentChunkBytes, total_bytes - cur_offset);
@@ -115,18 +110,19 @@ __global__ void persistent_two_gpu_allreduce_kernel_sm90(
 
         const size_t cur_offset = static_cast<size_t>(cur_chunk) * kPersistentChunkBytes;
         const size_t cur_bytes = min_sz(kPersistentChunkBytes, total_bytes - cur_offset);
-        const size_t cur_elem_offset = cur_offset / sizeof(half);
-        const size_t cur_numel = cur_bytes / sizeof(half);
 
-        // Send current chunk to peer-owned mailbox buffer.
-        if (threadIdx.x == 0) {
-            tma::store_async(
-                send_bytes + cur_offset,
+        // cp.reduce.async.bulk requires 16B multiple.
+        const size_t bulk_bytes = cur_bytes & ~static_cast<size_t>(0xF);
+        const size_t tail_bytes = cur_bytes - bulk_bytes;
+
+        if (threadIdx.x == 0 && bulk_bytes > 0) {
+            tma::reduce_add_noftz_f16_async(
+                peer_accum_bytes + cur_offset,
                 cur_smem,
-                static_cast<uint32_t>(cur_bytes));
+                static_cast<uint32_t>(bulk_bytes));
         }
 
-        // Preload next local chunk in parallel with the current send/handshake.
+        // Preload next local chunk while current reduction is in flight.
         if (next_chunk < num_chunks) {
             const size_t next_offset = static_cast<size_t>(next_chunk) * kPersistentChunkBytes;
             const size_t next_bytes = min_sz(kPersistentChunkBytes, total_bytes - next_offset);
@@ -142,29 +138,24 @@ __global__ void persistent_two_gpu_allreduce_kernel_sm90(
             }
         }
 
-        if (threadIdx.x == 0) {
-            // Make sure the async engine is done reading cur_smem before we ever
-            // reuse this stage.
-            tma::store_async_read_wait<0>();
-
-            __threadfence_system();
-            send_chunk_signals[cur_chunk] = seq;
-            __threadfence_system();
-
-            while (recv_chunk_signals[cur_chunk] < seq) {
-            }
-            __threadfence_system();
+        // Make sure async engine is done reading cur_smem before reusing the stage.
+        if (threadIdx.x == 0 && bulk_bytes > 0) {
+            tma::reduce_async_read_wait<0>();
         }
         __syncthreads();
 
-        // Reduce current chunk.
-        // Local operand comes from shared memory loaded by TMA.
-        const half* cur_local_half = reinterpret_cast<const half*>(cur_smem);
-        for (size_t i = threadIdx.x; i < cur_numel; i += blockDim.x) {
-            const size_t idx = cur_elem_offset + i;
-            float a = __half2float(cur_local_half[i]);
-            float b = __half2float(recv_buf[idx]);
-            local_out[idx] = __float2half_rn(a + b);
+        // Tail fallback for non-16B-multiple remainder.
+        if (tail_bytes > 0) {
+            const size_t bulk_elems = bulk_bytes / sizeof(half);
+            const size_t tail_elems = tail_bytes / sizeof(half);
+            const half* cur_half = reinterpret_cast<const half*>(cur_smem);
+
+            for (size_t i = threadIdx.x; i < tail_elems; i += blockDim.x) {
+                const size_t idx = (cur_offset / sizeof(half)) + bulk_elems + i;
+                float oldv = __half2float(peer_accum_out[idx]);
+                float addv = __half2float(cur_half[bulk_elems + i]);
+                peer_accum_out[idx] = __float2half_rn(oldv + addv);
+            }
         }
 
         __syncthreads();
@@ -173,8 +164,6 @@ __global__ void persistent_two_gpu_allreduce_kernel_sm90(
         next_chunk += chunk_stride;
         cur_buf ^= 1;
 
-        // Before the next iteration consumes the next stage, wait for its TMA load
-        // to complete into shared memory.
         if (cur_chunk < num_chunks) {
             if (threadIdx.x == 0) {
                 sync::wait(load_barriers[cur_buf], 0);
@@ -213,14 +202,14 @@ inline void configure_persistent_kernel_smem_once(int device, size_t smem_bytes)
     if (smem_bytes > static_cast<size_t>(prop.sharedMemPerBlock)) {
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
-                persistent_two_gpu_allreduce_kernel_sm90,
+                persistent_two_gpu_reduce_to_peer_kernel_sm90,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
 
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
-                persistent_two_gpu_allreduce_kernel_sm90,
+                persistent_two_gpu_reduce_to_peer_kernel_sm90,
                 cudaFuncAttributePreferredSharedMemoryCarveout,
                 100),
             "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
@@ -308,6 +297,13 @@ inline int compute_num_chunks(size_t numel) {
     return static_cast<int>((total_bytes + kPersistentChunkBytes - 1) / kPersistentChunkBytes);
 }
 
+inline void create_event_on_device(int device, cudaEvent_t* ev, const char* what) {
+    system::runtime::set_device(device);
+    system::runtime::check_cuda(
+        cudaEventCreateWithFlags(ev, cudaEventDisableTiming),
+        what);
+}
+
 inline void alloc_persistent_peer_state(
     PersistentTwoGpuPeerState* st,
     int dev0,
@@ -324,35 +320,45 @@ inline void alloc_persistent_peer_state(
 
     std::vector<int> access_devices = {dev0, dev1};
 
-    st->send01 = system::alloc_peer_visible_buffer(bytes, dev1, access_devices);
-    st->send10 = system::alloc_peer_visible_buffer(bytes, dev0, access_devices);
-    st->sig01_chunks = system::alloc_peer_visible_buffer(
-        static_cast<size_t>(num_chunks) * sizeof(uint64_t), dev1, access_devices);
-    st->sig10_chunks = system::alloc_peer_visible_buffer(
-        static_cast<size_t>(num_chunks) * sizeof(uint64_t), dev0, access_devices);
-    st->seq = 0;
+    st->accum01 = system::alloc_peer_visible_buffer(bytes, dev1, access_devices);
+    st->accum10 = system::alloc_peer_visible_buffer(bytes, dev0, access_devices);
     st->num_chunks = num_chunks;
 
-    system::runtime::set_device(dev1);
-    system::runtime::check_cuda(
-        cudaMemset(st->sig01_chunks.ptr, 0, st->sig01_chunks.mapped_size),
-        "cudaMemset(sig01_chunks)");
-
-    system::runtime::set_device(dev0);
-    system::runtime::check_cuda(
-        cudaMemset(st->sig10_chunks.ptr, 0, st->sig10_chunks.mapped_size),
-        "cudaMemset(sig10_chunks)");
+    create_event_on_device(dev0, &st->init_done0, "cudaEventCreateWithFlags(init_done0)");
+    create_event_on_device(dev1, &st->init_done1, "cudaEventCreateWithFlags(init_done1)");
+    create_event_on_device(dev0, &st->reduce_done0, "cudaEventCreateWithFlags(reduce_done0)");
+    create_event_on_device(dev1, &st->reduce_done1, "cudaEventCreateWithFlags(reduce_done1)");
 }
 
-inline void free_persistent_peer_state(PersistentTwoGpuPeerState* st) {
+inline void free_persistent_peer_state(PersistentTwoGpuPeerState* st, int dev0, int dev1) {
     if (st == nullptr) {
         return;
     }
-    system::free_peer_visible_buffer(st->send01);
-    system::free_peer_visible_buffer(st->send10);
-    system::free_peer_visible_buffer(st->sig01_chunks);
-    system::free_peer_visible_buffer(st->sig10_chunks);
-    st->seq = 0;
+
+    system::free_peer_visible_buffer(st->accum01);
+    system::free_peer_visible_buffer(st->accum10);
+
+    if (st->init_done0) {
+        system::runtime::set_device(dev0);
+        cudaEventDestroy(st->init_done0);
+        st->init_done0 = nullptr;
+    }
+    if (st->init_done1) {
+        system::runtime::set_device(dev1);
+        cudaEventDestroy(st->init_done1);
+        st->init_done1 = nullptr;
+    }
+    if (st->reduce_done0) {
+        system::runtime::set_device(dev0);
+        cudaEventDestroy(st->reduce_done0);
+        st->reduce_done0 = nullptr;
+    }
+    if (st->reduce_done1) {
+        system::runtime::set_device(dev1);
+        cudaEventDestroy(st->reduce_done1);
+        st->reduce_done1 = nullptr;
+    }
+
     st->num_chunks = 0;
 }
 
@@ -380,7 +386,7 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_with_state(
     }
 
     const size_t bytes = numel * sizeof(half);
-    if (bytes > st->send01.mapped_size || bytes > st->send10.mapped_size) {
+    if (bytes > st->accum01.mapped_size || bytes > st->accum10.mapped_size) {
         return cudaErrorInvalidValue;
     }
 
@@ -389,41 +395,108 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_with_state(
         return cudaErrorInvalidValue;
     }
 
-    st->seq += 1;
-    const uint64_t seq = st->seq;
     const int num_blocks = std::min(kPersistentMaxBlocks, num_chunks);
     const size_t smem_bytes = 2 * kPersistentChunkBytes;
 
+    // Step 1: initialize accumulation buffers with local inputs.
     system::runtime::set_device(comm->devices[0]);
-    persistent_two_gpu_allreduce_kernel_sm90<<<num_blocks, kPersistentThreads, smem_bytes, comm->streams[0]>>>(
-        rank0_in,
-        rank0_out,
-        reinterpret_cast<half*>(st->send01.ptr),
-        reinterpret_cast<const half*>(st->send10.ptr),
-        reinterpret_cast<volatile unsigned long long*>(st->sig01_chunks.ptr),
-        reinterpret_cast<const volatile unsigned long long*>(st->sig10_chunks.ptr),
-        numel,
-        num_chunks,
-        static_cast<unsigned long long>(seq));
-    cudaError_t err0 = cudaGetLastError();
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(
+            st->accum10.ptr,
+            rank0_in,
+            bytes,
+            cudaMemcpyDeviceToDevice,
+            comm->streams[0]),
+        "cudaMemcpyAsync(rank0_in -> accum10)");
+    system::runtime::check_cuda(
+        cudaEventRecord(st->init_done0, comm->streams[0]),
+        "cudaEventRecord(init_done0)");
 
     system::runtime::set_device(comm->devices[1]);
-    persistent_two_gpu_allreduce_kernel_sm90<<<num_blocks, kPersistentThreads, smem_bytes, comm->streams[1]>>>(
-        rank1_in,
-        rank1_out,
-        reinterpret_cast<half*>(st->send10.ptr),
-        reinterpret_cast<const half*>(st->send01.ptr),
-        reinterpret_cast<volatile unsigned long long*>(st->sig10_chunks.ptr),
-        reinterpret_cast<const volatile unsigned long long*>(st->sig01_chunks.ptr),
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(
+            st->accum01.ptr,
+            rank1_in,
+            bytes,
+            cudaMemcpyDeviceToDevice,
+            comm->streams[1]),
+        "cudaMemcpyAsync(rank1_in -> accum01)");
+    system::runtime::check_cuda(
+        cudaEventRecord(st->init_done1, comm->streams[1]),
+        "cudaEventRecord(init_done1)");
+
+    // Step 2: cross-device wait so peer reduction sees initialized destination.
+    system::runtime::set_device(comm->devices[0]);
+    system::runtime::check_cuda(
+        cudaStreamWaitEvent(comm->streams[0], st->init_done1, 0),
+        "cudaStreamWaitEvent(stream0, init_done1)");
+
+    system::runtime::set_device(comm->devices[1]);
+    system::runtime::check_cuda(
+        cudaStreamWaitEvent(comm->streams[1], st->init_done0, 0),
+        "cudaStreamWaitEvent(stream1, init_done0)");
+
+    // Step 3: each GPU reduces its local input into the peer's accumulation buffer.
+    system::runtime::set_device(comm->devices[0]);
+    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<num_blocks, kPersistentThreads, smem_bytes, comm->streams[0]>>>(
+        rank0_in,
+        reinterpret_cast<half*>(st->accum01.ptr),
         numel,
-        num_chunks,
-        static_cast<unsigned long long>(seq));
+        num_chunks);
+    cudaError_t err0 = cudaGetLastError();
+    if (err0 != cudaSuccess) {
+        return err0;
+    }
+    system::runtime::check_cuda(
+        cudaEventRecord(st->reduce_done0, comm->streams[0]),
+        "cudaEventRecord(reduce_done0)");
+
+    system::runtime::set_device(comm->devices[1]);
+    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<num_blocks, kPersistentThreads, smem_bytes, comm->streams[1]>>>(
+        rank1_in,
+        reinterpret_cast<half*>(st->accum10.ptr),
+        numel,
+        num_chunks);
     cudaError_t err1 = cudaGetLastError();
-    
-    return (err0 != cudaSuccess) ? err0 : err1;
+    if (err1 != cudaSuccess) {
+        return err1;
+    }
+    system::runtime::check_cuda(
+        cudaEventRecord(st->reduce_done1, comm->streams[1]),
+        "cudaEventRecord(reduce_done1)");
+
+    // Step 4: each owner waits for the peer reduction to complete, then copies final
+    // accumulated result into the API output buffer.
+    system::runtime::set_device(comm->devices[0]);
+    system::runtime::check_cuda(
+        cudaStreamWaitEvent(comm->streams[0], st->reduce_done1, 0),
+        "cudaStreamWaitEvent(stream0, reduce_done1)");
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(
+            rank0_out,
+            st->accum10.ptr,
+            bytes,
+            cudaMemcpyDeviceToDevice,
+            comm->streams[0]),
+        "cudaMemcpyAsync(accum10 -> rank0_out)");
+
+    system::runtime::set_device(comm->devices[1]);
+    system::runtime::check_cuda(
+        cudaStreamWaitEvent(comm->streams[1], st->reduce_done0, 0),
+        "cudaStreamWaitEvent(stream1, reduce_done0)");
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(
+            rank1_out,
+            st->accum01.ptr,
+            bytes,
+            cudaMemcpyDeviceToDevice,
+            comm->streams[1]),
+        "cudaMemcpyAsync(accum01 -> rank1_out)");
+
+    return cudaSuccess;
 }
 
-}
+} // namespace
 
 cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
     comm::Communicator* comm,
@@ -460,7 +533,7 @@ cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
                          "sync enqueue_persistent_two_gpu_allreduce_sm90");
     }
 
-    free_persistent_peer_state(&st);
+    free_persistent_peer_state(&st, comm->devices[0], comm->devices[1]);
     return err;
 }
 
@@ -534,7 +607,7 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
     system::runtime::set_device(dev1);
     system::runtime::check_cuda(cudaFree(rank1_in), "cudaFree(rank1_in)");
 
-    free_persistent_peer_state(&st);
+    free_persistent_peer_state(&st, dev0, dev1);
     communicator_destroy(&comm);
     return true;
 }
@@ -669,7 +742,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     system::runtime::set_device(dev1);
     system::runtime::check_cuda(cudaFree(rank1_in), "cudaFree(rank1_in)");
 
-    free_persistent_peer_state(&st);
+    free_persistent_peer_state(&st, dev0, dev1);
     communicator_destroy(&comm);
 
     const double avg_basic_ms = basic_total_ms / static_cast<double>(iters);
