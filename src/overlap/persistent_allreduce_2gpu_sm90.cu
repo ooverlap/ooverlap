@@ -18,6 +18,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <unordered_map>
 
 #define OOVERLAP_PERSIST_NCCL_CHECK(cmd)                                                        \
     do {                                                                                        \
@@ -30,7 +32,7 @@
 namespace ooverlap {
 
 static constexpr int kPersistentThreads = 256;
-static constexpr size_t kPersistentChunkBytes = 16 * 1024;
+static constexpr size_t kPersistentChunkBytes = 64 * 1024;
 static constexpr int kPersistentMaxBlocks = 64;
 
 namespace {
@@ -137,6 +139,53 @@ __global__ void persistent_two_gpu_allreduce_kernel_sm90(
         next_chunk += chunk_stride;
         cur_buf ^= 1;
     }
+}
+
+inline void configure_persistent_kernel_smem_once(int device, size_t smem_bytes) {
+    struct KernelConfigCacheEntry {
+        bool configured = false;
+        size_t smem_bytes = 0;
+    };
+
+    static std::mutex mutex;
+    static std::unordered_map<int, KernelConfigCacheEntry> cache;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto it = cache.find(device);
+    if (it != cache.end() && it->second.configured && it->second.smem_bytes == smem_bytes) {
+        return;
+    }
+
+    system::runtime::set_device(device);
+
+    cudaDeviceProp prop{};
+    system::runtime::check_cuda(cudaGetDeviceProperties(&prop, device), "cudaGetDeviceProperties");
+
+    if (smem_bytes > static_cast<size_t>(prop.sharedMemPerBlockOptin)) {
+        throw std::runtime_error(
+            "persistent kernel requested dynamic shared memory exceeds device opt-in limit");
+    }
+
+    // Only opt in if we actually exceed the normal per-block shared memory limit.
+    if (smem_bytes > static_cast<size_t>(prop.sharedMemPerBlock)) {
+        system::runtime::check_cuda(
+            cudaFuncSetAttribute(
+                persistent_two_gpu_allreduce_kernel_sm90,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(smem_bytes)),
+            "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
+
+        // Only force carveout in the large-SMEM case where we actually need it.
+        system::runtime::check_cuda(
+            cudaFuncSetAttribute(
+                persistent_two_gpu_allreduce_kernel_sm90,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                100),
+            "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
+    }
+
+    cache[device] = {true, smem_bytes};
 }
 
 inline void sync_two_streams(
@@ -329,7 +378,7 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_with_state(
         num_chunks,
         static_cast<unsigned long long>(seq));
     cudaError_t err1 = cudaGetLastError();
-
+    
     return (err0 != cudaSuccess) ? err0 : err1;
 }
 
@@ -396,6 +445,10 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
         dev1,
         static_cast<size_t>(numel) * sizeof(half),
         compute_num_chunks(static_cast<size_t>(numel)));
+
+    const size_t smem_bytes = 2 * kPersistentChunkBytes;
+    configure_persistent_kernel_smem_once(dev0, smem_bytes);
+    configure_persistent_kernel_smem_once(dev1, smem_bytes);
 
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
 
@@ -469,6 +522,10 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         dev1,
         static_cast<size_t>(numel) * sizeof(half),
         compute_num_chunks(static_cast<size_t>(numel)));
+
+    const size_t smem_bytes = 2 * kPersistentChunkBytes;
+    configure_persistent_kernel_smem_once(dev0, smem_bytes);
+    configure_persistent_kernel_smem_once(dev1, smem_bytes);
 
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
 
