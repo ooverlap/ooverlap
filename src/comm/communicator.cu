@@ -179,7 +179,7 @@ CommBuffer* channel_get_slot_buffer(
     int dst_rank,
     int slot_idx) {
     CommChannel* ch = communicator_get_channel(comm, src_rank, dst_rank);
-    return ooverlap::channel_get_slot_buffer(ch, slot_idx);
+    return ooverlap::comm::channel_get_slot_buffer(ch, slot_idx);
 }
 
 const CommBuffer* channel_get_slot_buffer(
@@ -188,7 +188,7 @@ const CommBuffer* channel_get_slot_buffer(
     int dst_rank,
     int slot_idx) {
     const CommChannel* ch = communicator_get_channel(comm, src_rank, dst_rank);
-    return ooverlap::channel_get_slot_buffer(ch, slot_idx);
+    return ooverlap::comm::channel_get_slot_buffer(ch, slot_idx);
 }
 
 CommBuffer* channel_get_slot_signal_buffer(
@@ -197,7 +197,7 @@ CommBuffer* channel_get_slot_signal_buffer(
     int dst_rank,
     int slot_idx) {
     CommChannel* ch = communicator_get_channel(comm, src_rank, dst_rank);
-    return ooverlap::channel_get_slot_signal_buffer(ch, slot_idx);
+    return ooverlap::comm::channel_get_slot_signal_buffer(ch, slot_idx);
 }
 
 const CommBuffer* channel_get_slot_signal_buffer(
@@ -206,7 +206,7 @@ const CommBuffer* channel_get_slot_signal_buffer(
     int dst_rank,
     int slot_idx) {
     const CommChannel* ch = communicator_get_channel(comm, src_rank, dst_rank);
-    return ooverlap::channel_get_slot_signal_buffer(ch, slot_idx);
+    return ooverlap::comm::channel_get_slot_signal_buffer(ch, slot_idx);
 }
 
 CommBuffer* communicator_get_local_shard_buffer(

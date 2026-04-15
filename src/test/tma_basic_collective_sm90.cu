@@ -1,3 +1,4 @@
+#include "comm/buffer.h"
 #include "test/tma_basic_collective_sm90.h"
 #include "test/tma_collective_sm90.h"
 
@@ -60,7 +61,7 @@ inline void validate_state(BasicCollectiveState* st) {
 
 inline void zero_buffer_on_owner(
     const BasicCollectiveState* st,
-    const Buffer& buf) {
+    const comm::CommBuffer& buf) {
     system::runtime::set_device(st->devices[static_cast<size_t>(buf.owner_rank)]);
     system::runtime::check_cuda(cudaMemset(buf.ptr, 0, buf.bytes), "cudaMemset(buffer)");
 }
@@ -194,9 +195,8 @@ cudaError_t enqueue_basic_reduce_scatter_tma_sm90(
     const size_t shard_numel = full_numel / static_cast<size_t>(st->world_size);
     const size_t shard_bytes = shard_numel * sizeof(half);
 
-    // Each owner starts from its local shard contribution.
     for (int owner = 0; owner < st->world_size; ++owner) {
-        Buffer* shard_out = communicator_get_local_shard_buffer(st, owner);
+        comm::CommBuffer* shard_out = communicator_get_local_shard_buffer(st, owner);
 
         system::runtime::set_device(st->devices[static_cast<size_t>(owner)]);
         const half* src_local_shard =
@@ -212,18 +212,15 @@ cudaError_t enqueue_basic_reduce_scatter_tma_sm90(
             "cudaMemcpyAsync(local shard -> local_shard_buffer)");
     }
 
-    // Each sender pushes shard[owner] into channel(sender -> owner, slot 0).
     for (int sender = 0; sender < st->world_size; ++sender) {
         system::runtime::set_device(st->devices[static_cast<size_t>(sender)]);
 
         for (int owner = 0; owner < st->world_size; ++owner) {
             if (owner == sender) continue;
 
-            Buffer* slot_buf = channel_get_slot_buffer(st, sender, owner, 0);
+            comm::CommBuffer* slot_buf = channel_get_slot_buffer(st, sender, owner, 0);
             zero_buffer_on_owner(st, *slot_buf);
 
-            // IMPORTANT: zero_buffer_on_owner switched the current device to owner.
-            // Switch back to sender before using sender's stream for the TMA launch.
             system::runtime::set_device(st->devices[static_cast<size_t>(sender)]);
 
             const half* src =
@@ -244,15 +241,14 @@ cudaError_t enqueue_basic_reduce_scatter_tma_sm90(
 
     sync_all_streams(st, "cudaStreamSynchronize(RS sends)");
 
-    // Each owner accumulates received shards from channel(sender -> owner, slot 0).
     for (int owner = 0; owner < st->world_size; ++owner) {
-        Buffer* shard_out = communicator_get_local_shard_buffer(st, owner);
+        comm::CommBuffer* shard_out = communicator_get_local_shard_buffer(st, owner);
 
         system::runtime::set_device(st->devices[static_cast<size_t>(owner)]);
         for (int sender = 0; sender < st->world_size; ++sender) {
             if (sender == owner) continue;
 
-            const Buffer* slot_buf = channel_get_slot_buffer(st, sender, owner, 0);
+            const comm::CommBuffer* slot_buf = channel_get_slot_buffer(st, sender, owner, 0);
 
             system::runtime::check_cuda(
                 enqueue_fp16_add_inplace_sm90(
@@ -284,9 +280,8 @@ cudaError_t enqueue_basic_all_gather_tma_sm90(
 
     const size_t shard_bytes = shard_numel * sizeof(half);
 
-    // Zero full outputs and place local shard into its local slot.
     for (int recv = 0; recv < st->world_size; ++recv) {
-        Buffer* full_out = communicator_get_local_full_buffer(st, recv);
+        comm::CommBuffer* full_out = communicator_get_local_full_buffer(st, recv);
         zero_buffer_on_owner(st, *full_out);
 
         system::runtime::set_device(st->devices[static_cast<size_t>(recv)]);
@@ -302,18 +297,15 @@ cudaError_t enqueue_basic_all_gather_tma_sm90(
             "cudaMemcpyAsync(local shard -> full_output local slot)");
     }
 
-    // Each sender pushes its shard into channel(sender -> recv, slot 0).
     for (int sender = 0; sender < st->world_size; ++sender) {
         system::runtime::set_device(st->devices[static_cast<size_t>(sender)]);
 
         for (int recv = 0; recv < st->world_size; ++recv) {
             if (recv == sender) continue;
 
-            Buffer* slot_buf = channel_get_slot_buffer(st, sender, recv, 0);
+            comm::CommBuffer* slot_buf = channel_get_slot_buffer(st, sender, recv, 0);
             zero_buffer_on_owner(st, *slot_buf);
 
-            // IMPORTANT: zero_buffer_on_owner switched the current device to recv.
-            // Switch back to sender before using sender's stream for the TMA launch.
             system::runtime::set_device(st->devices[static_cast<size_t>(sender)]);
 
             system::runtime::check_cuda(
@@ -331,15 +323,14 @@ cudaError_t enqueue_basic_all_gather_tma_sm90(
 
     sync_all_streams(st, "cudaStreamSynchronize(AG sends)");
 
-    // Each receiver copies received shards into its full output slots.
     for (int recv = 0; recv < st->world_size; ++recv) {
-        Buffer* full_out = communicator_get_local_full_buffer(st, recv);
+        comm::CommBuffer* full_out = communicator_get_local_full_buffer(st, recv);
 
         system::runtime::set_device(st->devices[static_cast<size_t>(recv)]);
         for (int sender = 0; sender < st->world_size; ++sender) {
             if (sender == recv) continue;
 
-            const Buffer* slot_buf = channel_get_slot_buffer(st, sender, recv, 0);
+            const comm::CommBuffer* slot_buf = channel_get_slot_buffer(st, sender, recv, 0);
             half* dst_slot = buffer_as_half(full_out) + static_cast<size_t>(sender) * shard_numel;
 
             system::runtime::check_cuda(

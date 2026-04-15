@@ -13,7 +13,7 @@
 namespace ooverlap {
 
 cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
-    Communicator* comm,
+    comm::Communicator* comm,
     half* rank0_in,
     half* rank1_in,
     half* rank0_out,

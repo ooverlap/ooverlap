@@ -316,7 +316,7 @@ inline void free_persistent_peer_state(PersistentTwoGpuPeerState* st) {
 }
 
 inline cudaError_t enqueue_persistent_two_gpu_allreduce_with_state(
-    TmaCommunicator* comm,
+    comm::Communicator* comm,
     PersistentTwoGpuPeerState* st,
     half* rank0_in,
     half* rank1_in,
@@ -385,7 +385,7 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_with_state(
 } // namespace
 
 cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
-    TmaCommunicator* comm,
+    comm::Communicator* comm,
     half* rank0_in,
     half* rank1_in,
     half* rank0_out,
@@ -435,7 +435,7 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
         throw std::invalid_argument("tma_persistent_two_gpu_allreduce_smoke_test: dev0 and dev1 must differ");
     }
 
-    TmaCommunicator comm{};
+    comm::Communicator comm{};
     communicator_init(&comm, {dev0, dev1}, static_cast<size_t>(numel), 1);
 
     PersistentTwoGpuPeerState st{};
@@ -512,7 +512,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         throw std::invalid_argument("benchmark_persistent_two_gpu_allreduce_sm90: dev0 and dev1 must differ");
     }
 
-    TmaCommunicator comm{};
+    comm::Communicator comm{};
     communicator_init(&comm, {dev0, dev1}, static_cast<size_t>(numel), 1);
 
     PersistentTwoGpuPeerState st{};

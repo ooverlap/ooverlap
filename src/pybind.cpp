@@ -10,11 +10,12 @@
 #include "rmsnorm/rmsnorm.h"
 #include "overlap_impl.h"
 #include "overlap/gemm_scatter_sm90_dispatch.h"
-#include "overlap/tma_collective_sm90.h"
-#include "overlap/tma_basic_collective_sm90.h"
-#include "overlap/tma_vmm_smoke_test.h"
-#include "overlap/tma_benchmark_sm90.h"
-#include "overlap/persistent_allreduce_2gpu_sm90.h"
+
+#include "test/tma_collective_sm90.h"
+#include "test/tma_basic_collective_sm90.h"
+#include "test/tma_vmm_smoke_test.h"
+#include "test/tma_benchmark_sm90.h"
+#include "test/persistent_allreduce_2gpu_sm90.h"
 
 namespace py = pybind11;
 
