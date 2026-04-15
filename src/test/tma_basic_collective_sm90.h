@@ -7,12 +7,11 @@
 #include <cstdint>
 #include <vector>
 
-#include "overlap/tma_communicator.h"
+#include "comm/communicator.h"
 
 namespace ooverlap {
 
-// Compatibility alias so current benchmark / code can keep using the old name.
-using BasicCollectiveState = TmaCommunicator;
+using BasicCollectiveState = Communicator;
 
 bool init_basic_collective_same_process(
     BasicCollectiveState* st,
@@ -39,7 +38,6 @@ cudaError_t enqueue_basic_all_reduce_tma_sm90(
     const std::vector<half*>& local_full_buffers,
     size_t full_numel);
 
-// Smoke tests. If devices is empty, use all visible GPUs.
 bool tma_basic_ngpu_reduce_scatter_smoke_test(
     int64_t full_numel,
     const std::vector<int64_t>& devices = {});

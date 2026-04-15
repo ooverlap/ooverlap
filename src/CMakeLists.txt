@@ -183,13 +183,28 @@ if(gemm_files)
 endif()
 
 # -------------------------
-# overlap library (signal/reorder kernels, sm80/sm90, etc.)
+# overlap/comm/test library
 # -------------------------
 file(GLOB overlap_files CONFIGURE_DEPENDS
   ${OOVERLAP_SRC_DIR}/overlap/*.cu
   ${OOVERLAP_SRC_DIR}/overlap/*.cpp
+  ${OOVERLAP_SRC_DIR}/comm/*.cu
+  ${OOVERLAP_SRC_DIR}/comm/*.cpp
+  ${OOVERLAP_SRC_DIR}/test/*.cu
+  ${OOVERLAP_SRC_DIR}/test/*.cpp
   ${OOVERLAP_SRC_DIR}/sm90/*.cu
   ${OOVERLAP_SRC_DIR}/sm90/*.cpp
+)
+
+# The source-of-truth implementations still live in src/overlap for now,
+# but the test/benchmark wrappers in src/test include them. Exclude the
+# old overlap test/benchmark translation units from direct compilation.
+list(REMOVE_ITEM overlap_files
+  ${OOVERLAP_SRC_DIR}/overlap/tma_collective_sm90.cu
+  ${OOVERLAP_SRC_DIR}/overlap/tma_basic_collective_sm90.cu
+  ${OOVERLAP_SRC_DIR}/overlap/tma_vmm_smoke_test.cu
+  ${OOVERLAP_SRC_DIR}/overlap/tma_benchmark_sm90.cpp
+  ${OOVERLAP_SRC_DIR}/overlap/persistent_allreduce_2gpu_sm90.cu
 )
 
 if(overlap_files)

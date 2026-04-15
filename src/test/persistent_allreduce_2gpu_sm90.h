@@ -8,12 +8,12 @@
 #include <map>
 #include <string>
 
-#include "overlap/tma_communicator.h"
+#include "comm/communicator.h"
 
 namespace ooverlap {
 
 cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
-    TmaCommunicator* comm,
+    Communicator* comm,
     half* rank0_in,
     half* rank1_in,
     half* rank0_out,
