@@ -1,4 +1,4 @@
-#include "overlap/tma_vmm_smoke_test.h"
+#include "test/tma_vmm_smoke_test.h"
 #include "overlap/bulk_tma_copy_sm90.cuh"
 #include "ooverlap/system/vmm.cuh"
 

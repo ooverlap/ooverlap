@@ -1,5 +1,5 @@
-#include "overlap/tma_basic_collective_sm90.h"
-#include "overlap/tma_collective_sm90.h"
+#include "test/tma_basic_collective_sm90.h"
+#include "test/tma_collective_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/test_utils.cuh"

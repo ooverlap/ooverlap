@@ -1,4 +1,4 @@
-#include "overlap/tma_collective_sm90.h"
+#include "test/tma_collective_sm90.h"
 #include "overlap/bulk_tma_copy_sm90.cuh"
 
 #include "ooverlap/system/runtime_utils.cuh"

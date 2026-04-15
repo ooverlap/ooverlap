@@ -11,6 +11,7 @@
 #include "comm/channel.h"
 
 namespace ooverlap {
+namespace comm {
 
 struct Communicator {
     int world_size = 0;
@@ -99,4 +100,5 @@ cudaError_t channel_send_bulk_tma(
 // Compatibility aliases for current code.
 using TmaCommunicator = Communicator;
 
+} // namespace comm
 } // namespace ooverlap

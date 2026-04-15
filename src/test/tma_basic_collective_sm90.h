@@ -11,7 +11,7 @@
 
 namespace ooverlap {
 
-using BasicCollectiveState = Communicator;
+using BasicCollectiveState = comm::Communicator;
 
 bool init_basic_collective_same_process(
     BasicCollectiveState* st,
