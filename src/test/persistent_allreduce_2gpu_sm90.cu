@@ -36,6 +36,8 @@ static constexpr int kPersistentThreads = 16;
 static constexpr size_t kPersistentChunkBytes = 16 * 1024;
 static constexpr int kPersistentMaxBlocks = 16;
 static constexpr int kPersistentStageDepth = 3;
+static constexpr size_t kPersistentStaticSharedBytes =
+    static_cast<size_t>(kPersistentStageDepth) * sizeof(sync::semaphore);
 
 namespace {
 
@@ -86,7 +88,6 @@ __global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
     int cur_chunk = start_chunk;
     int next_chunk_to_load = start_chunk + chunk_stride;
 
-    // Preload the very first stage only. Subsequent stages are loaded as the ring advances.
     {
         const size_t cur_offset = static_cast<size_t>(cur_chunk) * kPersistentChunkBytes;
         const size_t cur_bytes = min_sz(kPersistentChunkBytes, total_bytes - cur_offset);
@@ -126,7 +127,6 @@ __global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
                 static_cast<uint32_t>(bulk_bytes));
         }
 
-        // Schedule the next load into the ring. Only wait when the stage is actually being reused.
         if (next_chunk_to_load < num_chunks) {
             const int next_stage = (local_iter + 1) % kPersistentStageDepth;
 
@@ -173,10 +173,10 @@ __global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
     }
 }
 
-inline void configure_persistent_kernel_smem_once(int device, size_t smem_bytes) {
+inline void configure_persistent_kernel_smem_once(int device, size_t dynamic_smem_bytes) {
     struct KernelConfigCacheEntry {
         bool configured = false;
-        size_t smem_bytes = 0;
+        size_t dynamic_smem_bytes = 0;
     };
 
     static std::mutex mutex;
@@ -185,7 +185,9 @@ inline void configure_persistent_kernel_smem_once(int device, size_t smem_bytes)
     std::lock_guard<std::mutex> lock(mutex);
 
     auto it = cache.find(device);
-    if (it != cache.end() && it->second.configured && it->second.smem_bytes == smem_bytes) {
+    if (it != cache.end() &&
+        it->second.configured &&
+        it->second.dynamic_smem_bytes == dynamic_smem_bytes) {
         return;
     }
 
@@ -194,17 +196,19 @@ inline void configure_persistent_kernel_smem_once(int device, size_t smem_bytes)
     cudaDeviceProp prop{};
     system::runtime::check_cuda(cudaGetDeviceProperties(&prop, device), "cudaGetDeviceProperties");
 
-    if (smem_bytes > static_cast<size_t>(prop.sharedMemPerBlockOptin)) {
+    const size_t total_smem_bytes = dynamic_smem_bytes + kPersistentStaticSharedBytes;
+
+    if (total_smem_bytes > static_cast<size_t>(prop.sharedMemPerBlockOptin)) {
         throw std::runtime_error(
-            "persistent kernel requested dynamic shared memory exceeds device opt-in limit");
+            "persistent kernel requested total shared memory exceeds device opt-in limit");
     }
 
-    if (smem_bytes > static_cast<size_t>(prop.sharedMemPerBlock)) {
+    if (total_smem_bytes > static_cast<size_t>(prop.sharedMemPerBlock)) {
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
                 persistent_two_gpu_reduce_to_peer_kernel_sm90,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(smem_bytes)),
+                static_cast<int>(dynamic_smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
 
         system::runtime::check_cuda(
@@ -215,7 +219,7 @@ inline void configure_persistent_kernel_smem_once(int device, size_t smem_bytes)
             "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
     }
 
-    cache[device] = {true, smem_bytes};
+    cache[device] = {true, dynamic_smem_bytes};
 }
 
 inline void sync_two_streams(
@@ -409,7 +413,6 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_peer_outputs_with_state(
     const int num_blocks = std::min(kPersistentMaxBlocks, num_chunks);
     const size_t smem_bytes = static_cast<size_t>(kPersistentStageDepth) * kPersistentChunkBytes;
 
-    // E2E path: initialize peer-visible outputs with local contribution.
     system::runtime::set_device(comm->devices[0]);
     system::runtime::check_cuda(
         cudaMemcpyAsync(
@@ -585,7 +588,6 @@ inline double elapsed_ms_persistent_kernel_only(
     double total_ms = 0.0;
 
     for (int i = 0; i < iters; ++i) {
-        // Untimed init, by design excluded from kernel-only metric.
         system::runtime::set_device(comm->devices[0]);
         system::runtime::check_cuda(
             cudaMemcpyAsync(
@@ -622,7 +624,6 @@ inline double elapsed_ms_persistent_kernel_only(
             cudaStreamWaitEvent(comm->streams[1], st->init_done0, 0),
             "cudaStreamWaitEvent(stream1, init_done0)");
 
-        // Timed section: only the reduction kernel path and its completion ordering.
         system::runtime::set_device(comm->devices[0]);
         system::runtime::check_cuda(
             cudaEventRecord(start0, comm->streams[0]),
@@ -706,7 +707,6 @@ cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
         return cudaErrorInvalidDevicePointer;
     }
 
-    // Safe public wrapper: still returns generic outputs for callers.
     PersistentTwoGpuPeerState st{};
     PersistentPeerOutputs peer_outs{};
 
@@ -907,7 +907,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                 "enqueue_basic_all_reduce_tma_sm90");
         });
 
-    // Warm up persistent E2E path.
     for (int i = 0; i < warmup; ++i) {
         system::runtime::check_cuda(
             enqueue_persistent_two_gpu_allreduce_peer_outputs_with_state(
@@ -937,7 +936,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                 "enqueue_persistent_two_gpu_allreduce_peer_outputs_with_state");
         });
 
-    // Warm up kernel-only path with untimed init.
     for (int i = 0; i < warmup; ++i) {
         system::runtime::set_device(dev0);
         system::runtime::check_cuda(
@@ -1046,8 +1044,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         persistent_kernel_only_total_ms / static_cast<double>(iters);
     const double avg_nccl_ms = nccl_total_ms / static_cast<double>(iters);
 
-    // Keep avg_ms_persistent mapped to kernel-only so the existing Python
-    // test script shows the number you care about right now.
     return {
         {"numel", static_cast<double>(numel)},
         {"avg_ms_basic", avg_basic_ms},
