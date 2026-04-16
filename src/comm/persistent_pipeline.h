@@ -1,8 +1,8 @@
 #pragma once
 
-#include "comm/persistent_stage.h"
-#include "comm/persistent_load.h"
-#include "comm/persistent_reduce.h"
+#include "comm/pipeline_stage.h"
+#include "comm/pipeline_load.h"
+#include "comm/pipeline_reduce.h"
 
 #include <cuda_fp16.h>
 #include <cstddef>
@@ -12,8 +12,8 @@ namespace ooverlap {
 namespace comm {
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
-struct PersistentChunkPipeline {
-    PersistentChunkStage stages[StageDepth];
+struct PersistentPipeline {
+    PipelineStage stages[StageDepth];
 
     LoadOp load_op{};
     ReduceOp reduce_op{};
@@ -32,7 +32,7 @@ struct PersistentChunkPipeline {
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
 __device__ __forceinline__ void persistent_pipeline_bind_stage_storage(
-    PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe,
+    PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe,
     unsigned char* smem_base,
     sync::semaphore* barriers) {
     for (int i = 0; i < StageDepth; ++i) {
@@ -46,7 +46,7 @@ __device__ __forceinline__ void persistent_pipeline_bind_stage_storage(
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
 __device__ __forceinline__ void persistent_pipeline_init(
-    PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe,
+    PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe,
     const unsigned char* src_bytes,
     unsigned char* dst_bytes,
     size_t total_bytes,
@@ -65,30 +65,30 @@ __device__ __forceinline__ void persistent_pipeline_init(
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
 __device__ __forceinline__ bool persistent_pipeline_active(
-    const PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
+    const PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
     return pipe->cur_chunk < pipe->num_chunks;
 }
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
-__device__ __forceinline__ PersistentChunkStage* persistent_pipeline_current_stage(
-    PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
+__device__ __forceinline__ PipelineStage* persistent_pipeline_current_stage(
+    PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
     return &pipe->stages[pipe->local_iter % StageDepth];
 }
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
-__device__ __forceinline__ const PersistentChunkStage* persistent_pipeline_current_stage(
-    const PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
+__device__ __forceinline__ const PipelineStage* persistent_pipeline_current_stage(
+    const PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
     return &pipe->stages[pipe->local_iter % StageDepth];
 }
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
 __device__ __forceinline__ void persistent_pipeline_prime(
-    PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
+    PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
     if (!persistent_pipeline_active(pipe)) {
         return;
     }
 
-    PersistentChunkStage* first = &pipe->stages[0];
+    PipelineStage* first = &pipe->stages[0];
     persistent_stage_set_chunk<ChunkBytes>(
         first,
         pipe->cur_chunk,
@@ -101,7 +101,7 @@ __device__ __forceinline__ void persistent_pipeline_prime(
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
 __device__ __forceinline__ void persistent_pipeline_wait_current_stage(
-    PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
+    PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
     if (threadIdx.x == 0) {
         pipe->load_op.wait_ready(persistent_pipeline_current_stage(pipe));
     }
@@ -109,7 +109,7 @@ __device__ __forceinline__ void persistent_pipeline_wait_current_stage(
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
 __device__ __forceinline__ void persistent_pipeline_issue_current_reduce(
-    PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
+    PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
     if (threadIdx.x == 0) {
         pipe->reduce_op.issue_bulk(
             persistent_pipeline_current_stage(pipe),
@@ -119,7 +119,7 @@ __device__ __forceinline__ void persistent_pipeline_issue_current_reduce(
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
 __device__ __forceinline__ void persistent_pipeline_schedule_next_load(
-    PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
+    PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
     if (pipe->next_chunk_to_load >= pipe->num_chunks) {
         return;
     }
@@ -129,7 +129,7 @@ __device__ __forceinline__ void persistent_pipeline_schedule_next_load(
             pipe->reduce_op.template wait_before_stage_reuse<StageDepth>();
         }
 
-        PersistentChunkStage* next_stage =
+        PipelineStage* next_stage =
             &pipe->stages[(pipe->local_iter + 1) % StageDepth];
 
         persistent_stage_set_chunk<ChunkBytes>(
@@ -143,7 +143,7 @@ __device__ __forceinline__ void persistent_pipeline_schedule_next_load(
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
 __device__ __forceinline__ void persistent_pipeline_finish_current_tail(
-    PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
+    PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
     pipe->reduce_op.finish_tail(
         persistent_pipeline_current_stage(pipe),
         reinterpret_cast<half*>(pipe->dst_bytes));
@@ -151,7 +151,7 @@ __device__ __forceinline__ void persistent_pipeline_finish_current_tail(
 
 template <int StageDepth, size_t ChunkBytes, typename LoadOp, typename ReduceOp>
 __device__ __forceinline__ void persistent_pipeline_advance(
-    PersistentChunkPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
+    PersistentPipeline<StageDepth, ChunkBytes, LoadOp, ReduceOp>* pipe) {
     pipe->cur_chunk = pipe->next_chunk_to_load;
     pipe->next_chunk_to_load += pipe->chunk_stride;
     ++pipe->local_iter;

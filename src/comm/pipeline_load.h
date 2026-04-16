@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/persistent_stage.h"
+#include "comm/pipeline_stage.h"
 #include "ooverlap/tma/tma.cuh"
 
 #include <cstdint>
@@ -8,9 +8,9 @@
 namespace ooverlap {
 namespace comm {
 
-struct PersistentLinearTmaLoad {
+struct PipelineTMALoad {
     __device__ __forceinline__ void issue(
-        const PersistentChunkStage* stage,
+        const PipelineStage* stage,
         const unsigned char* src_bytes) const {
         sync::init_semaphore(*stage->load_barrier, 1);
         tma::expect_bytes(
@@ -24,7 +24,7 @@ struct PersistentLinearTmaLoad {
     }
 
     __device__ __forceinline__ void wait_ready(
-        const PersistentChunkStage* stage) const {
+        const PipelineStage* stage) const {
         sync::wait(*stage->load_barrier, 0);
     }
 };

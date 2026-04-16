@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/persistent_stage.h"
+#include "comm/pipeline_stage.h"
 #include "ooverlap/tma/tma_reduce.cuh"
 
 #include <cuda_fp16.h>
@@ -10,16 +10,16 @@
 namespace ooverlap {
 namespace comm {
 
-struct PersistentTmaReduceAddNoFtzF16 {
+struct PipelineTMAReduceAddNoFtzF16 {
     template <int StageDepth>
     __device__ __forceinline__ void wait_before_stage_reuse() const {
         tma::reduce_async_read_wait<StageDepth - 1>();
     }
 
     __device__ __forceinline__ void issue_bulk(
-        const PersistentChunkStage* stage,
+        const PipelineStage* stage,
         unsigned char* dst_bytes) const {
-        const size_t bulk_bytes = persistent_stage_bulk_bytes(stage);
+        const size_t bulk_bytes = pipeline_stage_bulk_bytes(stage);
         if (bulk_bytes == 0) {
             return;
         }
@@ -31,10 +31,10 @@ struct PersistentTmaReduceAddNoFtzF16 {
     }
 
     __device__ __forceinline__ void finish_tail(
-        const PersistentChunkStage* stage,
+        const PipelineStage* stage,
         half* dst_half) const {
-        const size_t bulk_bytes = persistent_stage_bulk_bytes(stage);
-        const size_t tail_bytes = persistent_stage_tail_bytes(stage);
+        const size_t bulk_bytes = pipeline_stage_bulk_bytes(stage);
+        const size_t tail_bytes = pipeline_stage_tail_bytes(stage);
 
         if (tail_bytes == 0) {
             return;
