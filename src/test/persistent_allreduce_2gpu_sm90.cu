@@ -1,8 +1,7 @@
 #include "test/persistent_allreduce_2gpu_sm90.h"
 
 #include "test/tma_basic_collective_sm90.h"
-#include "ooverlap/tma/tma.cuh"
-#include "ooverlap/tma/tma_reduce.cuh"
+#include "comm/persistent_pipeline.h"
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/system/peer_buffer.cuh"
 #include "ooverlap/testing/test_utils.cuh"
@@ -39,6 +38,15 @@ static constexpr int kPersistentStageDepth = 3;
 static constexpr size_t kPersistentStaticSharedBytes =
     static_cast<size_t>(kPersistentStageDepth) * sizeof(sync::semaphore);
 
+using PersistentLoadOp = comm::PersistentLinearTmaLoad;
+using PersistentReduceOp = comm::PersistentTmaReduceAddNoFtzF16;
+using PersistentPipeline =
+    comm::PersistentChunkPipeline<
+        kPersistentStageDepth,
+        kPersistentChunkBytes,
+        PersistentLoadOp,
+        PersistentReduceOp>;
+
 namespace {
 
 struct PersistentTwoGpuPeerState {
@@ -54,10 +62,6 @@ struct PersistentPeerOutputs {
     system::mapped_peer_buffer out1; // owned by dev1, visible to dev0/dev1
 };
 
-__host__ __device__ __forceinline__ size_t min_sz(size_t a, size_t b) {
-    return (a < b) ? a : b;
-}
-
 __global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
     const half* local_in,
     half* peer_out,
@@ -72,104 +76,39 @@ __global__ void persistent_two_gpu_reduce_to_peer_kernel_sm90(
     }
 
     extern __shared__ uint4 shared_storage_u4[];
-    unsigned char* shared_raw = reinterpret_cast<unsigned char*>(shared_storage_u4);
+    unsigned char* shared_raw =
+        reinterpret_cast<unsigned char*>(shared_storage_u4);
 
     __shared__ sync::semaphore load_barriers[kPersistentStageDepth];
 
-    auto stage_ptr = [&](int stage) -> unsigned char* {
-        return shared_raw + static_cast<size_t>(stage) * kPersistentChunkBytes;
-    };
-
-    const unsigned char* local_bytes = reinterpret_cast<const unsigned char*>(local_in);
-    unsigned char* peer_bytes = reinterpret_cast<unsigned char*>(peer_out);
+    PersistentPipeline pipe{};
     const size_t total_bytes = numel * sizeof(half);
 
-    int local_iter = 0;
-    int cur_chunk = start_chunk;
-    int next_chunk_to_load = start_chunk + chunk_stride;
+    comm::persistent_pipeline_bind_stage_storage(&pipe, shared_raw, load_barriers);
+    comm::persistent_pipeline_init(
+        &pipe,
+        reinterpret_cast<const unsigned char*>(local_in),
+        reinterpret_cast<unsigned char*>(peer_out),
+        total_bytes,
+        start_chunk,
+        chunk_stride,
+        num_chunks);
 
-    {
-        const size_t cur_offset = static_cast<size_t>(cur_chunk) * kPersistentChunkBytes;
-        const size_t cur_bytes = min_sz(kPersistentChunkBytes, total_bytes - cur_offset);
+    comm::persistent_pipeline_prime(&pipe);
+    __syncthreads();
 
-        if (threadIdx.x == 0) {
-            sync::init_semaphore(load_barriers[0], 1);
-            tma::expect_bytes(load_barriers[0], static_cast<uint32_t>(cur_bytes));
-            tma::load_async(
-                stage_ptr(0),
-                local_bytes + cur_offset,
-                static_cast<uint32_t>(cur_bytes),
-                load_barriers[0]);
-        }
-        __syncthreads();
-    }
-
-    while (cur_chunk < num_chunks) {
-        const int cur_stage = local_iter % kPersistentStageDepth;
-
-        if (threadIdx.x == 0) {
-            sync::wait(load_barriers[cur_stage], 0);
-        }
+    while (comm::persistent_pipeline_active(&pipe)) {
+        comm::persistent_pipeline_wait_current_stage(&pipe);
         __syncthreads();
 
-        unsigned char* cur_smem = stage_ptr(cur_stage);
-
-        const size_t cur_offset = static_cast<size_t>(cur_chunk) * kPersistentChunkBytes;
-        const size_t cur_bytes = min_sz(kPersistentChunkBytes, total_bytes - cur_offset);
-
-        const size_t bulk_bytes = cur_bytes & ~static_cast<size_t>(0xF);
-        const size_t tail_bytes = cur_bytes - bulk_bytes;
-
-        if (threadIdx.x == 0 && bulk_bytes > 0) {
-            tma::reduce_add_noftz_f16_async(
-                peer_bytes + cur_offset,
-                cur_smem,
-                static_cast<uint32_t>(bulk_bytes));
-        }
-
-        if (next_chunk_to_load < num_chunks) {
-            const int next_stage = (local_iter + 1) % kPersistentStageDepth;
-
-            if (threadIdx.x == 0) {
-                if ((local_iter + 1) >= kPersistentStageDepth) {
-                    tma::reduce_async_read_wait<kPersistentStageDepth - 1>();
-                }
-
-                const size_t next_offset =
-                    static_cast<size_t>(next_chunk_to_load) * kPersistentChunkBytes;
-                const size_t next_bytes =
-                    min_sz(kPersistentChunkBytes, total_bytes - next_offset);
-
-                sync::init_semaphore(load_barriers[next_stage], 1);
-                tma::expect_bytes(load_barriers[next_stage], static_cast<uint32_t>(next_bytes));
-                tma::load_async(
-                    stage_ptr(next_stage),
-                    local_bytes + next_offset,
-                    static_cast<uint32_t>(next_bytes),
-                    load_barriers[next_stage]);
-            }
-        }
-
+        comm::persistent_pipeline_issue_current_reduce(&pipe);
+        comm::persistent_pipeline_schedule_next_load(&pipe);
         __syncthreads();
 
-        if (tail_bytes > 0) {
-            const size_t bulk_elems = bulk_bytes / sizeof(half);
-            const size_t tail_elems = tail_bytes / sizeof(half);
-            const half* cur_half = reinterpret_cast<const half*>(cur_smem);
-
-            for (size_t i = threadIdx.x; i < tail_elems; i += blockDim.x) {
-                const size_t idx = (cur_offset / sizeof(half)) + bulk_elems + i;
-                float oldv = __half2float(peer_out[idx]);
-                float addv = __half2float(cur_half[bulk_elems + i]);
-                peer_out[idx] = __float2half_rn(oldv + addv);
-            }
-        }
-
+        comm::persistent_pipeline_finish_current_tail(&pipe);
         __syncthreads();
 
-        cur_chunk = next_chunk_to_load;
-        next_chunk_to_load += chunk_stride;
-        ++local_iter;
+        comm::persistent_pipeline_advance(&pipe);
     }
 }
 
@@ -298,7 +237,7 @@ inline std::vector<float> reference_two_gpu_sum_fp16(int64_t numel) {
 
 inline int compute_num_chunks(size_t numel) {
     const size_t total_bytes = numel * sizeof(half);
-    return static_cast<int>((total_bytes + kPersistentChunkBytes - 1) / kPersistentChunkBytes);
+    return comm::persistent_compute_num_chunks(total_bytes, kPersistentChunkBytes);
 }
 
 inline void create_event_on_device(int device, cudaEvent_t* ev, const char* what) {
@@ -450,7 +389,11 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_peer_outputs_with_state(
         "cudaStreamWaitEvent(stream1, init_done0)");
 
     system::runtime::set_device(comm->devices[0]);
-    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<num_blocks, kPersistentThreads, smem_bytes, comm->streams[0]>>>(
+    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<
+        num_blocks,
+        kPersistentThreads,
+        smem_bytes,
+        comm->streams[0]>>>(
         rank0_in,
         rank1_out_peer,
         numel,
@@ -464,7 +407,11 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_peer_outputs_with_state(
         "cudaEventRecord(reduce_done0)");
 
     system::runtime::set_device(comm->devices[1]);
-    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<num_blocks, kPersistentThreads, smem_bytes, comm->streams[1]>>>(
+    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<
+        num_blocks,
+        kPersistentThreads,
+        smem_bytes,
+        comm->streams[1]>>>(
         rank1_in,
         rank0_out_peer,
         numel,
@@ -522,7 +469,11 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_peer_outputs_kernel_only
     const size_t smem_bytes = static_cast<size_t>(kPersistentStageDepth) * kPersistentChunkBytes;
 
     system::runtime::set_device(comm->devices[0]);
-    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<num_blocks, kPersistentThreads, smem_bytes, comm->streams[0]>>>(
+    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<
+        num_blocks,
+        kPersistentThreads,
+        smem_bytes,
+        comm->streams[0]>>>(
         rank0_in,
         rank1_out_peer,
         numel,
@@ -536,7 +487,11 @@ inline cudaError_t enqueue_persistent_two_gpu_allreduce_peer_outputs_kernel_only
         "cudaEventRecord(reduce_done0)");
 
     system::runtime::set_device(comm->devices[1]);
-    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<num_blocks, kPersistentThreads, smem_bytes, comm->streams[1]>>>(
+    persistent_two_gpu_reduce_to_peer_kernel_sm90<<<
+        num_blocks,
+        kPersistentThreads,
+        smem_bytes,
+        comm->streams[1]>>>(
         rank1_in,
         rank0_out_peer,
         numel,
