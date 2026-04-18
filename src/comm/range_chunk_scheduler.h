@@ -112,24 +112,31 @@ __host__ __device__ __forceinline__ const Chunk* chunk_scheduler_current(
     return &sched->current;
 }
 
-__host__ __device__ __forceinline__ bool chunk_scheduler_peek_next(
+__host__ __device__ __forceinline__ bool chunk_scheduler_peek_ahead(
     const RangeChunkScheduler* sched,
+    int ahead,
     Chunk* out) {
-    if (sched == nullptr) {
-        if (out != nullptr) {
-            chunk_clear(out);
-        }
+    if (out == nullptr) {
+        return false;
+    }
+    chunk_clear(out);
+
+    if (sched == nullptr || ahead < 0) {
         return false;
     }
     if (!chunk_is_valid(&sched->current)) {
-        if (out != nullptr) {
-            chunk_clear(out);
-        }
         return false;
     }
 
-    const int next_chunk_idx = sched->current_chunk_idx + sched->chunk_stride;
-    return chunk_scheduler_make_chunk(sched, next_chunk_idx, out);
+    const int target_chunk_idx =
+        sched->current_chunk_idx + ahead * sched->chunk_stride;
+    return chunk_scheduler_make_chunk(sched, target_chunk_idx, out);
+}
+
+__host__ __device__ __forceinline__ bool chunk_scheduler_peek_next(
+    const RangeChunkScheduler* sched,
+    Chunk* out) {
+    return chunk_scheduler_peek_ahead(sched, 1, out);
 }
 
 __host__ __device__ __forceinline__ void chunk_scheduler_advance(
