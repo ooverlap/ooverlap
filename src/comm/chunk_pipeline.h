@@ -48,22 +48,11 @@ __device__ __forceinline__ bool chunk_pipeline_try_prime(
         return false;
     }
 
-    for (int ahead = 0; ahead < StageDepth; ++ahead) {
-        Chunk chunk{};
-        const bool ok = (ahead == 0)
-            ? chunk_scheduler_peek_ahead(&pipe->scheduler, 0, &chunk)
-            : chunk_scheduler_peek_ahead(&pipe->scheduler, ahead, &chunk);
+    PipelineStage* first = &pipe->stages[0];
+    pipeline_stage_set_chunk(first, chunk_scheduler_current(&pipe->scheduler));
 
-        if (!ok) {
-            break;
-        }
-
-        PipelineStage* stage = &pipe->stages[ahead];
-        pipeline_stage_set_chunk(stage, &chunk);
-
-        if (threadIdx.x == 0) {
-            pipe->load_op.issue(stage);
-        }
+    if (threadIdx.x == 0) {
+        pipe->load_op.issue(first);
     }
 
     return true;
@@ -114,18 +103,24 @@ template <int StageDepth, typename Scheduler, typename LoadOp, typename ReduceOp
 __device__ __forceinline__ void chunk_pipeline_schedule_next_load(
     ChunkPipeline<StageDepth, Scheduler, LoadOp, ReduceOp>* pipe) {
     Chunk next_chunk{};
-    if (!chunk_scheduler_peek_ahead(&pipe->scheduler, StageDepth, &next_chunk)) {
+    if (!chunk_scheduler_peek_next(&pipe->scheduler, &next_chunk)) {
         return;
     }
 
     if (threadIdx.x == 0) {
-        pipe->reduce_op.template wait_before_stage_reuse<StageDepth>();
+        // TODO(keyvand): revisit deeper prefetch / multi-stage priming.
+        // The simple one-step lookahead is currently faster for this kernel.
+        // If we retry deeper lookahead later, we should model stage retirement
+        // explicitly instead of reusing the same stage ring heuristically.
+        if ((pipe->local_iter + 1) >= StageDepth) {
+            pipe->reduce_op.template wait_before_stage_reuse<StageDepth>();
+        }
 
-        PipelineStage* refill_stage =
-            &pipe->stages[pipe->local_iter % StageDepth];
+        PipelineStage* next_stage =
+            &pipe->stages[(pipe->local_iter + 1) % StageDepth];
 
-        pipeline_stage_set_chunk(refill_stage, &next_chunk);
-        pipe->load_op.issue(refill_stage);
+        pipeline_stage_set_chunk(next_stage, &next_chunk);
+        pipe->load_op.issue(next_stage);
     }
 }
 
