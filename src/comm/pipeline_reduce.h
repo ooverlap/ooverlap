@@ -17,22 +17,20 @@ struct PipelineTMAReduceAddNoFtzF16 {
     }
 
     __device__ __forceinline__ void issue_bulk(
-        const PipelineStage* stage,
-        unsigned char* dst_bytes) const {
+        const PipelineStage* stage) const {
         const size_t bulk_bytes = pipeline_stage_bulk_bytes(stage);
         if (bulk_bytes == 0) {
             return;
         }
 
         tma::reduce_add_noftz_f16_async(
-            dst_bytes + stage->chunk_offset_bytes,
+            stage->chunk.dst,
             stage->smem,
             static_cast<uint32_t>(bulk_bytes));
     }
 
     __device__ __forceinline__ void finish_tail(
-        const PipelineStage* stage,
-        half* dst_half) const {
+        const PipelineStage* stage) const {
         const size_t bulk_bytes = pipeline_stage_bulk_bytes(stage);
         const size_t tail_bytes = pipeline_stage_tail_bytes(stage);
 
@@ -42,14 +40,14 @@ struct PipelineTMAReduceAddNoFtzF16 {
 
         const size_t bulk_elems = bulk_bytes / sizeof(half);
         const size_t tail_elems = tail_bytes / sizeof(half);
-        const size_t elem_offset = stage->chunk_offset_bytes / sizeof(half);
 
+        half* dst_half = reinterpret_cast<half*>(stage->chunk.dst);
         const half* src_half = reinterpret_cast<const half*>(stage->smem);
 
         for (size_t i = threadIdx.x; i < tail_elems; i += blockDim.x) {
-            const size_t idx = elem_offset + bulk_elems + i;
+            const size_t idx = bulk_elems + i;
             const float oldv = __half2float(dst_half[idx]);
-            const float addv = __half2float(src_half[bulk_elems + i]);
+            const float addv = __half2float(src_half[idx]);
             dst_half[idx] = __float2half_rn(oldv + addv);
         }
     }
