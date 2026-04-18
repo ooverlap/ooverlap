@@ -42,9 +42,39 @@ __device__ __forceinline__ void chunk_pipeline_init(
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ReduceOp>
-__device__ __forceinline__ bool chunk_pipeline_active(
+__device__ __forceinline__ bool chunk_pipeline_try_prime(
+    ChunkPipeline<StageDepth, Scheduler, LoadOp, ReduceOp>* pipe) {
+    if (!chunk_scheduler_try_prime_current(&pipe->scheduler)) {
+        return false;
+    }
+
+    PipelineStage* first = &pipe->stages[0];
+    pipeline_stage_set_chunk(first, chunk_scheduler_current(&pipe->scheduler));
+
+    if (threadIdx.x == 0) {
+        pipe->load_op.issue(first);
+    }
+    return true;
+}
+
+template <int StageDepth, typename Scheduler, typename LoadOp, typename ReduceOp>
+__device__ __forceinline__ void chunk_pipeline_wait_for_work(
+    ChunkPipeline<StageDepth, Scheduler, LoadOp, ReduceOp>* pipe) {
+    while (!chunk_scheduler_try_prime_current(&pipe->scheduler)) {
+    }
+
+    PipelineStage* first = &pipe->stages[0];
+    pipeline_stage_set_chunk(first, chunk_scheduler_current(&pipe->scheduler));
+
+    if (threadIdx.x == 0) {
+        pipe->load_op.issue(first);
+    }
+}
+
+template <int StageDepth, typename Scheduler, typename LoadOp, typename ReduceOp>
+__device__ __forceinline__ bool chunk_pipeline_has_current(
     const ChunkPipeline<StageDepth, Scheduler, LoadOp, ReduceOp>* pipe) {
-    return chunk_scheduler_active(&pipe->scheduler);
+    return chunk_scheduler_has_current(&pipe->scheduler);
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ReduceOp>
@@ -57,21 +87,6 @@ template <int StageDepth, typename Scheduler, typename LoadOp, typename ReduceOp
 __device__ __forceinline__ const PipelineStage* chunk_pipeline_current_stage(
     const ChunkPipeline<StageDepth, Scheduler, LoadOp, ReduceOp>* pipe) {
     return &pipe->stages[pipe->local_iter % StageDepth];
-}
-
-template <int StageDepth, typename Scheduler, typename LoadOp, typename ReduceOp>
-__device__ __forceinline__ void chunk_pipeline_prime(
-    ChunkPipeline<StageDepth, Scheduler, LoadOp, ReduceOp>* pipe) {
-    if (!chunk_pipeline_active(pipe)) {
-        return;
-    }
-
-    PipelineStage* first = &pipe->stages[0];
-    pipeline_stage_set_chunk(first, chunk_scheduler_current(&pipe->scheduler));
-
-    if (threadIdx.x == 0) {
-        pipe->load_op.issue(first);
-    }
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ReduceOp>
@@ -122,6 +137,11 @@ __device__ __forceinline__ void chunk_pipeline_advance(
     ChunkPipeline<StageDepth, Scheduler, LoadOp, ReduceOp>* pipe) {
     chunk_scheduler_advance(&pipe->scheduler);
     ++pipe->local_iter;
+
+    if (chunk_scheduler_has_current(&pipe->scheduler)) {
+        PipelineStage* next_current = chunk_pipeline_current_stage(pipe);
+        pipeline_stage_set_chunk(next_current, chunk_scheduler_current(&pipe->scheduler));
+    }
 }
 
 } // namespace comm

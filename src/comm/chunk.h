@@ -1,7 +1,11 @@
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
+
+#include "comm/utils.h"
 
 namespace ooverlap {
 namespace comm {
@@ -12,82 +16,97 @@ enum class ChunkOpKind : uint8_t {
     kReduceAddNoFtzF16 = 2,
 };
 
+struct WorkSpan {
+    const unsigned char* src_base = nullptr;
+    unsigned char* dst_base = nullptr;
+    size_t total_bytes = 0;
+    ChunkOpKind op = ChunkOpKind::kInvalid;
+    uint64_t user_tag = 0;
+};
+
 struct Chunk {
     const unsigned char* src = nullptr;
     unsigned char* dst = nullptr;
     size_t bytes = 0;
 
-    int registration_idx = -1;
+    uint64_t span_ticket = 0;
+    uint64_t user_tag = 0;
+
     int chunk_idx = -1;
+    size_t span_offset_bytes = 0;
 
     ChunkOpKind op = ChunkOpKind::kInvalid;
 };
 
-struct ChunkRegistration {
-    const unsigned char* src_base = nullptr;
-    unsigned char* dst_base = nullptr;
+__host__ __device__ __forceinline__ void work_span_clear(WorkSpan* span) {
+    span->src_base = nullptr;
+    span->dst_base = nullptr;
+    span->total_bytes = 0;
+    span->op = ChunkOpKind::kInvalid;
+    span->user_tag = 0;
+}
 
-    size_t total_bytes = 0;
-    size_t chunk_bytes = 0;
-
-    ChunkOpKind op = ChunkOpKind::kInvalid;
-};
+__host__ __device__ __forceinline__ bool work_span_is_valid(const WorkSpan* span) {
+    return span != nullptr &&
+           span->src_base != nullptr &&
+           span->dst_base != nullptr &&
+           span->total_bytes > 0 &&
+           span->op != ChunkOpKind::kInvalid;
+}
 
 __host__ __device__ __forceinline__ void chunk_clear(Chunk* chunk) {
     chunk->src = nullptr;
     chunk->dst = nullptr;
     chunk->bytes = 0;
-    chunk->registration_idx = -1;
+    chunk->span_ticket = 0;
+    chunk->user_tag = 0;
     chunk->chunk_idx = -1;
+    chunk->span_offset_bytes = 0;
     chunk->op = ChunkOpKind::kInvalid;
 }
 
 __host__ __device__ __forceinline__ bool chunk_is_valid(const Chunk* chunk) {
     return chunk != nullptr &&
+           chunk->src != nullptr &&
+           chunk->dst != nullptr &&
            chunk->bytes > 0 &&
-           chunk->registration_idx >= 0 &&
-           chunk->chunk_idx >= 0;
+           chunk->chunk_idx >= 0 &&
+           chunk->op != ChunkOpKind::kInvalid;
 }
 
-__host__ __device__ __forceinline__ int chunk_registration_num_chunks(
-    const ChunkRegistration* reg) {
-    if (reg == nullptr || reg->chunk_bytes == 0 || reg->total_bytes == 0) {
-        return 0;
-    }
-    return static_cast<int>((reg->total_bytes + reg->chunk_bytes - 1) / reg->chunk_bytes);
-}
-
-__host__ __device__ __forceinline__ bool chunk_registration_resolve_chunk(
-    const ChunkRegistration* reg,
-    int registration_idx,
+__host__ __device__ __forceinline__ bool chunk_make_from_span(
+    const WorkSpan* span,
+    uint64_t span_ticket,
+    size_t span_offset_bytes,
     int chunk_idx,
+    size_t chunk_bytes,
     Chunk* out) {
     if (out == nullptr) {
         return false;
     }
     chunk_clear(out);
 
-    if (reg == nullptr) {
+    if (!work_span_is_valid(span)) {
         return false;
     }
-    if (reg->chunk_bytes == 0 || reg->total_bytes == 0) {
+    if (chunk_bytes == 0) {
+        return false;
+    }
+    if (span_offset_bytes >= span->total_bytes) {
         return false;
     }
 
-    const int num_chunks = chunk_registration_num_chunks(reg);
-    if (chunk_idx < 0 || chunk_idx >= num_chunks) {
-        return false;
-    }
+    const size_t bytes =
+        utils::min_sz(chunk_bytes, span->total_bytes - span_offset_bytes);
 
-    const size_t offset = static_cast<size_t>(chunk_idx) * reg->chunk_bytes;
-    const size_t bytes = chunk_min_sz(reg->chunk_bytes, reg->total_bytes - offset);
-
-    out->src = (reg->src_base == nullptr) ? nullptr : (reg->src_base + offset);
-    out->dst = (reg->dst_base == nullptr) ? nullptr : (reg->dst_base + offset);
+    out->src = span->src_base + span_offset_bytes;
+    out->dst = span->dst_base + span_offset_bytes;
     out->bytes = bytes;
-    out->registration_idx = registration_idx;
+    out->span_ticket = span_ticket;
+    out->user_tag = span->user_tag;
     out->chunk_idx = chunk_idx;
-    out->op = reg->op;
+    out->span_offset_bytes = span_offset_bytes;
+    out->op = span->op;
     return true;
 }
 
