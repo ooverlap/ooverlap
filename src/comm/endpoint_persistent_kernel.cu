@@ -266,10 +266,13 @@ bool endpoint_persistent_control_init(
     system::runtime::check_cuda(
         cudaMalloc(&ctl->stop_flag, sizeof(uint32_t)),
         "cudaMalloc(endpoint persistent stop_flag)");
-
+    
     system::runtime::check_cuda(
-        cudaStreamCreateWithFlags(&ctl->control_stream, cudaStreamNonBlocking),
-        "cudaStreamCreateWithFlags(endpoint persistent control_stream)");
+    cudaStreamCreateWithPriority(
+        &ctl->control_stream,
+        cudaStreamNonBlocking,
+        5),
+    "cudaStreamCreateWithPriority(producer_stream)");
 
     system::runtime::check_cuda(
         cudaMemsetAsync(
