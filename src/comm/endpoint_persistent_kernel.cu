@@ -22,196 +22,79 @@ __device__ __forceinline__ bool endpoint_persistent_should_stop(
     return (*reinterpret_cast<volatile const uint32_t*>(stop_flag)) != 0u;
 }
 
-/*__global__ void endpoint_persistent_kernel_sm90(*/
-    /*DeviceEndpointRuntime runtime,*/
-    /*const uint32_t* stop_flag) {*/
-    /*if (blockIdx.x != 0) {*/
-        /*return;*/
-    /*}*/
-
-    /*extern __shared__ uint4 shared_storage_u4[];*/
-    /*unsigned char* shared_raw =*/
-        /*reinterpret_cast<unsigned char*>(shared_storage_u4);*/
-
-    /*__shared__ sync::semaphore load_barriers[kEndpointPersistentStageDepth];*/
-    /*__shared__ exec::ChunkSchedulerScratch<kEndpointPersistentWatchThreads> sched_scratch;*/
-    /*__shared__ int shared_should_stop;*/
-
-    /*EndpointPersistentScheduler scheduler{};*/
-    /*exec::chunk_scheduler_init(*/
-        /*&scheduler,*/
-        /*runtime.scheduler_bindings,*/
-        /*runtime.num_scheduler_bindings,*/
-        /*kEndpointPersistentChunkBytes,*/
-        /*&sched_scratch);*/
-
-    /*EndpointPersistentPipeline pipe{};*/
-    /*exec::chunk_pipeline_bind_stage_storage<*/
-        /*kEndpointPersistentStageDepth,*/
-        /*kEndpointPersistentChunkBytes>(*/
-        /*&pipe,*/
-        /*shared_raw,*/
-        /*load_barriers);*/
-    /*exec::chunk_pipeline_init(&pipe, &scheduler);*/
-
-    /*while (true) {*/
-        /*if (threadIdx.x == 0) {*/
-            /*shared_should_stop = endpoint_persistent_should_stop(stop_flag) ? 1 : 0;*/
-        /*}*/
-        /*__syncthreads();*/
-
-        /*if (shared_should_stop) {*/
-            /*return;*/
-        /*}*/
-
-        /*if (!exec::chunk_pipeline_has_current(&pipe)) {*/
-            /*if (!exec::chunk_pipeline_try_prime(&pipe)) {*/
-/*#if defined(__CUDA_ARCH__)*/
-                /*if (threadIdx.x == 0) {*/
-                    /*__nanosleep(256);*/
-                /*}*/
-/*#endif*/
-                /*__syncthreads();*/
-                /*continue;*/
-            /*}*/
-            /*__syncthreads();*/
-        /*}*/
-
-        /*exec::chunk_pipeline_wait_current_stage(&pipe);*/
-        /*__syncthreads();*/
-
-        /*exec::chunk_pipeline_issue_current_reduce(&pipe);*/
-        /*exec::chunk_pipeline_schedule_next_load(&pipe);*/
-        /*__syncthreads();*/
-
-        /*exec::chunk_pipeline_finish_current_tail(&pipe);*/
-        /*__syncthreads();*/
-
-        /*exec::chunk_pipeline_advance(&pipe);*/
-        /*__syncthreads();*/
-    /*}*/
-/*}*/
-
-/*__global__ void endpoint_persistent_kernel_sm90(*/
-    /*DeviceEndpointRuntime runtime,*/
-    /*const uint32_t* stop_flag) {*/
-    /*if (blockIdx.x != 0) {*/
-        /*return;*/
-    /*}*/
-
-    /*__shared__ exec::ChunkSchedulerScratch<kEndpointPersistentWatchThreads> sched_scratch;*/
-    /*__shared__ int shared_should_stop;*/
-
-    /*EndpointPersistentScheduler scheduler{};*/
-    /*exec::chunk_scheduler_init(*/
-        /*&scheduler,*/
-        /*runtime.scheduler_bindings,*/
-        /*runtime.num_scheduler_bindings,*/
-        /*kEndpointPersistentChunkBytes,*/
-        /*&sched_scratch);*/
-
-    /*while (true) {*/
-        /*if (threadIdx.x == 0) {*/
-            /*shared_should_stop =*/
-                /*(*reinterpret_cast<volatile const uint32_t*>(stop_flag) != 0u) ? 1 : 0;*/
-        /*}*/
-        /*__syncthreads();*/
-
-        /*if (shared_should_stop) {*/
-            /*return;*/
-        /*}*/
-
-        /*if (!exec::chunk_scheduler_try_prime_current(&scheduler)) {*/
-/*#if defined(__CUDA_ARCH__)*/
-            /*if (threadIdx.x == 0) {*/
-                /*__nanosleep(256);*/
-            /*}*/
-/*#endif*/
-            /*__syncthreads();*/
-            /*continue;*/
-        /*}*/
-
-        /*__syncthreads();*/
-
-        /*// Debug mode: consume the work without pipeline/TMA.*/
-        
-        /*exec::chunk_scheduler_advance(&scheduler);*/
-
-        /*__syncthreads();*/
-    /*}*/
-/*}*/
-
 __global__ void endpoint_persistent_kernel_sm90(
     DeviceEndpointRuntime runtime,
     const uint32_t* stop_flag) {
-  if (blockIdx.x != 0) return;
-
-  __shared__ int should_stop;
-  __shared__ int has_work;
-  __shared__ int active_binding_idx;
-  __shared__ comm::exec::Chunk current_chunk;
-
-  while (true) {
-    if (threadIdx.x == 0) {
-      should_stop = (*reinterpret_cast<volatile const uint32_t*>(stop_flag) != 0u) ? 1 : 0;
+    if (blockIdx.x != 0) {
+        return;
     }
-    __syncthreads();
-    if (should_stop) return;
 
-    if (threadIdx.x == 0) {
-      comm::exec::ChunkScheduler<1> sched{};
-      comm::exec::chunk_scheduler_init<1>(
-          &sched,
-          runtime.scheduler_bindings,
-          runtime.num_scheduler_bindings,
-          comm::kEndpointPersistentChunkBytes);
+    extern __shared__ uint4 shared_storage_u4[];
+    unsigned char* shared_raw =
+        reinterpret_cast<unsigned char*>(shared_storage_u4);
 
-      if (!comm::exec::chunk_scheduler_try_prime_current(&sched)) {
-        has_work = 0;
-      } else {
-        has_work = 1;
-        active_binding_idx = sched.active_binding_idx;
-        current_chunk = *comm::exec::chunk_scheduler_current(&sched);
-      }
-    }
-    __syncthreads();
+    __shared__ sync::semaphore load_barriers[kEndpointPersistentStageDepth];
+    __shared__ exec::ChunkSchedulerScratch<kEndpointPersistentWatchThreads> sched_scratch;
+    __shared__ int shared_should_stop;
 
-    if (!has_work) {
+    EndpointPersistentScheduler scheduler{};
+    exec::chunk_scheduler_init(
+        &scheduler,
+        runtime.scheduler_bindings,
+        runtime.num_scheduler_bindings,
+        kEndpointPersistentChunkBytes,
+        &sched_scratch);
+
+    EndpointPersistentPipeline pipe{};
+    exec::chunk_pipeline_bind_stage_storage<
+        kEndpointPersistentStageDepth,
+        kEndpointPersistentChunkBytes>(
+        &pipe,
+        shared_raw,
+        load_barriers);
+    exec::chunk_pipeline_init(&pipe, &scheduler);
+
+    while (true) {
+        if (threadIdx.x == 0) {
+            shared_should_stop = endpoint_persistent_should_stop(stop_flag) ? 1 : 0;
+        }
+        __syncthreads();
+
+        if (shared_should_stop) {
+            return;
+        }
+
+        if (!exec::chunk_pipeline_has_current(&pipe)) {
+            if (!exec::chunk_pipeline_try_prime(&pipe)) {
 #if defined(__CUDA_ARCH__)
-      if (threadIdx.x == 0) __nanosleep(256);
+                if (threadIdx.x == 0) {
+                    __nanosleep(256);
+                }
 #endif
-      __syncthreads();
-      continue;
-    }
+                __syncthreads();
+                continue;
+            }
+            __syncthreads();
+        }
 
-    // direct reduction for now
-    const auto& span = current_chunk.tile_spans[0];
-    half* dst = reinterpret_cast<half*>(current_chunk.dst);
-    const half* src = reinterpret_cast<const half*>(span.src);
-    const size_t elems = current_chunk.bytes / sizeof(half);
+        exec::chunk_pipeline_wait_current_stage(&pipe);
+        __syncthreads();
 
-    for (size_t i = threadIdx.x; i < elems; i += blockDim.x) {
-      const float oldv = __half2float(dst[i]);
-      const float addv = __half2float(src[i]);
-      dst[i] = __float2half_rn(oldv + addv);
-    }
-    __syncthreads();
+        exec::chunk_pipeline_issue_current_reduce(&pipe);
+        exec::chunk_pipeline_schedule_next_load(&pipe);
+        __syncthreads();
 
-    if (threadIdx.x == 0) {
-      auto* q = runtime.scheduler_bindings[active_binding_idx].queue;
-      *q->head = current_chunk.span_ticket + current_chunk.num_tile_spans;
-      __threadfence();
+        exec::chunk_pipeline_finish_current_tail(&pipe);
+        __syncthreads();
+
+        exec::chunk_pipeline_advance(&pipe);
+        __syncthreads();
     }
-    __syncthreads();
-  }
 }
 
 void configure_endpoint_persistent_kernel_smem(
     int device,
     size_t dynamic_smem_bytes) {
-    if (dynamic_smem_bytes == 0) {
-    return;
-}
     system::runtime::set_device(device);
 
     cudaDeviceProp prop{};
@@ -266,13 +149,10 @@ bool endpoint_persistent_control_init(
     system::runtime::check_cuda(
         cudaMalloc(&ctl->stop_flag, sizeof(uint32_t)),
         "cudaMalloc(endpoint persistent stop_flag)");
-    
+
     system::runtime::check_cuda(
-    cudaStreamCreateWithPriority(
-        &ctl->control_stream,
-        cudaStreamNonBlocking,
-        5),
-    "cudaStreamCreateWithPriority(producer_stream)");
+        cudaStreamCreateWithFlags(&ctl->control_stream, cudaStreamNonBlocking),
+        "cudaStreamCreateWithFlags(endpoint persistent control_stream)");
 
     system::runtime::check_cuda(
         cudaMemsetAsync(
@@ -361,9 +241,8 @@ void endpoint_persistent_control_destroy(
 }
 
 size_t endpoint_persistent_kernel_dynamic_smem_bytes() {
-    return 0;
-    /*return static_cast<size_t>(kEndpointPersistentStageDepth) **/
-           /*kEndpointPersistentChunkBytes;*/
+    return static_cast<size_t>(kEndpointPersistentStageDepth) *
+           kEndpointPersistentChunkBytes;
 }
 
 cudaError_t launch_endpoint_persistent_kernel_sm90(

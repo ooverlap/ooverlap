@@ -14,21 +14,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
-#include <string>
 #include <thread>
 #include <vector>
 
 namespace ooverlap {
 namespace {
-
-struct PersistentDebugState {
-    unsigned long long loop_count = 0;
-    unsigned long long no_work_count = 0;
-    unsigned long long primed_count = 0;
-    unsigned long long advanced_count = 0;
-    unsigned long long last_head = 0;
-    unsigned long long last_tail = 0;
-};
 
 __global__ void publish_single_ready_tile_kernel(
     comm::collective::ReadyTileQueue queue,
@@ -51,77 +41,6 @@ __global__ void publish_single_ready_tile_kernel(
         nullptr);
 
     *status_out = ok ? 1 : 0;
-}
-
-__global__ void spin_only_kernel(
-    const uint32_t* stop_flag,
-    PersistentDebugState* dbg) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-
-    while ((*reinterpret_cast<volatile const uint32_t*>(stop_flag)) == 0u) {
-        dbg->loop_count += 1;
-#if defined(__CUDA_ARCH__)
-        __nanosleep(256);
-#endif
-    }
-}
-
-__global__ void queue_read_only_kernel(
-    comm::collective::ReadyTileQueue queue,
-    const uint32_t* stop_flag,
-    PersistentDebugState* dbg) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-
-    while ((*reinterpret_cast<volatile const uint32_t*>(stop_flag)) == 0u) {
-        dbg->loop_count += 1;
-        dbg->last_head = *reinterpret_cast<volatile const uint64_t*>(queue.head);
-        dbg->last_tail = *reinterpret_cast<volatile const uint64_t*>(queue.tail);
-#if defined(__CUDA_ARCH__)
-        __nanosleep(256);
-#endif
-    }
-}
-
-__global__ void scheduler_prime_only_kernel(
-    comm::DeviceEndpointRuntime runtime,
-    const uint32_t* stop_flag,
-    PersistentDebugState* dbg) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-
-    while ((*reinterpret_cast<volatile const uint32_t*>(stop_flag)) == 0u) {
-        dbg->loop_count += 1;
-
-        if (runtime.num_scheduler_bindings > 0 &&
-            runtime.scheduler_bindings != nullptr &&
-            runtime.scheduler_bindings[0].queue != nullptr) {
-            auto* q = runtime.scheduler_bindings[0].queue;
-            dbg->last_head = *reinterpret_cast<volatile const uint64_t*>(q->head);
-            dbg->last_tail = *reinterpret_cast<volatile const uint64_t*>(q->tail);
-        }
-
-        comm::exec::ChunkScheduler<1> sched{};
-        comm::exec::chunk_scheduler_init<1>(
-            &sched,
-            runtime.scheduler_bindings,
-            runtime.num_scheduler_bindings,
-            comm::kEndpointPersistentChunkBytes);
-
-        if (!comm::exec::chunk_scheduler_try_prime_current(&sched)) {
-            dbg->no_work_count += 1;
-        } else {
-            dbg->primed_count += 1;
-        }
-
-#if defined(__CUDA_ARCH__)
-        __nanosleep(256);
-#endif
-    }
 }
 
 std::vector<half> make_host_pattern(
@@ -187,391 +106,6 @@ void copy_queue_state(
     }
 }
 
-PersistentDebugState copy_debug_state(
-    const PersistentDebugState* dbg_dev) {
-    PersistentDebugState out{};
-    cudaError_t err = cudaMemcpy(
-        &out,
-        dbg_dev,
-        sizeof(PersistentDebugState),
-        cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(
-            std::string("copy_debug_state failed: ") +
-            cudaGetErrorString(err));
-    }
-    return out;
-}
-
-bool wait_event_with_timeout(
-    cudaEvent_t ev,
-    int timeout_ms) {
-    const auto start = std::chrono::steady_clock::now();
-
-    while (true) {
-        cudaError_t st = cudaEventQuery(ev);
-        if (st == cudaSuccess) {
-            return true;
-        }
-        if (st != cudaErrorNotReady) {
-            throw std::runtime_error(
-                std::string("cudaEventQuery failed: ") +
-                cudaGetErrorString(st));
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-        if (elapsed_ms > timeout_ms) {
-            return false;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
-
-void reset_phase_state(
-    comm::EndpointRuntime* runtime,
-    half* dst_dev,
-    size_t bytes,
-    int* publish_status_dev,
-    PersistentDebugState* dbg_dev,
-    const std::vector<half>& host_zero,
-    comm::EndpointPersistentControl* control) {
-    comm::collective::ready_tile_queue_reset(&runtime->input_queues_host[0]);
-
-    system::runtime::check_cuda(
-        cudaMemcpy(dst_dev, host_zero.data(), bytes, cudaMemcpyHostToDevice),
-        "reset_phase_state: cudaMemcpy(host_zero -> dst_dev)");
-
-    system::runtime::check_cuda(
-        cudaMemset(publish_status_dev, 0, sizeof(int)),
-        "reset_phase_state: cudaMemset(publish_status_dev)");
-
-    system::runtime::check_cuda(
-        cudaMemset(dbg_dev, 0, sizeof(PersistentDebugState)),
-        "reset_phase_state: cudaMemset(dbg_dev)");
-
-    comm::endpoint_persistent_control_reset(control);
-}
-
-bool launch_publish_and_wait(
-    const comm::collective::ReadyTileQueue& queue,
-    const half* src_dev,
-    uint32_t bytes,
-    int* publish_status_dev,
-    cudaStream_t producer_stream,
-    int timeout_ms) {
-    cudaEvent_t done = nullptr;
-    system::runtime::check_cuda(
-        cudaEventCreateWithFlags(&done, cudaEventDisableTiming),
-        "cudaEventCreateWithFlags(publish done)");
-
-    publish_single_ready_tile_kernel<<<1, 1, 0, producer_stream>>>(
-        queue,
-        src_dev,
-        bytes,
-        0,
-        publish_status_dev);
-    system::runtime::check_cuda(
-        cudaGetLastError(),
-        "publish_single_ready_tile_kernel");
-
-    system::runtime::check_cuda(
-        cudaEventRecord(done, producer_stream),
-        "cudaEventRecord(publish done)");
-
-    const bool finished = wait_event_with_timeout(done, timeout_ms);
-
-    cudaError_t err = cudaEventDestroy(done);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(
-            std::string("cudaEventDestroy(publish done) failed: ") +
-            cudaGetErrorString(err));
-    }
-
-    return finished;
-}
-
-void check_publish_status(
-    int* publish_status_dev,
-    const char* phase_name) {
-    int publish_status = 0;
-    system::runtime::check_cuda(
-        cudaMemcpy(
-            &publish_status,
-            publish_status_dev,
-            sizeof(int),
-            cudaMemcpyDeviceToHost),
-        "cudaMemcpy(publish_status)");
-
-    if (publish_status != 1) {
-        throw std::runtime_error(
-            std::string(phase_name) + ": publish kernel completed but did not publish tile");
-    }
-}
-
-void stop_and_join_resident(
-    comm::EndpointPersistentControl* control,
-    cudaStream_t resident_stream) {
-    comm::endpoint_persistent_control_request_stop(control);
-    system::runtime::check_cuda(
-        cudaStreamSynchronize(resident_stream),
-        "cudaStreamSynchronize(resident stream)");
-}
-
-void run_spin_only_overlap_phase(
-    comm::EndpointRuntime* runtime,
-    comm::EndpointPersistentControl* control,
-    const half* src_dev,
-    half* dst_dev,
-    size_t bytes,
-    int* publish_status_dev,
-    PersistentDebugState* dbg_dev,
-    cudaStream_t producer_stream,
-    cudaStream_t resident_stream,
-    const std::vector<half>& host_zero) {
-    std::printf("[phase] spin_only begin\n"); std::fflush(stdout);
-
-    reset_phase_state(runtime, dst_dev, bytes, publish_status_dev, dbg_dev, host_zero, control);
-    std::printf("[phase] spin_only after reset\n"); std::fflush(stdout);
-
-    spin_only_kernel<<<1, 1, 0, resident_stream>>>(
-        control->stop_flag,
-        dbg_dev);
-    system::runtime::check_cuda(cudaGetLastError(), "spin_only_kernel");
-    std::printf("[phase] spin_only after resident launch\n"); std::fflush(stdout);
-
-    const bool publish_finished = launch_publish_and_wait(
-        runtime->input_queues_host[0],
-        src_dev,
-        static_cast<uint32_t>(bytes),
-        publish_status_dev,
-        producer_stream,
-        200);
-    std::printf("[phase] spin_only publish_finished=%d\n", int(publish_finished));
-    std::fflush(stdout);
-
-    std::printf("[phase] spin_only before stop_and_join\n"); std::fflush(stdout);
-    stop_and_join_resident(control, resident_stream);
-    std::printf("[phase] spin_only after stop_and_join\n"); std::fflush(stdout);
-
-    const PersistentDebugState dbg = copy_debug_state(dbg_dev);
-
-    if (!publish_finished) {
-        throw std::runtime_error(
-            "spin_only overlap failed: producer did not complete while dummy resident kernel was alive");
-    }
-
-    check_publish_status(publish_status_dev, "spin_only");
-
-    uint64_t head = 0;
-    uint64_t tail = 0;
-    copy_queue_state(runtime->input_queues_host[0], &head, &tail);
-
-    std::printf(
-        "[phase] spin_only ok loops=%llu head=%llu tail=%llu\n",
-        dbg.loop_count,
-        static_cast<unsigned long long>(head),
-        static_cast<unsigned long long>(tail));
-    std::fflush(stdout);
-}
-
-void run_queue_read_only_overlap_phase(
-    comm::EndpointRuntime* runtime,
-    comm::EndpointPersistentControl* control,
-    const half* src_dev,
-    half* dst_dev,
-    size_t bytes,
-    int* publish_status_dev,
-    PersistentDebugState* dbg_dev,
-    cudaStream_t producer_stream,
-    cudaStream_t resident_stream,
-    const std::vector<half>& host_zero) {
-    std::printf("[phase] queue_read_only begin\n"); std::fflush(stdout);
-
-    reset_phase_state(runtime, dst_dev, bytes, publish_status_dev, dbg_dev, host_zero, control);
-    std::printf("[phase] queue_read_only after reset\n"); std::fflush(stdout);
-
-    queue_read_only_kernel<<<1, 1, 0, resident_stream>>>(
-        runtime->input_queues_host[0],
-        control->stop_flag,
-        dbg_dev);
-    system::runtime::check_cuda(cudaGetLastError(), "queue_read_only_kernel");
-    std::printf("[phase] queue_read_only after resident launch\n"); std::fflush(stdout);
-
-    const bool publish_finished = launch_publish_and_wait(
-        runtime->input_queues_host[0],
-        src_dev,
-        static_cast<uint32_t>(bytes),
-        publish_status_dev,
-        producer_stream,
-        200);
-    std::printf("[phase] queue_read_only publish_finished=%d\n", int(publish_finished));
-    std::fflush(stdout);
-
-    std::printf("[phase] queue_read_only before stop_and_join\n"); std::fflush(stdout);
-    stop_and_join_resident(control, resident_stream);
-    std::printf("[phase] queue_read_only after stop_and_join\n"); std::fflush(stdout);
-
-    const PersistentDebugState dbg = copy_debug_state(dbg_dev);
-
-    if (!publish_finished) {
-        throw std::runtime_error(
-            "queue_read_only overlap failed: producer did not complete while resident kernel only read queue state");
-    }
-
-    check_publish_status(publish_status_dev, "queue_read_only");
-
-    uint64_t head = 0;
-    uint64_t tail = 0;
-    copy_queue_state(runtime->input_queues_host[0], &head, &tail);
-
-    std::printf(
-        "[phase] queue_read_only ok loops=%llu last_head=%llu last_tail=%llu final_head=%llu final_tail=%llu\n",
-        dbg.loop_count,
-        dbg.last_head,
-        dbg.last_tail,
-        static_cast<unsigned long long>(head),
-        static_cast<unsigned long long>(tail));
-    std::fflush(stdout);
-}
-
-void run_scheduler_prime_only_overlap_phase(
-    comm::EndpointRuntime* runtime,
-    comm::EndpointPersistentControl* control,
-    const half* src_dev,
-    half* dst_dev,
-    size_t bytes,
-    int* publish_status_dev,
-    PersistentDebugState* dbg_dev,
-    cudaStream_t producer_stream,
-    cudaStream_t resident_stream,
-    const std::vector<half>& host_zero) {
-    std::printf("[phase] scheduler_prime_only begin\n"); std::fflush(stdout);
-
-    reset_phase_state(runtime, dst_dev, bytes, publish_status_dev, dbg_dev, host_zero, control);
-    std::printf("[phase] scheduler_prime_only after reset\n"); std::fflush(stdout);
-
-    scheduler_prime_only_kernel<<<1, 1, 0, resident_stream>>>(
-        runtime->device,
-        control->stop_flag,
-        dbg_dev);
-    system::runtime::check_cuda(cudaGetLastError(), "scheduler_prime_only_kernel");
-    std::printf("[phase] scheduler_prime_only after resident launch\n"); std::fflush(stdout);
-
-    const bool publish_finished = launch_publish_and_wait(
-        runtime->input_queues_host[0],
-        src_dev,
-        static_cast<uint32_t>(bytes),
-        publish_status_dev,
-        producer_stream,
-        200);
-    std::printf("[phase] scheduler_prime_only publish_finished=%d\n", int(publish_finished));
-    std::fflush(stdout);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    std::printf("[phase] scheduler_prime_only before stop_and_join\n"); std::fflush(stdout);
-    stop_and_join_resident(control, resident_stream);
-    std::printf("[phase] scheduler_prime_only after stop_and_join\n"); std::fflush(stdout);
-
-    const PersistentDebugState dbg = copy_debug_state(dbg_dev);
-
-    if (!publish_finished) {
-        throw std::runtime_error(
-            "scheduler_prime_only overlap failed: producer did not complete while resident kernel polled scheduler");
-    }
-
-    check_publish_status(publish_status_dev, "scheduler_prime_only");
-
-    uint64_t head = 0;
-    uint64_t tail = 0;
-    copy_queue_state(runtime->input_queues_host[0], &head, &tail);
-
-    std::printf(
-        "[phase] scheduler_prime_only ok loops=%llu no_work=%llu primed=%llu final_head=%llu final_tail=%llu\n",
-        dbg.loop_count,
-        dbg.no_work_count,
-        dbg.primed_count,
-        static_cast<unsigned long long>(head),
-        static_cast<unsigned long long>(tail));
-    std::fflush(stdout);
-}
-
-void run_full_persistent_direct_phase(
-    comm::EndpointRuntime* runtime,
-    comm::EndpointPersistentControl* control,
-    const half* src_dev,
-    half* dst_dev,
-    size_t bytes,
-    int* publish_status_dev,
-    cudaStream_t producer_stream,
-    const std::vector<half>& host_zero,
-    const std::vector<half>& host_src) {
-    std::printf("[phase] full_persistent_direct begin\n"); std::fflush(stdout);
-
-    system::runtime::check_cuda(
-        cudaMemcpy(dst_dev, host_zero.data(), bytes, cudaMemcpyHostToDevice),
-        "full_persistent_direct: reset dst");
-    system::runtime::check_cuda(
-        cudaMemset(publish_status_dev, 0, sizeof(int)),
-        "full_persistent_direct: reset publish_status");
-    comm::collective::ready_tile_queue_reset(&runtime->input_queues_host[0]);
-    comm::endpoint_persistent_control_reset(control);
-
-    publish_single_ready_tile_kernel<<<1, 1, 0, producer_stream>>>(
-        runtime->input_queues_host[0],
-        src_dev,
-        static_cast<uint32_t>(bytes),
-        0,
-        publish_status_dev);
-    system::runtime::check_cuda(
-        cudaGetLastError(),
-        "full_persistent_direct: publish_single_ready_tile_kernel");
-
-    system::runtime::check_cuda(
-        cudaStreamSynchronize(producer_stream),
-        "full_persistent_direct: cudaStreamSynchronize(producer_stream)");
-
-    check_publish_status(publish_status_dev, "full_persistent_direct");
-
-    system::runtime::check_cuda(
-        comm::launch_endpoint_persistent_kernel_sm90(
-            comm::endpoint_runtime_device_handle(runtime),
-            control,
-            runtime->endpoint.stream),
-        "launch_endpoint_persistent_kernel_sm90");
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    stop_and_join_resident(control, runtime->endpoint.stream);
-
-    uint64_t head = 0;
-    uint64_t tail = 0;
-    copy_queue_state(runtime->input_queues_host[0], &head, &tail);
-
-    if (head != 1 || tail != 1) {
-        throw std::runtime_error(
-            "full_persistent_direct failed: expected queue state head=1 tail=1 after stop");
-    }
-
-    std::vector<half> host_dst(static_cast<size_t>(bytes / sizeof(half)));
-    system::runtime::check_cuda(
-        cudaMemcpy(host_dst.data(), dst_dev, bytes, cudaMemcpyDeviceToHost),
-        "full_persistent_direct: cudaMemcpy(dst_dev -> host_dst)");
-
-    expect_half_vectors_close(
-        host_dst,
-        host_src,
-        "full_persistent_direct");
-
-    std::printf(
-        "[phase] full_persistent_direct ok head=%llu tail=%llu\n",
-        static_cast<unsigned long long>(head),
-        static_cast<unsigned long long>(tail));
-    std::fflush(stdout);
-}
-
 } // namespace
 
 bool endpoint_persistent_smoke_test(
@@ -592,11 +126,10 @@ bool endpoint_persistent_smoke_test(
     half* src_dev = nullptr;
     half* dst_dev = nullptr;
     int* publish_status_dev = nullptr;
-    PersistentDebugState* dbg_dev = nullptr;
     cudaStream_t producer_stream = nullptr;
-    cudaStream_t resident_stream = nullptr;
 
     bool control_initialized = false;
+    bool persistent_launched = false;
 
     try {
         const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
@@ -614,38 +147,9 @@ bool endpoint_persistent_smoke_test(
         std::printf("[smoke] after endpoint_runtime_init\n"); std::fflush(stdout);
 
         system::runtime::set_device(dev0);
-
-        cudaDeviceProp prop{};
-        system::runtime::check_cuda(
-            cudaGetDeviceProperties(&prop, dev0),
-            "cudaGetDeviceProperties(dev0)");
-        std::printf(
-            "[smoke] concurrentKernels=%d multiProcessorCount=%d\n",
-            prop.concurrentKernels,
-            prop.multiProcessorCount);
-        std::fflush(stdout);
-
         system::runtime::check_cuda(
             cudaStreamCreateWithFlags(&producer_stream, cudaStreamNonBlocking),
             "cudaStreamCreateWithFlags(producer_stream)");
-
-        int least_priority = 0;
-        int greatest_priority = 0;
-        system::runtime::check_cuda(
-            cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority),
-            "cudaDeviceGetStreamPriorityRange");
-        std::printf(
-            "[smoke] stream priorities: least=%d greatest=%d\n",
-            least_priority,
-            greatest_priority);
-        std::fflush(stdout);
-
-        system::runtime::check_cuda(
-            cudaStreamCreateWithPriority(
-                &resident_stream,
-                cudaStreamNonBlocking,
-                least_priority),
-            "cudaStreamCreateWithPriority(resident_stream)");
 
         system::runtime::check_cuda(
             cudaMalloc(&src_dev, bytes),
@@ -656,9 +160,6 @@ bool endpoint_persistent_smoke_test(
         system::runtime::check_cuda(
             cudaMalloc(&publish_status_dev, sizeof(int)),
             "cudaMalloc(publish_status_dev)");
-        system::runtime::check_cuda(
-            cudaMalloc(&dbg_dev, sizeof(PersistentDebugState)),
-            "cudaMalloc(dbg_dev)");
 
         system::runtime::check_cuda(
             cudaMemcpy(src_dev, host_src.data(), bytes, cudaMemcpyHostToDevice),
@@ -669,9 +170,6 @@ bool endpoint_persistent_smoke_test(
         system::runtime::check_cuda(
             cudaMemset(publish_status_dev, 0, sizeof(int)),
             "cudaMemset(publish_status_dev)");
-        system::runtime::check_cuda(
-            cudaMemset(dbg_dev, 0, sizeof(PersistentDebugState)),
-            "cudaMemset(dbg_dev)");
 
         std::printf("[smoke] after device buffer alloc/init\n"); std::fflush(stdout);
 
@@ -693,64 +191,86 @@ bool endpoint_persistent_smoke_test(
         comm::endpoint_persistent_control_init(&control, dev0);
         control_initialized = true;
 
-        run_spin_only_overlap_phase(
-            &runtime,
-            &control,
+        std::printf("[smoke] before publish launch\n"); std::fflush(stdout);
+        publish_single_ready_tile_kernel<<<1, 1, 0, producer_stream>>>(
+            runtime.input_queues_host[0],
             src_dev,
-            dst_dev,
-            bytes,
-            publish_status_dev,
-            dbg_dev,
-            producer_stream,
-            resident_stream,
-            host_zero);
+            static_cast<uint32_t>(bytes),
+            0,
+            publish_status_dev);
+        system::runtime::check_cuda(
+            cudaGetLastError(),
+            "publish_single_ready_tile_kernel");
 
-        run_queue_read_only_overlap_phase(
-            &runtime,
-            &control,
-            src_dev,
-            dst_dev,
-            bytes,
-            publish_status_dev,
-            dbg_dev,
-            producer_stream,
-            resident_stream,
-            host_zero);
+        std::printf("[smoke] after publish launch\n"); std::fflush(stdout);
+        system::runtime::check_cuda(
+            cudaStreamSynchronize(producer_stream),
+            "cudaStreamSynchronize(producer_stream)");
+        std::printf("[smoke] after producer sync\n"); std::fflush(stdout);
 
-        run_scheduler_prime_only_overlap_phase(
-            &runtime,
-            &control,
-            src_dev,
-            dst_dev,
-            bytes,
-            publish_status_dev,
-            dbg_dev,
-            producer_stream,
-            resident_stream,
-            host_zero);
+        int publish_status = 0;
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                &publish_status,
+                publish_status_dev,
+                sizeof(int),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(publish_status)");
 
-        run_full_persistent_direct_phase(
-            &runtime,
-            &control,
-            src_dev,
-            dst_dev,
-            bytes,
-            publish_status_dev,
-            producer_stream,
-            host_zero,
-            host_src);
-
-        if (resident_stream != nullptr) {
-            cudaStreamDestroy(resident_stream);
-            resident_stream = nullptr;
+        if (publish_status != 1) {
+            throw std::runtime_error("publish_single_ready_tile_kernel failed to publish tile");
         }
+
+        std::printf("[smoke] before persistent launch\n"); std::fflush(stdout);
+        system::runtime::check_cuda(
+            comm::launch_endpoint_persistent_kernel_sm90(
+                comm::endpoint_runtime_device_handle(&runtime),
+                &control,
+                runtime.endpoint.stream),
+            "launch_endpoint_persistent_kernel_sm90");
+        persistent_launched = true;
+        std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
+
+        std::printf("[smoke] letting persistent kernel run\n"); std::fflush(stdout);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        std::printf("[smoke] requesting stop\n"); std::fflush(stdout);
+        comm::endpoint_persistent_control_request_stop(&control);
+
+        system::runtime::check_cuda(
+            cudaStreamSynchronize(runtime.endpoint.stream),
+            "cudaStreamSynchronize(persistent stream)");
+        std::printf("[smoke] persistent stream joined\n"); std::fflush(stdout);
+
+        uint64_t head = 0;
+        uint64_t tail = 0;
+        copy_queue_state(runtime.input_queues_host[0], &head, &tail);
+
+        std::printf(
+            "[smoke] queue after persistent head=%llu tail=%llu\n",
+            static_cast<unsigned long long>(head),
+            static_cast<unsigned long long>(tail));
+        std::fflush(stdout);
+
+        if (head != 1 || tail != 1) {
+            throw std::runtime_error(
+                "persistent kernel did not consume exactly one published tile");
+        }
+
+        std::printf("[smoke] copying dst to host\n"); std::fflush(stdout);
+        std::vector<half> host_dst(static_cast<size_t>(numel));
+        system::runtime::check_cuda(
+            cudaMemcpy(host_dst.data(), dst_dev, bytes, cudaMemcpyDeviceToHost),
+            "cudaMemcpy(dst_dev -> host_dst)");
+
+        expect_half_vectors_close(
+            host_dst,
+            host_src,
+            "endpoint_persistent_smoke_test");
+
         if (producer_stream != nullptr) {
             cudaStreamDestroy(producer_stream);
             producer_stream = nullptr;
-        }
-        if (dbg_dev != nullptr) {
-            cudaFree(dbg_dev);
-            dbg_dev = nullptr;
         }
         if (publish_status_dev != nullptr) {
             cudaFree(publish_status_dev);
@@ -775,24 +295,15 @@ bool endpoint_persistent_smoke_test(
         return true;
     } catch (...) {
         try {
-            if (control_initialized) {
+            if (persistent_launched && control_initialized) {
                 comm::endpoint_persistent_control_request_stop(&control);
-                if (resident_stream != nullptr) {
-                    cudaStreamSynchronize(resident_stream);
-                }
                 cudaStreamSynchronize(runtime.endpoint.stream);
             }
         } catch (...) {
         }
 
-        if (resident_stream != nullptr) {
-            cudaStreamDestroy(resident_stream);
-        }
         if (producer_stream != nullptr) {
             cudaStreamDestroy(producer_stream);
-        }
-        if (dbg_dev != nullptr) {
-            cudaFree(dbg_dev);
         }
         if (publish_status_dev != nullptr) {
             cudaFree(publish_status_dev);
