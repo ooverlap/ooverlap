@@ -92,53 +92,118 @@ __device__ __forceinline__ bool endpoint_persistent_should_stop(
     /*}*/
 /*}*/
 
+/*__global__ void endpoint_persistent_kernel_sm90(*/
+    /*DeviceEndpointRuntime runtime,*/
+    /*const uint32_t* stop_flag) {*/
+    /*if (blockIdx.x != 0) {*/
+        /*return;*/
+    /*}*/
+
+    /*__shared__ exec::ChunkSchedulerScratch<kEndpointPersistentWatchThreads> sched_scratch;*/
+    /*__shared__ int shared_should_stop;*/
+
+    /*EndpointPersistentScheduler scheduler{};*/
+    /*exec::chunk_scheduler_init(*/
+        /*&scheduler,*/
+        /*runtime.scheduler_bindings,*/
+        /*runtime.num_scheduler_bindings,*/
+        /*kEndpointPersistentChunkBytes,*/
+        /*&sched_scratch);*/
+
+    /*while (true) {*/
+        /*if (threadIdx.x == 0) {*/
+            /*shared_should_stop =*/
+                /*(*reinterpret_cast<volatile const uint32_t*>(stop_flag) != 0u) ? 1 : 0;*/
+        /*}*/
+        /*__syncthreads();*/
+
+        /*if (shared_should_stop) {*/
+            /*return;*/
+        /*}*/
+
+        /*if (!exec::chunk_scheduler_try_prime_current(&scheduler)) {*/
+/*#if defined(__CUDA_ARCH__)*/
+            /*if (threadIdx.x == 0) {*/
+                /*__nanosleep(256);*/
+            /*}*/
+/*#endif*/
+            /*__syncthreads();*/
+            /*continue;*/
+        /*}*/
+
+        /*__syncthreads();*/
+
+        /*// Debug mode: consume the work without pipeline/TMA.*/
+        
+        /*exec::chunk_scheduler_advance(&scheduler);*/
+
+        /*__syncthreads();*/
+    /*}*/
+/*}*/
+
 __global__ void endpoint_persistent_kernel_sm90(
     DeviceEndpointRuntime runtime,
     const uint32_t* stop_flag) {
-    if (blockIdx.x != 0) {
-        return;
+  if (blockIdx.x != 0) return;
+
+  __shared__ int should_stop;
+  __shared__ int has_work;
+  __shared__ int active_binding_idx;
+  __shared__ comm::exec::Chunk current_chunk;
+
+  while (true) {
+    if (threadIdx.x == 0) {
+      should_stop = (*reinterpret_cast<volatile const uint32_t*>(stop_flag) != 0u) ? 1 : 0;
     }
+    __syncthreads();
+    if (should_stop) return;
 
-    __shared__ exec::ChunkSchedulerScratch<kEndpointPersistentWatchThreads> sched_scratch;
-    __shared__ int shared_should_stop;
+    if (threadIdx.x == 0) {
+      comm::exec::ChunkScheduler<1> sched{};
+      comm::exec::chunk_scheduler_init<1>(
+          &sched,
+          runtime.scheduler_bindings,
+          runtime.num_scheduler_bindings,
+          comm::kEndpointPersistentChunkBytes);
 
-    EndpointPersistentScheduler scheduler{};
-    exec::chunk_scheduler_init(
-        &scheduler,
-        runtime.scheduler_bindings,
-        runtime.num_scheduler_bindings,
-        kEndpointPersistentChunkBytes,
-        &sched_scratch);
+      if (!comm::exec::chunk_scheduler_try_prime_current(&sched)) {
+        has_work = 0;
+      } else {
+        has_work = 1;
+        active_binding_idx = sched.active_binding_idx;
+        current_chunk = *comm::exec::chunk_scheduler_current(&sched);
+      }
+    }
+    __syncthreads();
 
-    while (true) {
-        if (threadIdx.x == 0) {
-            shared_should_stop =
-                (*reinterpret_cast<volatile const uint32_t*>(stop_flag) != 0u) ? 1 : 0;
-        }
-        __syncthreads();
-
-        if (shared_should_stop) {
-            return;
-        }
-
-        if (!exec::chunk_scheduler_try_prime_current(&scheduler)) {
+    if (!has_work) {
 #if defined(__CUDA_ARCH__)
-            if (threadIdx.x == 0) {
-                __nanosleep(256);
-            }
+      if (threadIdx.x == 0) __nanosleep(256);
 #endif
-            __syncthreads();
-            continue;
-        }
-
-        __syncthreads();
-
-        // Debug mode: consume the work without pipeline/TMA.
-        
-        exec::chunk_scheduler_advance(&scheduler);
-
-        __syncthreads();
+      __syncthreads();
+      continue;
     }
+
+    // direct reduction for now
+    const auto& span = current_chunk.tile_spans[0];
+    half* dst = reinterpret_cast<half*>(current_chunk.dst);
+    const half* src = reinterpret_cast<const half*>(span.src);
+    const size_t elems = current_chunk.bytes / sizeof(half);
+
+    for (size_t i = threadIdx.x; i < elems; i += blockDim.x) {
+      const float oldv = __half2float(dst[i]);
+      const float addv = __half2float(src[i]);
+      dst[i] = __float2half_rn(oldv + addv);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      auto* q = runtime.scheduler_bindings[active_binding_idx].queue;
+      *q->head = current_chunk.span_ticket + current_chunk.num_tile_spans;
+      __threadfence();
+    }
+    __syncthreads();
+  }
 }
 
 void configure_endpoint_persistent_kernel_smem(
