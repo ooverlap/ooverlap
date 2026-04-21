@@ -13,62 +13,6 @@ namespace comm {
 namespace collective {
 namespace {
 
-TileState* find_tile_state(
-    std::vector<TileState>* states,
-    uint64_t op_id,
-    uint32_t tile_id) {
-    for (auto& st : *states) {
-        if (st.op_id == op_id && st.tile_id == tile_id) {
-            return &st;
-        }
-    }
-    return nullptr;
-}
-
-TileState* get_or_create_tile_state(
-    AllReducePlanner* planner,
-    const PublishedTile* tile) {
-    TileState* st = find_tile_state(&planner->tile_states, tile->op_id, tile->tile_id);
-    if (st != nullptr) {
-        return st;
-    }
-
-    TileState fresh{};
-    fresh.op_id = tile->op_id;
-    fresh.tile_id = tile->tile_id;
-    fresh.logical_dst_offset_bytes = tile->logical_dst_offset_bytes;
-    fresh.bytes = tile->bytes;
-    fresh.expected_contributors =
-        static_cast<uint16_t>(planner->session->group->world_size);
-    fresh.received_contributors = 0;
-    fresh.contributor_mask = 0;
-    fresh.first_publish_ticket = tile->publish_ticket;
-    fresh.last_publish_ticket = tile->publish_ticket;
-    fresh.reduce_kind = static_cast<ReduceKind>(tile->reduce_kind);
-    fresh.complete = false;
-
-    planner->tile_states.push_back(fresh);
-    return &planner->tile_states.back();
-}
-
-PublishedTile read_published_tile_host(
-    const std::vector<int>& devices,
-    int owner_rank,
-    const PublishedTileQueue* q,
-    uint64_t ticket) {
-
-    PublishedTile out{};
-    const PublishedTile* records = published_tile_queue_records(q);
-    const PublishedTile* src =
-        &records[static_cast<size_t>(ticket % static_cast<uint64_t>(q->capacity))];
-
-    system::runtime::set_device(devices[static_cast<size_t>(owner_rank)]);
-    system::runtime::check_cuda(
-        cudaMemcpy(&out, src, sizeof(PublishedTile), cudaMemcpyDeviceToHost),
-        "cudaMemcpy(published tile record)");
-    return out;
-}
-
 uint32_t read_u32_host(
     const std::vector<int>& devices,
     int owner_rank,
@@ -92,6 +36,24 @@ void write_u32_host(
     system::runtime::check_cuda(
         cudaMemcpy(ptr, &value, sizeof(uint32_t), cudaMemcpyHostToDevice),
         what);
+}
+
+PublishedTile read_published_tile_host(
+    const std::vector<int>& devices,
+    int owner_rank,
+    const PublishedTileQueue* q,
+    uint32_t ticket) {
+
+    PublishedTile out{};
+    const PublishedTile* records = published_tile_queue_records(q);
+    const PublishedTile* src =
+        &records[static_cast<size_t>(ticket % q->capacity)];
+
+    system::runtime::set_device(devices[static_cast<size_t>(owner_rank)]);
+    system::runtime::check_cuda(
+        cudaMemcpy(&out, src, sizeof(PublishedTile), cudaMemcpyDeviceToHost),
+        "cudaMemcpy(published tile record)");
+    return out;
 }
 
 transport::DispatchRecord dispatch_record_from_chunk_task(
@@ -122,19 +84,18 @@ bool allreduce_planner_init(
     if (planner == nullptr) {
         throw std::invalid_argument("allreduce_planner_init: planner is null");
     }
-    if (session == nullptr) {
-        throw std::invalid_argument("allreduce_planner_init: session is null");
-    }
-    if (session->group == nullptr) {
-        throw std::invalid_argument("allreduce_planner_init: session->group is null");
-    }
-    if (dispatch_chunk_bytes == 0) {
-        throw std::invalid_argument("allreduce_planner_init: dispatch_chunk_bytes must be > 0");
+    if (session == nullptr || session->group == nullptr) {
+        throw std::invalid_argument("allreduce_planner_init: session/group is null");
     }
 
     planner->session = session;
-    planner->dispatch_chunk_bytes = dispatch_chunk_bytes;
-    planner->tile_states.clear();
+    planner->dispatch_chunk_bytes =
+        (dispatch_chunk_bytes != 0)
+            ? dispatch_chunk_bytes
+            : session->group->channel_dispatch_chunk_bytes;
+    if (planner->dispatch_chunk_bytes == 0) {
+        throw std::invalid_argument("allreduce_planner_init: dispatch_chunk_bytes must be > 0");
+    }
     return true;
 }
 
@@ -145,26 +106,14 @@ void allreduce_planner_destroy(
     }
     planner->session = nullptr;
     planner->dispatch_chunk_bytes = 0;
-    planner->tile_states.clear();
-}
-
-void allreduce_planner_reset(
-    AllReducePlanner* planner) {
-    if (planner == nullptr) {
-        throw std::invalid_argument("allreduce_planner_reset: planner is null");
-    }
-    planner->tile_states.clear();
 }
 
 bool allreduce_planner_progress_rank(
     AllReducePlanner* planner,
     int producer_rank) {
 
-    if (planner == nullptr) {
-        throw std::invalid_argument("allreduce_planner_progress_rank: planner is null");
-    }
-    if (planner->session == nullptr || planner->session->group == nullptr) {
-        throw std::invalid_argument("allreduce_planner_progress_rank: planner session/group is null");
+    if (planner == nullptr || planner->session == nullptr || planner->session->group == nullptr) {
+        throw std::invalid_argument("allreduce_planner_progress_rank: planner/session/group is null");
     }
 
     Group* group = planner->session->group;
@@ -173,7 +122,7 @@ bool allreduce_planner_progress_rank(
     PublishedTileQueue* q =
         allreduce_session_get_published_tile_queue(planner->session, producer_rank);
 
-    uint32_t head = read_u32_host(
+    const uint32_t head = read_u32_host(
         group->devices,
         producer_rank,
         q->head_buffer.ptr,
@@ -199,40 +148,52 @@ bool allreduce_planner_progress_rank(
             break;
         }
 
+        uint32_t window_idx = kInvalidWindowIndex;
+        TileState* st =
+            allreduce_session_bind_tile_state(planner->session, &tile, &window_idx);
+
+        // No free operation window right now -> backpressure.
+        if (st == nullptr) {
+            break;
+        }
+
         changed = true;
 
-        TileState* st = get_or_create_tile_state(planner, &tile);
-        tile_state_note_contributor(st, &tile);
+        if (!tile_state_note_contributor(st, &tile)) {
+            throw std::runtime_error("allreduce_planner_progress_rank: tile_state_note_contributor failed");
+        }
 
-        // Current baseline lowering:
-        // fan out this producer contribution to every peer rank.
-        // Physical destination is currently resolved to group local_full_buffers.
-        // TODO(keyvand): replace this with session-owned operation window mapping.
+        allreduce_session_update_window_contributor_count(
+            planner->session,
+            window_idx,
+            static_cast<uint32_t>(st->received_contributors));
+
+        // TODO(keyvand): add an explicit self/local path.
+        // For now we only lower to real peer channels.
         for (int dst_rank = 0; dst_rank < group->world_size; ++dst_rank) {
-            if (dst_rank == producer_rank) {
-                continue;
-            }
-
             Channel* ch = group_get_channel(group, producer_rank, dst_rank);
             if (ch == nullptr) {
                 continue;
             }
 
-            auto* dst_buf = group_get_local_full_buffer(group, dst_rank);
-            unsigned char* dst_base =
-                reinterpret_cast<unsigned char*>(dst_buf->ptr) +
-                tile.logical_dst_offset_bytes;
+            AllReducePhysicalTileMapping mapping{};
+            if (!allreduce_session_resolve_physical_mapping(
+                    planner->session,
+                    window_idx,
+                    dst_rank,
+                    &mapping)) {
+                throw std::runtime_error("allreduce_planner_progress_rank: failed to resolve physical mapping");
+            }
 
             const int num_chunks = static_cast<int>(
-                (static_cast<size_t>(tile.bytes) + planner->dispatch_chunk_bytes - 1) /
+                (mapping.bytes + planner->dispatch_chunk_bytes - 1) /
                 planner->dispatch_chunk_bytes);
 
             for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
                 ChunkTask task{};
-                if (!chunk_task_make_from_published_tile(
+                if (!chunk_task_make_from_published_tile_and_mapping(
                         &tile,
-                        dst_rank,
-                        dst_base,
+                        &mapping,
                         planner->dispatch_chunk_bytes,
                         chunk_idx,
                         &task)) {
@@ -249,6 +210,10 @@ bool allreduce_planner_progress_rank(
                     throw std::runtime_error("allreduce_planner_progress_rank: failed to push DispatchRecord");
                 }
             }
+        }
+
+        if (tile_state_is_complete(st)) {
+            allreduce_session_mark_window_complete(planner->session, window_idx);
         }
 
         consumed_head += 1;
@@ -268,11 +233,8 @@ bool allreduce_planner_progress_rank(
 
 bool allreduce_planner_progress(
     AllReducePlanner* planner) {
-    if (planner == nullptr) {
-        throw std::invalid_argument("allreduce_planner_progress: planner is null");
-    }
-    if (planner->session == nullptr || planner->session->group == nullptr) {
-        throw std::invalid_argument("allreduce_planner_progress: planner session/group is null");
+    if (planner == nullptr || planner->session == nullptr || planner->session->group == nullptr) {
+        throw std::invalid_argument("allreduce_planner_progress: planner/session/group is null");
     }
 
     bool changed = false;

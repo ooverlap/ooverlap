@@ -181,6 +181,41 @@ bool dispatch_queue_push_host_blocking(
 DeviceDispatchQueueHandle dispatch_queue_get_device_handle(
     const DispatchQueue* q);
 
+__device__ __forceinline__ bool device_dispatch_queue_try_peek_ticket(
+    const DeviceDispatchQueueHandle* q,
+    uint64_t ticket,
+    DispatchRecord* out) {
+    if (q == nullptr || out == nullptr ||
+        q->records == nullptr || q->head == nullptr || q->tail == nullptr) {
+        return false;
+    }
+
+    dispatch_record_clear(out);
+
+    const uint64_t head_ticket = *((volatile const uint64_t*)q->head);
+    const uint64_t tail_ticket = *((volatile const uint64_t*)q->tail);
+
+    if (ticket < head_ticket || ticket >= tail_ticket) {
+        return false;
+    }
+
+    const DispatchRecord* rec =
+        &q->records[static_cast<size_t>(ticket % static_cast<uint64_t>(q->capacity))];
+
+    const uint32_t flags = *((volatile const uint32_t*)&rec->flags);
+    const uint64_t seen_ticket = *((volatile const uint64_t*)&rec->queue_ticket);
+
+    if ((flags & kDispatchRecordFlagReady) == 0u) {
+        return false;
+    }
+    if (seen_ticket != ticket) {
+        return false;
+    }
+
+    *out = *rec;
+    return dispatch_record_is_valid(out);
+}
+
 __device__ __forceinline__ bool device_dispatch_queue_try_peek_head(
     const DeviceDispatchQueueHandle* q,
     DispatchRecord* out) {
