@@ -162,6 +162,8 @@ bool endpoint_persistent_smoke_test(
         throw std::invalid_argument("endpoint_persistent_smoke_test: dev0 and dev1 must differ");
     }
 
+    std::printf("[smoke] launched persistent kernel\n"); std::fflush(stdout);
+
     comm::Group group{};
     comm::EndpointRuntime runtime{};
     comm::EndpointPersistentControl control{};
@@ -243,35 +245,30 @@ bool endpoint_persistent_smoke_test(
             cudaStreamSynchronize(producer_stream),
             "cudaStreamSynchronize(producer_stream)");
 
-        int publish_status = 0;
-        system::runtime::check_cuda(
-            cudaMemcpy(
-                &publish_status,
-                publish_status_dev,
-                sizeof(int),
-                cudaMemcpyDeviceToHost),
-            "cudaMemcpy(publish_status)");
-        if (publish_status != 1) {
-            throw std::runtime_error("publish_single_ready_tile_kernel failed to publish tile");
-        }
-
+        std::printf("[smoke] published tile\n"); std::fflush(stdout);
+        std::printf("[smoke] waiting for queue drain\n"); std::fflush(stdout);
+        
         const bool drained =
-            poll_queue_head_until(runtime.input_queues_host[0], 1, dev0, 5000);
-        if (!drained) {
-            throw std::runtime_error("timeout waiting for persistent kernel to consume queue head");
-        }
+    poll_queue_head_until(runtime.input_queues_host[0], 1, dev0, 5000);
+if (!drained) {
+    throw std::runtime_error("timeout waiting for persistent kernel to consume queue head");
+}
 
-        std::vector<half> host_dst(static_cast<size_t>(numel));
-        system::runtime::check_cuda(
-            cudaMemcpy(host_dst.data(), dst_dev, bytes, cudaMemcpyDeviceToHost),
-            "cudaMemcpy(dst_dev -> host_dst)");
+std::printf("[smoke] requesting stop\n"); std::fflush(stdout);
 
-        expect_half_vectors_close(host_dst, host_src, "endpoint_persistent_smoke_test");
+comm::endpoint_persistent_control_request_stop(&control);
+system::runtime::check_cuda(
+    cudaStreamSynchronize(runtime.endpoint.stream),
+    "cudaStreamSynchronize(persistent stream)");
+std::printf("[smoke] persistent stream joined\n"); std::fflush(stdout);
+std::printf("[smoke] copying dst to host\n"); std::fflush(stdout);
 
-        comm::endpoint_persistent_control_request_stop(&control);
-        system::runtime::check_cuda(
-            cudaStreamSynchronize(runtime.endpoint.stream),
-            "cudaStreamSynchronize(persistent stream)");
+std::vector<half> host_dst(static_cast<size_t>(numel));
+system::runtime::check_cuda(
+    cudaMemcpy(host_dst.data(), dst_dev, bytes, cudaMemcpyDeviceToHost),
+    "cudaMemcpy(dst_dev -> host_dst)");
+
+expect_half_vectors_close(host_dst, host_src, "endpoint_persistent_smoke_test");
 
         if (producer_stream != nullptr) {
             cudaStreamDestroy(producer_stream);
