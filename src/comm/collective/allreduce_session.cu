@@ -1,4 +1,5 @@
 #include "comm/collective/allreduce_session.h"
+#include "comm/collective/allreduce_planner.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
 
@@ -298,6 +299,11 @@ void allreduce_session_destroy(
         }
     }
 
+    if (session->planner_initialized) {
+        allreduce_planner_destroy(&session->planner);
+        session->planner_initialized = false;
+    }
+
     session->group = nullptr;
     session->op_id = 0;
     session->reduce_kind = ReduceKind::kSum;
@@ -310,6 +316,9 @@ void allreduce_session_destroy(
     session->operation_window_table.entries.clear();
     session->completion_table.owner_rank = -1;
     session->completion_table.flag_buffers.clear();
+
+    session->planner = AllReducePlanner{};
+    session->planner_initialized = false;
 }
 
 void allreduce_session_reset_rank_queue(
@@ -330,6 +339,14 @@ void allreduce_session_reset_all_queues(
 
     for (uint32_t i = 0; i < session->operation_window_capacity; ++i) {
         reset_window_impl(session, i);
+    }
+
+    if (session->planner_initialized) {
+        allreduce_planner_destroy(&session->planner);
+        allreduce_planner_init(
+            &session->planner,
+            session,
+            session->group->channel_dispatch_chunk_bytes);
     }
 }
 
@@ -623,6 +640,177 @@ bool allreduce_session_resolve_physical_mapping(
     }
 
     return false;
+}
+
+namespace {
+
+TileState* find_tile_state_by_tile_id(
+    AllReduceSession* session,
+    uint32_t tile_id,
+    uint32_t* out_window_idx) {
+    if (session == nullptr) {
+        return nullptr;
+    }
+
+    for (uint32_t i = 0; i < session->tile_state_table.entries.size(); ++i) {
+        TileState& st = session->tile_state_table.entries[i];
+        if (st.op_id == session->op_id && st.tile_id == tile_id) {
+            if (out_window_idx != nullptr) {
+                *out_window_idx = i;
+            }
+            return &st;
+        }
+    }
+    return nullptr;
+}
+
+bool session_has_pending_published_tiles(
+    const AllReduceSession* session) {
+    if (session == nullptr || session->group == nullptr) {
+        return false;
+    }
+
+    for (int rank = 0; rank < session->group->world_size; ++rank) {
+        const PublishedTileQueue* q =
+            allreduce_session_get_published_tile_queue(session, rank);
+
+        const uint32_t head = read_u32_on_rank(
+            session->group->devices,
+            rank,
+            q->head_buffer.ptr,
+            "cudaMemcpy(read published queue head)");
+        const uint32_t tail = read_u32_on_rank(
+            session->group->devices,
+            rank,
+            q->tail_buffer.ptr,
+            "cudaMemcpy(read published queue tail)");
+
+        if (head < tail) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool session_has_inflight_incomplete_windows(
+    const AllReduceSession* session) {
+    if (session == nullptr) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < session->operation_window_table.entries.size(); ++i) {
+        const TileAccumulatorWindow& win =
+            session->operation_window_table.entries[i];
+        if (!win.in_use) {
+            continue;
+        }
+        if (!allreduce_session_window_is_complete(session, i)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+} // namespace
+
+bool allreduce_session_begin(
+    AllReduceSession* session,
+    Group* group,
+    uint64_t op_id,
+    uint32_t published_tile_capacity,
+    uint32_t operation_window_capacity,
+    size_t operation_window_bytes,
+    ReduceKind reduce_kind,
+    AllReducePhysicalDstKind physical_dst_kind,
+    size_t dispatch_chunk_bytes) {
+    if (!allreduce_session_init_with_window_pool(
+            session,
+            group,
+            op_id,
+            published_tile_capacity,
+            operation_window_capacity,
+            operation_window_bytes,
+            reduce_kind,
+            physical_dst_kind)) {
+        return false;
+    }
+
+    const size_t resolved_dispatch_chunk_bytes =
+        (dispatch_chunk_bytes != 0)
+            ? dispatch_chunk_bytes
+            : group->channel_dispatch_chunk_bytes;
+
+    allreduce_planner_init(
+        &session->planner,
+        session,
+        resolved_dispatch_chunk_bytes);
+    session->planner_initialized = true;
+    return true;
+}
+
+bool allreduce_session_progress(
+    AllReduceSession* session) {
+    if (session == nullptr || session->group == nullptr) {
+        throw std::invalid_argument("allreduce_session_progress: session/group is null");
+    }
+
+    if (!session->planner_initialized) {
+        allreduce_planner_init(
+            &session->planner,
+            session,
+            session->group->channel_dispatch_chunk_bytes);
+        session->planner_initialized = true;
+    }
+
+    return allreduce_planner_progress(&session->planner);
+}
+
+bool allreduce_session_wait_tile(
+    AllReduceSession* session,
+    uint32_t tile_id,
+    uint32_t* out_window_idx) {
+    if (session == nullptr || session->group == nullptr) {
+        throw std::invalid_argument("allreduce_session_wait_tile: session/group is null");
+    }
+
+    while (true) {
+        allreduce_session_progress(session);
+
+        uint32_t window_idx = kInvalidWindowIndex;
+        const TileState* st =
+            find_tile_state_by_tile_id(session, tile_id, &window_idx);
+
+        if (st != nullptr &&
+            st->complete &&
+            allreduce_session_window_is_complete(session, window_idx)) {
+            if (out_window_idx != nullptr) {
+                *out_window_idx = window_idx;
+            }
+            return true;
+        }
+    }
+}
+
+bool allreduce_session_wait_all(
+    AllReduceSession* session) {
+    if (session == nullptr || session->group == nullptr) {
+        throw std::invalid_argument("allreduce_session_wait_all: session/group is null");
+    }
+
+    while (true) {
+        allreduce_session_progress(session);
+
+        const bool pending_published =
+            session_has_pending_published_tiles(session);
+        const bool inflight_incomplete =
+            session_has_inflight_incomplete_windows(session);
+
+        if (!pending_published && !inflight_incomplete) {
+            return true;
+        }
+    }
 }
 
 } // namespace collective

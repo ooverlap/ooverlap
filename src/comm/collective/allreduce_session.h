@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "comm/collective/allreduce_mapping.h"
+#include "comm/collective/allreduce_planner.h"
 #include "comm/collective/device_session_handle.h"
 #include "comm/collective/operation_window.h"
 #include "comm/collective/published_tile.h"
@@ -30,6 +31,9 @@ struct AllReduceSession {
     TileStateTable tile_state_table;
     TileAccumulatorWindowTable operation_window_table;
     TileCompletionTable completion_table;
+
+    AllReducePlanner planner{};
+    bool planner_initialized = false;
 };
 
 bool allreduce_session_init(
@@ -48,6 +52,28 @@ bool allreduce_session_init_with_window_pool(
     size_t operation_window_bytes,
     ReduceKind reduce_kind = ReduceKind::kSum,
     AllReducePhysicalDstKind physical_dst_kind = AllReducePhysicalDstKind::kDirectFinal);
+
+bool allreduce_session_begin(
+    AllReduceSession* session,
+    Group* group,
+    uint64_t op_id,
+    uint32_t published_tile_capacity,
+    uint32_t operation_window_capacity = 0,
+    size_t operation_window_bytes = 0,
+    ReduceKind reduce_kind = ReduceKind::kSum,
+    AllReducePhysicalDstKind physical_dst_kind = AllReducePhysicalDstKind::kDirectFinal,
+    size_t dispatch_chunk_bytes = 0);
+
+bool allreduce_session_progress(
+    AllReduceSession* session);
+
+bool allreduce_session_wait_tile(
+    AllReduceSession* session,
+    uint32_t tile_id,
+    uint32_t* out_window_idx = nullptr);
+
+bool allreduce_session_wait_all(
+    AllReduceSession* session);
 
 void allreduce_session_destroy(
     AllReduceSession* session);

@@ -8,6 +8,7 @@
 
 #include "comm/transport/buffer.h"
 #include "comm/channel.h"
+#include "comm/channel_worker.h"
 #include "comm/endpoint.h"
 
 namespace ooverlap {
@@ -28,6 +29,7 @@ struct Group {
     size_t channel_dispatch_chunk_bytes = 0;
 
     std::vector<Channel> channels;
+    std::vector<ChannelWorker> channel_workers;
 
     std::vector<transport::CommBuffer> local_shard_buffers;
     std::vector<transport::CommBuffer> local_full_buffers;
@@ -59,6 +61,16 @@ Channel* group_get_channel(
     int dst_rank);
 
 const Channel* group_get_channel(
+    const Group* group,
+    int src_rank,
+    int dst_rank);
+
+ChannelWorker* group_get_channel_worker(
+    Group* group,
+    int src_rank,
+    int dst_rank);
+
+const ChannelWorker* group_get_channel_worker(
     const Group* group,
     int src_rank,
     int dst_rank);

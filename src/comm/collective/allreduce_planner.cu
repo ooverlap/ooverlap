@@ -1,4 +1,5 @@
 #include "comm/collective/allreduce_planner.h"
+#include "comm/collective/allreduce_session.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
 

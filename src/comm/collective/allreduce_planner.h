@@ -3,12 +3,13 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "comm/collective/allreduce_session.h"
 #include "comm/transport/dispatch_queue.h"
 
 namespace ooverlap {
 namespace comm {
 namespace collective {
+
+struct AllReduceSession;
 
 struct AllReducePlanner {
     AllReduceSession* session = nullptr;

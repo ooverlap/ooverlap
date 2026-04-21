@@ -1,4 +1,6 @@
 #include "comm/communicator.h"
+#include "comm/channel_worker.h"
+#include "comm/transport/control_plane.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
 
@@ -50,6 +52,7 @@ bool group_init(
     group->channel_dispatch_chunk_bytes = channel_dispatch_chunk_bytes;
 
     group->channels.resize(static_cast<size_t>(group->world_size * group->world_size));
+    group->channel_workers.resize(static_cast<size_t>(group->world_size * group->world_size));
     group->local_shard_buffers.resize(static_cast<size_t>(group->world_size));
     group->local_full_buffers.resize(static_cast<size_t>(group->world_size));
 
@@ -94,6 +97,9 @@ bool group_init(
                 ch.dispatch_queue_capacity = 0;
                 ch.dispatch_chunk_bytes = 0;
                 ch.slots.clear();
+                channel_worker_reset(
+                    &group->channel_workers[static_cast<size_t>(
+                        channel_index(group->world_size, src, dst))]);
                 continue;
             }
 
@@ -108,6 +114,12 @@ bool group_init(
                     src,
                     dst,
                     channel_dispatch_capacity);
+                transport::direct_reduce_control_init(
+                    group->devices,
+                    &ch.direct_control,
+                    dst,
+                    src,
+                    dst);
                 continue;
             }
 
@@ -128,6 +140,12 @@ bool group_init(
                 system::runtime::check_cuda(
                     cudaMemset(slot_ref.signal_buffer.ptr, 0, slot_ref.signal_buffer.bytes),
                     "cudaMemset(channel slot signal)");
+                transport::channel_slot_control_init(
+                    group->devices,
+                    &slot_ref.control,
+                    dst,
+                    src,
+                    slot_ref.slot_id);
             }
 
             transport::dispatch_queue_init(
@@ -138,6 +156,22 @@ bool group_init(
                 dst,
                 channel_dispatch_capacity);
         }
+
+        for (int src = 0; src < group->world_size; ++src) {
+        for (int dst = 0; dst < group->world_size; ++dst) {
+            if (src == dst) {
+                continue;
+            }
+
+            Channel* ch = group_get_channel(group, src, dst);
+            Endpoint* ep = group_get_endpoint(group, src);
+            ChannelWorker* worker =
+                &group->channel_workers[static_cast<size_t>(
+                    channel_index(group->world_size, src, dst))];
+
+            channel_worker_bind(worker, ep, ch);
+        }
+    }
     }
 
     return true;
@@ -153,9 +187,12 @@ void group_destroy(
         for (auto& slot : ch.slots) {
             free_comm_buffer(group->devices, slot.buffer);
             free_comm_buffer(group->devices, slot.signal_buffer);
+            transport::channel_slot_control_destroy(group->devices, &slot.control);
             slot.seq = 0;
             slot.slot_id = 0;
         }
+
+        transport::direct_reduce_control_destroy(group->devices, &ch.direct_control);
         ch.slots.clear();
         transport::dispatch_queue_destroy(group->devices, &ch.dispatch_queue);
         ch.dispatch_queue_capacity = 0;
@@ -182,6 +219,10 @@ void group_destroy(
         }
     }
 
+    for (auto& worker : group->channel_workers) {
+        channel_worker_reset(&worker);
+    }
+
     group->world_size = 0;
     group->devices.clear();
     group->streams.clear();
@@ -194,6 +235,7 @@ void group_destroy(
     group->channels.clear();
     group->local_shard_buffers.clear();
     group->local_full_buffers.clear();
+    group->channel_workers.clear();
 }
 
 Endpoint* group_get_endpoint(
@@ -244,6 +286,38 @@ const Channel* group_get_channel(
         return nullptr;
     }
     return &group->channels[static_cast<size_t>(channel_index(group->world_size, src_rank, dst_rank))];
+}
+
+ChannelWorker* group_get_channel_worker(
+    Group* group,
+    int src_rank,
+    int dst_rank) {
+    if (group == nullptr) {
+        throw std::invalid_argument("group_get_channel_worker: group is null");
+    }
+    validate_rank_or_throw(group->world_size, src_rank, "group_get_channel_worker: invalid src_rank");
+    validate_rank_or_throw(group->world_size, dst_rank, "group_get_channel_worker: invalid dst_rank");
+    if (src_rank == dst_rank) {
+        return nullptr;
+    }
+    return &group->channel_workers[static_cast<size_t>(
+        channel_index(group->world_size, src_rank, dst_rank))];
+}
+
+const ChannelWorker* group_get_channel_worker(
+    const Group* group,
+    int src_rank,
+    int dst_rank) {
+    if (group == nullptr) {
+        throw std::invalid_argument("group_get_channel_worker: group is null");
+    }
+    validate_rank_or_throw(group->world_size, src_rank, "group_get_channel_worker: invalid src_rank");
+    validate_rank_or_throw(group->world_size, dst_rank, "group_get_channel_worker: invalid dst_rank");
+    if (src_rank == dst_rank) {
+        return nullptr;
+    }
+    return &group->channel_workers[static_cast<size_t>(
+        channel_index(group->world_size, src_rank, dst_rank))];
 }
 
 transport::CommBuffer* group_get_local_shard_buffer(

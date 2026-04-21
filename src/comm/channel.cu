@@ -69,6 +69,30 @@ const transport::CommBuffer* channel_get_slot_signal_buffer(
     return &ch->slots[static_cast<size_t>(slot_idx)].signal_buffer;
 }
 
+transport::ChannelSlotControl* channel_get_slot_control(
+    Channel* ch,
+    int slot_idx) {
+    if (ch == nullptr) {
+        return nullptr;
+    }
+    if (slot_idx < 0 || slot_idx >= ch->num_slots) {
+        throw std::invalid_argument("channel_get_slot_control: invalid slot_idx");
+    }
+    return &ch->slots[static_cast<size_t>(slot_idx)].control;
+}
+
+const transport::ChannelSlotControl* channel_get_slot_control(
+    const Channel* ch,
+    int slot_idx) {
+    if (ch == nullptr) {
+        return nullptr;
+    }
+    if (slot_idx < 0 || slot_idx >= ch->num_slots) {
+        throw std::invalid_argument("channel_get_slot_control: invalid slot_idx");
+    }
+    return &ch->slots[static_cast<size_t>(slot_idx)].control;
+}
+
 transport::DispatchQueue* channel_get_dispatch_queue(
     Channel* ch) {
     if (ch == nullptr) {
@@ -83,6 +107,22 @@ const transport::DispatchQueue* channel_get_dispatch_queue(
         return nullptr;
     }
     return &ch->dispatch_queue;
+}
+
+transport::DirectReduceControlPlane* channel_get_direct_control(
+    Channel* ch) {
+    if (ch == nullptr) {
+        return nullptr;
+    }
+    return &ch->direct_control;
+}
+
+const transport::DirectReduceControlPlane* channel_get_direct_control(
+    const Channel* ch) {
+    if (ch == nullptr) {
+        return nullptr;
+    }
+    return &ch->direct_control;
 }
 
 } // namespace comm
