@@ -12,10 +12,11 @@
 #include "overlap/gemm_scatter_sm90_dispatch.h"
 
 #include "test/tma_collective_sm90.h"
-#include "test/tma_basic_collective_sm90.h"
+//#include "test/tma_basic_collective_sm90.h"
 #include "test/tma_vmm_smoke_test.h"
-#include "test/tma_benchmark_sm90.h"
-#include "test/persistent_allreduce_2gpu_sm90.h"
+//#include "test/tma_benchmark_sm90.h"
+//#include "test/persistent_allreduce_2gpu_sm90.h"
+#include "test/endpoint_persistent_smoke_test.h"
 
 namespace py = pybind11;
 
@@ -206,57 +207,64 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev1") = 1,
         "2-GPU same-process all-gather smoke test above bulk-TMA");
 
-  m.def("tma_basic_ngpu_reduce_scatter_smoke_test",
-        &ooverlap::tma_basic_ngpu_reduce_scatter_smoke_test,
-        py::arg("full_numel"),
-        py::arg("devices") = std::vector<int64_t>{},
-        "Basic same-process N-GPU reduce-scatter smoke test above bulk-TMA");
+  /*m.def("tma_basic_ngpu_reduce_scatter_smoke_test",*/
+        /*&ooverlap::tma_basic_ngpu_reduce_scatter_smoke_test,*/
+        /*py::arg("full_numel"),*/
+        /*py::arg("devices") = std::vector<int64_t>{},*/
+        /*"Basic same-process N-GPU reduce-scatter smoke test above bulk-TMA");*/
 
-  m.def("tma_basic_ngpu_all_gather_smoke_test",
-        &ooverlap::tma_basic_ngpu_all_gather_smoke_test,
-        py::arg("shard_numel"),
-        py::arg("devices") = std::vector<int64_t>{},
-        "Basic same-process N-GPU all-gather smoke test above bulk-TMA");
+  /*m.def("tma_basic_ngpu_all_gather_smoke_test",*/
+        /*&ooverlap::tma_basic_ngpu_all_gather_smoke_test,*/
+        /*py::arg("shard_numel"),*/
+        /*py::arg("devices") = std::vector<int64_t>{},*/
+        /*"Basic same-process N-GPU all-gather smoke test above bulk-TMA");*/
 
-  m.def("tma_basic_ngpu_all_reduce_smoke_test",
-        &ooverlap::tma_basic_ngpu_all_reduce_smoke_test,
-        py::arg("full_numel"),
-        py::arg("devices") = std::vector<int64_t>{},
-        "Basic same-process N-GPU all-reduce smoke test above bulk-TMA");
+  /*m.def("tma_basic_ngpu_all_reduce_smoke_test",*/
+        /*&ooverlap::tma_basic_ngpu_all_reduce_smoke_test,*/
+        /*py::arg("full_numel"),*/
+        /*py::arg("devices") = std::vector<int64_t>{},*/
+        /*"Basic same-process N-GPU all-reduce smoke test above bulk-TMA");*/
 
-  m.def("benchmark_2gpu_copy_sm90",
-        &ooverlap::benchmark_2gpu_copy_sm90,
+  /*m.def("benchmark_2gpu_copy_sm90",*/
+        /*&ooverlap::benchmark_2gpu_copy_sm90,*/
+        /*py::arg("numel"),*/
+        /*py::arg("iters"),*/
+        /*py::arg("warmup"),*/
+        /*py::arg("dev0") = 0,*/
+        /*py::arg("dev1") = 1,*/
+        /*"Benchmark 2-GPU bulk-TMA copy vs cudaMemcpyPeerAsync");*/
+
+  /*m.def("benchmark_basic_ngpu_collective_sm90",*/
+        /*&ooverlap::benchmark_basic_ngpu_collective_sm90,*/
+        /*py::arg("op"),*/
+        /*py::arg("numel"),*/
+        /*py::arg("devices"),*/
+        /*py::arg("iters"),*/
+        /*py::arg("warmup"),*/
+        /*"Benchmark basic same-process N-GPU collective vs NCCL");*/
+
+  /*m.def("tma_persistent_two_gpu_allreduce_smoke_test",*/
+        /*&ooverlap::tma_persistent_two_gpu_allreduce_smoke_test,*/
+        /*py::arg("numel"),*/
+        /*py::arg("dev0") = 0,*/
+        /*py::arg("dev1") = 1,*/
+        /*"Persistent 2-GPU all-reduce smoke test");*/
+
+  /*m.def("benchmark_persistent_two_gpu_allreduce_sm90",*/
+        /*&ooverlap::benchmark_persistent_two_gpu_allreduce_sm90,*/
+        /*py::arg("numel"),*/
+        /*py::arg("iters"),*/
+        /*py::arg("warmup"),*/
+        /*py::arg("dev0") = 0,*/
+        /*py::arg("dev1") = 1,*/
+        /*"Benchmark persistent 2-GPU all-reduce vs basic TMA vs NCCL");*/
+
+  m.def("endpoint_persistent_smoke_test",
+        &ooverlap::endpoint_persistent_smoke_test,
         py::arg("numel"),
-        py::arg("iters"),
-        py::arg("warmup"),
         py::arg("dev0") = 0,
         py::arg("dev1") = 1,
-        "Benchmark 2-GPU bulk-TMA copy vs cudaMemcpyPeerAsync");
-
-  m.def("benchmark_basic_ngpu_collective_sm90",
-        &ooverlap::benchmark_basic_ngpu_collective_sm90,
-        py::arg("op"),
-        py::arg("numel"),
-        py::arg("devices"),
-        py::arg("iters"),
-        py::arg("warmup"),
-        "Benchmark basic same-process N-GPU collective vs NCCL");
-
-  m.def("tma_persistent_two_gpu_allreduce_smoke_test",
-        &ooverlap::tma_persistent_two_gpu_allreduce_smoke_test,
-        py::arg("numel"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1,
-        "Persistent 2-GPU all-reduce smoke test");
-
-  m.def("benchmark_persistent_two_gpu_allreduce_sm90",
-        &ooverlap::benchmark_persistent_two_gpu_allreduce_sm90,
-        py::arg("numel"),
-        py::arg("iters"),
-        py::arg("warmup"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1,
-        "Benchmark persistent 2-GPU all-reduce vs basic TMA vs NCCL");
+        "Endpoint-runtime persistent-kernel smoke test");
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
