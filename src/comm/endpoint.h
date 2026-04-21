@@ -12,7 +12,9 @@ struct Endpoint {
 };
 
 inline bool endpoint_is_valid(const Endpoint& ep) {
-    return ep.rank >= 0 && ep.device >= 0 && ep.stream != nullptr;
+    return ep.rank >= 0 &&
+           ep.device >= 0 &&
+           ep.stream != nullptr;
 }
 
 } // namespace comm
