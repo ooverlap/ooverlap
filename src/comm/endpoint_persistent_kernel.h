@@ -14,7 +14,7 @@ namespace ooverlap {
 namespace comm {
 
 static constexpr int kEndpointPersistentWatchThreads = 16;
-static constexpr int kEndpointPersistentThreads = 128;
+static constexpr int kEndpointPersistentThreads = 1;
 static constexpr int kEndpointPersistentStageDepth = 3;
 static constexpr size_t kEndpointPersistentChunkBytes = 16 * 1024;
 

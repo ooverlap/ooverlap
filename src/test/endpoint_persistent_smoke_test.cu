@@ -173,6 +173,37 @@ bool poll_queue_head_until(
     }
 }
 
+__global__ void drain_once_kernel(
+    comm::DeviceEndpointRuntime runtime,
+    int* status_out) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    // status:
+    // 0 = not set
+    // 1 = no schedulable work
+    // 2 = primed current chunk
+    // 3 = advanced head successfully
+
+    
+    comm::exec::ChunkScheduler<1> sched{};
+comm::exec::chunk_scheduler_init<1>(
+    &sched,
+    runtime.scheduler_bindings,
+    runtime.num_scheduler_bindings,
+    comm::kEndpointPersistentChunkBytes);
+
+    if (!comm::exec::chunk_scheduler_try_prime_current(&sched)) {
+        *status_out = 1;
+        return;
+    }
+
+    *status_out = 2;
+    comm::exec::chunk_scheduler_advance(&sched);
+    *status_out = 3;
+}
+
 } // namespace
 
 bool endpoint_persistent_smoke_test(
@@ -193,6 +224,7 @@ bool endpoint_persistent_smoke_test(
     half* src_dev = nullptr;
     half* dst_dev = nullptr;
     int* publish_status_dev = nullptr;
+    int* drain_status_dev = nullptr;
     cudaStream_t producer_stream = nullptr;
 
     try {
@@ -216,6 +248,12 @@ system::runtime::check_cuda(
 system::runtime::check_cuda(cudaMalloc(&src_dev, bytes), "cudaMalloc(src_dev)");
 system::runtime::check_cuda(cudaMalloc(&dst_dev, bytes), "cudaMalloc(dst_dev)");
 system::runtime::check_cuda(cudaMalloc(&publish_status_dev, sizeof(int)), "cudaMalloc(publish_status_dev)");
+system::runtime::check_cuda(
+    cudaMalloc(&drain_status_dev, sizeof(int)),
+    "cudaMalloc(drain_status_dev)");
+system::runtime::check_cuda(
+    cudaMemset(drain_status_dev, 0, sizeof(int)),
+    "cudaMemset(drain_status_dev)");
 
 system::runtime::check_cuda(
     cudaMemcpy(src_dev, host_src.data(), bytes, cudaMemcpyHostToDevice),
@@ -274,6 +312,37 @@ system::runtime::check_cuda(
     "cudaStreamSynchronize(producer_stream)");
 
 std::printf("[smoke] after producer sync\n"); std::fflush(stdout);        
+print_queue_head_tail(runtime.input_queues_host[0], "[smoke] queue after publish");
+
+std::printf("[smoke] before drain_once launch\n"); std::fflush(stdout);
+drain_once_kernel<<<1, 1, 0, producer_stream>>>(
+    runtime.device,
+    drain_status_dev);
+system::runtime::check_cuda(
+    cudaGetLastError(),
+    "drain_once_kernel");
+
+system::runtime::check_cuda(
+    cudaStreamSynchronize(producer_stream),
+    "cudaStreamSynchronize(drain_once)");
+
+std::printf("[smoke] after drain_once sync\n"); std::fflush(stdout);
+print_queue_head_tail(runtime.input_queues_host[0], "[smoke] queue after drain_once");
+
+int drain_status = 0;
+system::runtime::check_cuda(
+    cudaMemcpy(
+        &drain_status,
+        drain_status_dev,
+        sizeof(int),
+        cudaMemcpyDeviceToHost),
+    "cudaMemcpy(drain_status)");
+
+std::printf("[smoke] drain status=%d\n", drain_status); std::fflush(stdout);
+
+if (drain_status != 3) {
+    throw std::runtime_error("drain_once_kernel did not consume the published tile");
+}
         std::printf("[smoke] published tile\n"); std::fflush(stdout);
         std::printf("[smoke] waiting for queue drain\n"); std::fflush(stdout);
         

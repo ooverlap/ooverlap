@@ -134,6 +134,7 @@ __global__ void endpoint_persistent_kernel_sm90(
         __syncthreads();
 
         // Debug mode: consume the work without pipeline/TMA.
+        
         exec::chunk_scheduler_advance(&scheduler);
 
         __syncthreads();
