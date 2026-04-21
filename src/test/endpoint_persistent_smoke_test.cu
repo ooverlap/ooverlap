@@ -260,13 +260,10 @@ system::runtime::check_cuda(
     "launch_endpoint_persistent_kernel_sm90");
 std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
 
-std::printf("[smoke] waiting for queue drain\n"); std::fflush(stdout);
-const bool drained =
-    poll_queue_head_until(runtime.input_queues_host[0], 1, dev0, 5000);
-if (!drained) {
-    throw std::runtime_error(
-        "timeout waiting for persistent kernel to consume queue head");
-}
+persistent_launched = true;
+
+std::printf("[smoke] letting persistent kernel run\n"); std::fflush(stdout);
+std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
 std::printf("[smoke] requesting stop\n"); std::fflush(stdout);
 comm::endpoint_persistent_control_request_stop(&control);
@@ -275,6 +272,30 @@ system::runtime::check_cuda(
     cudaStreamSynchronize(runtime.endpoint.stream),
     "cudaStreamSynchronize(persistent stream)");
 std::printf("[smoke] persistent stream joined\n"); std::fflush(stdout);
+
+uint64_t head = 0;
+uint64_t tail = 0;
+system::runtime::check_cuda(
+    cudaMemcpy(&head,
+               runtime.input_queues_host[0].head,
+               sizeof(uint64_t),
+               cudaMemcpyDeviceToHost),
+    "cudaMemcpy(queue head after persistent)");
+system::runtime::check_cuda(
+    cudaMemcpy(&tail,
+               runtime.input_queues_host[0].tail,
+               sizeof(uint64_t),
+               cudaMemcpyDeviceToHost),
+    "cudaMemcpy(queue tail after persistent)");
+
+std::printf("[smoke] queue after persistent head=%llu tail=%llu\n",
+            static_cast<unsigned long long>(head),
+            static_cast<unsigned long long>(tail));
+std::fflush(stdout);
+
+if (head != 1 || tail != 1) {
+    throw std::runtime_error("persistent kernel did not consume exactly one published tile");
+}
 
         std::printf("[smoke] copying dst to host\n"); std::fflush(stdout);
         std::vector<half> host_dst(static_cast<size_t>(numel));
