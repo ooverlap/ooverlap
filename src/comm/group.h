@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "comm/buffer.h"
+#include "comm/transport/buffer.h"
 #include "comm/channel.h"
 #include "comm/endpoint.h"
 
@@ -31,8 +31,8 @@ struct Group {
     std::vector<Channel> channels;
 
     // Local, device-owned scratch buffers.
-    std::vector<CommBuffer> local_shard_buffers;
-    std::vector<CommBuffer> local_full_buffers;
+    std::vector<transport::CommBuffer> local_shard_buffers;
+    std::vector<transport::CommBuffer> local_full_buffers;
 };
 
 bool group_init(
@@ -63,19 +63,19 @@ const Channel* group_get_channel(
     int src_rank,
     int dst_rank);
 
-CommBuffer* group_get_local_shard_buffer(
+transport::CommBuffer* group_get_local_shard_buffer(
     Group* group,
     int rank);
 
-const CommBuffer* group_get_local_shard_buffer(
+const transport::CommBuffer* group_get_local_shard_buffer(
     const Group* group,
     int rank);
 
-CommBuffer* group_get_local_full_buffer(
+transport::CommBuffer* group_get_local_full_buffer(
     Group* group,
     int rank);
 
-const CommBuffer* group_get_local_full_buffer(
+const transport::CommBuffer* group_get_local_full_buffer(
     const Group* group,
     int rank);
 

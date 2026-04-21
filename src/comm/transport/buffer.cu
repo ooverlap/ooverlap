@@ -1,4 +1,4 @@
-#include "comm/buffer.h"
+#include "comm/transport/buffer.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/system/peer_buffer.cuh"
@@ -10,6 +10,7 @@
 
 namespace ooverlap {
 namespace comm {
+namespace transport {
 
 CommBuffer alloc_peer_visible_buffer_for_rank(
     const std::vector<int>& devices,
@@ -77,5 +78,6 @@ void free_comm_buffer(
     buf.peer_visible = false;
 }
 
+} // namespace transport
 } // namespace comm
 } // namespace ooverlap

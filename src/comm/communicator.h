@@ -42,43 +42,43 @@ const CommChannel* communicator_get_channel(
     int src_rank,
     int dst_rank);
 
-CommBuffer* channel_get_slot_buffer(
+transport::CommBuffer* channel_get_slot_buffer(
     Communicator* comm,
     int src_rank,
     int dst_rank,
     int slot_idx);
 
-const CommBuffer* channel_get_slot_buffer(
+const transport::CommBuffer* channel_get_slot_buffer(
     const Communicator* comm,
     int src_rank,
     int dst_rank,
     int slot_idx);
 
-CommBuffer* channel_get_slot_signal_buffer(
+transport::CommBuffer* channel_get_slot_signal_buffer(
     Communicator* comm,
     int src_rank,
     int dst_rank,
     int slot_idx);
 
-const CommBuffer* channel_get_slot_signal_buffer(
+const transport::CommBuffer* channel_get_slot_signal_buffer(
     const Communicator* comm,
     int src_rank,
     int dst_rank,
     int slot_idx);
 
-CommBuffer* communicator_get_local_shard_buffer(
+transport::CommBuffer* communicator_get_local_shard_buffer(
     Communicator* comm,
     int rank);
 
-const CommBuffer* communicator_get_local_shard_buffer(
+const transport::CommBuffer* communicator_get_local_shard_buffer(
     const Communicator* comm,
     int rank);
 
-CommBuffer* communicator_get_local_full_buffer(
+transport::CommBuffer* communicator_get_local_full_buffer(
     Communicator* comm,
     int rank);
 
-const CommBuffer* communicator_get_local_full_buffer(
+const transport::CommBuffer* communicator_get_local_full_buffer(
     const Communicator* comm,
     int rank);
 

@@ -9,6 +9,7 @@
 
 namespace ooverlap {
 namespace comm {
+namespace exec {
 
 enum class ChunkOpKind : uint8_t {
     kInvalid = 0,
@@ -110,5 +111,6 @@ __host__ __device__ __forceinline__ bool chunk_make_from_span(
     return true;
 }
 
+} // namespace exec
 } // namespace comm
 } // namespace ooverlap

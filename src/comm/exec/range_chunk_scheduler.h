@@ -1,9 +1,10 @@
 #pragma once
 
-#include "comm/chunk.h"
+#include "comm/exec/chunk.h"
 
 namespace ooverlap {
 namespace comm {
+namespace exec {
 
 struct RangeChunkScheduler {
     const unsigned char* src_base = nullptr;
@@ -154,5 +155,6 @@ __host__ __device__ __forceinline__ void chunk_scheduler_advance(
     }
 }
 
+} // namespace exec
 } // namespace comm
 } // namespace ooverlap

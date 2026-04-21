@@ -3,8 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "comm/chunk.h"
 #include "comm/collective/published_tile.h"
+#include "comm/exec/chunk.h"
+#include "comm/utils.h"
 
 namespace ooverlap {
 namespace comm {
@@ -47,7 +48,7 @@ struct ChunkTask {
     int chunk_idx = -1;
     int num_chunks = 0;
 
-    ChunkOpKind op = ChunkOpKind::kInvalid;
+    exec::ChunkOpKind op = exec::ChunkOpKind::kInvalid;
 };
 
 __host__ __device__ __forceinline__ void tile_state_clear(
@@ -147,7 +148,7 @@ __host__ __device__ __forceinline__ void chunk_task_clear(
     task->publish_ticket = 0;
     task->chunk_idx = -1;
     task->num_chunks = 0;
-    task->op = ChunkOpKind::kInvalid;
+    task->op = exec::ChunkOpKind::kInvalid;
 }
 
 __host__ __device__ __forceinline__ bool chunk_task_is_valid(
@@ -161,7 +162,7 @@ __host__ __device__ __forceinline__ bool chunk_task_is_valid(
            task->bytes > 0 &&
            task->chunk_idx >= 0 &&
            task->num_chunks > 0 &&
-           task->op != ChunkOpKind::kInvalid;
+           task->op != exec::ChunkOpKind::kInvalid;
 }
 
 __host__ __device__ __forceinline__ bool chunk_task_make_from_published_tile(
@@ -205,14 +206,14 @@ __host__ __device__ __forceinline__ bool chunk_task_make_from_published_tile(
     out->publish_ticket = tile->publish_ticket;
     out->chunk_idx = chunk_idx;
     out->num_chunks = num_chunks;
-    out->op = ChunkOpKind::kReduceAddNoFtzF16;
+    out->op = exec::ChunkOpKind::kReduceAddNoFtzF16;
     return true;
 }
 
 __host__ __device__ __forceinline__ void chunk_task_to_exec_chunk(
     const ChunkTask* task,
-    Chunk* out) {
-    chunk_clear(out);
+    exec::Chunk* out) {
+    exec::chunk_clear(out);
     if (!chunk_task_is_valid(task)) {
         return;
     }

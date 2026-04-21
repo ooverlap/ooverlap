@@ -1,12 +1,13 @@
 #pragma once
 
-#include "comm/pipeline_stage.h"
+#include "comm/exec/pipeline_stage.h"
 #include "ooverlap/tma/tma.cuh"
 
 #include <cstdint>
 
 namespace ooverlap {
 namespace comm {
+namespace exec {
 
 struct PipelineTMALoad {
     __device__ __forceinline__ void issue(
@@ -28,5 +29,6 @@ struct PipelineTMALoad {
     }
 };
 
+} // namespace exec
 } // namespace comm
 } // namespace ooverlap

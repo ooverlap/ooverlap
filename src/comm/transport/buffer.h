@@ -8,6 +8,7 @@
 
 namespace ooverlap {
 namespace comm {
+namespace transport {
 
 struct CommBuffer {
     void* ptr = nullptr;
@@ -46,8 +47,6 @@ inline const uint64_t* buffer_as_u64(const CommBuffer* buf) {
     return reinterpret_cast<const uint64_t*>(buf->ptr);
 }
 
-// Compatibility alias for current code.
-using Buffer = CommBuffer;
-
+} // namespace transport
 } // namespace comm
 } // namespace ooverlap

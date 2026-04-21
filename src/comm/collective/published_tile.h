@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "comm/buffer.h"
+#include "comm/transport/buffer.h"
 
 namespace ooverlap {
 namespace comm {
@@ -36,10 +36,10 @@ struct PublishedTile {
 };
 
 struct PublishedTileQueue {
-    CommBuffer records_buffer;
-    CommBuffer head_buffer;      // optional consumer cursor / dequeue progress
-    CommBuffer tail_buffer;      // producer reservation cursor
-    CommBuffer overflow_buffer;  // non-zero if producer ran out of queue space
+    transport::CommBuffer records_buffer;
+    transport::CommBuffer head_buffer;
+    transport::CommBuffer tail_buffer;
+    transport::CommBuffer overflow_buffer;
 
     uint32_t capacity = 0;
     int owner_rank = -1;

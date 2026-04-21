@@ -1,13 +1,15 @@
 #pragma once
 
-#include "comm/work_queue.h"
+#include "comm/transport/work_queue.h"
+#include "comm/exec/chunk.h"
 
 namespace ooverlap {
 namespace comm {
+namespace exec {
 
 template <int QueueCapacity>
 struct ChunkScheduler {
-    WorkQueue<QueueCapacity>* queue = nullptr;
+    transport::WorkQueue<QueueCapacity>* queue = nullptr;
     size_t chunk_bytes = 0;
 
     bool has_active_span = false;
@@ -36,7 +38,7 @@ __host__ __device__ __forceinline__ void chunk_scheduler_reset(
 template <int QueueCapacity>
 __host__ __device__ __forceinline__ void chunk_scheduler_init(
     ChunkScheduler<QueueCapacity>* sched,
-    WorkQueue<QueueCapacity>* queue,
+    transport::WorkQueue<QueueCapacity>* queue,
     size_t chunk_bytes) {
     sched->queue = queue;
     sched->chunk_bytes = chunk_bytes;
@@ -188,5 +190,6 @@ __device__ __forceinline__ void chunk_scheduler_advance(
     chunk_scheduler_try_prime_current(sched);
 }
 
+} // namespace exec
 } // namespace comm
 } // namespace ooverlap

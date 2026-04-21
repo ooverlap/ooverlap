@@ -21,7 +21,7 @@ void validate_rank_or_throw(
     }
 }
 
-CommBuffer* channel_get_slot_buffer(
+transport::CommBuffer* channel_get_slot_buffer(
     CommChannel* ch,
     int slot_idx) {
     if (ch == nullptr) {
@@ -33,7 +33,7 @@ CommBuffer* channel_get_slot_buffer(
     return &ch->slots[static_cast<size_t>(slot_idx)].buffer;
 }
 
-const CommBuffer* channel_get_slot_buffer(
+const transport::CommBuffer* channel_get_slot_buffer(
     const CommChannel* ch,
     int slot_idx) {
     if (ch == nullptr) {
@@ -45,7 +45,7 @@ const CommBuffer* channel_get_slot_buffer(
     return &ch->slots[static_cast<size_t>(slot_idx)].buffer;
 }
 
-CommBuffer* channel_get_slot_signal_buffer(
+transport::CommBuffer* channel_get_slot_signal_buffer(
     CommChannel* ch,
     int slot_idx) {
     if (ch == nullptr) {
@@ -57,7 +57,7 @@ CommBuffer* channel_get_slot_signal_buffer(
     return &ch->slots[static_cast<size_t>(slot_idx)].signal_buffer;
 }
 
-const CommBuffer* channel_get_slot_signal_buffer(
+const transport::CommBuffer* channel_get_slot_signal_buffer(
     const CommChannel* ch,
     int slot_idx) {
     if (ch == nullptr) {

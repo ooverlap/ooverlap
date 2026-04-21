@@ -1,12 +1,13 @@
 #pragma once
 
-#include "comm/chunk.h"
+#include "comm/exec/chunk.h"
 
 #include <cuda_runtime.h>
 #include <cstdint>
 
 namespace ooverlap {
 namespace comm {
+namespace transport {
 
 enum class WorkQueueSlotState : int {
     kFree = 0,
@@ -16,7 +17,7 @@ enum class WorkQueueSlotState : int {
 
 template <int Capacity>
 struct WorkQueueSlot {
-    WorkSpan span{};
+    exec::WorkSpan span{};
     uint64_t ticket = 0;
     int state = static_cast<int>(WorkQueueSlotState::kFree);
 };
@@ -43,7 +44,7 @@ __host__ __device__ __forceinline__ void work_queue_reset(
 template <int Capacity>
 __device__ __forceinline__ uint64_t work_queue_push_blocking(
     WorkQueue<Capacity>* queue,
-    const WorkSpan* span) {
+    const exec::WorkSpan* span) {
     const uint64_t ticket =
         static_cast<uint64_t>(atomicAdd(reinterpret_cast<unsigned long long*>(&queue->tail_ticket), 1ULL));
 
@@ -68,7 +69,7 @@ template <int Capacity>
 __device__ __forceinline__ bool work_queue_try_peek_ticket(
     const WorkQueue<Capacity>* queue,
     uint64_t ticket,
-    WorkSpan* out) {
+    exec::WorkSpan* out) {
     if (out == nullptr) {
         return false;
     }
@@ -94,7 +95,7 @@ __device__ __forceinline__ bool work_queue_try_peek_ticket(
 template <int Capacity>
 __device__ __forceinline__ bool work_queue_try_peek_head(
     const WorkQueue<Capacity>* queue,
-    WorkSpan* out,
+    exec::WorkSpan* out,
     uint64_t* ticket_out) {
     if (queue == nullptr || out == nullptr || ticket_out == nullptr) {
         return false;
@@ -124,5 +125,6 @@ __device__ __forceinline__ void work_queue_release_head(
     queue->head_ticket = ticket + 1;
 }
 
+} // namespace transport
 } // namespace comm
 } // namespace ooverlap

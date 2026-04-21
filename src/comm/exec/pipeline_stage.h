@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/chunk.h"
+#include "comm/exec/chunk.h"
 #include "ooverlap/sync/sync.cuh"
 
 #include <cstddef>
@@ -8,6 +8,7 @@
 
 namespace ooverlap {
 namespace comm {
+namespace exec {
 
 struct PipelineStage {
     unsigned char* smem = nullptr;
@@ -47,5 +48,6 @@ __host__ __device__ __forceinline__ void pipeline_stage_set_chunk(
     stage->chunk = *chunk;
 }
 
+} // namespace exec
 } // namespace comm
 } // namespace ooverlap

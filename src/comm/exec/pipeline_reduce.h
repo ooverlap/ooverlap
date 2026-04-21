@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/pipeline_stage.h"
+#include "comm/exec/pipeline_stage.h"
 #include "ooverlap/tma/tma_reduce.cuh"
 
 #include <cuda_fp16.h>
@@ -9,6 +9,7 @@
 
 namespace ooverlap {
 namespace comm {
+namespace exec {
 
 struct PipelineTMAReduceAddNoFtzF16 {
     template <int StageDepth>
@@ -53,5 +54,6 @@ struct PipelineTMAReduceAddNoFtzF16 {
     }
 };
 
+} // namespace exec
 } // namespace comm
 } // namespace ooverlap

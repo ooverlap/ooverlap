@@ -1,12 +1,11 @@
 #pragma once
 
-#include "comm/chunk_scheduler.h"
-#include "comm/pipeline_stage.h"
-#include "comm/pipeline_load.h"
-#include "comm/pipeline_reduce.h"
+#include "comm/exec/chunk_scheduler.h"
+#include "comm/exec/pipeline_stage.h"
 
 namespace ooverlap {
 namespace comm {
+namespace exec {
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ReduceOp>
 struct ChunkPipeline {
@@ -142,5 +141,6 @@ __device__ __forceinline__ void chunk_pipeline_advance(
     }
 }
 
+} // namespace exec
 } // namespace comm
 } // namespace ooverlap

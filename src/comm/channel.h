@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/buffer.h"
+#include "comm/transport/buffer.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -15,8 +15,8 @@ enum class ChannelMode : uint8_t {
 };
 
 struct ChannelSlot {
-    CommBuffer buffer;
-    CommBuffer signal_buffer;   // uint64_t flag/sequence storage, peer-visible
+    transport::CommBuffer buffer;
+    transport::CommBuffer signal_buffer;   // uint64_t flag/sequence storage, peer-visible
     uint64_t seq = 0;
     uint32_t slot_id = 0;
 };
@@ -44,19 +44,19 @@ void validate_rank_or_throw(
     int rank,
     const char* what);
 
-CommBuffer* channel_get_slot_buffer(
+transport::CommBuffer* channel_get_slot_buffer(
     Channel* ch,
     int slot_idx);
 
-const CommBuffer* channel_get_slot_buffer(
+const transport::CommBuffer* channel_get_slot_buffer(
     const Channel* ch,
     int slot_idx);
 
-CommBuffer* channel_get_slot_signal_buffer(
+transport::CommBuffer* channel_get_slot_signal_buffer(
     Channel* ch,
     int slot_idx);
 
-const CommBuffer* channel_get_slot_signal_buffer(
+const transport::CommBuffer* channel_get_slot_signal_buffer(
     const Channel* ch,
     int slot_idx);
 

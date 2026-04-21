@@ -68,9 +68,9 @@ bool group_init(
 
     for (int rank = 0; rank < group->world_size; ++rank) {
         group->local_shard_buffers[rank] =
-            alloc_local_buffer_for_rank(group->devices, rank, shard_bytes);
+            transport::alloc_local_buffer_for_rank(group->devices, rank, shard_bytes);
         group->local_full_buffers[rank] =
-            alloc_local_buffer_for_rank(group->devices, rank, full_bytes);
+            transport::alloc_local_buffer_for_rank(group->devices, rank, full_bytes);
     }
 
     for (int src = 0; src < group->world_size; ++src) {
@@ -105,9 +105,9 @@ bool group_init(
                 ChannelSlot& slot_ref = ch.slots[static_cast<size_t>(slot)];
                 slot_ref.slot_id = static_cast<uint32_t>(slot);
                 slot_ref.buffer =
-                    alloc_peer_visible_buffer_for_rank(group->devices, dst, shard_bytes);
+                    transport::alloc_peer_visible_buffer_for_rank(group->devices, dst, shard_bytes);
                 slot_ref.signal_buffer =
-                    alloc_peer_visible_buffer_for_rank(group->devices, dst, signal_bytes);
+                    transport::alloc_peer_visible_buffer_for_rank(group->devices, dst, signal_bytes);
                 slot_ref.seq = 0;
 
                 system::runtime::set_device(group->devices[dst]);
@@ -219,7 +219,7 @@ const Channel* group_get_channel(
     return &group->channels[static_cast<size_t>(channel_index(group->world_size, src_rank, dst_rank))];
 }
 
-CommBuffer* group_get_local_shard_buffer(
+transport::CommBuffer* group_get_local_shard_buffer(
     Group* group,
     int rank) {
     if (group == nullptr) {
@@ -229,7 +229,7 @@ CommBuffer* group_get_local_shard_buffer(
     return &group->local_shard_buffers[static_cast<size_t>(rank)];
 }
 
-const CommBuffer* group_get_local_shard_buffer(
+const transport::CommBuffer* group_get_local_shard_buffer(
     const Group* group,
     int rank) {
     if (group == nullptr) {
@@ -239,7 +239,7 @@ const CommBuffer* group_get_local_shard_buffer(
     return &group->local_shard_buffers[static_cast<size_t>(rank)];
 }
 
-CommBuffer* group_get_local_full_buffer(
+transport::CommBuffer* group_get_local_full_buffer(
     Group* group,
     int rank) {
     if (group == nullptr) {
@@ -249,7 +249,7 @@ CommBuffer* group_get_local_full_buffer(
     return &group->local_full_buffers[static_cast<size_t>(rank)];
 }
 
-const CommBuffer* group_get_local_full_buffer(
+const transport::CommBuffer* group_get_local_full_buffer(
     const Group* group,
     int rank) {
     if (group == nullptr) {
@@ -295,7 +295,7 @@ const CommChannel* communicator_get_channel(
     return group_get_channel(comm, src_rank, dst_rank);
 }
 
-CommBuffer* channel_get_slot_buffer(
+transport::CommBuffer* channel_get_slot_buffer(
     Communicator* comm,
     int src_rank,
     int dst_rank,
@@ -304,7 +304,7 @@ CommBuffer* channel_get_slot_buffer(
     return ooverlap::comm::channel_get_slot_buffer(ch, slot_idx);
 }
 
-const CommBuffer* channel_get_slot_buffer(
+const transport::CommBuffer* channel_get_slot_buffer(
     const Communicator* comm,
     int src_rank,
     int dst_rank,
@@ -313,7 +313,7 @@ const CommBuffer* channel_get_slot_buffer(
     return ooverlap::comm::channel_get_slot_buffer(ch, slot_idx);
 }
 
-CommBuffer* channel_get_slot_signal_buffer(
+transport::CommBuffer* channel_get_slot_signal_buffer(
     Communicator* comm,
     int src_rank,
     int dst_rank,
@@ -322,7 +322,7 @@ CommBuffer* channel_get_slot_signal_buffer(
     return ooverlap::comm::channel_get_slot_signal_buffer(ch, slot_idx);
 }
 
-const CommBuffer* channel_get_slot_signal_buffer(
+const transport::CommBuffer* channel_get_slot_signal_buffer(
     const Communicator* comm,
     int src_rank,
     int dst_rank,
@@ -331,25 +331,25 @@ const CommBuffer* channel_get_slot_signal_buffer(
     return ooverlap::comm::channel_get_slot_signal_buffer(ch, slot_idx);
 }
 
-CommBuffer* communicator_get_local_shard_buffer(
+transport::CommBuffer* communicator_get_local_shard_buffer(
     Communicator* comm,
     int rank) {
     return group_get_local_shard_buffer(comm, rank);
 }
 
-const CommBuffer* communicator_get_local_shard_buffer(
+const transport::CommBuffer* communicator_get_local_shard_buffer(
     const Communicator* comm,
     int rank) {
     return group_get_local_shard_buffer(comm, rank);
 }
 
-CommBuffer* communicator_get_local_full_buffer(
+transport::CommBuffer* communicator_get_local_full_buffer(
     Communicator* comm,
     int rank) {
     return group_get_local_full_buffer(comm, rank);
 }
 
-const CommBuffer* communicator_get_local_full_buffer(
+const transport::CommBuffer* communicator_get_local_full_buffer(
     const Communicator* comm,
     int rank) {
     return group_get_local_full_buffer(comm, rank);
