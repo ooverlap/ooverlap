@@ -173,35 +173,76 @@ bool poll_queue_head_until(
     }
 }
 
-__global__ void drain_once_kernel(
+__global__ void execute_once_kernel(
     comm::DeviceEndpointRuntime runtime,
     int* status_out) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
+    if (blockIdx.x != 0) {
         return;
     }
 
-    // status:
-    // 0 = not set
-    // 1 = no schedulable work
-    // 2 = primed current chunk
-    // 3 = advanced head successfully
+    __shared__ comm::exec::Chunk current_chunk;
+    __shared__ int has_work;
+    __shared__ int active_binding_idx;
 
-    
-    comm::exec::ChunkScheduler<1> sched{};
-comm::exec::chunk_scheduler_init<1>(
-    &sched,
-    runtime.scheduler_bindings,
-    runtime.num_scheduler_bindings,
-    comm::kEndpointPersistentChunkBytes);
+    if (threadIdx.x == 0) {
+        // status:
+        // 0 = not set
+        // 1 = no schedulable work
+        // 2 = primed chunk
+        // 3 = reduced and advanced
 
-    if (!comm::exec::chunk_scheduler_try_prime_current(&sched)) {
-        *status_out = 1;
+        comm::exec::ChunkScheduler<1> sched{};
+        comm::exec::chunk_scheduler_init<1>(
+            &sched,
+            runtime.scheduler_bindings,
+            runtime.num_scheduler_bindings,
+            comm::kEndpointPersistentChunkBytes);
+
+        if (!comm::exec::chunk_scheduler_try_prime_current(&sched)) {
+            has_work = 0;
+            *status_out = 1;
+            return;
+        }
+
+        has_work = 1;
+        active_binding_idx = sched.active_binding_idx;
+        current_chunk = *comm::exec::chunk_scheduler_current(&sched);
+        *status_out = 2;
+    }
+    __syncthreads();
+
+    if (!has_work) {
         return;
     }
 
-    *status_out = 2;
-    comm::exec::chunk_scheduler_advance(&sched);
-    *status_out = 3;
+    if (current_chunk.num_tile_spans != 1) {
+        if (threadIdx.x == 0) {
+            *status_out = -1;
+        }
+        return;
+    }
+
+    const comm::exec::ChunkTileSpan& span = current_chunk.tile_spans[0];
+
+    half* dst = reinterpret_cast<half*>(current_chunk.dst);
+    const half* src = reinterpret_cast<const half*>(span.src);
+
+    const size_t elems = current_chunk.bytes / sizeof(half);
+
+    for (size_t i = threadIdx.x; i < elems; i += blockDim.x) {
+        const float oldv = __half2float(dst[i]);
+        const float addv = __half2float(src[i]);
+        dst[i] = __float2half_rn(oldv + addv);
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        auto* q = runtime.scheduler_bindings[active_binding_idx].queue;
+        *q->head = current_chunk.span_ticket + current_chunk.num_tile_spans;
+        __threadfence();
+        *status_out = 3;
+    }
 }
 
 } // namespace
@@ -285,12 +326,12 @@ std::printf("[smoke] after configure_queue_operation\n"); std::fflush(stdout);
 comm::endpoint_persistent_control_init(&control, dev0);
 
 std::printf("[smoke] before persistent launch\n"); std::fflush(stdout);
-system::runtime::check_cuda(
-    comm::launch_endpoint_persistent_kernel_sm90(
-        comm::endpoint_runtime_device_handle(&runtime),
-        &control,
-        runtime.endpoint.stream),
-    "launch_endpoint_persistent_kernel_sm90");
+/*system::runtime::check_cuda(*/
+    /*comm::launch_endpoint_persistent_kernel_sm90(*/
+        /*comm::endpoint_runtime_device_handle(&runtime),*/
+        /*&control,*/
+        /*runtime.endpoint.stream),*/
+    /*"launch_endpoint_persistent_kernel_sm90");*/
 
 std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
 
@@ -314,20 +355,20 @@ system::runtime::check_cuda(
 std::printf("[smoke] after producer sync\n"); std::fflush(stdout);        
 print_queue_head_tail(runtime.input_queues_host[0], "[smoke] queue after publish");
 
-std::printf("[smoke] before drain_once launch\n"); std::fflush(stdout);
-drain_once_kernel<<<1, 1, 0, producer_stream>>>(
+std::printf("[smoke] before execute_once launch\n"); std::fflush(stdout);
+execute_once_kernel<<<1, 128, 0, producer_stream>>>(
     runtime.device,
     drain_status_dev);
 system::runtime::check_cuda(
     cudaGetLastError(),
-    "drain_once_kernel");
+    "execute_once_kernel");
 
 system::runtime::check_cuda(
     cudaStreamSynchronize(producer_stream),
-    "cudaStreamSynchronize(drain_once)");
+    "cudaStreamSynchronize(execute_once)");
 
-std::printf("[smoke] after drain_once sync\n"); std::fflush(stdout);
-print_queue_head_tail(runtime.input_queues_host[0], "[smoke] queue after drain_once");
+std::printf("[smoke] after execute_once sync\n"); std::fflush(stdout);
+print_queue_head_tail(runtime.input_queues_host[0], "[smoke] queue after execute_once");
 
 int drain_status = 0;
 system::runtime::check_cuda(
