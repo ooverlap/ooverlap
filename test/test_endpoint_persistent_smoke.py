@@ -27,6 +27,8 @@ def main():
     assert torch.cuda.device_count() >= 2, "Need at least 2 GPUs"
 
     ext = load_ooverlap_ext()
+    print("loaded extension")
+    print("calling smoke test")
     ok = ext.endpoint_persistent_smoke_test(
         int(args.numel),
         int(args.dev0),

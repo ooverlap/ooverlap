@@ -191,11 +191,12 @@ bool endpoint_persistent_smoke_test(
             "launch_endpoint_persistent_kernel_sm90");
 
         publish_single_ready_tile_kernel<<<1, 1, 0, producer_stream>>>(
-            runtime.device.input_queues[0],
+            runtime.input_queues_host[0],
             src_dev,
             static_cast<uint32_t>(bytes),
             0,
             publish_status_dev);
+        
         system::runtime::check_cuda(
             cudaGetLastError(),
             "publish_single_ready_tile_kernel");
