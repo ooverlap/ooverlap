@@ -29,6 +29,12 @@ struct OperationDesc {
     uint64_t dst_ptr = 0;
     size_t dst_bytes = 0;
 
+    // Minimal mapping policy for now:
+    // dst_offset_bytes = tile_id * tile_stride_bytes
+    //
+    // tile_id is expected to be local to this operation/queue.
+    size_t tile_stride_bytes = 0;
+
     // For reduce-scatter style completion tracking later.
     uint32_t expected_contributions = 0;
     uint32_t reserved0 = 0;
@@ -52,6 +58,7 @@ __host__ __device__ __forceinline__ void operation_desc_clear(
     op->dst_rank = -1;
     op->dst_ptr = 0;
     op->dst_bytes = 0;
+    op->tile_stride_bytes = 0;
     op->expected_contributions = 0;
     op->reserved0 = 0;
     op->op = exec::ChunkOpKind::kInvalid;
@@ -71,6 +78,7 @@ __host__ __device__ __forceinline__ bool operation_desc_is_valid(
            op->dst_rank >= 0 &&
            op->dst_ptr != 0 &&
            op->dst_bytes > 0 &&
+           op->tile_stride_bytes > 0 &&
            op->expected_contributions > 0 &&
            op->op != exec::ChunkOpKind::kInvalid;
 }
@@ -84,6 +92,46 @@ __host__ __device__ __forceinline__ bool operation_desc_is_active(
 __host__ __device__ __forceinline__ unsigned char* operation_desc_dst_base(
     const OperationDesc* op) {
     return reinterpret_cast<unsigned char*>(op->dst_ptr);
+}
+
+__host__ __device__ __forceinline__ size_t operation_desc_tile_dst_offset_bytes(
+    const OperationDesc* op,
+    uint64_t tile_id) {
+    return static_cast<size_t>(tile_id) * op->tile_stride_bytes;
+}
+
+__host__ __device__ __forceinline__ bool operation_desc_try_map_tile(
+    const OperationDesc* op,
+    uint64_t tile_id,
+    size_t tile_bytes,
+    unsigned char** dst_out,
+    size_t* dst_offset_out) {
+    if (dst_out == nullptr || dst_offset_out == nullptr) {
+        return false;
+    }
+    *dst_out = nullptr;
+    *dst_offset_out = 0;
+
+    if (!operation_desc_is_active(op) || tile_bytes == 0) {
+        return false;
+    }
+
+    const size_t dst_offset =
+        operation_desc_tile_dst_offset_bytes(op, tile_id);
+
+    if (dst_offset >= op->dst_bytes) {
+        return false;
+    }
+    if (tile_bytes > op->tile_stride_bytes) {
+        return false;
+    }
+    if ((dst_offset + tile_bytes) > op->dst_bytes) {
+        return false;
+    }
+
+    *dst_out = operation_desc_dst_base(op) + dst_offset;
+    *dst_offset_out = dst_offset;
+    return true;
 }
 
 __host__ __device__ __forceinline__ bool operation_table_is_configured(

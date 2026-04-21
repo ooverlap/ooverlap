@@ -98,7 +98,7 @@ __host__ __device__ __forceinline__ bool scheduler_queue_binding_is_valid(
            collective::operation_desc_is_active(binding->operation);
 }
 
-__device__ __forceinline__ bool chunk_scheduler_fail_oversized_tile() {
+__device__ __forceinline__ bool chunk_scheduler_fail_invalid_mapping() {
 #if defined(__CUDA_ARCH__)
     asm volatile("trap;");
 #endif
@@ -172,66 +172,54 @@ __device__ __forceinline__ bool chunk_scheduler_try_build_chunk_from_binding(
     const collective::ReadyTileQueue& queue = *binding.queue;
     const collective::OperationDesc& op_desc = *binding.operation;
 
-    size_t total_bytes = 0;
-    int num_tiles = 0;
-    uint64_t ticket = start_ticket;
-
-    while (num_tiles < kChunkMaxTileSpans) {
-        collective::ReadyTile tile{};
-        if (!collective::device_ready_tile_queue_try_peek_ticket(
-                &queue,
-                ticket,
-                &tile)) {
-            break;
-        }
-
-        if (tile.bytes > sched->chunk_bytes) {
-            return chunk_scheduler_fail_oversized_tile();
-        }
-
-        if (tile.bytes > op_desc.dst_bytes) {
-            return chunk_scheduler_fail_oversized_tile();
-        }
-
-        if ((total_bytes + static_cast<size_t>(tile.bytes)) > sched->chunk_bytes) {
-            break;
-        }
-
-        if ((total_bytes + static_cast<size_t>(tile.bytes)) > op_desc.dst_bytes) {
-            break;
-        }
-
-        ChunkTileSpan* span = &out->tile_spans[num_tiles];
-        span->src = collective::ready_tile_src_bytes(&tile);
-        span->bytes = static_cast<size_t>(tile.bytes);
-        span->dst_offset_bytes = total_bytes;
-        span->tile_id = tile.tile_id;
-        span->queue_ticket = tile.queue_ticket;
-        span->dim0 = tile.dim0;
-        span->dim1 = tile.dim1;
-        span->dim2 = tile.dim2;
-
-        total_bytes += static_cast<size_t>(tile.bytes);
-        ++num_tiles;
-        ++ticket;
-    }
-
-    if (num_tiles == 0) {
+    collective::ReadyTile tile{};
+    if (!collective::device_ready_tile_queue_try_peek_ticket(
+            &queue,
+            start_ticket,
+            &tile)) {
         return false;
     }
 
-    out->dst = collective::operation_desc_dst_base(&op_desc);
-    out->bytes = total_bytes;
+    // Temporary invariant:
+    // one tile per chunk until we support per-tile destination offsets
+    // inside a multi-tile chunk.
+    if (tile.bytes > sched->chunk_bytes) {
+        return chunk_scheduler_fail_invalid_mapping();
+    }
+
+    unsigned char* mapped_dst = nullptr;
+    size_t mapped_dst_offset = 0;
+    if (!collective::operation_desc_try_map_tile(
+            &op_desc,
+            tile.tile_id,
+            static_cast<size_t>(tile.bytes),
+            &mapped_dst,
+            &mapped_dst_offset)) {
+        return chunk_scheduler_fail_invalid_mapping();
+    }
+
+    ChunkTileSpan* span = &out->tile_spans[0];
+    span->src = collective::ready_tile_src_bytes(&tile);
+    span->bytes = static_cast<size_t>(tile.bytes);
+    span->dst_offset_bytes = 0;
+    span->tile_id = tile.tile_id;
+    span->queue_ticket = tile.queue_ticket;
+    span->dim0 = tile.dim0;
+    span->dim1 = tile.dim1;
+    span->dim2 = tile.dim2;
+
+    out->dst = mapped_dst;
+    out->bytes = static_cast<size_t>(tile.bytes);
     out->queue_id = op_desc.queue_id;
     out->dst_rank = op_desc.dst_rank;
     out->span_ticket = start_ticket;
-    out->user_tag = out->tile_spans[0].tile_id;
+    out->user_tag = tile.tile_id;
     out->chunk_idx = 0;
-    out->span_offset_bytes = 0;
+    out->span_offset_bytes = mapped_dst_offset;
     out->op = op_desc.op;
-    out->num_tile_spans = num_tiles;
+    out->num_tile_spans = 1;
 
-    *out_num_tiles = num_tiles;
+    *out_num_tiles = 1;
     return true;
 }
 
@@ -251,20 +239,28 @@ __device__ __forceinline__ bool chunk_scheduler_binding_has_schedulable_work(
         return false;
     }
 
-    const collective::OperationDesc& op_desc = *binding.operation;
-
     collective::ReadyTile tile{};
     if (!collective::device_ready_tile_queue_try_peek_head(binding.queue, &tile)) {
         return false;
     }
 
     if (tile.bytes > sched->chunk_bytes) {
-        return chunk_scheduler_fail_oversized_tile();
-    }
-    if (tile.bytes > op_desc.dst_bytes) {
-        return chunk_scheduler_fail_oversized_tile();
+        return chunk_scheduler_fail_invalid_mapping();
     }
 
+    unsigned char* mapped_dst = nullptr;
+    size_t mapped_dst_offset = 0;
+    if (!collective::operation_desc_try_map_tile(
+            binding.operation,
+            tile.tile_id,
+            static_cast<size_t>(tile.bytes),
+            &mapped_dst,
+            &mapped_dst_offset)) {
+        return chunk_scheduler_fail_invalid_mapping();
+    }
+
+    (void)mapped_dst;
+    (void)mapped_dst_offset;
     return true;
 }
 
