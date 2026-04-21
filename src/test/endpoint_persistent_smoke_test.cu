@@ -174,77 +174,60 @@ bool endpoint_persistent_smoke_test(
     cudaStream_t producer_stream = nullptr;
 
     try {
-        comm::group_init(
-            &group,
-            {dev0, dev1},
-            comm::kEndpointPersistentChunkBytes);
-
-        comm::endpoint_runtime_init(
-            &runtime,
-            &group,
-            0,
-            1,
-            8);
-
-        system::runtime::set_device(dev0);
-        system::runtime::check_cuda(
-            cudaStreamCreate(&producer_stream),
-            "cudaStreamCreate(producer_stream)");
 
         const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
         const auto host_src = make_host_pattern(numel);
-        const std::vector<half> host_zero(static_cast<size_t>(numel), __float2half_rn(0.0f));
+        std::printf("[smoke] before group_init\n"); std::fflush(stdout);
+comm::group_init(&group, {dev0, dev1}, comm::kEndpointPersistentChunkBytes);
 
-        system::runtime::check_cuda(cudaMalloc(&src_dev, bytes), "cudaMalloc(src_dev)");
-        system::runtime::check_cuda(cudaMalloc(&dst_dev, bytes), "cudaMalloc(dst_dev)");
-        system::runtime::check_cuda(cudaMalloc(&publish_status_dev, sizeof(int)), "cudaMalloc(publish_status_dev)");
+std::printf("[smoke] after group_init\n"); std::fflush(stdout);
+comm::endpoint_runtime_init(&runtime, &group, 0, 1, 8);
 
-        system::runtime::check_cuda(
-            cudaMemcpy(src_dev, host_src.data(), bytes, cudaMemcpyHostToDevice),
-            "cudaMemcpy(host_src -> src_dev)");
-        system::runtime::check_cuda(
-            cudaMemcpy(dst_dev, host_zero.data(), bytes, cudaMemcpyHostToDevice),
-            "cudaMemcpy(host_zero -> dst_dev)");
-        system::runtime::check_cuda(
-            cudaMemset(publish_status_dev, 0, sizeof(int)),
-            "cudaMemset(publish_status_dev)");
+std::printf("[smoke] after endpoint_runtime_init\n"); std::fflush(stdout);
+comm::endpoint_runtime_configure_queue_operation(
+    &runtime,
+    0,
+    1,
+    0,
+    dst_dev,
+    bytes,
+    bytes,
+    1,
+    comm::exec::ChunkOpKind::kReduceAddNoFtzF16,
+    1,
+    true);
 
-        comm::endpoint_runtime_configure_queue_operation(
-            &runtime,
-            0,
-            1,
-            0,
-            dst_dev,
-            bytes,
-            bytes,
-            1,
-            comm::exec::ChunkOpKind::kReduceAddNoFtzF16,
-            1,
-            true);
+std::printf("[smoke] after configure_queue_operation\n"); std::fflush(stdout);
+comm::endpoint_persistent_control_init(&control, dev0);
 
-        comm::endpoint_persistent_control_init(&control, dev0);
-        system::runtime::check_cuda(
-            comm::launch_endpoint_persistent_kernel_sm90(
-                comm::endpoint_runtime_device_handle(&runtime),
-                &control,
-                runtime.endpoint.stream),
-            "launch_endpoint_persistent_kernel_sm90");
+std::printf("[smoke] before persistent launch\n"); std::fflush(stdout);
+system::runtime::check_cuda(
+    comm::launch_endpoint_persistent_kernel_sm90(
+        comm::endpoint_runtime_device_handle(&runtime),
+        &control,
+        runtime.endpoint.stream),
+    "launch_endpoint_persistent_kernel_sm90");
 
-        publish_single_ready_tile_kernel<<<1, 1, 0, producer_stream>>>(
-            runtime.input_queues_host[0],
-            src_dev,
-            static_cast<uint32_t>(bytes),
-            0,
-            publish_status_dev);
+std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
+
+std::printf("[smoke] before publish launch\n"); std::fflush(stdout);
+publish_single_ready_tile_kernel<<<1, 1, 0, producer_stream>>>(
+    runtime.input_queues_host[0],
+    src_dev,
+    static_cast<uint32_t>(bytes),
+    0,
+    publish_status_dev);
+system::runtime::check_cuda(cudaGetLastError(), "publish_single_ready_tile_kernel");
+
+std::printf("[smoke] after publish launch\n"); std::fflush(stdout);
+system::runtime::check_cuda(
+    cudaStreamSynchronize(producer_stream),
+    "cudaStreamSynchronize(producer_stream)");
+
+std::printf("[smoke] after producer sync\n"); std::fflush(stdout);
+
+
         
-        system::runtime::check_cuda(
-            cudaGetLastError(),
-            "publish_single_ready_tile_kernel");
-
-        system::runtime::check_cuda(
-            cudaStreamSynchronize(producer_stream),
-            "cudaStreamSynchronize(producer_stream)");
-
         std::printf("[smoke] published tile\n"); std::fflush(stdout);
         std::printf("[smoke] waiting for queue drain\n"); std::fflush(stdout);
         
