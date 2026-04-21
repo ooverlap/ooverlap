@@ -1,5 +1,6 @@
 #pragma once
 
+#include "comm/collective/operation.h"
 #include "comm/collective/published_tile.h"
 #include "comm/exec/chunk.h"
 
@@ -11,19 +12,11 @@ namespace comm {
 namespace exec {
 
 struct SchedulerQueueBinding {
-    uint32_t queue_id = 0;
-
-    // Placeholder for later operation/routing logic.
-    int dst_rank = -1;
-
     // Producer -> persistent-kernel mailbox on this GPU.
-    collective::ReadyTileQueue queue{};
+    collective::ReadyTileQueue* queue = nullptr;
 
-    // Channel staging buffer / destination scratch for this binding.
-    unsigned char* channel_buffer_base = nullptr;
-    size_t channel_buffer_bytes = 0;
-
-    ChunkOpKind op = ChunkOpKind::kCopy;
+    // Policy / routing / destination meaning for this queue.
+    collective::OperationDesc* operation = nullptr;
 };
 
 template <int WatchThreads>
@@ -99,10 +92,10 @@ __host__ __device__ __forceinline__ void chunk_scheduler_init(
 __host__ __device__ __forceinline__ bool scheduler_queue_binding_is_valid(
     const SchedulerQueueBinding* binding) {
     return binding != nullptr &&
-           collective::ready_tile_queue_is_configured(&binding->queue) &&
-           binding->channel_buffer_base != nullptr &&
-           binding->channel_buffer_bytes > 0 &&
-           binding->op != ChunkOpKind::kInvalid;
+           binding->queue != nullptr &&
+           binding->operation != nullptr &&
+           collective::ready_tile_queue_is_configured(binding->queue) &&
+           collective::operation_desc_is_active(binding->operation);
 }
 
 __device__ __forceinline__ bool chunk_scheduler_fail_oversized_tile() {
@@ -134,7 +127,7 @@ __host__ __device__ __forceinline__ uint32_t chunk_scheduler_active_queue_id(
         sched->active_binding_idx >= sched->num_bindings) {
         return 0;
     }
-    return sched->bindings[sched->active_binding_idx].queue_id;
+    return sched->bindings[sched->active_binding_idx].operation->queue_id;
 }
 
 template <int WatchThreads>
@@ -147,7 +140,7 @@ __host__ __device__ __forceinline__ int chunk_scheduler_active_dst_rank(
         sched->active_binding_idx >= sched->num_bindings) {
         return -1;
     }
-    return sched->bindings[sched->active_binding_idx].dst_rank;
+    return sched->bindings[sched->active_binding_idx].operation->dst_rank;
 }
 
 template <int WatchThreads>
@@ -176,6 +169,9 @@ __device__ __forceinline__ bool chunk_scheduler_try_build_chunk_from_binding(
         return false;
     }
 
+    const collective::ReadyTileQueue& queue = *binding.queue;
+    const collective::OperationDesc& op_desc = *binding.operation;
+
     size_t total_bytes = 0;
     int num_tiles = 0;
     uint64_t ticket = start_ticket;
@@ -183,7 +179,7 @@ __device__ __forceinline__ bool chunk_scheduler_try_build_chunk_from_binding(
     while (num_tiles < kChunkMaxTileSpans) {
         collective::ReadyTile tile{};
         if (!collective::device_ready_tile_queue_try_peek_ticket(
-                &binding.queue,
+                &queue,
                 ticket,
                 &tile)) {
             break;
@@ -193,7 +189,7 @@ __device__ __forceinline__ bool chunk_scheduler_try_build_chunk_from_binding(
             return chunk_scheduler_fail_oversized_tile();
         }
 
-        if (tile.bytes > binding.channel_buffer_bytes) {
+        if (tile.bytes > op_desc.dst_bytes) {
             return chunk_scheduler_fail_oversized_tile();
         }
 
@@ -201,7 +197,7 @@ __device__ __forceinline__ bool chunk_scheduler_try_build_chunk_from_binding(
             break;
         }
 
-        if ((total_bytes + static_cast<size_t>(tile.bytes)) > binding.channel_buffer_bytes) {
+        if ((total_bytes + static_cast<size_t>(tile.bytes)) > op_desc.dst_bytes) {
             break;
         }
 
@@ -224,15 +220,15 @@ __device__ __forceinline__ bool chunk_scheduler_try_build_chunk_from_binding(
         return false;
     }
 
-    out->dst = binding.channel_buffer_base;
+    out->dst = collective::operation_desc_dst_base(&op_desc);
     out->bytes = total_bytes;
-    out->queue_id = binding.queue_id;
-    out->dst_rank = binding.dst_rank;
+    out->queue_id = op_desc.queue_id;
+    out->dst_rank = op_desc.dst_rank;
     out->span_ticket = start_ticket;
     out->user_tag = out->tile_spans[0].tile_id;
     out->chunk_idx = 0;
     out->span_offset_bytes = 0;
-    out->op = binding.op;
+    out->op = op_desc.op;
     out->num_tile_spans = num_tiles;
 
     *out_num_tiles = num_tiles;
@@ -255,15 +251,17 @@ __device__ __forceinline__ bool chunk_scheduler_binding_has_schedulable_work(
         return false;
     }
 
+    const collective::OperationDesc& op_desc = *binding.operation;
+
     collective::ReadyTile tile{};
-    if (!collective::device_ready_tile_queue_try_peek_head(&binding.queue, &tile)) {
+    if (!collective::device_ready_tile_queue_try_peek_head(binding.queue, &tile)) {
         return false;
     }
 
     if (tile.bytes > sched->chunk_bytes) {
         return chunk_scheduler_fail_oversized_tile();
     }
-    if (tile.bytes > binding.channel_buffer_bytes) {
+    if (tile.bytes > op_desc.dst_bytes) {
         return chunk_scheduler_fail_oversized_tile();
     }
 
@@ -289,7 +287,7 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk_sequenti
         }
 
         const uint64_t start_ticket =
-            *(sched->bindings[binding_idx].queue.head);
+            *(sched->bindings[binding_idx].queue->head);
 
         Chunk built{};
         int built_num_tiles = 0;
@@ -386,7 +384,7 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
 
     const int binding_idx = scratch->selected_binding_idx;
     const uint64_t start_ticket =
-        *(sched->bindings[binding_idx].queue.head);
+        *(sched->bindings[binding_idx].queue->head);
 
     Chunk built{};
     int built_num_tiles = 0;
@@ -435,8 +433,6 @@ __device__ __forceinline__ bool chunk_scheduler_peek_next(
         return false;
     }
 
-    // Only look ahead within the same queue.
-    // Cross-queue lookahead is scheduler policy, not pipeline prefetch policy.
     const uint64_t next_start_ticket =
         sched->active_start_ticket + static_cast<uint64_t>(sched->active_num_tiles);
 
@@ -462,9 +458,7 @@ __device__ __forceinline__ void chunk_scheduler_advance(
     const uint64_t new_head =
         sched->active_start_ticket + static_cast<uint64_t>(sched->active_num_tiles);
 
-    // All threads write the same value, so this is safe for the current
-    // block-cooperative single-consumer design.
-    *binding.queue.head = new_head;
+    *binding.queue->head = new_head;
     __threadfence();
 
     sched->has_active_chunk = false;
