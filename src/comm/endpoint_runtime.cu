@@ -26,11 +26,11 @@ void endpoint_runtime_reset_device_handle(
     rt->device.input_queues = nullptr;
     rt->device.num_input_queues = 0;
 
+    rt->device.operations = nullptr;
+    rt->device.num_operations = 0;
+
     rt->device.scheduler_bindings = nullptr;
     rt->device.num_scheduler_bindings = 0;
-
-    rt->device.outgoing_channels = nullptr;
-    rt->device.num_outgoing_channels = 0;
 }
 
 void endpoint_runtime_reset_host_state(
@@ -41,12 +41,12 @@ void endpoint_runtime_reset_host_state(
 
     rt->endpoint = Endpoint{};
     rt->input_queues_host.clear();
+    rt->operations_host.clear();
     rt->scheduler_bindings_host.clear();
-    rt->outgoing_channels_host.clear();
 
     rt->input_queues_device = nullptr;
     rt->scheduler_bindings_device = nullptr;
-    rt->outgoing_channels_device = nullptr;
+    rt->operation_table = collective::OperationTable{};
 
     endpoint_runtime_reset_device_handle(rt);
 }
@@ -91,41 +91,30 @@ bool endpoint_runtime_init(
 
     rt->endpoint = *group_get_endpoint(group, rank);
 
-    // Build the local outgoing channel list for this endpoint.
-    rt->outgoing_channels_host.reserve(static_cast<size_t>(group->world_size - 1));
-    for (int dst_rank = 0; dst_rank < group->world_size; ++dst_rank) {
-        if (dst_rank == rank) {
-            continue;
-        }
-
-        const Channel* ch = group_get_channel(group, rank, dst_rank);
-        if (ch != nullptr) {
-            rt->outgoing_channels_host.push_back(*ch);
-        }
-    }
-
-    // Allocate local ready queues for GEMM -> persistent-kernel handoff.
+    // One queue and one operation slot per input queue for now.
     rt->input_queues_host.resize(static_cast<size_t>(num_input_queues));
+    rt->operations_host.resize(static_cast<size_t>(num_input_queues));
+    rt->scheduler_bindings_host.resize(static_cast<size_t>(num_input_queues));
+
     for (int i = 0; i < num_input_queues; ++i) {
         collective::ready_tile_queue_init(
             &rt->input_queues_host[static_cast<size_t>(i)],
             rt->endpoint.device,
             input_queue_capacity);
-    }
 
-    // Default scheduler bindings are created but left unbound until the caller
-    // explicitly maps each queue to a destination/op.
-    rt->scheduler_bindings_host.resize(static_cast<size_t>(num_input_queues));
-    for (int i = 0; i < num_input_queues; ++i) {
+        collective::operation_desc_clear(
+            &rt->operations_host[static_cast<size_t>(i)]);
+
         exec::SchedulerQueueBinding binding{};
-        binding.queue_id = static_cast<uint32_t>(i);
-        binding.dst_rank = -1;
-        binding.queue = rt->input_queues_host[static_cast<size_t>(i)];
-        binding.channel_buffer_base = nullptr;
-        binding.channel_buffer_bytes = 0;
-        binding.op = exec::ChunkOpKind::kInvalid;
+        binding.queue = nullptr;
+        binding.operation = nullptr;
         rt->scheduler_bindings_host[static_cast<size_t>(i)] = binding;
     }
+
+    collective::operation_table_init(
+        &rt->operation_table,
+        rt->endpoint.device,
+        static_cast<uint32_t>(num_input_queues));
 
     system::runtime::set_device(rt->endpoint.device);
 
@@ -140,14 +129,6 @@ bool endpoint_runtime_init(
             &rt->scheduler_bindings_device,
             rt->scheduler_bindings_host.size() * sizeof(exec::SchedulerQueueBinding)),
         "cudaMalloc(endpoint runtime scheduler_bindings_device)");
-
-    if (!rt->outgoing_channels_host.empty()) {
-        system::runtime::check_cuda(
-            cudaMalloc(
-                &rt->outgoing_channels_device,
-                rt->outgoing_channels_host.size() * sizeof(Channel)),
-            "cudaMalloc(endpoint runtime outgoing_channels_device)");
-    }
 
     endpoint_runtime_refresh_device(rt);
     return true;
@@ -167,13 +148,6 @@ void endpoint_runtime_destroy(
         system::runtime::set_device(device);
     }
 
-    if (rt->outgoing_channels_device != nullptr) {
-        system::runtime::check_cuda(
-            cudaFree(rt->outgoing_channels_device),
-            "cudaFree(endpoint runtime outgoing_channels_device)");
-        rt->outgoing_channels_device = nullptr;
-    }
-
     if (rt->scheduler_bindings_device != nullptr) {
         system::runtime::check_cuda(
             cudaFree(rt->scheduler_bindings_device),
@@ -187,6 +161,8 @@ void endpoint_runtime_destroy(
             "cudaFree(endpoint runtime input_queues_device)");
         rt->input_queues_device = nullptr;
     }
+
+    collective::operation_table_destroy(&rt->operation_table);
 
     for (auto& q : rt->input_queues_host) {
         collective::ready_tile_queue_destroy(&q);
@@ -206,11 +182,17 @@ void endpoint_runtime_refresh_device(
     if (rt->input_queues_host.empty()) {
         throw std::invalid_argument("endpoint_runtime_refresh_device: no input queues");
     }
+    if (rt->operations_host.empty()) {
+        throw std::invalid_argument("endpoint_runtime_refresh_device: no operations");
+    }
     if (rt->scheduler_bindings_host.empty()) {
         throw std::invalid_argument("endpoint_runtime_refresh_device: no scheduler bindings");
     }
     if (rt->input_queues_device == nullptr) {
         throw std::invalid_argument("endpoint_runtime_refresh_device: input_queues_device is null");
+    }
+    if (!collective::operation_table_is_configured(&rt->operation_table)) {
+        throw std::invalid_argument("endpoint_runtime_refresh_device: operation_table not configured");
     }
     if (rt->scheduler_bindings_device == nullptr) {
         throw std::invalid_argument("endpoint_runtime_refresh_device: scheduler_bindings_device is null");
@@ -228,25 +210,35 @@ void endpoint_runtime_refresh_device(
 
     system::runtime::check_cuda(
         cudaMemcpy(
+            rt->operation_table.records,
+            rt->operations_host.data(),
+            rt->operations_host.size() * sizeof(collective::OperationDesc),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy(endpoint runtime operation table)");
+
+    // Rebuild binding pointers so they point at device-resident queue/op records.
+    for (int i = 0; i < static_cast<int>(rt->scheduler_bindings_host.size()); ++i) {
+        exec::SchedulerQueueBinding binding{};
+        binding.queue = &rt->input_queues_device[static_cast<size_t>(i)];
+
+        if (collective::operation_desc_is_active(
+                &rt->operations_host[static_cast<size_t>(i)])) {
+            binding.operation =
+                &rt->operation_table.records[static_cast<size_t>(i)];
+        } else {
+            binding.operation = nullptr;
+        }
+
+        rt->scheduler_bindings_host[static_cast<size_t>(i)] = binding;
+    }
+
+    system::runtime::check_cuda(
+        cudaMemcpy(
             rt->scheduler_bindings_device,
             rt->scheduler_bindings_host.data(),
             rt->scheduler_bindings_host.size() * sizeof(exec::SchedulerQueueBinding),
             cudaMemcpyHostToDevice),
         "cudaMemcpy(endpoint runtime scheduler bindings)");
-
-    if (!rt->outgoing_channels_host.empty()) {
-        if (rt->outgoing_channels_device == nullptr) {
-            throw std::invalid_argument("endpoint_runtime_refresh_device: outgoing_channels_device is null");
-        }
-
-        system::runtime::check_cuda(
-            cudaMemcpy(
-                rt->outgoing_channels_device,
-                rt->outgoing_channels_host.data(),
-                rt->outgoing_channels_host.size() * sizeof(Channel),
-                cudaMemcpyHostToDevice),
-            "cudaMemcpy(endpoint runtime outgoing channels)");
-    }
 
     rt->device.rank = rt->endpoint.rank;
     rt->device.device = rt->endpoint.device;
@@ -255,89 +247,84 @@ void endpoint_runtime_refresh_device(
     rt->device.input_queues = rt->input_queues_device;
     rt->device.num_input_queues = static_cast<int>(rt->input_queues_host.size());
 
+    rt->device.operations = rt->operation_table.records;
+    rt->device.num_operations = static_cast<int>(rt->operations_host.size());
+
     rt->device.scheduler_bindings = rt->scheduler_bindings_device;
     rt->device.num_scheduler_bindings = static_cast<int>(rt->scheduler_bindings_host.size());
-
-    rt->device.outgoing_channels = rt->outgoing_channels_device;
-    rt->device.num_outgoing_channels = static_cast<int>(rt->outgoing_channels_host.size());
 }
 
-int endpoint_runtime_find_outgoing_channel_index(
-    const EndpointRuntime* rt,
-    int dst_rank) {
-    if (rt == nullptr) {
-        throw std::invalid_argument("endpoint_runtime_find_outgoing_channel_index: rt is null");
-    }
-
-    for (int i = 0; i < static_cast<int>(rt->outgoing_channels_host.size()); ++i) {
-        const Channel& ch = rt->outgoing_channels_host[static_cast<size_t>(i)];
-        if (ch.dst_rank == dst_rank) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
-bool endpoint_runtime_bind_queue_to_dst(
+bool endpoint_runtime_configure_queue_operation(
     EndpointRuntime* rt,
     int queue_idx,
+    uint32_t op_id,
     int dst_rank,
-    exec::ChunkOpKind op) {
+    void* dst_ptr,
+    size_t dst_bytes,
+    size_t tile_stride_bytes,
+    uint32_t expected_contributions,
+    exec::ChunkOpKind op,
+    uint32_t epoch,
+    bool enabled) {
     endpoint_runtime_validate_queue_index(
         rt,
         queue_idx,
-        "endpoint_runtime_bind_queue_to_dst: invalid queue_idx");
+        "endpoint_runtime_configure_queue_operation: invalid queue_idx");
 
+    if (op_id == 0) {
+        throw std::invalid_argument("endpoint_runtime_configure_queue_operation: op_id must be > 0");
+    }
     if (dst_rank < 0) {
-        throw std::invalid_argument("endpoint_runtime_bind_queue_to_dst: invalid dst_rank");
+        throw std::invalid_argument("endpoint_runtime_configure_queue_operation: invalid dst_rank");
+    }
+    if (dst_ptr == nullptr) {
+        throw std::invalid_argument("endpoint_runtime_configure_queue_operation: dst_ptr is null");
+    }
+    if (dst_bytes == 0) {
+        throw std::invalid_argument("endpoint_runtime_configure_queue_operation: dst_bytes must be > 0");
+    }
+    if (tile_stride_bytes == 0) {
+        throw std::invalid_argument("endpoint_runtime_configure_queue_operation: tile_stride_bytes must be > 0");
+    }
+    if (expected_contributions == 0) {
+        throw std::invalid_argument("endpoint_runtime_configure_queue_operation: expected_contributions must be > 0");
     }
     if (op == exec::ChunkOpKind::kInvalid) {
-        throw std::invalid_argument("endpoint_runtime_bind_queue_to_dst: invalid op");
+        throw std::invalid_argument("endpoint_runtime_configure_queue_operation: invalid op");
     }
 
-    const int channel_idx = endpoint_runtime_find_outgoing_channel_index(rt, dst_rank);
-    if (channel_idx < 0) {
-        return false;
+    collective::OperationDesc desc{};
+    desc.op_id = op_id;
+    desc.queue_id = static_cast<uint32_t>(queue_idx);
+    desc.epoch = epoch;
+    desc.flags = enabled ? collective::kOperationFlagEnabled : 0u;
+    desc.src_rank = rt->endpoint.rank;
+    desc.dst_rank = dst_rank;
+    desc.dst_ptr = reinterpret_cast<uint64_t>(dst_ptr);
+    desc.dst_bytes = dst_bytes;
+    desc.tile_stride_bytes = tile_stride_bytes;
+    desc.expected_contributions = expected_contributions;
+    desc.op = op;
+
+    if (!collective::operation_desc_is_valid(&desc)) {
+        throw std::invalid_argument("endpoint_runtime_configure_queue_operation: produced invalid descriptor");
     }
 
-    const Channel& ch = rt->outgoing_channels_host[static_cast<size_t>(channel_idx)];
-    const transport::CommBuffer* buf = channel_get_buffer(&ch);
-    if (buf == nullptr || buf->ptr == nullptr || buf->bytes == 0) {
-        return false;
-    }
-
-    exec::SchedulerQueueBinding& binding =
-        rt->scheduler_bindings_host[static_cast<size_t>(queue_idx)];
-
-    binding.queue_id = static_cast<uint32_t>(queue_idx);
-    binding.dst_rank = dst_rank;
-    binding.queue = rt->input_queues_host[static_cast<size_t>(queue_idx)];
-    binding.channel_buffer_base = reinterpret_cast<unsigned char*>(buf->ptr);
-    binding.channel_buffer_bytes = buf->bytes;
-    binding.op = op;
-
+    rt->operations_host[static_cast<size_t>(queue_idx)] = desc;
     endpoint_runtime_refresh_device(rt);
     return true;
 }
 
-bool endpoint_runtime_unbind_queue(
+bool endpoint_runtime_clear_queue_operation(
     EndpointRuntime* rt,
     int queue_idx) {
     endpoint_runtime_validate_queue_index(
         rt,
         queue_idx,
-        "endpoint_runtime_unbind_queue: invalid queue_idx");
+        "endpoint_runtime_clear_queue_operation: invalid queue_idx");
 
-    exec::SchedulerQueueBinding& binding =
-        rt->scheduler_bindings_host[static_cast<size_t>(queue_idx)];
-
-    binding.queue_id = static_cast<uint32_t>(queue_idx);
-    binding.dst_rank = -1;
-    binding.queue = rt->input_queues_host[static_cast<size_t>(queue_idx)];
-    binding.channel_buffer_base = nullptr;
-    binding.channel_buffer_bytes = 0;
-    binding.op = exec::ChunkOpKind::kInvalid;
+    collective::operation_desc_clear(
+        &rt->operations_host[static_cast<size_t>(queue_idx)]);
 
     endpoint_runtime_refresh_device(rt);
     return true;
