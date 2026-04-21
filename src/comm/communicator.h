@@ -7,28 +7,21 @@
 #include <cstdint>
 #include <vector>
 
-#include "comm/buffer.h"
-#include "comm/channel.h"
+#include "comm/group.h"
 
 namespace ooverlap {
 namespace comm {
 
-struct Communicator {
-    int world_size = 0;
-    std::vector<int> devices;
-    std::vector<cudaStream_t> streams;
-
-    size_t max_full_numel = 0;
-    size_t max_shard_numel = 0;
-    int num_channel_slots = 0;
-
-    // Dense matrix layout: channels[src_rank * world_size + dst_rank]
-    std::vector<CommChannel> channels;
-
-    // Local, device-owned scratch buffers.
-    std::vector<CommBuffer> local_shard_buffers;
-    std::vector<CommBuffer> local_full_buffers;
-};
+// New model:
+//   Endpoint  -> per GPU
+//   Channel   -> per directed peer pair
+//   Group     -> participating set of endpoints
+//
+// Compatibility:
+//   current code still uses Communicator/TmaCommunicator and the old helper APIs.
+//   We keep those names as aliases/wrappers over Group.
+using Communicator = Group;
+using TmaCommunicator = Communicator;
 
 bool communicator_init(
     Communicator* comm,
@@ -36,7 +29,8 @@ bool communicator_init(
     size_t max_full_numel,
     int num_channel_slots = 1);
 
-void communicator_destroy(Communicator* comm);
+void communicator_destroy(
+    Communicator* comm);
 
 CommChannel* communicator_get_channel(
     Communicator* comm,
@@ -96,9 +90,6 @@ cudaError_t channel_send_bulk_tma(
     const half* src,
     size_t numel,
     cudaStream_t stream);
-
-// Compatibility aliases for current code.
-using TmaCommunicator = Communicator;
 
 } // namespace comm
 } // namespace ooverlap
