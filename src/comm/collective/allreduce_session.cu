@@ -35,6 +35,9 @@ void reset_rank_queue_impl(
         cudaMemset(q.records_buffer.ptr, 0, q.records_buffer.bytes),
         "cudaMemset(allreduce session records)");
     system::runtime::check_cuda(
+        cudaMemset(q.head_buffer.ptr, 0, q.head_buffer.bytes),
+        "cudaMemset(allreduce session head)");
+    system::runtime::check_cuda(
         cudaMemset(q.tail_buffer.ptr, 0, q.tail_buffer.bytes),
         "cudaMemset(allreduce session tail)");
     system::runtime::check_cuda(
@@ -83,6 +86,8 @@ bool allreduce_session_init(
         q.owner_rank = rank;
         q.records_buffer =
             alloc_local_buffer_for_rank(group->devices, rank, records_bytes);
+        q.head_buffer =
+            alloc_local_buffer_for_rank(group->devices, rank, scalar_bytes);
         q.tail_buffer =
             alloc_local_buffer_for_rank(group->devices, rank, scalar_bytes);
         q.overflow_buffer =
@@ -102,6 +107,7 @@ void allreduce_session_destroy(
     if (session->group != nullptr) {
         for (auto& q : session->published_tile_queues) {
             free_comm_buffer(session->group->devices, q.records_buffer);
+            free_comm_buffer(session->group->devices, q.head_buffer);
             free_comm_buffer(session->group->devices, q.tail_buffer);
             free_comm_buffer(session->group->devices, q.overflow_buffer);
             q.capacity = 0;
@@ -136,6 +142,38 @@ void allreduce_session_reset_all_queues(
     }
 }
 
+const PublishedTileQueue* allreduce_session_get_published_tile_queue(
+    const AllReduceSession* session,
+    int rank) {
+    if (session == nullptr) {
+        throw std::invalid_argument("allreduce_session_get_published_tile_queue: session is null");
+    }
+    if (session->group == nullptr) {
+        throw std::invalid_argument("allreduce_session_get_published_tile_queue: session->group is null");
+    }
+    validate_rank_or_throw(
+        session->group->world_size,
+        rank,
+        "allreduce_session_get_published_tile_queue: invalid rank");
+    return &session->published_tile_queues[static_cast<size_t>(rank)];
+}
+
+PublishedTileQueue* allreduce_session_get_published_tile_queue(
+    AllReduceSession* session,
+    int rank) {
+    if (session == nullptr) {
+        throw std::invalid_argument("allreduce_session_get_published_tile_queue: session is null");
+    }
+    if (session->group == nullptr) {
+        throw std::invalid_argument("allreduce_session_get_published_tile_queue: session->group is null");
+    }
+    validate_rank_or_throw(
+        session->group->world_size,
+        rank,
+        "allreduce_session_get_published_tile_queue: invalid rank");
+    return &session->published_tile_queues[static_cast<size_t>(rank)];
+}
+
 DeviceSessionHandle allreduce_session_get_device_handle(
     const AllReduceSession* session,
     int rank) {
@@ -159,6 +197,7 @@ DeviceSessionHandle allreduce_session_get_device_handle(
     out.world_size = session->group->world_size;
     out.reduce_kind = session->reduce_kind;
     out.records = reinterpret_cast<PublishedTile*>(q.records_buffer.ptr);
+    out.head = reinterpret_cast<uint32_t*>(q.head_buffer.ptr);
     out.tail = reinterpret_cast<uint32_t*>(q.tail_buffer.ptr);
     out.overflow = reinterpret_cast<uint32_t*>(q.overflow_buffer.ptr);
     out.capacity = q.capacity;
