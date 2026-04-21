@@ -234,48 +234,47 @@ bool endpoint_persistent_smoke_test(
         comm::endpoint_persistent_control_init(&control, dev0);
         control_initialized = true;
 
-        std::printf("[smoke] before persistent launch\n"); std::fflush(stdout);
-        system::runtime::check_cuda(
-            comm::launch_endpoint_persistent_kernel_sm90(
-                comm::endpoint_runtime_device_handle(&runtime),
-                &control,
-                runtime.endpoint.stream),
-            "launch_endpoint_persistent_kernel_sm90");
-        persistent_launched = true;
-        std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
-
         std::printf("[smoke] before publish launch\n"); std::fflush(stdout);
-        publish_single_ready_tile_kernel<<<1, 1, 0, producer_stream>>>(
-            runtime.input_queues_host[0],
-            src_dev,
-            static_cast<uint32_t>(bytes),
-            0,
-            publish_status_dev);
-        system::runtime::check_cuda(
-            cudaGetLastError(),
-            "publish_single_ready_tile_kernel");
+publish_single_ready_tile_kernel<<<1, 1, 0, producer_stream>>>(
+    runtime.input_queues_host[0],
+    src_dev,
+    static_cast<uint32_t>(bytes),
+    0,
+    publish_status_dev);
+system::runtime::check_cuda(
+    cudaGetLastError(),
+    "publish_single_ready_tile_kernel");
 
-        std::printf("[smoke] after publish launch\n"); std::fflush(stdout);
-        system::runtime::check_cuda(
-            cudaStreamSynchronize(producer_stream),
-            "cudaStreamSynchronize(producer_stream)");
-        std::printf("[smoke] after producer sync\n"); std::fflush(stdout);
+std::printf("[smoke] after publish launch\n"); std::fflush(stdout);
+system::runtime::check_cuda(
+    cudaStreamSynchronize(producer_stream),
+    "cudaStreamSynchronize(producer_stream)");
+std::printf("[smoke] after producer sync\n"); std::fflush(stdout);
 
-        std::printf("[smoke] waiting for queue drain\n"); std::fflush(stdout);
-        const bool drained =
-            poll_queue_head_until(runtime.input_queues_host[0], 1, dev0, 5000);
-        if (!drained) {
-            throw std::runtime_error(
-                "timeout waiting for persistent kernel to consume queue head");
-        }
+std::printf("[smoke] before persistent launch\n"); std::fflush(stdout);
+system::runtime::check_cuda(
+    comm::launch_endpoint_persistent_kernel_sm90(
+        comm::endpoint_runtime_device_handle(&runtime),
+        &control,
+        runtime.endpoint.stream),
+    "launch_endpoint_persistent_kernel_sm90");
+std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
 
-        std::printf("[smoke] requesting stop\n"); std::fflush(stdout);
-        comm::endpoint_persistent_control_request_stop(&control);
+std::printf("[smoke] waiting for queue drain\n"); std::fflush(stdout);
+const bool drained =
+    poll_queue_head_until(runtime.input_queues_host[0], 1, dev0, 5000);
+if (!drained) {
+    throw std::runtime_error(
+        "timeout waiting for persistent kernel to consume queue head");
+}
 
-        system::runtime::check_cuda(
-            cudaStreamSynchronize(runtime.endpoint.stream),
-            "cudaStreamSynchronize(persistent stream)");
-        std::printf("[smoke] persistent stream joined\n"); std::fflush(stdout);
+std::printf("[smoke] requesting stop\n"); std::fflush(stdout);
+comm::endpoint_persistent_control_request_stop(&control);
+
+system::runtime::check_cuda(
+    cudaStreamSynchronize(runtime.endpoint.stream),
+    "cudaStreamSynchronize(persistent stream)");
+std::printf("[smoke] persistent stream joined\n"); std::fflush(stdout);
 
         std::printf("[smoke] copying dst to host\n"); std::fflush(stdout);
         std::vector<half> host_dst(static_cast<size_t>(numel));
