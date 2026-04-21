@@ -12,14 +12,15 @@
 
 namespace ooverlap {
 namespace comm {
-
+    
 bool group_init(
     Group* group,
     const std::vector<int>& devices,
     size_t max_full_numel,
     int num_channel_slots,
-    ChannelMode channel_mode) {
-
+    ChannelMode channel_mode,
+    uint32_t channel_dispatch_capacity,
+    size_t channel_dispatch_chunk_bytes) {
     if (group == nullptr) {
         throw std::invalid_argument("group_init: group is null");
     }
@@ -45,6 +46,8 @@ bool group_init(
     group->max_full_numel = max_full_numel;
     group->max_shard_numel = max_full_numel / devices.size();
     group->num_channel_slots = num_channel_slots;
+    group->channel_dispatch_capacity = channel_dispatch_capacity;
+    group->channel_dispatch_chunk_bytes = channel_dispatch_chunk_bytes;
 
     group->channels.resize(static_cast<size_t>(group->world_size * group->world_size));
     group->local_shard_buffers.resize(static_cast<size_t>(group->world_size));
@@ -82,10 +85,14 @@ bool group_init(
             ch.src_device = group->devices[src];
             ch.dst_device = group->devices[dst];
             ch.mode = channel_mode;
+            ch.dispatch_queue_capacity = channel_dispatch_capacity;
+            ch.dispatch_chunk_bytes = channel_dispatch_chunk_bytes;
 
             if (src == dst) {
                 ch.slot_bytes = 0;
                 ch.num_slots = 0;
+                ch.dispatch_queue_capacity = 0;
+                ch.dispatch_chunk_bytes = 0;
                 ch.slots.clear();
                 continue;
             }
@@ -94,6 +101,13 @@ bool group_init(
                 ch.slot_bytes = 0;
                 ch.num_slots = 0;
                 ch.slots.clear();
+                transport::dispatch_queue_init(
+                    group->devices,
+                    &ch.dispatch_queue,
+                    src,
+                    src,
+                    dst,
+                    channel_dispatch_capacity);
                 continue;
             }
 
@@ -115,6 +129,14 @@ bool group_init(
                     cudaMemset(slot_ref.signal_buffer.ptr, 0, slot_ref.signal_buffer.bytes),
                     "cudaMemset(channel slot signal)");
             }
+
+            transport::dispatch_queue_init(
+                group->devices,
+                &ch.dispatch_queue,
+                src,
+                src,
+                dst,
+                channel_dispatch_capacity);
         }
     }
 
@@ -135,6 +157,9 @@ void group_destroy(
             slot.slot_id = 0;
         }
         ch.slots.clear();
+        transport::dispatch_queue_destroy(group->devices, &ch.dispatch_queue);
+        ch.dispatch_queue_capacity = 0;
+        ch.dispatch_chunk_bytes = 0;
         ch.src_rank = -1;
         ch.dst_rank = -1;
         ch.src_device = -1;
@@ -164,6 +189,8 @@ void group_destroy(
     group->max_full_numel = 0;
     group->max_shard_numel = 0;
     group->num_channel_slots = 0;
+    group->channel_dispatch_capacity = 0;
+    group->channel_dispatch_chunk_bytes = 0;
     group->channels.clear();
     group->local_shard_buffers.clear();
     group->local_full_buffers.clear();

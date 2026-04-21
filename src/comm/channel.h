@@ -1,6 +1,7 @@
 #pragma once
 
 #include "comm/transport/buffer.h"
+#include "comm/transport/dispatch_queue.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -16,7 +17,7 @@ enum class ChannelMode : uint8_t {
 
 struct ChannelSlot {
     transport::CommBuffer buffer;
-    transport::CommBuffer signal_buffer;   // uint64_t flag/sequence storage, peer-visible
+    transport::CommBuffer signal_buffer;
     uint64_t seq = 0;
     uint32_t slot_id = 0;
 };
@@ -32,6 +33,12 @@ struct Channel {
     size_t slot_bytes = 0;
     int num_slots = 0;
     std::vector<ChannelSlot> slots;
+
+    // Channel-local lowered-work queue.
+    // Planner emits DispatchRecord here.
+    transport::DispatchQueue dispatch_queue;
+    uint32_t dispatch_queue_capacity = 0;
+    size_t dispatch_chunk_bytes = 0;
 };
 
 int channel_index(
@@ -60,11 +67,16 @@ const transport::CommBuffer* channel_get_slot_signal_buffer(
     const Channel* ch,
     int slot_idx);
 
+transport::DispatchQueue* channel_get_dispatch_queue(
+    Channel* ch);
+
+const transport::DispatchQueue* channel_get_dispatch_queue(
+    const Channel* ch);
+
 inline bool channel_is_direct_reduce(const Channel* ch) {
     return ch != nullptr && ch->mode == ChannelMode::kDirectReduce;
 }
 
-// Compatibility aliases for current code.
 using CommSlot = ChannelSlot;
 using CommChannel = Channel;
 

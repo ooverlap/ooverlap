@@ -16,21 +16,19 @@ namespace comm {
 struct Group {
     int world_size = 0;
 
-    // Kept for compatibility with current code.
     std::vector<int> devices;
     std::vector<cudaStream_t> streams;
-
-    // New top-level per-GPU primitive.
     std::vector<Endpoint> endpoints;
 
     size_t max_full_numel = 0;
     size_t max_shard_numel = 0;
     int num_channel_slots = 0;
 
-    // Dense matrix layout: channels[src_rank * world_size + dst_rank]
+    uint32_t channel_dispatch_capacity = 0;
+    size_t channel_dispatch_chunk_bytes = 0;
+
     std::vector<Channel> channels;
 
-    // Local, device-owned scratch buffers.
     std::vector<transport::CommBuffer> local_shard_buffers;
     std::vector<transport::CommBuffer> local_full_buffers;
 };
@@ -40,7 +38,9 @@ bool group_init(
     const std::vector<int>& devices,
     size_t max_full_numel,
     int num_channel_slots = 1,
-    ChannelMode channel_mode = ChannelMode::kSlotQueue);
+    ChannelMode channel_mode = ChannelMode::kSlotQueue,
+    uint32_t channel_dispatch_capacity = 1024,
+    size_t channel_dispatch_chunk_bytes = 16 * 1024);
 
 void group_destroy(
     Group* group);

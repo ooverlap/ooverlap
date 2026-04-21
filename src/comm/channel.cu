@@ -69,5 +69,21 @@ const transport::CommBuffer* channel_get_slot_signal_buffer(
     return &ch->slots[static_cast<size_t>(slot_idx)].signal_buffer;
 }
 
+transport::DispatchQueue* channel_get_dispatch_queue(
+    Channel* ch) {
+    if (ch == nullptr) {
+        return nullptr;
+    }
+    return &ch->dispatch_queue;
+}
+
+const transport::DispatchQueue* channel_get_dispatch_queue(
+    const Channel* ch) {
+    if (ch == nullptr) {
+        return nullptr;
+    }
+    return &ch->dispatch_queue;
+}
+
 } // namespace comm
 } // namespace ooverlap

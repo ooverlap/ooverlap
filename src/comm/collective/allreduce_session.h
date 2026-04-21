@@ -19,7 +19,6 @@ struct AllReduceSession {
 
     uint32_t published_tile_capacity = 0;
 
-    // One producer-facing queue per rank.
     std::vector<PublishedTileQueue> published_tile_queues;
 };
 

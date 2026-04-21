@@ -185,11 +185,15 @@ endif()
 # -------------------------
 # overlap/comm/test library
 # -------------------------
-file(GLOB overlap_files CONFIGURE_DEPENDS
+file(GLOB_RECURSE overlap_files CONFIGURE_DEPENDS
   ${OOVERLAP_SRC_DIR}/overlap/*.cu
   ${OOVERLAP_SRC_DIR}/overlap/*.cpp
   ${OOVERLAP_SRC_DIR}/comm/*.cu
   ${OOVERLAP_SRC_DIR}/comm/*.cpp
+  ${OOVERLAP_SRC_DIR}/comm/*/*.cu
+  ${OOVERLAP_SRC_DIR}/comm/*/*.cpp
+  ${OOVERLAP_SRC_DIR}/comm/*/*/*.cu
+  ${OOVERLAP_SRC_DIR}/comm/*/*/*.cpp
   ${OOVERLAP_SRC_DIR}/test/*.cu
   ${OOVERLAP_SRC_DIR}/test/*.cpp
   ${OOVERLAP_SRC_DIR}/sm90/*.cu
