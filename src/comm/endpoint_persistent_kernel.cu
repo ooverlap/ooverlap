@@ -143,6 +143,9 @@ __global__ void endpoint_persistent_kernel_sm90(
 void configure_endpoint_persistent_kernel_smem(
     int device,
     size_t dynamic_smem_bytes) {
+    if (dynamic_smem_bytes == 0) {
+    return;
+}
     system::runtime::set_device(device);
 
     cudaDeviceProp prop{};
@@ -289,8 +292,9 @@ void endpoint_persistent_control_destroy(
 }
 
 size_t endpoint_persistent_kernel_dynamic_smem_bytes() {
-    return static_cast<size_t>(kEndpointPersistentStageDepth) *
-           kEndpointPersistentChunkBytes;
+    return 0;
+    /*return static_cast<size_t>(kEndpointPersistentStageDepth) **/
+           /*kEndpointPersistentChunkBytes;*/
 }
 
 cudaError_t launch_endpoint_persistent_kernel_sm90(
