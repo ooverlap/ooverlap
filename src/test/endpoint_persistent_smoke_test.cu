@@ -82,32 +82,70 @@ bool poll_queue_head_until(
     int timeout_ms) {
     auto start = std::chrono::steady_clock::now();
 
-    while (true) {
-        uint64_t head_value = 0;
-        system::runtime::set_device(device);
-        cudaError_t err = cudaMemcpy(
-            &head_value,
-            q.head,
-            sizeof(uint64_t),
-            cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("cudaMemcpy(queue head) failed: ") +
-                cudaGetErrorString(err));
-        }
+    system::runtime::set_device(device);
 
-        if (head_value >= target_head) {
-            return true;
-        }
+    cudaStream_t poll_stream = nullptr;
+    uint64_t* head_host_pinned = nullptr;
 
-        auto now = std::chrono::steady_clock::now();
-        const auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-        if (elapsed_ms > timeout_ms) {
-            return false;
-        }
+    cudaError_t err = cudaSuccess;
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    err = cudaStreamCreateWithFlags(&poll_stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("cudaStreamCreateWithFlags(poll_stream) failed: ") +
+            cudaGetErrorString(err));
+    }
+
+    err = cudaMallocHost(&head_host_pinned, sizeof(uint64_t));
+    if (err != cudaSuccess) {
+        cudaStreamDestroy(poll_stream);
+        throw std::runtime_error(
+            std::string("cudaMallocHost(head_host_pinned) failed: ") +
+            cudaGetErrorString(err));
+    }
+
+    try {
+        while (true) {
+            err = cudaMemcpyAsync(
+                head_host_pinned,
+                q.head,
+                sizeof(uint64_t),
+                cudaMemcpyDeviceToHost,
+                poll_stream);
+            if (err != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("cudaMemcpyAsync(queue head) failed: ") +
+                    cudaGetErrorString(err));
+            }
+
+            err = cudaStreamSynchronize(poll_stream);
+            if (err != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("cudaStreamSynchronize(poll_stream) failed: ") +
+                    cudaGetErrorString(err));
+            }
+
+            if (*head_host_pinned >= target_head) {
+                cudaFreeHost(head_host_pinned);
+                cudaStreamDestroy(poll_stream);
+                return true;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+            if (elapsed_ms > timeout_ms) {
+                cudaFreeHost(head_host_pinned);
+                cudaStreamDestroy(poll_stream);
+                return false;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    } catch (...) {
+        cudaFreeHost(head_host_pinned);
+        cudaStreamDestroy(poll_stream);
+        throw;
     }
 }
 

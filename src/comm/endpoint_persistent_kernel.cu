@@ -145,12 +145,26 @@ bool endpoint_persistent_control_init(
 
     ctl->device = device;
     system::runtime::set_device(device);
+
     system::runtime::check_cuda(
         cudaMalloc(&ctl->stop_flag, sizeof(uint32_t)),
         "cudaMalloc(endpoint persistent stop_flag)");
+
     system::runtime::check_cuda(
-        cudaMemset(ctl->stop_flag, 0, sizeof(uint32_t)),
-        "cudaMemset(endpoint persistent stop_flag)");
+        cudaStreamCreateWithFlags(&ctl->control_stream, cudaStreamNonBlocking),
+        "cudaStreamCreateWithFlags(endpoint persistent control_stream)");
+
+    system::runtime::check_cuda(
+        cudaMemsetAsync(
+            ctl->stop_flag,
+            0,
+            sizeof(uint32_t),
+            ctl->control_stream),
+        "cudaMemsetAsync(endpoint persistent stop_flag init)");
+
+    system::runtime::check_cuda(
+        cudaStreamSynchronize(ctl->control_stream),
+        "cudaStreamSynchronize(endpoint persistent stop_flag init)");
 
     return true;
 }
@@ -164,8 +178,16 @@ void endpoint_persistent_control_reset(
 
     system::runtime::set_device(ctl->device);
     system::runtime::check_cuda(
-        cudaMemset(ctl->stop_flag, 0, sizeof(uint32_t)),
-        "cudaMemset(endpoint persistent reset)");
+        cudaMemsetAsync(
+            ctl->stop_flag,
+            0,
+            sizeof(uint32_t),
+            ctl->control_stream),
+        "cudaMemsetAsync(endpoint persistent reset)");
+
+    system::runtime::check_cuda(
+        cudaStreamSynchronize(ctl->control_stream),
+        "cudaStreamSynchronize(endpoint persistent reset)");
 }
 
 void endpoint_persistent_control_request_stop(
@@ -175,15 +197,20 @@ void endpoint_persistent_control_request_stop(
             "endpoint_persistent_control_request_stop: control not configured");
     }
 
-    const uint32_t one = 1u;
     system::runtime::set_device(ctl->device);
+
+    // Any nonzero value is fine; the kernel only checks != 0.
     system::runtime::check_cuda(
-        cudaMemcpy(
+        cudaMemsetAsync(
             ctl->stop_flag,
-            &one,
+            1,
             sizeof(uint32_t),
-            cudaMemcpyHostToDevice),
-        "cudaMemcpy(endpoint persistent request_stop)");
+            ctl->control_stream),
+        "cudaMemsetAsync(endpoint persistent request_stop)");
+
+    system::runtime::check_cuda(
+        cudaStreamSynchronize(ctl->control_stream),
+        "cudaStreamSynchronize(endpoint persistent request_stop)");
 }
 
 void endpoint_persistent_control_destroy(
@@ -196,6 +223,12 @@ void endpoint_persistent_control_destroy(
         system::runtime::set_device(ctl->device);
     }
 
+    if (ctl->control_stream != nullptr) {
+        system::runtime::check_cuda(
+            cudaStreamDestroy(ctl->control_stream),
+            "cudaStreamDestroy(endpoint persistent control_stream)");
+    }
+
     if (ctl->stop_flag != nullptr) {
         system::runtime::check_cuda(
             cudaFree(ctl->stop_flag),
@@ -203,6 +236,7 @@ void endpoint_persistent_control_destroy(
     }
 
     ctl->stop_flag = nullptr;
+    ctl->control_stream = nullptr;
     ctl->device = -1;
 }
 

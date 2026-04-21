@@ -31,6 +31,7 @@ using EndpointPersistentPipeline =
 
 struct EndpointPersistentControl {
     uint32_t* stop_flag = nullptr;  // device pointer
+    cudaStream_t control_stream = nullptr;
     int device = -1;
 };
 
@@ -38,6 +39,7 @@ __host__ __device__ __forceinline__ bool endpoint_persistent_control_is_valid(
     const EndpointPersistentControl* ctl) {
     return ctl != nullptr &&
            ctl->stop_flag != nullptr &&
+           ctl->control_stream != nullptr &&
            ctl->device >= 0;
 }
 
