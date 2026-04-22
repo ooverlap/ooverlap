@@ -24,6 +24,72 @@
 namespace ooverlap {
 namespace {
 
+struct HostMappedMailbox {
+    uint32_t* host_ptr = nullptr;
+    std::vector<uint32_t*> device_ptrs;
+    size_t count = 0;
+
+    void init(size_t n, const std::vector<int>& devices) {
+        if (n == 0) {
+            throw std::invalid_argument("HostMappedMailbox::init: n must be > 0");
+        }
+        destroy();
+
+        count = n;
+
+        cudaError_t err = cudaHostAlloc(
+            reinterpret_cast<void**>(&host_ptr),
+            count * sizeof(uint32_t),
+            cudaHostAllocMapped | cudaHostAllocPortable);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cudaHostAlloc(mapped mailbox) failed: ") +
+                cudaGetErrorString(err));
+        }
+
+        device_ptrs.resize(devices.size(), nullptr);
+
+        for (size_t i = 0; i < devices.size(); ++i) {
+            system::runtime::set_device(devices[i]);
+            err = cudaHostGetDevicePointer(
+                reinterpret_cast<void**>(&device_ptrs[i]),
+                host_ptr,
+                0);
+            if (err != cudaSuccess) {
+                cudaFreeHost(host_ptr);
+                host_ptr = nullptr;
+                device_ptrs.clear();
+                count = 0;
+                throw std::runtime_error(
+                    std::string("cudaHostGetDevicePointer(mapped mailbox) failed: ") +
+                    cudaGetErrorString(err));
+            }
+        }
+    }
+
+    void reset(uint32_t value) {
+        if (host_ptr == nullptr) {
+            throw std::invalid_argument("HostMappedMailbox::reset: not initialized");
+        }
+        for (size_t i = 0; i < count; ++i) {
+            host_ptr[i] = value;
+        }
+    }
+
+    uint32_t* device_ptr_for_rank(size_t rank) const {
+        return device_ptrs.at(rank);
+    }
+
+    void destroy() {
+        if (host_ptr != nullptr) {
+            cudaFreeHost(host_ptr);
+        }
+        host_ptr = nullptr;
+        device_ptrs.clear();
+        count = 0;
+    }
+};
+
 std::vector<int> normalize_devices(
     const std::vector<int64_t>& devices64) {
     std::vector<int> out;
@@ -116,31 +182,11 @@ void expect_half_vectors_close(
     }
 }
 
-void copy_u32_buffer_from_owner(
-    int owner_device,
-    const void* ptr,
-    size_t count,
-    std::vector<uint32_t>* out) {
-    if (out == nullptr) {
-        throw std::invalid_argument("copy_u32_buffer_from_owner: out is null");
-    }
-
-    out->resize(count);
-
-    system::runtime::set_device(owner_device);
-    system::runtime::check_cuda(
-        cudaMemcpy(
-            out->data(),
-            ptr,
-            count * sizeof(uint32_t),
-            cudaMemcpyDeviceToHost),
-        "cudaMemcpy(u32 buffer -> host)");
-}
-
 bool all_u32_equal_to_one(
-    const std::vector<uint32_t>& values) {
-    for (uint32_t v : values) {
-        if (v != 1u) {
+    const uint32_t* ptr,
+    size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (ptr[i] != 1u) {
             return false;
         }
     }
@@ -148,31 +194,16 @@ bool all_u32_equal_to_one(
 }
 
 bool wait_until_all_ranks_done(
-    const std::vector<int>& devices,
-    const std::vector<comm::transport::CommBuffer>& done_buffers,
-    size_t num_chunks,
-    int timeout_ms,
-    std::vector<std::vector<uint32_t>>* host_done_cache) {
-    if (host_done_cache == nullptr) {
-        throw std::invalid_argument("wait_until_all_ranks_done: host_done_cache is null");
-    }
-
-    host_done_cache->assign(done_buffers.size(), std::vector<uint32_t>(num_chunks, 0u));
-
+    const std::vector<HostMappedMailbox>& done_flags,
+    int timeout_ms) {
     const auto start = std::chrono::steady_clock::now();
 
     while (true) {
         bool all_done = true;
-
-        for (size_t r = 0; r < done_buffers.size(); ++r) {
-            copy_u32_buffer_from_owner(
-                devices[r],
-                done_buffers[r].ptr,
-                num_chunks,
-                &(*host_done_cache)[r]);
-
-            if (!all_u32_equal_to_one((*host_done_cache)[r])) {
+        for (const auto& done : done_flags) {
+            if (!all_u32_equal_to_one(done.host_ptr, done.count)) {
                 all_done = false;
+                break;
             }
         }
 
@@ -192,28 +223,26 @@ bool wait_until_all_ranks_done(
 }
 
 std::string build_progress_debug_string(
-    const std::vector<int>& devices,
-    const std::vector<comm::transport::CommBuffer>& inbound_buffers,
-    const std::vector<comm::transport::CommBuffer>& done_buffers,
-    size_t num_chunks) {
+    const std::vector<HostMappedMailbox>& inbound_steps,
+    const std::vector<HostMappedMailbox>& done_flags) {
+    std::string out;
 
-    std::string output("");
-    for (size_t r = 0; r < done_buffers.size(); ++r) {
-        std::vector<uint32_t> host_done;
-        std::vector<uint32_t> host_inbound;
-        copy_u32_buffer_from_owner(devices[r], done_buffers[r].ptr, num_chunks, &host_done);
-        copy_u32_buffer_from_owner(devices[r], inbound_buffers[r].ptr, num_chunks, &host_inbound);
-
-        for (size_t c = 0; c < num_chunks; ++c) {
-            output = output + " " +std::string("first incomplete rank=") +
-                       std::to_string(r) +
+    for (size_t r = 0; r < done_flags.size(); ++r) {
+        for (size_t c = 0; c < done_flags[r].count; ++c) {
+            if (done_flags[r].host_ptr[c] != 1u) {
+                out += " first incomplete rank=" + std::to_string(r) +
                        " chunk=" + std::to_string(c) +
-                       " done=" + std::to_string(host_done[c]) +
-                       " inbound_step=" + std::to_string(host_inbound[c]);
+                       " done=" + std::to_string(done_flags[r].host_ptr[c]) +
+                       " inbound_step=" + std::to_string(inbound_steps[r].host_ptr[c]);
+                break;
+            }
         }
     }
 
-    return output;
+    if (out.empty()) {
+        out = " all ranks complete";
+    }
+    return out;
 }
 
 } // namespace
@@ -237,8 +266,8 @@ bool endpoint_persistent_smoke_test(
     std::vector<comm::EndpointPersistentControl> controls(static_cast<size_t>(world_size));
 
     std::vector<comm::transport::CommBuffer> accums(static_cast<size_t>(world_size));
-    std::vector<comm::transport::CommBuffer> inbound_steps(static_cast<size_t>(world_size));
-    std::vector<comm::transport::CommBuffer> done_flags(static_cast<size_t>(world_size));
+    std::vector<HostMappedMailbox> inbound_steps(static_cast<size_t>(world_size));
+    std::vector<HostMappedMailbox> done_flags(static_cast<size_t>(world_size));
 
     std::vector<comm::collective::ChunkStateTable> chunk_states(static_cast<size_t>(world_size));
     std::vector<comm::collective::DeviceOperationDesc> op_devs(static_cast<size_t>(world_size));
@@ -278,17 +307,8 @@ bool endpoint_persistent_smoke_test(
                     r,
                     bytes);
 
-            inbound_steps[static_cast<size_t>(r)] =
-                comm::transport::alloc_peer_visible_buffer_for_rank(
-                    group.devices,
-                    r,
-                    static_cast<size_t>(num_chunks) * sizeof(uint32_t));
-
-            done_flags[static_cast<size_t>(r)] =
-                comm::transport::alloc_peer_visible_buffer_for_rank(
-                    group.devices,
-                    r,
-                    static_cast<size_t>(num_chunks) * sizeof(uint32_t));
+            inbound_steps[static_cast<size_t>(r)].init(num_chunks, devices);
+            done_flags[static_cast<size_t>(r)].init(num_chunks, devices);
         }
 
         for (int r = 0; r < world_size; ++r) {
@@ -319,18 +339,42 @@ bool endpoint_persistent_smoke_test(
                 accums[static_cast<size_t>(next_rank)].ptr,
                 bytes,
                 chunk_bytes,
-                inbound_steps[static_cast<size_t>(r)].ptr,
-                inbound_steps[static_cast<size_t>(next_rank)].ptr,
-                done_flags[static_cast<size_t>(r)].ptr,
-                done_flags[static_cast<size_t>(next_rank)].ptr,
+                inbound_steps[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+                inbound_steps[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
+                done_flags[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+                done_flags[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
                 chunk_states[static_cast<size_t>(r)].records,
                 1);
         }
 
         for (int r = 0; r < world_size; ++r) {
-            comm::collective::operation_desc_reset_local_state(
-                group.devices[static_cast<size_t>(r)],
-                &ops[static_cast<size_t>(r)]);
+            inbound_steps[static_cast<size_t>(r)].reset(
+                comm::collective::kOperationInboundStepInvalid);
+            done_flags[static_cast<size_t>(r)].reset(0u);
+        }
+
+        for (int r = 0; r < world_size; ++r) {
+            for (uint32_t idx = 0; idx < num_chunks; ++idx) {
+                if (comm::collective::operation_desc_actor_rank_for_step(
+                        &ops[static_cast<size_t>(r)],
+                        idx,
+                        0u) == r) {
+                    inbound_steps[static_cast<size_t>(r)].host_ptr[idx] = 0u;
+                }
+            }
+        }
+
+        for (int r = 0; r < world_size; ++r) {
+            std::printf("[smoke] init mailbox rank=%d chunk0 inbound=%u done=%u\n",
+                        r,
+                        inbound_steps[static_cast<size_t>(r)].host_ptr[0],
+                        done_flags[static_cast<size_t>(r)].host_ptr[0]);
+        }
+        std::fflush(stdout);
+
+        for (int r = 0; r < world_size; ++r) {
+            comm::collective::chunk_state_table_reset(
+                &chunk_states[static_cast<size_t>(r)]);
         }
 
         for (int r = 0; r < world_size; ++r) {
@@ -376,22 +420,14 @@ bool endpoint_persistent_smoke_test(
         std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
 
         std::printf("[smoke] waiting for chunk completion\n"); std::fflush(stdout);
-        std::vector<std::vector<uint32_t>> host_done_cache;
-        const bool all_done = wait_until_all_ranks_done(
-            devices,
-            done_flags,
-            num_chunks,
-            timeout_ms,
-            &host_done_cache);
+        const bool all_done = wait_until_all_ranks_done(done_flags, timeout_ms);
 
         if (!all_done) {
             throw std::runtime_error(
                 std::string("endpoint_persistent_smoke_test: timeout waiting for done flags; ") +
                 build_progress_debug_string(
-                    devices,
                     inbound_steps,
-                    done_flags,
-                    num_chunks));
+                    done_flags));
         }
 
         std::printf("[smoke] all chunks done\n"); std::fflush(stdout);
@@ -410,15 +446,8 @@ bool endpoint_persistent_smoke_test(
         std::printf("[smoke] persistent streams joined\n"); std::fflush(stdout);
 
         for (int r = 0; r < world_size; ++r) {
-            std::vector<uint32_t> host_done;
-            copy_u32_buffer_from_owner(
-                devices[static_cast<size_t>(r)],
-                done_flags[static_cast<size_t>(r)].ptr,
-                num_chunks,
-                &host_done);
-
-            for (uint32_t i = 0; i < num_chunks; ++i) {
-                if (host_done[static_cast<size_t>(i)] != 1u) {
+            for (size_t i = 0; i < done_flags[static_cast<size_t>(r)].count; ++i) {
+                if (done_flags[static_cast<size_t>(r)].host_ptr[i] != 1u) {
                     throw std::runtime_error(
                         "endpoint_persistent_smoke_test: done flag was not set");
                 }
@@ -450,11 +479,11 @@ bool endpoint_persistent_smoke_test(
             comm::collective::chunk_state_table_destroy(&table);
         }
 
-        for (auto& buf : done_flags) {
-            comm::transport::free_comm_buffer(group.devices, buf);
+        for (auto& box : done_flags) {
+            box.destroy();
         }
-        for (auto& buf : inbound_steps) {
-            comm::transport::free_comm_buffer(group.devices, buf);
+        for (auto& box : inbound_steps) {
+            box.destroy();
         }
         for (auto& accum : accums) {
             comm::transport::free_comm_buffer(group.devices, accum);
@@ -491,11 +520,11 @@ bool endpoint_persistent_smoke_test(
             try { comm::collective::chunk_state_table_destroy(&table); } catch (...) {}
         }
 
-        for (auto& buf : done_flags) {
-            try { comm::transport::free_comm_buffer(group.devices, buf); } catch (...) {}
+        for (auto& box : done_flags) {
+            try { box.destroy(); } catch (...) {}
         }
-        for (auto& buf : inbound_steps) {
-            try { comm::transport::free_comm_buffer(group.devices, buf); } catch (...) {}
+        for (auto& box : inbound_steps) {
+            try { box.destroy(); } catch (...) {}
         }
         for (auto& accum : accums) {
             try { comm::transport::free_comm_buffer(group.devices, accum); } catch (...) {}
