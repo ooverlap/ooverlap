@@ -35,6 +35,16 @@
 namespace ooverlap {
 namespace {
 
+void bench_trace(const char* msg) {
+    std::printf("[bench] %s\n", msg);
+    std::fflush(stdout);
+}
+
+void bench_trace_iter(const char* phase, int iter, const char* msg) {
+    std::printf("[bench] phase=%s iter=%d %s\n", phase, iter, msg);
+    std::fflush(stdout);
+}
+
 __global__ void fp16_add_inplace_kernel(
     half* dst,
     const half* src,
@@ -597,6 +607,7 @@ bool wait_until_all_ranks_done_no_sleep(
     PersistentTwoGpuState* st,
     int timeout_ms) {
     const auto start = std::chrono::steady_clock::now();
+    uint64_t spins = 0;
 
     while (true) {
         bool all_done = true;
@@ -615,6 +626,14 @@ bool wait_until_all_ranks_done_no_sleep(
             return true;
         }
 
+        ++spins;
+        if ((spins & ((1ull << 18) - 1ull)) == 0ull) {
+            std::printf("[bench] wait done flags: still waiting spins=%llu\n",
+                        static_cast<unsigned long long>(spins));
+            std::fflush(stdout);
+            dump_persistent_debug_state(st, "wait_until_all_ranks_done_no_sleep");
+        }
+
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
@@ -630,6 +649,7 @@ bool wait_until_all_timing_events_complete(
     PersistentTwoGpuState* st,
     int timeout_ms) {
     const auto start = std::chrono::steady_clock::now();
+    uint64_t spins = 0;
 
     while (true) {
         bool all_done = true;
@@ -649,6 +669,14 @@ bool wait_until_all_timing_events_complete(
 
         if (all_done) {
             return true;
+        }
+
+        ++spins;
+        if ((spins & ((1ull << 20) - 1ull)) == 0ull) {
+            std::printf("[bench] wait timing events: still waiting spins=%llu\n",
+                        static_cast<unsigned long long>(spins));
+            std::fflush(stdout);
+            dump_persistent_debug_state(st, "wait_until_all_timing_events_complete");
         }
 
         const auto now = std::chrono::steady_clock::now();
@@ -1007,6 +1035,34 @@ void prepare_persistent_two_gpu_run(
             st->group.devices[static_cast<size_t>(r)],
             &st->ops[static_cast<size_t>(r)]);
     }
+
+    {
+        uint32_t meta0[2] = {0, 0};
+        uint32_t meta1[2] = {0, 0};
+
+        system::runtime::set_device(st->devices[0]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                meta0,
+                st->ready_queues[0].device_ptr_for_rank(0),
+                2 * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(prepare queue meta0 -> host)");
+
+        system::runtime::set_device(st->devices[1]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                meta1,
+                st->ready_queues[1].device_ptr_for_rank(1),
+                2 * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(prepare queue meta1 -> host)");
+
+        std::printf(
+            "[bench] prepare persistent queue meta r0=(head=%u tail=%u) r1=(head=%u tail=%u)\n",
+            meta0[0], meta0[1], meta1[0], meta1[1]);
+        std::fflush(stdout);
+    }
 }
 
 PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
@@ -1018,8 +1074,14 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
 
     const auto host_wait_start = std::chrono::steady_clock::now();
 
+    bench_trace("persistent measure: enter wait_until_all_timing_events_complete");
+
     const bool timing_done =
         wait_until_all_timing_events_complete(st, timeout_ms);
+
+    bench_trace(timing_done
+        ? "persistent measure: timing events complete"
+        : "persistent measure: timing events timeout");
 
     const auto host_wait_stop = std::chrono::steady_clock::now();
 
@@ -1053,8 +1115,14 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
             "cudaEventElapsedTime(persistent timing)");
     }
 
+    bench_trace("persistent measure: enter wait_until_all_ranks_done_no_sleep");
+
     const bool all_done =
         wait_until_all_ranks_done_no_sleep(st, timeout_ms);
+
+    bench_trace(all_done
+        ? "persistent measure: all done flags complete"
+        : "persistent measure: all done flags timeout");
 
     if (!all_done) {
         for (int r = 0; r < 2; ++r) {
@@ -1082,6 +1150,11 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
         std::chrono::duration<double, std::milli>(host_wait_stop - host_wait_start).count();
     out.stop_join_ms = 0.0;
     out.total_ms = out.device_done_ms;
+    std::printf(
+        "[bench] persistent measure: device_done_ms=%.6f host_wait_done_ms=%.6f\n",
+        out.device_done_ms,
+        out.host_wait_done_ms);
+    std::fflush(stdout);
     return out;
 }
 
@@ -1436,6 +1509,8 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
         // Phase 1: persistent only
         launch_persistent_two_gpu_run(&persistent);
+
+        bench_trace("benchmark: persistent warmup begin");
 
         for (int i = 0; i < warmup; ++i) {
             prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
