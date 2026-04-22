@@ -2,6 +2,7 @@
 
 #include "ooverlap/system/runtime_utils.cuh"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -12,47 +13,98 @@ namespace ooverlap {
 namespace comm {
 namespace {
 
-static constexpr size_t kEndpointPersistentStaticSharedBytes =
-    static_cast<size_t>(kEndpointPersistentStageDepth) * sizeof(sync::semaphore) +
-    sizeof(exec::ChunkSchedulerScratch<kEndpointPersistentWatchThreads>) +
-    sizeof(int);
-
 __device__ __forceinline__ bool endpoint_persistent_should_stop(
     const uint32_t* stop_flag) {
     return (*reinterpret_cast<volatile const uint32_t*>(stop_flag)) != 0u;
 }
 
+__device__ __forceinline__ void endpoint_persistent_seed_chunk_state(
+    collective::ChunkState* st,
+    const exec::Chunk* chunk,
+    const collective::OperationDesc* op) {
+    if (st == nullptr || chunk == nullptr || op == nullptr) {
+        return;
+    }
+
+    st->op_id = op->op_id;
+    st->epoch = op->epoch;
+    st->chunk_idx = static_cast<uint32_t>(chunk->chunk_idx);
+    st->flags = collective::kChunkStateFlagSeeded |
+                collective::kChunkStateFlagActive;
+    st->contributions_seen = 1;
+    st->expected_contributions = op->expected_contributions;
+    st->step = 0;
+    st->send_count = 0;
+    st->offset_bytes = chunk->range_offset_bytes;
+    st->bytes = chunk->bytes;
+
+    if (op->expected_contributions <= 1) {
+        st->flags |= collective::kChunkStateFlagDone;
+        st->flags &= ~collective::kChunkStateFlagActive;
+    }
+}
+
+__device__ __forceinline__ void endpoint_persistent_copy_bytes(
+    unsigned char* dst,
+    const unsigned char* src,
+    size_t bytes) {
+    for (size_t i = threadIdx.x; i < bytes; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+__device__ __forceinline__ void endpoint_persistent_seed_local_partial(
+    const exec::Chunk* chunk,
+    const collective::OperationDesc* op) {
+    const unsigned char* src = chunk->src;
+    unsigned char* partial =
+        collective::operation_desc_partial_chunk_ptr(
+            op,
+            static_cast<uint32_t>(chunk->chunk_idx));
+
+    endpoint_persistent_copy_bytes(partial, src, chunk->bytes);
+}
+
+__device__ __forceinline__ void endpoint_persistent_finalize_chunk(
+    const exec::Chunk* chunk,
+    const collective::OperationDesc* op) {
+    const unsigned char* partial =
+        collective::operation_desc_partial_chunk_ptr(
+            op,
+            static_cast<uint32_t>(chunk->chunk_idx));
+    unsigned char* dst =
+        collective::operation_desc_dst_chunk_ptr(
+            op,
+            static_cast<uint32_t>(chunk->chunk_idx));
+
+    endpoint_persistent_copy_bytes(dst, partial, chunk->bytes);
+}
+
 __global__ void endpoint_persistent_kernel_sm90(
     DeviceEndpointRuntime runtime,
+    const collective::OperationDesc* operation,
+    collective::ChunkState* chunk_states,
     const uint32_t* stop_flag) {
     if (blockIdx.x != 0) {
         return;
     }
 
-    extern __shared__ uint4 shared_storage_u4[];
-    unsigned char* shared_raw =
-        reinterpret_cast<unsigned char*>(shared_storage_u4);
-
-    __shared__ sync::semaphore load_barriers[kEndpointPersistentStageDepth];
-    __shared__ exec::ChunkSchedulerScratch<kEndpointPersistentWatchThreads> sched_scratch;
     __shared__ int shared_should_stop;
+    __shared__ int shared_has_chunk;
+    __shared__ exec::Chunk shared_chunk;
+    __shared__ int shared_need_seed;
 
-    EndpointPersistentScheduler scheduler{};
-    exec::chunk_scheduler_init(
-        &scheduler,
-        runtime.scheduler_bindings,
-        runtime.num_scheduler_bindings,
-        kEndpointPersistentChunkBytes,
-        &sched_scratch);
+    exec::ChunkScheduler<1> scheduler{};
 
-    EndpointPersistentPipeline pipe{};
-    exec::chunk_pipeline_bind_stage_storage<
-        kEndpointPersistentStageDepth,
-        kEndpointPersistentChunkBytes>(
-        &pipe,
-        shared_raw,
-        load_barriers);
-    exec::chunk_pipeline_init(&pipe, &scheduler);
+    if (threadIdx.x == 0) {
+        exec::chunk_scheduler_init(
+            &scheduler,
+            runtime.submission,
+            kEndpointPersistentChunkBytes);
+        shared_has_chunk = 0;
+        shared_need_seed = 0;
+    }
+    __syncthreads();
 
     while (true) {
         if (threadIdx.x == 0) {
@@ -64,30 +116,57 @@ __global__ void endpoint_persistent_kernel_sm90(
             return;
         }
 
-        if (!exec::chunk_pipeline_has_current(&pipe)) {
-            if (!exec::chunk_pipeline_try_prime(&pipe)) {
-#if defined(__CUDA_ARCH__)
-                if (threadIdx.x == 0) {
-                    __nanosleep(256);
+        if (threadIdx.x == 0) {
+            if (!exec::chunk_scheduler_try_prime_current(&scheduler)) {
+                shared_has_chunk = 0;
+            } else {
+                shared_chunk = *exec::chunk_scheduler_current(&scheduler);
+                shared_has_chunk = 1;
+
+                if (shared_chunk.chunk_idx < 0 ||
+                    static_cast<uint32_t>(shared_chunk.chunk_idx) >= operation->num_chunks) {
+                    shared_need_seed = 0;
+                } else {
+                    const collective::ChunkState* st =
+                        &chunk_states[shared_chunk.chunk_idx];
+                    shared_need_seed = collective::chunk_state_is_seeded(st) ? 0 : 1;
                 }
+            }
+        }
+        __syncthreads();
+
+        if (!shared_has_chunk) {
+#if defined(__CUDA_ARCH__)
+            if (threadIdx.x == 0) {
+                __nanosleep(256);
+            }
 #endif
-                __syncthreads();
-                continue;
+            __syncthreads();
+            continue;
+        }
+
+        if (shared_need_seed) {
+            endpoint_persistent_seed_local_partial(&shared_chunk, operation);
+            __syncthreads();
+
+            if (collective::operation_desc_is_active(operation) &&
+                operation->expected_contributions <= 1) {
+                endpoint_persistent_finalize_chunk(&shared_chunk, operation);
+            }
+            __syncthreads();
+
+            if (threadIdx.x == 0) {
+                endpoint_persistent_seed_chunk_state(
+                    &chunk_states[shared_chunk.chunk_idx],
+                    &shared_chunk,
+                    operation);
             }
             __syncthreads();
         }
 
-        exec::chunk_pipeline_wait_current_stage(&pipe);
-        __syncthreads();
-
-        exec::chunk_pipeline_issue_current_reduce(&pipe);
-        exec::chunk_pipeline_schedule_next_load(&pipe);
-        __syncthreads();
-
-        exec::chunk_pipeline_finish_current_tail(&pipe);
-        __syncthreads();
-
-        exec::chunk_pipeline_advance(&pipe);
+        if (threadIdx.x == 0) {
+            exec::chunk_scheduler_advance(&scheduler);
+        }
         __syncthreads();
     }
 }
@@ -95,6 +174,10 @@ __global__ void endpoint_persistent_kernel_sm90(
 void configure_endpoint_persistent_kernel_smem(
     int device,
     size_t dynamic_smem_bytes) {
+    if (dynamic_smem_bytes == 0) {
+        return;
+    }
+
     system::runtime::set_device(device);
 
     cudaDeviceProp prop{};
@@ -102,16 +185,13 @@ void configure_endpoint_persistent_kernel_smem(
         cudaGetDeviceProperties(&prop, device),
         "cudaGetDeviceProperties(endpoint persistent)");
 
-    const size_t total_smem_bytes =
-        dynamic_smem_bytes + kEndpointPersistentStaticSharedBytes;
-
-    if (total_smem_bytes >
+    if (dynamic_smem_bytes >
         static_cast<size_t>(prop.sharedMemPerBlockOptin)) {
         throw std::runtime_error(
             "endpoint persistent kernel requested shared memory exceeds device opt-in limit");
     }
 
-    if (total_smem_bytes >
+    if (dynamic_smem_bytes >
         static_cast<size_t>(prop.sharedMemPerBlock)) {
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
@@ -199,7 +279,6 @@ void endpoint_persistent_control_request_stop(
 
     system::runtime::set_device(ctl->device);
 
-    // Any nonzero value is fine; the kernel only checks != 0.
     system::runtime::check_cuda(
         cudaMemsetAsync(
             ctl->stop_flag,
@@ -241,15 +320,22 @@ void endpoint_persistent_control_destroy(
 }
 
 size_t endpoint_persistent_kernel_dynamic_smem_bytes() {
-    return static_cast<size_t>(kEndpointPersistentStageDepth) *
-           kEndpointPersistentChunkBytes;
+    return 0;
 }
 
 cudaError_t launch_endpoint_persistent_kernel_sm90(
     const DeviceEndpointRuntime* runtime,
+    const collective::OperationDesc* operation,
+    collective::ChunkState* chunk_states,
     const EndpointPersistentControl* control,
     cudaStream_t stream) {
     if (!device_endpoint_runtime_is_valid(runtime)) {
+        return cudaErrorInvalidValue;
+    }
+    if (operation == nullptr || !collective::operation_desc_is_active(operation)) {
+        return cudaErrorInvalidValue;
+    }
+    if (chunk_states == nullptr) {
         return cudaErrorInvalidValue;
     }
     if (!endpoint_persistent_control_is_valid(control)) {
@@ -257,6 +343,9 @@ cudaError_t launch_endpoint_persistent_kernel_sm90(
     }
     if (runtime->device != control->device) {
         return cudaErrorInvalidDevice;
+    }
+    if (!collective::operation_desc_matches_submission(operation, runtime->submission)) {
+        return cudaErrorInvalidValue;
     }
 
     const size_t dynamic_smem_bytes =
@@ -277,6 +366,8 @@ cudaError_t launch_endpoint_persistent_kernel_sm90(
         dynamic_smem_bytes,
         launch_stream>>>(
         *runtime,
+        operation,
+        chunk_states,
         control->stop_flag);
 
     return cudaGetLastError();

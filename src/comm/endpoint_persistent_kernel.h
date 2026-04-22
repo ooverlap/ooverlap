@@ -5,29 +5,14 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "comm/collective/operation.h"
 #include "comm/endpoint_runtime.h"
-#include "comm/exec/chunk_pipeline.h"
-#include "comm/exec/pipeline_load.h"
-#include "comm/exec/pipeline_reduce.h"
 
 namespace ooverlap {
 namespace comm {
 
-static constexpr int kEndpointPersistentWatchThreads = 16;
-static constexpr int kEndpointPersistentThreads = 1;
-static constexpr int kEndpointPersistentStageDepth = 3;
+static constexpr int kEndpointPersistentThreads = 128;
 static constexpr size_t kEndpointPersistentChunkBytes = 16 * 1024;
-
-using EndpointPersistentScheduler =
-    exec::ChunkScheduler<kEndpointPersistentWatchThreads>;
-using EndpointPersistentLoadOp = exec::PipelineTMALoad;
-using EndpointPersistentReduceOp = exec::PipelineTMAReduceAddNoFtzF16;
-using EndpointPersistentPipeline =
-    exec::ChunkPipeline<
-        kEndpointPersistentStageDepth,
-        EndpointPersistentScheduler,
-        EndpointPersistentLoadOp,
-        EndpointPersistentReduceOp>;
 
 struct EndpointPersistentControl {
     uint32_t* stop_flag = nullptr;  // device pointer
@@ -60,6 +45,8 @@ size_t endpoint_persistent_kernel_dynamic_smem_bytes();
 
 cudaError_t launch_endpoint_persistent_kernel_sm90(
     const DeviceEndpointRuntime* runtime,
+    const collective::OperationDesc* operation,
+    collective::ChunkState* chunk_states,
     const EndpointPersistentControl* control,
     cudaStream_t stream = nullptr);
 
