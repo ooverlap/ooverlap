@@ -23,6 +23,48 @@ void free_peer_visible_mappings(
     system::vmm::vm_unmap(buf->ptr, buf->bytes);
 }
 
+std::vector<int> normalize_access_ranks(
+    int world_size,
+    int owner_rank,
+    const std::vector<int>& access_ranks) {
+    if (world_size <= 0) {
+        throw std::invalid_argument("normalize_access_ranks: invalid world_size");
+    }
+    if (owner_rank < 0 || owner_rank >= world_size) {
+        throw std::invalid_argument("normalize_access_ranks: invalid owner_rank");
+    }
+
+    std::vector<int> out;
+    out.reserve(access_ranks.size() + 1);
+
+    auto push_unique = [&out, world_size](int r) {
+        if (r < 0 || r >= world_size) {
+            throw std::invalid_argument("normalize_access_ranks: invalid access rank");
+        }
+        if (std::find(out.begin(), out.end(), r) == out.end()) {
+            out.push_back(r);
+        }
+    };
+
+    push_unique(owner_rank);
+    for (int r : access_ranks) {
+        push_unique(r);
+    }
+
+    return out;
+}
+
+std::vector<int> ranks_to_devices(
+    const std::vector<int>& devices,
+    const std::vector<int>& ranks) {
+    std::vector<int> out;
+    out.reserve(ranks.size());
+    for (int r : ranks) {
+        out.push_back(devices[static_cast<size_t>(r)]);
+    }
+    return out;
+}
+
 } // namespace
 
 CommBuffer alloc_peer_visible_buffer_for_rank(
@@ -30,22 +72,50 @@ CommBuffer alloc_peer_visible_buffer_for_rank(
     int owner_rank,
     size_t bytes) {
 
-    if (owner_rank < 0 || owner_rank >= static_cast<int>(devices.size())) {
-        throw std::invalid_argument("alloc_peer_visible_buffer_for_rank: invalid owner_rank");
-    }
-    if (bytes == 0) {
-        throw std::invalid_argument("alloc_peer_visible_buffer_for_rank: bytes must be > 0");
+    std::vector<int> all_ranks(devices.size());
+    for (size_t i = 0; i < devices.size(); ++i) {
+        all_ranks[i] = static_cast<int>(i);
     }
 
+    return alloc_peer_visible_buffer_for_rank_with_access_ranks(
+        devices,
+        owner_rank,
+        all_ranks,
+        bytes);
+}
+
+CommBuffer alloc_peer_visible_buffer_for_rank_with_access_ranks(
+    const std::vector<int>& devices,
+    int owner_rank,
+    const std::vector<int>& access_ranks,
+    size_t bytes) {
+
+    if (owner_rank < 0 || owner_rank >= static_cast<int>(devices.size())) {
+        throw std::invalid_argument("alloc_peer_visible_buffer_for_rank_with_access_ranks: invalid owner_rank");
+    }
+    if (bytes == 0) {
+        throw std::invalid_argument("alloc_peer_visible_buffer_for_rank_with_access_ranks: bytes must be > 0");
+    }
+
+    const std::vector<int> normalized_ranks =
+        normalize_access_ranks(static_cast<int>(devices.size()), owner_rank, access_ranks);
+    const std::vector<int> access_devices =
+        ranks_to_devices(devices, normalized_ranks);
+
     auto mapped =
-        system::alloc_peer_visible_buffer(bytes, devices[owner_rank], devices);
+        system::alloc_peer_visible_buffer(bytes, devices[owner_rank], access_devices);
 
     CommBuffer out{};
     out.ptr = mapped.ptr;
     out.bytes = mapped.mapped_size;
     out.owner_rank = owner_rank;
     out.peer_visible = true;
-    out.device_ptrs.resize(devices.size(), mapped.ptr);
+    out.device_ptrs.resize(devices.size(), nullptr);
+
+    for (int r : normalized_ranks) {
+        out.device_ptrs[static_cast<size_t>(r)] = mapped.ptr;
+    }
+
     return out;
 }
 

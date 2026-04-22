@@ -24,6 +24,20 @@
 namespace ooverlap {
 namespace {
 
+static int prev_rank_of(
+    int rank,
+    int world_size) {
+    return (rank - 1 + world_size) % world_size;
+}
+
+static bool rank_needs_accum_access(
+    int owner_rank,
+    int view_rank,
+    int world_size) {
+    return view_rank == owner_rank ||
+           view_rank == prev_rank_of(owner_rank, world_size);
+}
+
 struct HostMappedMailbox {
     uint32_t* host_ptr = nullptr;
     std::vector<uint32_t*> device_ptrs;
@@ -360,6 +374,7 @@ static void dump_accum_peer_views(
     int64_t numel,
     int sample_count = 8) {
     const int64_t n = std::min<int64_t>(numel, sample_count);
+    const int world_size = static_cast<int>(devices.size());
 
     std::printf("[debug] prelaunch accum peer-view dump\n");
     for (size_t owner = 0; owner < accums.size(); ++owner) {
@@ -370,6 +385,13 @@ static void dump_accum_peer_views(
         std::printf("\n");
 
         for (size_t view_rank = 0; view_rank < devices.size(); ++view_rank) {
+            if (!rank_needs_accum_access(
+                    static_cast<int>(owner),
+                    static_cast<int>(view_rank),
+                    world_size)) {
+                continue;
+            }
+
             std::vector<half> host(static_cast<size_t>(n));
 
             system::runtime::set_device(devices[view_rank]);
@@ -406,9 +428,17 @@ static void validate_accum_peer_views_or_throw(
     int64_t numel,
     int sample_count = 8) {
     const int64_t n = std::min<int64_t>(numel, sample_count);
+    const int world_size = static_cast<int>(devices.size());
 
     for (size_t owner = 0; owner < accums.size(); ++owner) {
         for (size_t view_rank = 0; view_rank < devices.size(); ++view_rank) {
+            if (!rank_needs_accum_access(
+                    static_cast<int>(owner),
+                    static_cast<int>(view_rank),
+                    world_size)) {
+                continue;
+            }
+
             std::vector<half> host(static_cast<size_t>(n));
 
             system::runtime::set_device(devices[view_rank]);
@@ -496,15 +526,18 @@ bool endpoint_persistent_smoke_test(
         std::printf("[smoke] after endpoint_runtime_init\n"); std::fflush(stdout);
 
         for (int r = 0; r < world_size; ++r) {
-            accums[static_cast<size_t>(r)] =
-                comm::transport::alloc_peer_visible_buffer_for_rank(
-                    group.devices,
-                    r,
-                    bytes);
+    const int prev_rank = prev_rank_of(r, world_size);
 
-            inbound_steps[static_cast<size_t>(r)].init(num_chunks, devices);
-            done_flags[static_cast<size_t>(r)].init(num_chunks, devices);
-        }
+    accums[static_cast<size_t>(r)] =
+        comm::transport::alloc_peer_visible_buffer_for_rank_with_access_ranks(
+            group.devices,
+            r,
+            {prev_rank},
+            bytes);
+
+    inbound_steps[static_cast<size_t>(r)].init(num_chunks, devices);
+    done_flags[static_cast<size_t>(r)].init(num_chunks, devices);
+} 
 
         for (int r = 0; r < world_size; ++r) {
             system::runtime::set_device(group.devices[static_cast<size_t>(r)]);

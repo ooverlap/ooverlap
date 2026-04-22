@@ -12,17 +12,20 @@ namespace comm {
 namespace transport {
 
 struct CommBuffer {
-    // Legacy/default pointer. For peer-visible buffers this is the owner's
-    // device view. Prefer device_ptr_for_rank() at callsites.
+    // Default pointer. For peer-visible buffers this is the owner's device view.
     void* ptr = nullptr;
 
     // Device-visible pointer view per rank/device in the group.
-    // For local buffers only owner_rank is populated.
+    // For ranks that do not have access, the entry is nullptr.
     std::vector<void*> device_ptrs{};
 
     size_t bytes = 0;
     int owner_rank = -1;
     bool peer_visible = false;
+
+    inline bool has_device_ptr_for_rank(size_t rank) const {
+        return rank < device_ptrs.size() && device_ptrs[rank] != nullptr;
+    }
 
     inline void* device_ptr_for_rank(size_t rank) const {
         if (rank >= device_ptrs.size()) {
@@ -38,6 +41,13 @@ struct CommBuffer {
 CommBuffer alloc_peer_visible_buffer_for_rank(
     const std::vector<int>& devices,
     int owner_rank,
+    size_t bytes);
+
+// New: allocate owner-local VMM buffer but expose it only to a subset of ranks.
+CommBuffer alloc_peer_visible_buffer_for_rank_with_access_ranks(
+    const std::vector<int>& devices,
+    int owner_rank,
+    const std::vector<int>& access_ranks,
     size_t bytes);
 
 CommBuffer alloc_local_buffer_for_rank(
