@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -38,69 +39,67 @@ static bool rank_needs_accum_access(
            view_rank == prev_rank_of(owner_rank, world_size);
 }
 
-struct HostMappedMailbox {
-    uint32_t* host_ptr = nullptr;
-    std::vector<uint32_t*> device_ptrs;
+struct DeviceMailbox {
+    comm::transport::CommBuffer buf{};
+    std::vector<uint32_t> host_cache{};
     size_t count = 0;
+    int owner_rank = -1;
 
-    void init(size_t n, const std::vector<int>& devices) {
+    void init(
+        const std::vector<int>& devices,
+        int owner_rank_,
+        const std::vector<int>& access_ranks,
+        size_t n) {
         if (n == 0) {
-            throw std::invalid_argument("HostMappedMailbox::init: n must be > 0");
+            throw std::invalid_argument("DeviceMailbox::init: n must be > 0");
         }
-        destroy();
 
+        destroy(devices);
+
+        owner_rank = owner_rank_;
         count = n;
+        host_cache.assign(n, 0u);
 
-        cudaError_t err = cudaHostAlloc(
-            reinterpret_cast<void**>(&host_ptr),
-            count * sizeof(uint32_t),
-            cudaHostAllocMapped | cudaHostAllocPortable);
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("cudaHostAlloc(mapped mailbox) failed: ") +
-                cudaGetErrorString(err));
-        }
-
-        device_ptrs.resize(devices.size(), nullptr);
-
-        for (size_t i = 0; i < devices.size(); ++i) {
-            system::runtime::set_device(devices[i]);
-            err = cudaHostGetDevicePointer(
-                reinterpret_cast<void**>(&device_ptrs[i]),
-                host_ptr,
-                0);
-            if (err != cudaSuccess) {
-                cudaFreeHost(host_ptr);
-                host_ptr = nullptr;
-                device_ptrs.clear();
-                count = 0;
-                throw std::runtime_error(
-                    std::string("cudaHostGetDevicePointer(mapped mailbox) failed: ") +
-                    cudaGetErrorString(err));
-            }
-        }
-    }
-
-    void reset(uint32_t value) {
-        if (host_ptr == nullptr) {
-            throw std::invalid_argument("HostMappedMailbox::reset: not initialized");
-        }
-        for (size_t i = 0; i < count; ++i) {
-            host_ptr[i] = value;
-        }
+        buf = comm::transport::alloc_peer_visible_buffer_for_rank_with_access_ranks(
+            devices,
+            owner_rank,
+            access_ranks,
+            n * sizeof(uint32_t));
     }
 
     uint32_t* device_ptr_for_rank(size_t rank) const {
-        return device_ptrs.at(rank);
+        return reinterpret_cast<uint32_t*>(buf.device_ptr_for_rank(rank));
     }
 
-    void destroy() {
-        if (host_ptr != nullptr) {
-            cudaFreeHost(host_ptr);
+    uint32_t* owner_device_ptr() const {
+        return reinterpret_cast<uint32_t*>(
+            buf.device_ptr_for_rank(static_cast<size_t>(owner_rank)));
+    }
+
+    void copy_owner_to_host(
+        const std::vector<int>& devices) {
+        if (owner_rank < 0) {
+            throw std::invalid_argument("DeviceMailbox::copy_owner_to_host: not initialized");
         }
-        host_ptr = nullptr;
-        device_ptrs.clear();
+
+        system::runtime::set_device(devices[static_cast<size_t>(owner_rank)]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                host_cache.data(),
+                owner_device_ptr(),
+                count * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(DeviceMailbox owner -> host)");
+    }
+
+    void destroy(const std::vector<int>& devices) {
+        if (owner_rank >= 0 && buf.bytes != 0) {
+            comm::transport::free_comm_buffer(devices, buf);
+        }
+        buf = comm::transport::CommBuffer{};
+        host_cache.clear();
         count = 0;
+        owner_rank = -1;
     }
 };
 
@@ -113,21 +112,25 @@ std::vector<int> normalize_devices(
     } else {
         out.reserve(devices64.size());
         for (int64_t d64 : devices64) {
-            if (d64 < 0 || d64 > static_cast<int64_t>(std::numeric_limits<int>::max())) {
-                throw std::invalid_argument("endpoint_persistent_smoke_test: invalid device id");
+            if (d64 < 0 ||
+                d64 > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+                throw std::invalid_argument(
+                    "endpoint_persistent_smoke_test: invalid device id");
             }
             out.push_back(static_cast<int>(d64));
         }
     }
 
     if (out.size() < 2) {
-        throw std::invalid_argument("endpoint_persistent_smoke_test: need at least 2 devices");
+        throw std::invalid_argument(
+            "endpoint_persistent_smoke_test: need at least 2 devices");
     }
 
     for (size_t i = 0; i < out.size(); ++i) {
         for (size_t j = i + 1; j < out.size(); ++j) {
             if (out[i] == out[j]) {
-                throw std::invalid_argument("endpoint_persistent_smoke_test: duplicate devices are not allowed");
+                throw std::invalid_argument(
+                    "endpoint_persistent_smoke_test: duplicate devices are not allowed");
             }
         }
     }
@@ -208,14 +211,17 @@ bool all_u32_equal_to_one(
 }
 
 bool wait_until_all_ranks_done(
-    const std::vector<HostMappedMailbox>& done_flags,
+    std::vector<DeviceMailbox>& done_flags,
+    const std::vector<int>& devices,
     int timeout_ms) {
     const auto start = std::chrono::steady_clock::now();
 
     while (true) {
         bool all_done = true;
-        for (const auto& done : done_flags) {
-            if (!all_u32_equal_to_one(done.host_ptr, done.count)) {
+
+        for (auto& done : done_flags) {
+            done.copy_owner_to_host(devices);
+            if (!all_u32_equal_to_one(done.host_cache.data(), done.count)) {
                 all_done = false;
                 break;
             }
@@ -237,17 +243,31 @@ bool wait_until_all_ranks_done(
 }
 
 std::string build_progress_debug_string(
-    const std::vector<HostMappedMailbox>& inbound_steps,
-    const std::vector<HostMappedMailbox>& done_flags) {
+    const std::vector<int>& devices,
+    const std::vector<comm::transport::CommBuffer>& ready_queues,
+    std::vector<DeviceMailbox>& done_flags) {
     std::string out;
 
     for (size_t r = 0; r < done_flags.size(); ++r) {
+        done_flags[r].copy_owner_to_host(devices);
+
+        uint32_t meta[2] = {0, 0};
+        system::runtime::set_device(devices[r]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                meta,
+                ready_queues[r].device_ptr_for_rank(r),
+                2 * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(queue meta -> host)");
+
         for (size_t c = 0; c < done_flags[r].count; ++c) {
-            if (done_flags[r].host_ptr[c] != 1u) {
+            if (done_flags[r].host_cache[c] != 1u) {
                 out += " first incomplete rank=" + std::to_string(r) +
                        " chunk=" + std::to_string(c) +
-                       " done=" + std::to_string(done_flags[r].host_ptr[c]) +
-                       " inbound_step=" + std::to_string(inbound_steps[r].host_ptr[c]);
+                       " done=" + std::to_string(done_flags[r].host_cache[c]) +
+                       " queue_head=" + std::to_string(meta[0]) +
+                       " queue_tail=" + std::to_string(meta[1]);
                 break;
             }
         }
@@ -272,13 +292,15 @@ static void dump_rank_accum_samples(
         system::runtime::set_device(devices[r]);
         system::runtime::check_cuda(
             cudaMemcpy(
-    host.data(),
-    accums[r].device_ptr_for_rank(r),
+                host.data(),
+                accums[r].device_ptr_for_rank(r),
                 static_cast<size_t>(n) * sizeof(half),
                 cudaMemcpyDeviceToHost),
             "cudaMemcpy(accum sample -> host)");
 
-        std::printf("[debug] rank=%zu accum[0:%lld] =", r, static_cast<long long>(n));
+        std::printf("[debug] rank=%zu accum[0:%lld] =",
+                    r,
+                    static_cast<long long>(n));
         for (int64_t i = 0; i < n; ++i) {
             std::printf(" %.6f", __half2float(host[static_cast<size_t>(i)]));
         }
@@ -314,12 +336,36 @@ static void dump_rank_chunk0_state(
     std::fflush(stdout);
 }
 
+static void dump_rank_queue_meta(
+    const std::vector<int>& devices,
+    const std::vector<comm::transport::CommBuffer>& ready_queues) {
+    for (size_t r = 0; r < ready_queues.size(); ++r) {
+        uint32_t meta[2] = {0, 0};
+
+        system::runtime::set_device(devices[r]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                meta,
+                ready_queues[r].device_ptr_for_rank(r),
+                2 * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(queue meta -> host)");
+
+        std::printf(
+            "[debug] rank=%zu queue_head=%u queue_tail=%u\n",
+            r,
+            meta[0],
+            meta[1]);
+    }
+    std::fflush(stdout);
+}
+
 static void print_peer_access_matrix_and_validate_ring(
     const std::vector<int>& devices) {
     const int n = static_cast<int>(devices.size());
 
     std::printf("[smoke] cudaDeviceCanAccessPeer matrix (rows=src, cols=dst)\n");
-    std::printf("[smoke]        ");
+    std::printf("[smoke]       ");
     for (int j = 0; j < n; ++j) {
         std::printf(" %4d", devices[static_cast<size_t>(j)]);
     }
@@ -341,8 +387,6 @@ static void print_peer_access_matrix_and_validate_ring(
     }
     std::fflush(stdout);
 
-    // Validate the actual ring edges you are about to use:
-    // devices[0] -> devices[1] -> ... -> devices[n-1] -> devices[0]
     for (int i = 0; i < n; ++i) {
         const int src_dev = devices[static_cast<size_t>(i)];
         const int dst_dev = devices[static_cast<size_t>((i + 1) % n)];
@@ -484,6 +528,7 @@ bool endpoint_persistent_smoke_test(
 
     const std::vector<int> devices = normalize_devices(devices64);
     const int world_size = static_cast<int>(devices.size());
+
     print_peer_access_matrix_and_validate_ring(devices);
 
     comm::Group group{};
@@ -491,8 +536,8 @@ bool endpoint_persistent_smoke_test(
     std::vector<comm::EndpointPersistentControl> controls(static_cast<size_t>(world_size));
 
     std::vector<comm::transport::CommBuffer> accums(static_cast<size_t>(world_size));
-    std::vector<HostMappedMailbox> inbound_steps(static_cast<size_t>(world_size));
-    std::vector<HostMappedMailbox> done_flags(static_cast<size_t>(world_size));
+    std::vector<comm::transport::CommBuffer> ready_queues(static_cast<size_t>(world_size));
+    std::vector<DeviceMailbox> done_flags(static_cast<size_t>(world_size));
 
     std::vector<comm::collective::ChunkStateTable> chunk_states(static_cast<size_t>(world_size));
     std::vector<comm::collective::DeviceOperationDesc> op_devs(static_cast<size_t>(world_size));
@@ -506,6 +551,9 @@ bool endpoint_persistent_smoke_test(
         const size_t chunk_bytes = comm::kEndpointPersistentChunkBytes;
         const uint32_t num_chunks =
             comm::collective::operation_desc_compute_num_chunks(bytes, chunk_bytes);
+        const size_t queue_bytes =
+            2 * sizeof(uint32_t) +
+            static_cast<size_t>(num_chunks) * sizeof(comm::collective::ReadyItem);
 
         std::vector<std::vector<half>> host_srcs(static_cast<size_t>(world_size));
         for (int r = 0; r < world_size; ++r) {
@@ -526,43 +574,42 @@ bool endpoint_persistent_smoke_test(
         std::printf("[smoke] after endpoint_runtime_init\n"); std::fflush(stdout);
 
         for (int r = 0; r < world_size; ++r) {
-    const int prev_rank = prev_rank_of(r, world_size);
+            const int prev_rank = prev_rank_of(r, world_size);
 
-    accums[static_cast<size_t>(r)] =
-        comm::transport::alloc_peer_visible_buffer_for_rank_with_access_ranks(
-            group.devices,
-            r,
-            {prev_rank},
-            bytes);
+            accums[static_cast<size_t>(r)] =
+                comm::transport::alloc_peer_visible_buffer_for_rank_with_access_ranks(
+                    group.devices,
+                    r,
+                    {r, prev_rank},
+                    bytes);
 
-    inbound_steps[static_cast<size_t>(r)].init(num_chunks, devices);
-    done_flags[static_cast<size_t>(r)].init(num_chunks, devices);
-} 
+            ready_queues[static_cast<size_t>(r)] =
+                comm::transport::alloc_peer_visible_buffer_for_rank_with_access_ranks(
+                    group.devices,
+                    r,
+                    {r, prev_rank},
+                    queue_bytes);
+
+            done_flags[static_cast<size_t>(r)].init(
+                group.devices,
+                r,
+                {r, prev_rank},
+                num_chunks);
+        }
 
         for (int r = 0; r < world_size; ++r) {
             system::runtime::set_device(group.devices[static_cast<size_t>(r)]);
             system::runtime::check_cuda(
-                    cudaMemcpy(
-    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-    host_srcs[static_cast<size_t>(r)].data(),
+                cudaMemcpy(
+                    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+                    host_srcs[static_cast<size_t>(r)].data(),
                     bytes,
                     cudaMemcpyHostToDevice),
                 "cudaMemcpy(host_src -> accum)");
         }
 
-        dump_accum_peer_views(
-    devices,
-    accums,
-    host_srcs,
-    numel,
-    8);
-
-validate_accum_peer_views_or_throw(
-    devices,
-    accums,
-    host_srcs,
-    numel,
-    8);
+        dump_accum_peer_views(devices, accums, host_srcs, numel, 8);
+        validate_accum_peer_views_or_throw(devices, accums, host_srcs, numel, 8);
 
         for (int r = 0; r < world_size; ++r) {
             comm::collective::chunk_state_table_init(
@@ -575,58 +622,30 @@ validate_accum_peer_views_or_throw(
             const int next_rank = (r + 1) % world_size;
 
             comm::endpoint_runtime_build_ring_allreduce_operation(
-              &runtimes[static_cast<size_t>(r)],
-              &ops[static_cast<size_t>(r)],
-              accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-              accums[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
-              bytes,
-              chunk_bytes,
-              inbound_steps[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-              inbound_steps[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
-              done_flags[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-              done_flags[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
-              chunk_states[static_cast<size_t>(r)].records,
-              1);
+                &runtimes[static_cast<size_t>(r)],
+                &ops[static_cast<size_t>(r)],
+                accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+                accums[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
+                bytes,
+                chunk_bytes,
+                ready_queues[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+                ready_queues[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
+                done_flags[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+                done_flags[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
+                chunk_states[static_cast<size_t>(r)].records,
+                1);
 
             std::printf(
-    "[smoke] op rank=%d accum=0x%llx next_accum=0x%llx inbound=0x%llx next_inbound=0x%llx done=0x%llx next_done=0x%llx\n",
-    r,
-    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].accum_ptr),
-    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_accum_ptr),
-    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].done_ptr),
-    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_done_ptr));
-std::fflush(stdout);
-            }
-
-        for (int r = 0; r < world_size; ++r) {
-            inbound_steps[static_cast<size_t>(r)].reset(
-                comm::collective::kOperationInboundStepInvalid);
-            done_flags[static_cast<size_t>(r)].reset(0u);
-        }
-
-        for (int r = 0; r < world_size; ++r) {
-            for (uint32_t idx = 0; idx < num_chunks; ++idx) {
-                if (comm::collective::operation_desc_actor_rank_for_step(
-                        &ops[static_cast<size_t>(r)],
-                        idx,
-                        0u) == r) {
-                    inbound_steps[static_cast<size_t>(r)].host_ptr[idx] = 0u;
-                }
-            }
-        }
-
-        for (int r = 0; r < world_size; ++r) {
-            std::printf("[smoke] init mailbox rank=%d chunk0 inbound=%u done=%u\n",
-                        r,
-                        inbound_steps[static_cast<size_t>(r)].host_ptr[0],
-                        done_flags[static_cast<size_t>(r)].host_ptr[0]);
+                "[smoke] op rank=%d accum=0x%llx next_accum=0x%llx queue=0x%llx next_queue=0x%llx done=0x%llx next_done=0x%llx\n",
+                r,
+                static_cast<unsigned long long>(ops[static_cast<size_t>(r)].accum_ptr),
+                static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_accum_ptr),
+                static_cast<unsigned long long>(ops[static_cast<size_t>(r)].ready_queue_ptr),
+                static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_ready_queue_ptr),
+                static_cast<unsigned long long>(ops[static_cast<size_t>(r)].done_ptr),
+                static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_done_ptr));
         }
         std::fflush(stdout);
-
-        for (int r = 0; r < world_size; ++r) {
-            comm::collective::chunk_state_table_reset(
-                &chunk_states[static_cast<size_t>(r)]);
-        }
 
         for (int r = 0; r < world_size; ++r) {
             comm::collective::device_operation_desc_create(
@@ -635,18 +654,13 @@ std::fflush(stdout);
                 &ops[static_cast<size_t>(r)]);
         }
 
-        /*for (int r = 0; r < world_size; ++r) {*/
-            /*const int next_rank = (r + 1) % world_size;*/
-            /*comm::endpoint_runtime_configure_submission(*/
-    /*&runtimes[static_cast<size_t>(r)],*/
-    /*accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),*/
-    /*accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),*/
-    /*bytes,*/
-                /*comm::exec::ChunkOpKind::kReduceAddNoFtzF16,*/
-                /*1,*/
-                /*next_rank,*/
-                /*0);*/
-        /*}*/
+        for (int r = 0; r < world_size; ++r) {
+            comm::collective::operation_desc_reset_local_state(
+                group.devices[static_cast<size_t>(r)],
+                &ops[static_cast<size_t>(r)]);
+        }
+
+        dump_rank_queue_meta(devices, ready_queues);
 
         std::printf("[smoke] after operation setup\n"); std::fflush(stdout);
 
@@ -678,18 +692,17 @@ std::fflush(stdout);
         std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
 
         std::printf("[smoke] waiting for chunk completion\n"); std::fflush(stdout);
-        const bool all_done = wait_until_all_ranks_done(done_flags, timeout_ms);
+        const bool all_done = wait_until_all_ranks_done(done_flags, devices, timeout_ms);
 
         if (!all_done) {
+            dump_rank_queue_meta(devices, ready_queues);
             dump_rank_chunk0_state(devices, chunk_states);
             dump_rank_accum_samples(devices, accums, numel);
-        
+
             throw std::runtime_error(
-                std::string("endpoint_persistent_smoke_test: timeout waiting for done flags; ") +
-                build_progress_debug_string(
-                    inbound_steps,
-                    done_flags));
-        } 
+                std::string("endpoint_persistent_smoke_test: timeout waiting for done flags;") +
+                build_progress_debug_string(devices, ready_queues, done_flags));
+        }
 
         std::printf("[smoke] all chunks done\n"); std::fflush(stdout);
 
@@ -706,12 +719,11 @@ std::fflush(stdout);
         }
         std::printf("[smoke] persistent streams joined\n"); std::fflush(stdout);
 
-        for (int r = 0; r < world_size; ++r) {
-            for (size_t i = 0; i < done_flags[static_cast<size_t>(r)].count; ++i) {
-                if (done_flags[static_cast<size_t>(r)].host_ptr[i] != 1u) {
-                    throw std::runtime_error(
-                        "endpoint_persistent_smoke_test: done flag was not set");
-                }
+        for (auto& done : done_flags) {
+            done.copy_owner_to_host(devices);
+            if (!all_u32_equal_to_one(done.host_cache.data(), done.count)) {
+                throw std::runtime_error(
+                    "endpoint_persistent_smoke_test: done flag was not set");
             }
         }
 
@@ -720,8 +732,8 @@ std::fflush(stdout);
             system::runtime::set_device(group.devices[static_cast<size_t>(r)]);
             system::runtime::check_cuda(
                 cudaMemcpy(
-    host_out.data(),
-    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+                    host_out.data(),
+                    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
                     bytes,
                     cudaMemcpyDeviceToHost),
                 "cudaMemcpy(accum -> host)");
@@ -732,6 +744,7 @@ std::fflush(stdout);
                     host_ref,
                     "endpoint_persistent_smoke_test");
             } catch (...) {
+                dump_rank_queue_meta(devices, ready_queues);
                 dump_rank_chunk0_state(devices, chunk_states);
                 dump_rank_accum_samples(devices, accums, numel);
                 throw;
@@ -741,32 +754,29 @@ std::fflush(stdout);
         for (auto& op_dev : op_devs) {
             comm::collective::device_operation_desc_destroy(&op_dev);
         }
-
         for (auto& table : chunk_states) {
             comm::collective::chunk_state_table_destroy(&table);
         }
-
         for (auto& box : done_flags) {
-            box.destroy();
+            box.destroy(devices);
         }
-        for (auto& box : inbound_steps) {
-            box.destroy();
+        for (auto& q : ready_queues) {
+            comm::transport::free_comm_buffer(group.devices, q);
         }
         for (auto& accum : accums) {
             comm::transport::free_comm_buffer(group.devices, accum);
         }
-
         for (size_t i = 0; i < controls.size(); ++i) {
             if (control_initialized[i]) {
                 comm::endpoint_persistent_control_destroy(&controls[i]);
                 control_initialized[i] = false;
             }
         }
-
         for (auto& rt : runtimes) {
             comm::endpoint_runtime_destroy(&rt);
         }
         comm::group_destroy(&group);
+
         return true;
     } catch (...) {
         for (size_t i = 0; i < controls.size(); ++i) {
@@ -782,21 +792,18 @@ std::fflush(stdout);
         for (auto& op_dev : op_devs) {
             try { comm::collective::device_operation_desc_destroy(&op_dev); } catch (...) {}
         }
-
         for (auto& table : chunk_states) {
             try { comm::collective::chunk_state_table_destroy(&table); } catch (...) {}
         }
-
         for (auto& box : done_flags) {
-            try { box.destroy(); } catch (...) {}
+            try { box.destroy(devices); } catch (...) {}
         }
-        for (auto& box : inbound_steps) {
-            try { box.destroy(); } catch (...) {}
+        for (auto& q : ready_queues) {
+            try { comm::transport::free_comm_buffer(group.devices, q); } catch (...) {}
         }
         for (auto& accum : accums) {
             try { comm::transport::free_comm_buffer(group.devices, accum); } catch (...) {}
         }
-
         for (size_t i = 0; i < controls.size(); ++i) {
             try {
                 if (control_initialized[i]) {
@@ -805,11 +812,9 @@ std::fflush(stdout);
             } catch (...) {
             }
         }
-
         for (auto& rt : runtimes) {
             try { comm::endpoint_runtime_destroy(&rt); } catch (...) {}
         }
-
         try { comm::group_destroy(&group); } catch (...) {}
         throw;
     }
