@@ -527,6 +527,53 @@ void launch_persistent_two_gpu_run(
     }
 }
 
+void dump_persistent_debug_state(
+    const PersistentTwoGpuState* st,
+    const char* tag) {
+    if (st == nullptr) {
+        return;
+    }
+
+    printf("[debug] persistent dump: %s\n", tag);
+
+    for (size_t r = 0; r < st->devices.size(); ++r) {
+        const size_t show = (st->num_chunks < 4u) ? st->num_chunks : 4u;
+
+        printf("[debug] rank=%zu device=%d ready chunks (host mailboxes)\n",
+               r, st->devices[r]);
+
+        for (size_t i = 0; i < show; ++i) {
+            printf(
+                "  chunk=%zu inbound=%u done=%u\n",
+                i,
+                st->inbound_steps[r].host_ptr[i],
+                st->done_flags[r].host_ptr[i]);
+        }
+
+        std::vector<comm::collective::ChunkState> host_states(show);
+        system::runtime::set_device(st->devices[r]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                host_states.data(),
+                st->chunk_states[r].records,
+                show * sizeof(comm::collective::ChunkState),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(chunk_states -> host)");
+
+        for (size_t i = 0; i < show; ++i) {
+            const auto& cs = host_states[i];
+            printf(
+                "  state chunk=%zu flags=%u started=%u completed=%u bytes=%u offset=%zu\n",
+                i,
+                cs.flags,
+                cs.last_step_started,
+                cs.last_step_completed,
+                cs.bytes,
+                cs.offset_bytes);
+        }
+    }
+}
+
 PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
     PersistentTwoGpuState* st,
     int timeout_ms) {
@@ -540,8 +587,23 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
 
     const bool all_done =
         wait_until_all_ranks_done_no_sleep(st->done_flags, timeout_ms);
+
     if (!all_done) {
-        throw std::runtime_error("measure_persistent_host_breakdown_ms: timeout waiting for done flags");
+        for (int r = 0; r < 2; ++r) {
+            comm::endpoint_persistent_control_request_stop(
+                &st->controls[static_cast<size_t>(r)]);
+        }
+
+        for (int r = 0; r < 2; ++r) {
+            system::runtime::check_cuda(
+                cudaStreamSynchronize(
+                    st->runtimes[static_cast<size_t>(r)].endpoint.stream),
+                "cudaStreamSynchronize(persistent stream timeout flush)");
+        }
+
+        dump_persistent_debug_state(st, "timeout in measure_persistent_host_breakdown_ms");
+        throw std::runtime_error(
+            "measure_persistent_host_breakdown_ms: timeout waiting for done flags");
     }
 
     const auto t1 = std::chrono::steady_clock::now();
@@ -836,6 +898,8 @@ inline void verify_persistent_result(
     expect_half_vectors_close(got1, ref, "persistent verify rank1");
 }
 
+
+
 } // namespace
 
 std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
@@ -936,7 +1000,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         for (int i = 0; i < warmup; ++i) {
             prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
             launch_persistent_two_gpu_run(&persistent);
-            wait_and_stop_persistent_two_gpu_run(&persistent, 30000);
+            wait_and_stop_persistent_two_gpu_run(&persistent, 3000);
         }
 
         double basic_total_ms = 0.0;
@@ -994,7 +1058,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
 
             const PersistentTimingBreakdown t =
-                measure_persistent_host_breakdown_ms(&persistent, 30000);
+                measure_persistent_host_breakdown_ms(&persistent, 3000);
 
             persistent_launch_to_done_total_ms += t.launch_to_done_ms;
             persistent_stop_join_total_ms += t.stop_join_ms;

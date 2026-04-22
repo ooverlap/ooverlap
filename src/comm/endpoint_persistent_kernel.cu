@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <stdexcept>
 
+#define OOVERLAP_ENDPOINT_DEBUG 1
+
 namespace ooverlap {
 namespace comm {
 namespace {
@@ -71,6 +73,7 @@ __global__ void endpoint_persistent_kernel_sm90(
     __shared__ sync::semaphore stage_barriers[kPersistentStageDepth];
     __shared__ int should_stop;
     __shared__ int has_work;
+        __shared__ uint32_t debug_idle_loops;
 
     collective::ChunkState* chunk_states =
         collective::operation_desc_chunk_states(operation);
@@ -118,6 +121,7 @@ __global__ void endpoint_persistent_kernel_sm90(
             stage_barriers);
 
         exec::chunk_pipeline_init(&shared_pipe, &shared_scheduler);
+        debug_idle_loops = 0;
     }
     __syncthreads();
 
@@ -140,6 +144,32 @@ __global__ void endpoint_persistent_kernel_sm90(
         __syncthreads();
 
         if (!has_work) {
+            #if defined(OOVERLAP_ENDPOINT_DEBUG)
+            if (threadIdx.x == 0) {
+                ++debug_idle_loops;
+                if ((debug_idle_loops & 0x3ffffu) == 0u) {
+                    volatile uint32_t* local_inbound =
+                        reinterpret_cast<volatile uint32_t*>(
+                            collective::operation_desc_local_inbound_steps(operation));
+                    volatile uint32_t* local_done =
+                        reinterpret_cast<volatile uint32_t*>(
+                            collective::operation_desc_local_done(operation));
+
+                    printf(
+                        "[idle] rank=%d idle_loops=%u ready_count=%u next_search_idx=%u inbound0=%u done0=%u\n",
+                        operation->rank,
+                        debug_idle_loops,
+                        shared_pipe.scheduler.ready_count,
+                        shared_pipe.scheduler.next_search_idx,
+                        (operation->num_chunks > 0)
+                            ? exec::chunk_scheduler_atomic_load_u32(&local_inbound[0])
+                            : 0u,
+                        (operation->num_chunks > 0)
+                            ? exec::chunk_scheduler_atomic_load_u32(&local_done[0])
+                            : 0u);
+                }
+            }
+#endif
 #if defined(__CUDA_ARCH__)
             if (threadIdx.x == 0) {
                 __nanosleep(256);
@@ -148,6 +178,11 @@ __global__ void endpoint_persistent_kernel_sm90(
             __syncthreads();
             continue;
         }
+
+        if (threadIdx.x == 0) {
+            debug_idle_loops = 0;
+        }
+        __syncthreads();
 
         exec::chunk_pipeline_wait_current_stage(&shared_pipe);
         __syncthreads();

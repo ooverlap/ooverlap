@@ -6,6 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <cstdio>
+#define OOVERLAP_SCHED_DBG(...) printf(__VA_ARGS__)
+
 namespace ooverlap {
 namespace comm {
 namespace exec {
@@ -290,6 +293,16 @@ __device__ __forceinline__ void chunk_scheduler_refill_ready_cache(
                 }
                 chunk_scheduler_ready_push(sched, cand.chunk_idx, cand.step);
             }
+
+            if (sched->ready_count > 0) {
+                OOVERLAP_SCHED_DBG(
+                    "[refill] rank=%d ready_count=%u next_search_idx=%u first=(chunk=%u step=%u)\n",
+                    op->rank,
+                    sched->ready_count,
+                    sched->next_search_idx,
+                    sched->ready[sched->ready_head].chunk_idx,
+                    sched->ready[sched->ready_head].step);
+            }
         }
 
         __syncwarp();
@@ -320,11 +333,18 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
     ReadyCandidate cand{};
 
     while (true) {
+
         if (!chunk_scheduler_ready_pop(sched, &cand)) {
             return false;
         }
 
         if (!chunk_scheduler_candidate_is_valid(sched, cand.chunk_idx, cand.step)) {
+            OOVERLAP_SCHED_DBG(
+                "[stale] rank=%d chunk=%u step=%u ready_count=%u\n",
+                sched->operation->rank,
+                cand.chunk_idx,
+                cand.step,
+                sched->ready_count);
             continue;
         }
 
@@ -344,6 +364,13 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
 
         chunk_states[cand.chunk_idx].last_step_started = cand.step;
         chunk_states[cand.chunk_idx].flags |= collective::kChunkStateFlagInFlight;
+        OOVERLAP_SCHED_DBG(
+            "[activate] rank=%d chunk=%u step=%u ready_count=%u next_search_idx=%u\n",
+            op->rank,
+            cand.chunk_idx,
+            cand.step,
+            sched->ready_count,
+            sched->next_search_idx);
         return true;
     }
 }
@@ -423,6 +450,18 @@ __device__ __forceinline__ void chunk_scheduler_retire_current(
     if (chunk_scheduler_atomic_load_u32(&local_done[chunk_idx]) == 1u) {
         chunk_states[chunk_idx].flags |= collective::kChunkStateFlagDone;
     }
+
+    OOVERLAP_SCHED_DBG(
+        "[retire] rank=%d chunk=%u cur_step=%u next_step=%u local_done=%u next_inbound=%u next_done=%u\n",
+        op->rank,
+        chunk_idx,
+        current_step,
+        next_step,
+        chunk_scheduler_atomic_load_u32(&local_done[chunk_idx]),
+        (next_step < total_steps)
+            ? chunk_scheduler_atomic_load_u32(&next_inbound[chunk_idx])
+            : 0u,
+        chunk_scheduler_atomic_load_u32(&next_done[chunk_idx]));
 
     sched->has_active_chunk = false;
     sched->active_chunk_idx = -1;
