@@ -194,9 +194,6 @@ struct DeviceMailbox {
         int owner_rank_,
         const std::vector<int>& access_ranks,
         size_t n) {
-        if (n == 0) {
-            throw std::invalid_argument("DeviceMailbox::init: n must be > 0");
-        }
         destroy(devices);
 
         owner_rank = owner_rank_;
@@ -217,28 +214,8 @@ struct DeviceMailbox {
         return reinterpret_cast<uint32_t*>(buf.device_ptr_for_rank(static_cast<size_t>(owner_rank)));
     }
 
-    void fill_from_host(
-        const std::vector<int>& devices,
-        uint32_t value) {
-        if (owner_rank < 0) {
-            throw std::invalid_argument("DeviceMailbox::fill_from_host: not initialized");
-        }
-        host_cache.assign(count, value);
-        system::runtime::set_device(devices[static_cast<size_t>(owner_rank)]);
-        system::runtime::check_cuda(
-            cudaMemcpy(
-                owner_device_ptr(),
-                host_cache.data(),
-                count * sizeof(uint32_t),
-                cudaMemcpyHostToDevice),
-            "cudaMemcpy(DeviceMailbox fill_from_host)");
-    }
-
     void copy_owner_to_host(
         const std::vector<int>& devices) {
-        if (owner_rank < 0) {
-            throw std::invalid_argument("DeviceMailbox::copy_owner_to_host: not initialized");
-        }
         system::runtime::set_device(devices[static_cast<size_t>(owner_rank)]);
         system::runtime::check_cuda(
             cudaMemcpy(
@@ -274,7 +251,7 @@ struct PersistentTwoGpuState {
     std::vector<comm::EndpointPersistentControl> controls;
 
     std::vector<comm::transport::CommBuffer> accums;
-    std::vector<DeviceMailbox> inbound_steps;
+    std::vector<comm::transport::CommBuffer> ready_queues;
     std::vector<DeviceMailbox> done_flags;
 
     std::vector<comm::collective::ChunkStateTable> chunk_states;
@@ -301,8 +278,8 @@ void destroy_persistent_two_gpu_state(
     for (auto& box : st->done_flags) {
         try { box.destroy(st->devices); } catch (...) {}
     }
-    for (auto& box : st->inbound_steps) {
-        try { box.destroy(st->devices); } catch (...) {}
+    for (auto& q : st->ready_queues) {
+        try { comm::transport::free_comm_buffer(st->devices, q); } catch (...) {}
     }
     for (auto& accum : st->accums) {
         try { comm::transport::free_comm_buffer(st->devices, accum); } catch (...) {}
@@ -319,7 +296,7 @@ void destroy_persistent_two_gpu_state(
     st->runtimes.clear();
     st->controls.clear();
     st->accums.clear();
-    st->inbound_steps.clear();
+    st->ready_queues.clear();
     st->done_flags.clear();
     st->chunk_states.clear();
     st->ops.clear();
@@ -349,7 +326,7 @@ void init_persistent_two_gpu_state(
     st->runtimes.resize(2);
     st->controls.resize(2);
     st->accums.resize(2);
-    st->inbound_steps.resize(2);
+    st->ready_queues.resize(2);
     st->done_flags.resize(2);
     st->chunk_states.resize(2);
     st->ops.resize(2);
@@ -361,6 +338,10 @@ void init_persistent_two_gpu_state(
         comm::endpoint_runtime_init(&st->runtimes[static_cast<size_t>(r)], &st->group, r);
     }
 
+    const size_t queue_bytes =
+        2 * sizeof(uint32_t) +
+        static_cast<size_t>(st->num_chunks) * sizeof(comm::collective::ReadyItem);
+
     for (int r = 0; r < 2; ++r) {
         const int prev_rank = prev_rank_of(r, 2);
 
@@ -371,11 +352,12 @@ void init_persistent_two_gpu_state(
                 {r, prev_rank},
                 st->bytes);
 
-        st->inbound_steps[static_cast<size_t>(r)].init(
-            st->group.devices,
-            r,
-            {r, prev_rank},
-            st->num_chunks);
+        st->ready_queues[static_cast<size_t>(r)] =
+            comm::transport::alloc_peer_visible_buffer_for_rank_with_access_ranks(
+                st->group.devices,
+                r,
+                {r, prev_rank},
+                queue_bytes);
 
         st->done_flags[static_cast<size_t>(r)].init(
             st->group.devices,
@@ -399,8 +381,8 @@ void init_persistent_two_gpu_state(
             st->accums[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
             st->bytes,
             comm::kEndpointPersistentChunkBytes,
-            st->inbound_steps[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-            st->inbound_steps[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
+            st->ready_queues[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+            st->ready_queues[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
             st->done_flags[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
             st->done_flags[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
             st->chunk_states[static_cast<size_t>(r)].records,
@@ -484,20 +466,31 @@ void dump_persistent_debug_state(
     std::printf("[debug] persistent dump: %s\n", tag);
 
     for (size_t r = 0; r < st->devices.size(); ++r) {
-        auto& inbound = st->inbound_steps[r];
         auto& done = st->done_flags[r];
-
-        inbound.copy_owner_to_host(st->devices);
         done.copy_owner_to_host(st->devices);
 
-        const size_t show = (st->num_chunks < 4u) ? st->num_chunks : 4u;
+        uint32_t queue_meta[2] = {0, 0};
+        system::runtime::set_device(st->devices[r]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                queue_meta,
+                st->ready_queues[r].device_ptr_for_rank(r),
+                2 * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(queue meta -> host)");
 
-        std::printf("[debug] rank=%zu device=%d\n", r, st->devices[r]);
+        std::printf(
+            "[debug] rank=%zu device=%d queue_head=%u queue_tail=%u\n",
+            r,
+            st->devices[r],
+            queue_meta[0],
+            queue_meta[1]);
+
+        const size_t show = (st->num_chunks < 4u) ? st->num_chunks : 4u;
         for (size_t i = 0; i < show; ++i) {
             std::printf(
-                "  chunk=%zu inbound=%u done=%u\n",
+                "  done chunk=%zu value=%u\n",
                 i,
-                inbound.host_cache[i],
                 done.host_cache[i]);
         }
 

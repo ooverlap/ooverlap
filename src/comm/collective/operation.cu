@@ -22,8 +22,8 @@ bool operation_desc_build_ring_allreduce(
     exec::ChunkOpKind op,
     void* accum_ptr,
     void* next_accum_ptr,
-    void* inbound_steps_ptr,
-    void* next_inbound_steps_ptr,
+    void* ready_queue_ptr,
+    void* next_ready_queue_ptr,
     void* done_ptr,
     void* next_done_ptr,
     ChunkState* chunk_states_ptr,
@@ -55,11 +55,11 @@ bool operation_desc_build_ring_allreduce(
     if (world_size > 1 && next_accum_ptr == nullptr) {
         throw std::invalid_argument("operation_desc_build_ring_allreduce: next_accum_ptr is null");
     }
-    if (inbound_steps_ptr == nullptr) {
-        throw std::invalid_argument("operation_desc_build_ring_allreduce: inbound_steps_ptr is null");
+    if (ready_queue_ptr == nullptr) {
+        throw std::invalid_argument("operation_desc_build_ring_allreduce: ready_queue_ptr is null");
     }
-    if (world_size > 1 && next_inbound_steps_ptr == nullptr) {
-        throw std::invalid_argument("operation_desc_build_ring_allreduce: next_inbound_steps_ptr is null");
+    if (world_size > 1 && next_ready_queue_ptr == nullptr) {
+        throw std::invalid_argument("operation_desc_build_ring_allreduce: next_ready_queue_ptr is null");
     }
     if (done_ptr == nullptr) {
         throw std::invalid_argument("operation_desc_build_ring_allreduce: done_ptr is null");
@@ -78,6 +78,8 @@ bool operation_desc_build_ring_allreduce(
 
     const uint32_t num_chunks =
         operation_desc_compute_num_chunks(total_bytes, chunk_bytes);
+    const size_t queue_bytes =
+        2 * sizeof(uint32_t) + static_cast<size_t>(num_chunks) * sizeof(ReadyItem);
     const size_t progress_bytes =
         static_cast<size_t>(num_chunks) * sizeof(uint32_t);
 
@@ -103,11 +105,11 @@ bool operation_desc_build_ring_allreduce(
     out->next_accum_ptr = reinterpret_cast<uint64_t>(next_accum_ptr);
     out->next_accum_bytes = total_bytes;
 
-    out->inbound_steps_ptr = reinterpret_cast<uint64_t>(inbound_steps_ptr);
-    out->inbound_steps_bytes = progress_bytes;
+    out->ready_queue_ptr = reinterpret_cast<uint64_t>(ready_queue_ptr);
+    out->ready_queue_bytes = queue_bytes;
 
-    out->next_inbound_steps_ptr = reinterpret_cast<uint64_t>(next_inbound_steps_ptr);
-    out->next_inbound_steps_bytes = progress_bytes;
+    out->next_ready_queue_ptr = reinterpret_cast<uint64_t>(next_ready_queue_ptr);
+    out->next_ready_queue_bytes = queue_bytes;
 
     out->done_ptr = reinterpret_cast<uint64_t>(done_ptr);
     out->done_bytes = progress_bytes;
@@ -132,27 +134,40 @@ bool operation_desc_reset_local_state(
 
     const uint32_t total_steps = operation_desc_total_ring_steps(desc);
 
-    std::vector<uint32_t> inbound(desc->num_chunks, kOperationInboundStepInvalid);
     std::vector<uint32_t> done(desc->num_chunks, 0u);
+
+    const size_t queue_words = 2u + 2u * static_cast<size_t>(desc->num_chunks);
+    std::vector<uint32_t> queue(queue_words, 0u);
+
+    uint32_t* head_ptr = queue.data();
+    uint32_t* tail_ptr = queue.data() + 1;
+    ReadyItem* items = reinterpret_cast<ReadyItem*>(queue.data() + 2);
+
+    *head_ptr = 0u;
+    *tail_ptr = 0u;
 
     if (total_steps == 0) {
         std::fill(done.begin(), done.end(), 1u);
     } else {
+        uint32_t tail = 0u;
         for (uint32_t idx = 0; idx < desc->num_chunks; ++idx) {
             if (operation_desc_actor_rank_for_step(desc, idx, 0u) == desc->rank) {
-                inbound[static_cast<size_t>(idx)] = 0u;
+                items[tail].chunk_idx = idx;
+                items[tail].step = 0u;
+                ++tail;
             }
         }
+        *tail_ptr = tail;
     }
 
     system::runtime::set_device(device);
     system::runtime::check_cuda(
         cudaMemcpy(
-            reinterpret_cast<void*>(desc->inbound_steps_ptr),
-            inbound.data(),
-            static_cast<size_t>(desc->num_chunks) * sizeof(uint32_t),
+            reinterpret_cast<void*>(desc->ready_queue_ptr),
+            queue.data(),
+            queue.size() * sizeof(uint32_t),
             cudaMemcpyHostToDevice),
-        "cudaMemcpy(operation inbound_steps init)");
+        "cudaMemcpy(operation ready_queue init)");
 
     system::runtime::check_cuda(
         cudaMemcpy(

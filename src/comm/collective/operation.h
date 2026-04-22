@@ -23,17 +23,22 @@ enum : uint32_t {
 
 static constexpr uint32_t kOperationInboundStepInvalid = 0xffffffffu;
 
-// Minimal ring all-reduce operation descriptor using per-rank local progress.
+struct ReadyItem {
+    uint32_t chunk_idx = 0;
+    uint32_t step = kOperationInboundStepInvalid;
+};
+
+// Minimal ring all-reduce operation descriptor using per-rank local queue.
 //
 // Each rank owns:
-// - accum_ptr                : local full buffer
-// - inbound_steps_ptr        : local inbound step mailbox (polled locally)
-// - done_ptr                 : local done flags (polled locally / by host)
-// - chunk_states_ptr         : local per-chunk bookkeeping
+// - accum_ptr             : local full buffer
+// - ready_queue_ptr       : local ready queue storage
+// - done_ptr              : local done flags
+// - chunk_states_ptr      : local bookkeeping
 //
 // Previous rank writes remotely into:
 // - next_accum_ptr
-// - next_inbound_steps_ptr
+// - next_ready_queue_ptr
 // - next_done_ptr
 struct OperationDesc {
     uint32_t op_id = 0;
@@ -55,31 +60,28 @@ struct OperationDesc {
     uint32_t reserved2 = 0;
     uint64_t user_tag = 0;
 
-    // Local full buffer: starts as local partial, ends as full all-reduce result.
     uint64_t accum_ptr = 0;
     size_t accum_bytes = 0;
 
-    // Mapped pointer to next rank's full buffer.
     uint64_t next_accum_ptr = 0;
     size_t next_accum_bytes = 0;
 
-    // Local inbound step mailbox: one uint32 per chunk.
-    uint64_t inbound_steps_ptr = 0;
-    size_t inbound_steps_bytes = 0;
+    // Queue storage layout:
+    //   uint32_t head;
+    //   uint32_t tail;
+    //   ReadyItem items[num_chunks];
+    uint64_t ready_queue_ptr = 0;
+    size_t ready_queue_bytes = 0;
 
-    // Mapped pointer to next rank's local inbound mailbox.
-    uint64_t next_inbound_steps_ptr = 0;
-    size_t next_inbound_steps_bytes = 0;
+    uint64_t next_ready_queue_ptr = 0;
+    size_t next_ready_queue_bytes = 0;
 
-    // Local done flags: one uint32 per chunk.
     uint64_t done_ptr = 0;
     size_t done_bytes = 0;
 
-    // Mapped pointer to next rank's local done flags.
     uint64_t next_done_ptr = 0;
     size_t next_done_bytes = 0;
 
-    // Local per-rank bookkeeping, one ChunkState per chunk.
     uint64_t chunk_states_ptr = 0;
 };
 
@@ -94,13 +96,13 @@ struct ChunkState {
 };
 
 struct ChunkStateTable {
-    ChunkState* records = nullptr;  // device pointer
+    ChunkState* records = nullptr;
     uint32_t capacity = 0;
     int device = -1;
 };
 
 struct DeviceOperationDesc {
-    OperationDesc* ptr = nullptr;  // device pointer
+    OperationDesc* ptr = nullptr;
     int device = -1;
 };
 
@@ -120,6 +122,15 @@ __host__ __device__ __forceinline__ uint32_t operation_desc_total_ring_steps(
         return 0;
     }
     return static_cast<uint32_t>(2 * (op->world_size - 1));
+}
+
+__host__ __device__ __forceinline__ size_t operation_desc_ready_queue_storage_bytes(
+    const OperationDesc* op) {
+    if (op == nullptr) {
+        return 0;
+    }
+    return 2 * sizeof(uint32_t) +
+           static_cast<size_t>(op->num_chunks) * sizeof(ReadyItem);
 }
 
 __host__ __device__ __forceinline__ void operation_desc_clear(
@@ -145,10 +156,10 @@ __host__ __device__ __forceinline__ void operation_desc_clear(
     op->next_accum_ptr = 0;
     op->next_accum_bytes = 0;
 
-    op->inbound_steps_ptr = 0;
-    op->inbound_steps_bytes = 0;
-    op->next_inbound_steps_ptr = 0;
-    op->next_inbound_steps_bytes = 0;
+    op->ready_queue_ptr = 0;
+    op->ready_queue_bytes = 0;
+    op->next_ready_queue_ptr = 0;
+    op->next_ready_queue_bytes = 0;
 
     op->done_ptr = 0;
     op->done_bytes = 0;
@@ -172,6 +183,8 @@ __host__ __device__ __forceinline__ bool operation_desc_is_valid(
 
     const size_t num_chunks =
         static_cast<size_t>(operation_desc_compute_num_chunks(op->total_bytes, op->chunk_bytes));
+    const size_t queue_bytes =
+        2 * sizeof(uint32_t) + num_chunks * sizeof(ReadyItem);
     const size_t progress_bytes = num_chunks * sizeof(uint32_t);
 
     if (op->op_id == 0 ||
@@ -185,8 +198,8 @@ __host__ __device__ __forceinline__ bool operation_desc_is_valid(
         op->op == exec::ChunkOpKind::kInvalid ||
         op->accum_ptr == 0 ||
         op->accum_bytes < op->total_bytes ||
-        op->inbound_steps_ptr == 0 ||
-        op->inbound_steps_bytes < progress_bytes ||
+        op->ready_queue_ptr == 0 ||
+        op->ready_queue_bytes < queue_bytes ||
         op->done_ptr == 0 ||
         op->done_bytes < progress_bytes ||
         op->chunk_states_ptr == 0) {
@@ -196,8 +209,8 @@ __host__ __device__ __forceinline__ bool operation_desc_is_valid(
     if (op->world_size > 1) {
         if (op->next_accum_ptr == 0 ||
             op->next_accum_bytes < op->total_bytes ||
-            op->next_inbound_steps_ptr == 0 ||
-            op->next_inbound_steps_bytes < progress_bytes ||
+            op->next_ready_queue_ptr == 0 ||
+            op->next_ready_queue_bytes < queue_bytes ||
             op->next_done_ptr == 0 ||
             op->next_done_bytes < progress_bytes) {
             return false;
@@ -223,14 +236,39 @@ __host__ __device__ __forceinline__ unsigned char* operation_desc_next_accum_bas
     return reinterpret_cast<unsigned char*>(op->next_accum_ptr);
 }
 
-__host__ __device__ __forceinline__ uint32_t* operation_desc_local_inbound_steps(
+__host__ __device__ __forceinline__ unsigned char* operation_desc_local_ready_queue_base(
     const OperationDesc* op) {
-    return reinterpret_cast<uint32_t*>(op->inbound_steps_ptr);
+    return reinterpret_cast<unsigned char*>(op->ready_queue_ptr);
 }
 
-__host__ __device__ __forceinline__ uint32_t* operation_desc_next_inbound_steps(
+__host__ __device__ __forceinline__ unsigned char* operation_desc_next_ready_queue_base(
     const OperationDesc* op) {
-    return reinterpret_cast<uint32_t*>(op->next_inbound_steps_ptr);
+    return reinterpret_cast<unsigned char*>(op->next_ready_queue_ptr);
+}
+
+__host__ __device__ __forceinline__ uint32_t* operation_desc_local_ready_head(
+    const OperationDesc* op) {
+    return reinterpret_cast<uint32_t*>(op->ready_queue_ptr);
+}
+
+__host__ __device__ __forceinline__ uint32_t* operation_desc_local_ready_tail(
+    const OperationDesc* op) {
+    return reinterpret_cast<uint32_t*>(op->ready_queue_ptr) + 1;
+}
+
+__host__ __device__ __forceinline__ ReadyItem* operation_desc_local_ready_items(
+    const OperationDesc* op) {
+    return reinterpret_cast<ReadyItem*>(reinterpret_cast<uint32_t*>(op->ready_queue_ptr) + 2);
+}
+
+__host__ __device__ __forceinline__ uint32_t* operation_desc_next_ready_tail(
+    const OperationDesc* op) {
+    return reinterpret_cast<uint32_t*>(op->next_ready_queue_ptr) + 1;
+}
+
+__host__ __device__ __forceinline__ ReadyItem* operation_desc_next_ready_items(
+    const OperationDesc* op) {
+    return reinterpret_cast<ReadyItem*>(reinterpret_cast<uint32_t*>(op->next_ready_queue_ptr) + 2);
 }
 
 __host__ __device__ __forceinline__ uint32_t* operation_desc_local_done(
@@ -379,8 +417,8 @@ bool operation_desc_build_ring_allreduce(
     exec::ChunkOpKind op,
     void* accum_ptr,
     void* next_accum_ptr,
-    void* inbound_steps_ptr,
-    void* next_inbound_steps_ptr,
+    void* ready_queue_ptr,
+    void* next_ready_queue_ptr,
     void* done_ptr,
     void* next_done_ptr,
     ChunkState* chunk_states_ptr,

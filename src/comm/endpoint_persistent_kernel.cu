@@ -141,27 +141,29 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
         __syncthreads();
 
+        
         if (!has_work) {
-            #if defined(OOVERLAP_ENDPOINT_DEBUG)
+#if defined(OOVERLAP_ENDPOINT_DEBUG)
             if (threadIdx.x == 0) {
                 ++debug_idle_loops;
                 if ((debug_idle_loops & 0x3ffffu) == 0u) {
-                    volatile uint32_t* local_inbound =
-                        reinterpret_cast<volatile uint32_t*>(
-                            collective::operation_desc_local_inbound_steps(operation));
                     volatile uint32_t* local_done =
                         reinterpret_cast<volatile uint32_t*>(
                             collective::operation_desc_local_done(operation));
+                    volatile uint32_t* local_head =
+                        reinterpret_cast<volatile uint32_t*>(
+                            collective::operation_desc_local_ready_head(operation));
+                    volatile uint32_t* local_tail =
+                        reinterpret_cast<volatile uint32_t*>(
+                            collective::operation_desc_local_ready_tail(operation));
 
                     printf(
-                        "[idle] rank=%d idle_loops=%u ready_count=%u next_search_idx=%u inbound0=%u done0=%u\n",
+                        "[idle] rank=%d idle_loops=%u queue_count=%u head=%u tail=%u done0=%u\n",
                         operation->rank,
                         debug_idle_loops,
                         shared_pipe.scheduler.ready_count,
-                        shared_pipe.scheduler.next_search_idx,
-                        (operation->num_chunks > 0)
-                            ? exec::chunk_scheduler_atomic_load_u32(&local_inbound[0])
-                            : 0u,
+                        exec::chunk_scheduler_atomic_load_u32(local_head),
+                        exec::chunk_scheduler_atomic_load_u32(local_tail),
                         (operation->num_chunks > 0)
                             ? exec::chunk_scheduler_atomic_load_u32(&local_done[0])
                             : 0u);
