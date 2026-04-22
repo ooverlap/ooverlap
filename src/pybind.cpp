@@ -250,14 +250,14 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         /*py::arg("dev1") = 1,*/
         /*"Persistent 2-GPU all-reduce smoke test");*/
 
-  /*m.def("benchmark_persistent_two_gpu_allreduce_sm90",*/
-        /*&ooverlap::benchmark_persistent_two_gpu_allreduce_sm90,*/
-        /*py::arg("numel"),*/
-        /*py::arg("iters"),*/
-        /*py::arg("warmup"),*/
-        /*py::arg("dev0") = 0,*/
-        /*py::arg("dev1") = 1,*/
-        /*"Benchmark persistent 2-GPU all-reduce vs basic TMA vs NCCL");*/
+  m.def("benchmark_persistent_two_gpu_allreduce_sm90",
+        &ooverlap::benchmark_persistent_two_gpu_allreduce_sm90,
+        py::arg("numel"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        "Benchmark persistent 2-GPU all-reduce vs basic TMA vs NCCL");
 
   /*m.def("endpoint_persistent_smoke_test",*/
         /*&ooverlap::endpoint_persistent_smoke_test,*/

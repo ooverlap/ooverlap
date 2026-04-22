@@ -1,12 +1,13 @@
 #include "test/persistent_allreduce_2gpu_sm90.h"
 
-#include "test/tma_basic_collective_sm90.h"
+#include "test/tma_collective_sm90.h"
 
 #include "comm/collective/operation.h"
 #include "comm/endpoint_persistent_kernel.h"
 #include "comm/endpoint_runtime.h"
 #include "comm/group.h"
 #include "comm/transport/buffer.h"
+#include "ooverlap/system/peer_buffer.cuh"
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/test_utils.cuh"
 
@@ -14,7 +15,6 @@
 #include <cuda_runtime.h>
 #include <nccl.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -121,6 +121,22 @@ struct PersistentTwoGpuState {
     bool initialized = false;
 };
 
+struct BasicTwoGpuState {
+    int dev0 = -1;
+    int dev1 = -1;
+    cudaStream_t stream0 = nullptr;
+    cudaStream_t stream1 = nullptr;
+
+    system::mapped_peer_buffer inbox0{};
+    system::mapped_peer_buffer inbox1{};
+
+    half* work0 = nullptr;
+    half* work1 = nullptr;
+
+    size_t bytes = 0;
+    bool initialized = false;
+};
+
 inline std::vector<int> normalize_two_devices(
     int dev0,
     int dev1) {
@@ -210,58 +226,27 @@ inline void destroy_persistent_two_gpu_state(
     }
 
     for (auto& op_dev : st->op_devs) {
-        try {
-            comm::collective::device_operation_desc_destroy(&op_dev);
-        } catch (...) {
-        }
+        try { comm::collective::device_operation_desc_destroy(&op_dev); } catch (...) {}
     }
-
     for (auto& table : st->chunk_states) {
-        try {
-            comm::collective::chunk_state_table_destroy(&table);
-        } catch (...) {
-        }
+        try { comm::collective::chunk_state_table_destroy(&table); } catch (...) {}
     }
-
     for (auto& box : st->done_flags) {
-        try {
-            box.destroy();
-        } catch (...) {
-        }
+        try { box.destroy(); } catch (...) {}
     }
-
     for (auto& box : st->inbound_steps) {
-        try {
-            box.destroy();
-        } catch (...) {
-        }
+        try { box.destroy(); } catch (...) {}
     }
-
     for (auto& accum : st->accums) {
-        try {
-            comm::transport::free_comm_buffer(st->devices, accum);
-        } catch (...) {
-        }
+        try { comm::transport::free_comm_buffer(st->devices, accum); } catch (...) {}
     }
-
     for (auto& ctl : st->controls) {
-        try {
-            comm::endpoint_persistent_control_destroy(&ctl);
-        } catch (...) {
-        }
+        try { comm::endpoint_persistent_control_destroy(&ctl); } catch (...) {}
     }
-
     for (auto& rt : st->runtimes) {
-        try {
-            comm::endpoint_runtime_destroy(&rt);
-        } catch (...) {
-        }
+        try { comm::endpoint_runtime_destroy(&rt); } catch (...) {}
     }
-
-    try {
-        comm::group_destroy(&st->group);
-    } catch (...) {
-    }
+    try { comm::group_destroy(&st->group); } catch (...) {}
 
     st->devices.clear();
     st->runtimes.clear();
@@ -482,14 +467,6 @@ inline void copy_persistent_outputs_to_device(
         "sync copy_persistent_outputs_to_device");
 }
 
-template <typename Fn>
-double measure_host_ms(Fn&& fn) {
-    const auto start = std::chrono::steady_clock::now();
-    fn();
-    const auto stop = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::milli>(stop - start).count();
-}
-
 inline void verify_persistent_result(
     PersistentTwoGpuState* st,
     int64_t numel) {
@@ -505,8 +482,178 @@ inline void verify_persistent_result(
         numel,
         st->devices[1]);
 
-    testing::expect_allclose(got0, ref, "persistent benchmark verify rank0");
-    testing::expect_allclose(got1, ref, "persistent benchmark verify rank1");
+    testing::expect_allclose(got0, ref, "persistent verify rank0");
+    testing::expect_allclose(got1, ref, "persistent verify rank1");
+}
+
+inline void destroy_basic_two_gpu_state(
+    BasicTwoGpuState* st) {
+    if (st == nullptr) {
+        return;
+    }
+
+    try {
+        if (st->work0 != nullptr) {
+            system::runtime::set_device(st->dev0);
+            cudaFree(st->work0);
+        }
+    } catch (...) {
+    }
+    try {
+        if (st->work1 != nullptr) {
+            system::runtime::set_device(st->dev1);
+            cudaFree(st->work1);
+        }
+    } catch (...) {
+    }
+    try {
+        if (st->stream0 != nullptr) {
+            system::runtime::destroy_stream_on_device(st->dev0, st->stream0);
+        }
+    } catch (...) {
+    }
+    try {
+        if (st->stream1 != nullptr) {
+            system::runtime::destroy_stream_on_device(st->dev1, st->stream1);
+        }
+    } catch (...) {
+    }
+    try { system::free_peer_visible_buffer(st->inbox0); } catch (...) {}
+    try { system::free_peer_visible_buffer(st->inbox1); } catch (...) {}
+
+    st->dev0 = -1;
+    st->dev1 = -1;
+    st->stream0 = nullptr;
+    st->stream1 = nullptr;
+    st->work0 = nullptr;
+    st->work1 = nullptr;
+    st->bytes = 0;
+    st->initialized = false;
+}
+
+inline void init_basic_two_gpu_state(
+    BasicTwoGpuState* st,
+    int dev0,
+    int dev1,
+    size_t numel) {
+    if (st == nullptr) {
+        throw std::invalid_argument("init_basic_two_gpu_state: st is null");
+    }
+
+    destroy_basic_two_gpu_state(st);
+
+    st->dev0 = dev0;
+    st->dev1 = dev1;
+    st->bytes = numel * sizeof(half);
+
+    system::runtime::ensure_context_on_device(dev0);
+    system::runtime::ensure_context_on_device(dev1);
+
+    st->stream0 = system::runtime::create_stream_on_device(dev0);
+    st->stream1 = system::runtime::create_stream_on_device(dev1);
+
+    std::vector<int> access_devices = {dev0, dev1};
+    st->inbox0 = system::alloc_peer_visible_buffer(st->bytes, dev0, access_devices);
+    st->inbox1 = system::alloc_peer_visible_buffer(st->bytes, dev1, access_devices);
+
+    system::runtime::set_device(dev0);
+    system::runtime::check_cuda(cudaMalloc(&st->work0, st->bytes), "cudaMalloc(basic work0)");
+    system::runtime::check_cuda(cudaMemset(st->inbox0.ptr, 0, st->inbox0.mapped_size), "cudaMemset(inbox0)");
+
+    system::runtime::set_device(dev1);
+    system::runtime::check_cuda(cudaMalloc(&st->work1, st->bytes), "cudaMalloc(basic work1)");
+    system::runtime::check_cuda(cudaMemset(st->inbox1.ptr, 0, st->inbox1.mapped_size), "cudaMemset(inbox1)");
+
+    st->initialized = true;
+}
+
+inline void prepare_basic_two_gpu_run(
+    BasicTwoGpuState* st,
+    half* rank0_src,
+    half* rank1_src) {
+    if (st == nullptr || !st->initialized) {
+        throw std::invalid_argument("prepare_basic_two_gpu_run: state is not initialized");
+    }
+
+    system::runtime::set_device(st->dev0);
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(
+            st->work0,
+            rank0_src,
+            st->bytes,
+            cudaMemcpyDeviceToDevice,
+            st->stream0),
+        "cudaMemcpyAsync(src0 -> work0)");
+    system::runtime::check_cuda(
+        cudaMemsetAsync(
+            st->inbox0.ptr,
+            0,
+            st->inbox0.mapped_size,
+            st->stream0),
+        "cudaMemsetAsync(inbox0)");
+
+    system::runtime::set_device(st->dev1);
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(
+            st->work1,
+            rank1_src,
+            st->bytes,
+            cudaMemcpyDeviceToDevice,
+            st->stream1),
+        "cudaMemcpyAsync(src1 -> work1)");
+    system::runtime::check_cuda(
+        cudaMemsetAsync(
+            st->inbox1.ptr,
+            0,
+            st->inbox1.mapped_size,
+            st->stream1),
+        "cudaMemsetAsync(inbox1)");
+
+    sync_two_streams(
+        st->dev0, st->stream0,
+        st->dev1, st->stream1,
+        "sync prepare_basic_two_gpu_run");
+}
+
+inline void run_basic_two_gpu_allreduce(
+    BasicTwoGpuState* st,
+    size_t numel) {
+    if (st == nullptr || !st->initialized) {
+        throw std::invalid_argument("run_basic_two_gpu_allreduce: state is not initialized");
+    }
+
+    system::runtime::check_cuda(
+        enqueue_two_gpu_all_reduce_tma_sm90(
+            st->work0,
+            st->work1,
+            reinterpret_cast<half*>(st->inbox0.ptr),
+            reinterpret_cast<half*>(st->inbox1.ptr),
+            numel,
+            st->dev0,
+            st->dev1,
+            st->stream0,
+            st->stream1),
+        "enqueue_two_gpu_all_reduce_tma_sm90");
+}
+
+inline void verify_basic_result(
+    BasicTwoGpuState* st,
+    int64_t numel) {
+    auto ref = reference_two_gpu_sum_fp16(numel);
+
+    auto got0 = testing::copy_half_device_to_host_float(st->work0, numel, st->dev0);
+    auto got1 = testing::copy_half_device_to_host_float(st->work1, numel, st->dev1);
+
+    testing::expect_allclose(got0, ref, "basic verify rank0");
+    testing::expect_allclose(got1, ref, "basic verify rank1");
+}
+
+template <typename Fn>
+double measure_host_ms(Fn&& fn) {
+    const auto start = std::chrono::steady_clock::now();
+    fn();
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count();
 }
 
 } // namespace
@@ -520,7 +667,6 @@ cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
     half* rank1_out,
     size_t numel,
     int timeout_ms) {
-
     if (dev0 < 0 || dev1 < 0 || dev0 == dev1) {
         return cudaErrorInvalidValue;
     }
@@ -550,7 +696,6 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
     int64_t numel,
     int dev0,
     int dev1) {
-
     if (numel <= 0) {
         throw std::invalid_argument("tma_persistent_two_gpu_allreduce_smoke_test: numel must be > 0");
     }
@@ -595,15 +740,13 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
             try {
                 system::runtime::set_device(dev0);
                 cudaFree(rank0_in);
-            } catch (...) {
-            }
+            } catch (...) {}
         }
         if (rank1_in != nullptr) {
             try {
                 system::runtime::set_device(dev1);
                 cudaFree(rank1_in);
-            } catch (...) {
-            }
+            } catch (...) {}
         }
         destroy_persistent_two_gpu_state(&st);
         throw;
@@ -616,7 +759,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     int warmup,
     int dev0,
     int dev1) {
-
     if (numel <= 0 || iters <= 0 || warmup < 0) {
         throw std::invalid_argument("benchmark_persistent_two_gpu_allreduce_sm90: invalid args");
     }
@@ -626,146 +768,192 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
 
-    BasicCollectiveState basic_state{};
-    init_basic_collective_same_process(
-        &basic_state,
-        {dev0, dev1},
-        static_cast<size_t>(numel));
-
     PersistentTwoGpuState persistent{};
-    init_persistent_two_gpu_state(&persistent, dev0, dev1, static_cast<size_t>(numel));
+    BasicTwoGpuState basic{};
 
-    half* rank0_in = nullptr;
-    half* rank1_in = nullptr;
+    half* rank0_src = nullptr;
+    half* rank1_src = nullptr;
+    half* rank0_nccl_out = nullptr;
+    half* rank1_nccl_out = nullptr;
 
+    cudaStream_t nccl_stream0 = nullptr;
+    cudaStream_t nccl_stream1 = nullptr;
     ncclComm_t nccl_comms[2] = {nullptr, nullptr};
 
     try {
+        init_persistent_two_gpu_state(&persistent, dev0, dev1, static_cast<size_t>(numel));
+        init_basic_two_gpu_state(&basic, dev0, dev1, static_cast<size_t>(numel));
+
+        system::runtime::ensure_context_on_device(dev0);
+        system::runtime::ensure_context_on_device(dev1);
+        nccl_stream0 = system::runtime::create_stream_on_device(dev0);
+        nccl_stream1 = system::runtime::create_stream_on_device(dev1);
+
         system::runtime::set_device(dev0);
-        system::runtime::check_cuda(cudaMalloc(&rank0_in, bytes), "cudaMalloc(rank0_in)");
-        testing::fill_pattern(rank0_in, numel, 0.25f, 1.0f, basic_state.streams[0]);
+        system::runtime::check_cuda(cudaMalloc(&rank0_src, bytes), "cudaMalloc(rank0_src)");
+        system::runtime::check_cuda(cudaMalloc(&rank0_nccl_out, bytes), "cudaMalloc(rank0_nccl_out)");
+        testing::fill_pattern(rank0_src, numel, 0.25f, 1.0f, nccl_stream0);
 
         system::runtime::set_device(dev1);
-        system::runtime::check_cuda(cudaMalloc(&rank1_in, bytes), "cudaMalloc(rank1_in)");
-        testing::fill_pattern(rank1_in, numel, 0.50f, 2.0f, basic_state.streams[1]);
+        system::runtime::check_cuda(cudaMalloc(&rank1_src, bytes), "cudaMalloc(rank1_src)");
+        system::runtime::check_cuda(cudaMalloc(&rank1_nccl_out, bytes), "cudaMalloc(rank1_nccl_out)");
+        testing::fill_pattern(rank1_src, numel, 0.50f, 2.0f, nccl_stream1);
 
-        sync_two_streams(
-            dev0, basic_state.streams[0],
-            dev1, basic_state.streams[1],
-            "sync fill benchmark inputs");
-
-        std::vector<half*> basic_inputs = {rank0_in, rank1_in};
+        sync_two_streams(dev0, nccl_stream0, dev1, nccl_stream1, "sync fill benchmark inputs");
 
         int nccl_devices[2] = {dev0, dev1};
         OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitAll(nccl_comms, 2, nccl_devices));
 
         for (int i = 0; i < warmup; ++i) {
-            system::runtime::check_cuda(
-                enqueue_basic_all_reduce_tma_sm90(
-                    &basic_state,
-                    basic_inputs,
-                    static_cast<size_t>(numel)),
-                "basic warmup");
-
-            sync_two_streams(
-                dev0, basic_state.streams[0],
-                dev1, basic_state.streams[1],
-                "sync basic warmup");
+            prepare_basic_two_gpu_run(&basic, rank0_src, rank1_src);
+            run_basic_two_gpu_allreduce(&basic, static_cast<size_t>(numel));
         }
 
         for (int i = 0; i < warmup; ++i) {
+            system::runtime::set_device(dev0);
+            system::runtime::check_cuda(
+                cudaMemcpyAsync(rank0_nccl_out, rank0_src, bytes, cudaMemcpyDeviceToDevice, nccl_stream0),
+                "cudaMemcpyAsync(rank0 src -> nccl out)");
+            system::runtime::set_device(dev1);
+            system::runtime::check_cuda(
+                cudaMemcpyAsync(rank1_nccl_out, rank1_src, bytes, cudaMemcpyDeviceToDevice, nccl_stream1),
+                "cudaMemcpyAsync(rank1 src -> nccl out)");
+
+            sync_two_streams(dev0, nccl_stream0, dev1, nccl_stream1, "sync nccl warmup prepare");
+
             OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
             OOVERLAP_PERSIST_NCCL_CHECK(
                 ncclAllReduce(
-                    rank0_in,
-                    basic_collective_full_output_ptr(&basic_state, 0),
+                    rank0_nccl_out,
+                    rank0_nccl_out,
                     static_cast<size_t>(numel),
                     ncclFloat16,
                     ncclSum,
                     nccl_comms[0],
-                    basic_state.streams[0]));
+                    nccl_stream0));
             OOVERLAP_PERSIST_NCCL_CHECK(
                 ncclAllReduce(
-                    rank1_in,
-                    basic_collective_full_output_ptr(&basic_state, 1),
+                    rank1_nccl_out,
+                    rank1_nccl_out,
                     static_cast<size_t>(numel),
                     ncclFloat16,
                     ncclSum,
                     nccl_comms[1],
-                    basic_state.streams[1]));
+                    nccl_stream1));
             OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
 
-            sync_two_streams(
-                dev0, basic_state.streams[0],
-                dev1, basic_state.streams[1],
-                "sync nccl warmup");
+            sync_two_streams(dev0, nccl_stream0, dev1, nccl_stream1, "sync nccl warmup");
         }
 
         for (int i = 0; i < warmup; ++i) {
-            prepare_persistent_two_gpu_run(&persistent, rank0_in, rank1_in);
+            prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
             launch_persistent_two_gpu_run(&persistent);
             wait_and_stop_persistent_two_gpu_run(&persistent, 30000);
         }
 
         double basic_total_ms = 0.0;
         for (int i = 0; i < iters; ++i) {
+            prepare_basic_two_gpu_run(&basic, rank0_src, rank1_src);
             basic_total_ms += measure_host_ms([&] {
-                system::runtime::check_cuda(
-                    enqueue_basic_all_reduce_tma_sm90(
-                        &basic_state,
-                        basic_inputs,
-                        static_cast<size_t>(numel)),
-                    "enqueue_basic_all_reduce_tma_sm90");
-
-                sync_two_streams(
-                    dev0, basic_state.streams[0],
-                    dev1, basic_state.streams[1],
-                    "sync basic measured");
+                run_basic_two_gpu_allreduce(&basic, static_cast<size_t>(numel));
             });
         }
 
         double nccl_total_ms = 0.0;
         for (int i = 0; i < iters; ++i) {
+            system::runtime::set_device(dev0);
+            system::runtime::check_cuda(
+                cudaMemcpyAsync(rank0_nccl_out, rank0_src, bytes, cudaMemcpyDeviceToDevice, nccl_stream0),
+                "cudaMemcpyAsync(rank0 src -> nccl out)");
+            system::runtime::set_device(dev1);
+            system::runtime::check_cuda(
+                cudaMemcpyAsync(rank1_nccl_out, rank1_src, bytes, cudaMemcpyDeviceToDevice, nccl_stream1),
+                "cudaMemcpyAsync(rank1 src -> nccl out)");
+
+            sync_two_streams(dev0, nccl_stream0, dev1, nccl_stream1, "sync nccl measured prepare");
+
             nccl_total_ms += measure_host_ms([&] {
                 OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
                 OOVERLAP_PERSIST_NCCL_CHECK(
                     ncclAllReduce(
-                        rank0_in,
-                        basic_collective_full_output_ptr(&basic_state, 0),
+                        rank0_nccl_out,
+                        rank0_nccl_out,
                         static_cast<size_t>(numel),
                         ncclFloat16,
                         ncclSum,
                         nccl_comms[0],
-                        basic_state.streams[0]));
+                        nccl_stream0));
                 OOVERLAP_PERSIST_NCCL_CHECK(
                     ncclAllReduce(
-                        rank1_in,
-                        basic_collective_full_output_ptr(&basic_state, 1),
+                        rank1_nccl_out,
+                        rank1_nccl_out,
                         static_cast<size_t>(numel),
                         ncclFloat16,
                         ncclSum,
                         nccl_comms[1],
-                        basic_state.streams[1]));
+                        nccl_stream1));
                 OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
 
-                sync_two_streams(
-                    dev0, basic_state.streams[0],
-                    dev1, basic_state.streams[1],
-                    "sync nccl measured");
+                sync_two_streams(dev0, nccl_stream0, dev1, nccl_stream1, "sync nccl measured");
             });
         }
 
         double persistent_total_ms = 0.0;
         for (int i = 0; i < iters; ++i) {
-            prepare_persistent_two_gpu_run(&persistent, rank0_in, rank1_in);
-
+            prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
             persistent_total_ms += measure_host_ms([&] {
                 launch_persistent_two_gpu_run(&persistent);
                 wait_and_stop_persistent_two_gpu_run(&persistent, 30000);
             });
         }
 
-        prepare_persistent_two_gpu_run(&persistent, rank0_in, rank1_in);
+        prepare_basic_two_gpu_run(&basic, rank0_src, rank1_src);
+        run_basic_two_gpu_allreduce(&basic, static_cast<size_t>(numel));
+        verify_basic_result(&basic, numel);
+
+        system::runtime::set_device(dev0);
+        system::runtime::check_cuda(
+            cudaMemcpyAsync(rank0_nccl_out, rank0_src, bytes, cudaMemcpyDeviceToDevice, nccl_stream0),
+            "cudaMemcpyAsync(rank0 src -> nccl out verify)");
+        system::runtime::set_device(dev1);
+        system::runtime::check_cuda(
+            cudaMemcpyAsync(rank1_nccl_out, rank1_src, bytes, cudaMemcpyDeviceToDevice, nccl_stream1),
+            "cudaMemcpyAsync(rank1 src -> nccl out verify)");
+
+        sync_two_streams(dev0, nccl_stream0, dev1, nccl_stream1, "sync nccl verify prepare");
+
+        OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
+        OOVERLAP_PERSIST_NCCL_CHECK(
+            ncclAllReduce(
+                rank0_nccl_out,
+                rank0_nccl_out,
+                static_cast<size_t>(numel),
+                ncclFloat16,
+                ncclSum,
+                nccl_comms[0],
+                nccl_stream0));
+        OOVERLAP_PERSIST_NCCL_CHECK(
+            ncclAllReduce(
+                rank1_nccl_out,
+                rank1_nccl_out,
+                static_cast<size_t>(numel),
+                ncclFloat16,
+                ncclSum,
+                nccl_comms[1],
+                nccl_stream1));
+        OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
+
+        sync_two_streams(dev0, nccl_stream0, dev1, nccl_stream1, "sync nccl verify");
+
+        {
+            auto ref = reference_two_gpu_sum_fp16(numel);
+            auto got0 = testing::copy_half_device_to_host_float(rank0_nccl_out, numel, dev0);
+            auto got1 = testing::copy_half_device_to_host_float(rank1_nccl_out, numel, dev1);
+            testing::expect_allclose(got0, ref, "nccl verify rank0");
+            testing::expect_allclose(got1, ref, "nccl verify rank1");
+        }
+
+        prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
         launch_persistent_two_gpu_run(&persistent);
         wait_and_stop_persistent_two_gpu_run(&persistent, 30000);
         verify_persistent_result(&persistent, numel);
@@ -779,15 +967,24 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         nccl_comms[0] = nullptr;
         nccl_comms[1] = nullptr;
 
-        system::runtime::set_device(dev0);
-        system::runtime::check_cuda(cudaFree(rank0_in), "cudaFree(rank0_in)");
-        system::runtime::set_device(dev1);
-        system::runtime::check_cuda(cudaFree(rank1_in), "cudaFree(rank1_in)");
-        rank0_in = nullptr;
-        rank1_in = nullptr;
+        system::runtime::destroy_stream_on_device(dev0, nccl_stream0);
+        system::runtime::destroy_stream_on_device(dev1, nccl_stream1);
+        nccl_stream0 = nullptr;
+        nccl_stream1 = nullptr;
 
+        system::runtime::set_device(dev0);
+        system::runtime::check_cuda(cudaFree(rank0_src), "cudaFree(rank0_src)");
+        system::runtime::check_cuda(cudaFree(rank0_nccl_out), "cudaFree(rank0_nccl_out)");
+        system::runtime::set_device(dev1);
+        system::runtime::check_cuda(cudaFree(rank1_src), "cudaFree(rank1_src)");
+        system::runtime::check_cuda(cudaFree(rank1_nccl_out), "cudaFree(rank1_nccl_out)");
+        rank0_src = nullptr;
+        rank1_src = nullptr;
+        rank0_nccl_out = nullptr;
+        rank1_nccl_out = nullptr;
+
+        destroy_basic_two_gpu_state(&basic);
         destroy_persistent_two_gpu_state(&persistent);
-        destroy_basic_collective_same_process(&basic_state);
 
         return {
             {"numel", static_cast<double>(numel)},
@@ -805,23 +1002,40 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             try { ncclCommDestroy(nccl_comms[1]); } catch (...) {}
         }
 
-        if (rank0_in != nullptr) {
-            try {
-                system::runtime::set_device(dev0);
-                cudaFree(rank0_in);
-            } catch (...) {
-            }
+        if (nccl_stream0 != nullptr) {
+            try { system::runtime::destroy_stream_on_device(dev0, nccl_stream0); } catch (...) {}
         }
-        if (rank1_in != nullptr) {
-            try {
-                system::runtime::set_device(dev1);
-                cudaFree(rank1_in);
-            } catch (...) {
-            }
+        if (nccl_stream1 != nullptr) {
+            try { system::runtime::destroy_stream_on_device(dev1, nccl_stream1); } catch (...) {}
         }
 
+        if (rank0_src != nullptr) {
+            try {
+                system::runtime::set_device(dev0);
+                cudaFree(rank0_src);
+            } catch (...) {}
+        }
+        if (rank0_nccl_out != nullptr) {
+            try {
+                system::runtime::set_device(dev0);
+                cudaFree(rank0_nccl_out);
+            } catch (...) {}
+        }
+        if (rank1_src != nullptr) {
+            try {
+                system::runtime::set_device(dev1);
+                cudaFree(rank1_src);
+            } catch (...) {}
+        }
+        if (rank1_nccl_out != nullptr) {
+            try {
+                system::runtime::set_device(dev1);
+                cudaFree(rank1_nccl_out);
+            } catch (...) {}
+        }
+
+        destroy_basic_two_gpu_state(&basic);
         destroy_persistent_two_gpu_state(&persistent);
-        destroy_basic_collective_same_process(&basic_state);
         throw;
     }
 }
