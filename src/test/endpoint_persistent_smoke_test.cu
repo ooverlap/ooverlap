@@ -196,6 +196,8 @@ std::string build_progress_debug_string(
     const std::vector<comm::transport::CommBuffer>& inbound_buffers,
     const std::vector<comm::transport::CommBuffer>& done_buffers,
     size_t num_chunks) {
+
+    std::string output("");
     for (size_t r = 0; r < done_buffers.size(); ++r) {
         std::vector<uint32_t> host_done;
         std::vector<uint32_t> host_inbound;
@@ -203,17 +205,15 @@ std::string build_progress_debug_string(
         copy_u32_buffer_from_owner(devices[r], inbound_buffers[r].ptr, num_chunks, &host_inbound);
 
         for (size_t c = 0; c < num_chunks; ++c) {
-            if (host_done[c] != 1u) {
-                return std::string("first incomplete rank=") +
+            output = output + " " +std::string("first incomplete rank=") +
                        std::to_string(r) +
                        " chunk=" + std::to_string(c) +
                        " done=" + std::to_string(host_done[c]) +
                        " inbound_step=" + std::to_string(host_inbound[c]);
-            }
         }
     }
 
-    return "all ranks complete";
+    return output;
 }
 
 } // namespace
