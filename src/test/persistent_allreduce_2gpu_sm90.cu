@@ -1439,40 +1439,25 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         init_basic_cuda_memcpy_state(&basic, dev0, dev1, static_cast<size_t>(numel));
         init_nccl_allreduce_state(&nccl, dev0, dev1, static_cast<size_t>(numel));
 
+        // -----------------------------
+        // Phase 1: persistent benchmark
+        // -----------------------------
         launch_persistent_two_gpu_run(&persistent);
 
         for (int i = 0; i < warmup; ++i) {
             prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
             (void)measure_persistent_host_breakdown_ms(&persistent, 5000);
-
-            prepare_basic_cuda_memcpy_run(&basic, rank0_src, rank1_src);
-            run_basic_cuda_memcpy_allreduce(&basic, static_cast<size_t>(numel));
-
-            prepare_nccl_allreduce_run(&nccl, rank0_src, rank1_src);
-            run_nccl_allreduce(&nccl, static_cast<size_t>(numel));
         }
 
         double persistent_device_done_ms = 0.0;
         double persistent_host_wait_done_ms = 0.0;
-        double basic_ms = 0.0;
-        double nccl_ms = 0.0;
 
         for (int i = 0; i < iters; ++i) {
             prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
-            const auto persistent_timing =
+            const auto timing =
                 measure_persistent_host_breakdown_ms(&persistent, 5000);
-            persistent_device_done_ms += persistent_timing.device_done_ms;
-            persistent_host_wait_done_ms += persistent_timing.host_wait_done_ms;
-
-            prepare_basic_cuda_memcpy_run(&basic, rank0_src, rank1_src);
-            basic_ms += measure_host_ms([&]() {
-                run_basic_cuda_memcpy_allreduce(&basic, static_cast<size_t>(numel));
-            });
-
-            prepare_nccl_allreduce_run(&nccl, rank0_src, rank1_src);
-            nccl_ms += measure_host_ms([&]() {
-                run_nccl_allreduce(&nccl, static_cast<size_t>(numel));
-            });
+            persistent_device_done_ms += timing.device_done_ms;
+            persistent_host_wait_done_ms += timing.host_wait_done_ms;
         }
 
         const double persistent_stop_join_total_ms = measure_host_ms([&]() {
@@ -1490,7 +1475,41 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         });
 
         verify_persistent_result(&persistent, numel);
+
+        // -----------------------------
+        // Phase 2: basic memcpy benchmark
+        // -----------------------------
+        for (int i = 0; i < warmup; ++i) {
+            prepare_basic_cuda_memcpy_run(&basic, rank0_src, rank1_src);
+            run_basic_cuda_memcpy_allreduce(&basic, static_cast<size_t>(numel));
+        }
+
+        double basic_ms = 0.0;
+        for (int i = 0; i < iters; ++i) {
+            prepare_basic_cuda_memcpy_run(&basic, rank0_src, rank1_src);
+            basic_ms += measure_host_ms([&]() {
+                run_basic_cuda_memcpy_allreduce(&basic, static_cast<size_t>(numel));
+            });
+        }
+
         verify_basic_cuda_memcpy_result(&basic, numel);
+
+        // -----------------------------
+        // Phase 3: NCCL benchmark
+        // -----------------------------
+        for (int i = 0; i < warmup; ++i) {
+            prepare_nccl_allreduce_run(&nccl, rank0_src, rank1_src);
+            run_nccl_allreduce(&nccl, static_cast<size_t>(numel));
+        }
+
+        double nccl_ms = 0.0;
+        for (int i = 0; i < iters; ++i) {
+            prepare_nccl_allreduce_run(&nccl, rank0_src, rank1_src);
+            nccl_ms += measure_host_ms([&]() {
+                run_nccl_allreduce(&nccl, static_cast<size_t>(numel));
+            });
+        }
+
         verify_nccl_result(&nccl, numel);
 
         destroy_nccl_allreduce_state(&nccl);
