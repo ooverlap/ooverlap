@@ -100,7 +100,7 @@ __global__ void endpoint_persistent_kernel_sm90(
     if (!endpoint_persistent_runtime_is_minimally_valid(&runtime)) {
         return;
     }
-    if (!collective::operation_desc_is_active(operation)) {
+    if (operation == nullptr || !collective::operation_desc_is_active(operation)) {
         return;
     }
 
@@ -238,8 +238,6 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
 
         if (threadIdx.x == 0) {
-            // Make sure remote/local writes for the current chunk are visible
-            // before publishing the next step.
             __threadfence_system();
 
             const uint32_t next_step = shared_chunk_step + 1;
@@ -420,9 +418,13 @@ cudaError_t launch_endpoint_persistent_kernel_sm90(
         runtime->stream == nullptr) {
         return cudaErrorInvalidValue;
     }
-    if (operation == nullptr || !collective::operation_desc_is_active(operation)) {
+
+    // IMPORTANT:
+    // `operation` is a device pointer. Host code must not dereference it here.
+    if (operation == nullptr) {
         return cudaErrorInvalidValue;
     }
+
     if (!endpoint_persistent_control_is_valid(control)) {
         return cudaErrorInvalidValue;
     }
