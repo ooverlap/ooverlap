@@ -115,22 +115,7 @@ __device__ __forceinline__ void chunk_pipeline_wait_current_complete(
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
 __device__ __forceinline__ void chunk_pipeline_schedule_next_load(
     ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe) {
-    Chunk next_chunk{};
-    if (!chunk_scheduler_peek_next(&pipe->scheduler, &next_chunk)) {
-        return;
-    }
-
-    if (threadIdx.x == 0) {
-        if ((pipe->local_iter + 1) >= StageDepth) {
-            pipe->apply_op.template wait_before_stage_reuse<StageDepth>();
-        }
-
-        PipelineStage* next_stage =
-            &pipe->stages[(pipe->local_iter + 1) % StageDepth];
-
-        pipeline_stage_set_chunk(next_stage, &next_chunk);
-        pipe->load_op.issue(next_stage);
-    }
+    (void)pipe;
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>

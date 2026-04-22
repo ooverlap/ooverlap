@@ -90,14 +90,13 @@ __global__ void endpoint_persistent_kernel_sm90(
 
         if (total_steps == 0) {
             atomicExch(
-                reinterpret_cast<unsigned int*>(
-                    const_cast<uint32_t*>(&done[idx])),
+                reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(&done[idx])),
                 1u);
         }
     }
     __syncthreads();
 
-    using Scheduler = exec::ChunkScheduler<1>;
+    using Scheduler = exec::ChunkScheduler;
     using Pipe = exec::ChunkPipeline<
         kPersistentStageDepth,
         Scheduler,

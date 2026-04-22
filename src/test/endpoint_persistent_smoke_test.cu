@@ -637,18 +637,18 @@ std::fflush(stdout);
                 &ops[static_cast<size_t>(r)]);
         }
 
-        for (int r = 0; r < world_size; ++r) {
-            const int next_rank = (r + 1) % world_size;
-            comm::endpoint_runtime_configure_submission(
-    &runtimes[static_cast<size_t>(r)],
-    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-    bytes,
-                comm::exec::ChunkOpKind::kReduceAddNoFtzF16,
-                1,
-                next_rank,
-                0);
-        }
+        /*for (int r = 0; r < world_size; ++r) {*/
+            /*const int next_rank = (r + 1) % world_size;*/
+            /*comm::endpoint_runtime_configure_submission(*/
+    /*&runtimes[static_cast<size_t>(r)],*/
+    /*accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),*/
+    /*accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),*/
+    /*bytes,*/
+                /*comm::exec::ChunkOpKind::kReduceAddNoFtzF16,*/
+                /*1,*/
+                /*next_rank,*/
+                /*0);*/
+        /*}*/
 
         std::printf("[smoke] after operation setup\n"); std::fflush(stdout);
 

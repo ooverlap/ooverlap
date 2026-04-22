@@ -6,7 +6,7 @@
 
 #include "comm/collective/operation.h"
 #include "comm/endpoint.h"
-#include "comm/exec/chunk_scheduler.h"
+#include "comm/exec/chunk.h"
 #include "comm/group.h"
 
 namespace ooverlap {
@@ -17,16 +17,11 @@ struct DeviceEndpointRuntime {
     int world_size = 0;
     int device = -1;
     cudaStream_t stream = nullptr;
-
-    const exec::RangeSchedulerSubmission* submission = nullptr;
 };
 
 struct EndpointRuntime {
     Endpoint endpoint{};
     int world_size = 0;
-
-    exec::RangeSchedulerSubmission submission_host{};
-    exec::RangeSchedulerSubmission* submission_device = nullptr;
 
     DeviceEndpointRuntime device{};
 };
@@ -37,9 +32,7 @@ __host__ __device__ __forceinline__ bool device_endpoint_runtime_is_valid(
            rt->rank >= 0 &&
            rt->world_size > 0 &&
            rt->device >= 0 &&
-           rt->stream != nullptr &&
-           rt->submission != nullptr &&
-           exec::range_scheduler_submission_is_valid(rt->submission);
+           rt->stream != nullptr;
 }
 
 bool endpoint_runtime_init(

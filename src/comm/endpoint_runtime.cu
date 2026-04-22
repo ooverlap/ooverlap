@@ -22,7 +22,6 @@ void endpoint_runtime_reset_device_handle(
     rt->device.world_size = 0;
     rt->device.device = -1;
     rt->device.stream = nullptr;
-    rt->device.submission = nullptr;
 }
 
 void endpoint_runtime_reset_host_state(
@@ -33,8 +32,6 @@ void endpoint_runtime_reset_host_state(
 
     rt->endpoint = Endpoint{};
     rt->world_size = 0;
-    exec::range_scheduler_submission_clear(&rt->submission_host);
-    rt->submission_device = nullptr;
     endpoint_runtime_reset_device_handle(rt);
 }
 
@@ -58,15 +55,6 @@ bool endpoint_runtime_init(
 
     rt->endpoint = *group_get_endpoint(group, rank);
     rt->world_size = group->world_size;
-    exec::range_scheduler_submission_clear(&rt->submission_host);
-
-    system::runtime::set_device(rt->endpoint.device);
-
-    system::runtime::check_cuda(
-        cudaMalloc(
-            &rt->submission_device,
-            sizeof(exec::RangeSchedulerSubmission)),
-        "cudaMalloc(endpoint runtime submission_device)");
 
     endpoint_runtime_refresh_device(rt);
     return true;
@@ -76,21 +64,6 @@ void endpoint_runtime_destroy(
     EndpointRuntime* rt) {
     if (rt == nullptr) {
         return;
-    }
-
-    const int device =
-        (rt->endpoint.device >= 0) ? rt->endpoint.device :
-        (rt->device.device >= 0 ? rt->device.device : -1);
-
-    if (device >= 0) {
-        system::runtime::set_device(device);
-    }
-
-    if (rt->submission_device != nullptr) {
-        system::runtime::check_cuda(
-            cudaFree(rt->submission_device),
-            "cudaFree(endpoint runtime submission_device)");
-        rt->submission_device = nullptr;
     }
 
     endpoint_runtime_reset_host_state(rt);
@@ -107,25 +80,11 @@ void endpoint_runtime_refresh_device(
     if (rt->world_size <= 0) {
         throw std::invalid_argument("endpoint_runtime_refresh_device: world_size is invalid");
     }
-    if (rt->submission_device == nullptr) {
-        throw std::invalid_argument("endpoint_runtime_refresh_device: submission_device is null");
-    }
-
-    system::runtime::set_device(rt->endpoint.device);
-
-    system::runtime::check_cuda(
-        cudaMemcpy(
-            rt->submission_device,
-            &rt->submission_host,
-            sizeof(exec::RangeSchedulerSubmission),
-            cudaMemcpyHostToDevice),
-        "cudaMemcpy(endpoint runtime submission)");
 
     rt->device.rank = rt->endpoint.rank;
     rt->device.world_size = rt->world_size;
     rt->device.device = rt->endpoint.device;
     rt->device.stream = rt->endpoint.stream;
-    rt->device.submission = rt->submission_device;
 }
 
 bool endpoint_runtime_configure_submission(
@@ -162,21 +121,13 @@ bool endpoint_runtime_configure_submission(
         throw std::invalid_argument("endpoint_runtime_configure_submission: invalid dst_rank");
     }
 
-    exec::RangeSchedulerSubmission sub{};
-    sub.src = reinterpret_cast<const unsigned char*>(src_ptr);
-    sub.dst = reinterpret_cast<unsigned char*>(dst_ptr);
-    sub.bytes = bytes;
-    sub.op = op;
-    sub.op_id = op_id;
-    sub.dst_rank = dst_rank;
-    sub.user_tag = user_tag;
-
-    if (!exec::range_scheduler_submission_is_valid(&sub)) {
-        throw std::invalid_argument("endpoint_runtime_configure_submission: produced invalid submission");
-    }
-
-    rt->submission_host = sub;
-    endpoint_runtime_refresh_device(rt);
+    (void)src_ptr;
+    (void)dst_ptr;
+    (void)bytes;
+    (void)op;
+    (void)op_id;
+    (void)dst_rank;
+    (void)user_tag;
     return true;
 }
 
@@ -185,9 +136,6 @@ bool endpoint_runtime_clear_submission(
     if (rt == nullptr) {
         throw std::invalid_argument("endpoint_runtime_clear_submission: rt is null");
     }
-
-    exec::range_scheduler_submission_clear(&rt->submission_host);
-    endpoint_runtime_refresh_device(rt);
     return true;
 }
 
