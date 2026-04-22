@@ -593,8 +593,6 @@ validate_accum_peer_views_or_throw(
     r,
     static_cast<unsigned long long>(ops[static_cast<size_t>(r)].accum_ptr),
     static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_accum_ptr),
-    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].inbound_steps_ptr),
-    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_inbound_steps_ptr),
     static_cast<unsigned long long>(ops[static_cast<size_t>(r)].done_ptr),
     static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_done_ptr));
 std::fflush(stdout);
