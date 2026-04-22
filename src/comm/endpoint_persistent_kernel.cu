@@ -131,6 +131,9 @@ __global__ void endpoint_persistent_kernel_sm90(
             return;
         }
 
+        exec::chunk_scheduler_refill_ready_cache_parallel(&shared_pipe.scheduler);
+        __syncthreads();
+
         if (threadIdx.x == 0) {
             has_work = exec::chunk_pipeline_try_prime(&shared_pipe) ? 1 : 0;
         }
@@ -144,7 +147,7 @@ __global__ void endpoint_persistent_kernel_sm90(
 #endif
             __syncthreads();
             continue;
-        } 
+        }
 
         exec::chunk_pipeline_wait_current_stage(&shared_pipe);
         __syncthreads();
