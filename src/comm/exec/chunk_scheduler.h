@@ -241,22 +241,24 @@ __device__ __forceinline__ void chunk_scheduler_refill_ready_cache_parallel(
     collective::ChunkState* chunk_states =
         collective::operation_desc_chunk_states(op);
 
-    uint32_t base = sched->next_search_idx;
+    const uint32_t start = sched->next_search_idx;
 
-    for (uint32_t scanned = 0; scanned < op->num_chunks; scanned += kChunkSchedulerSearchWarp) {
-        __syncwarp();
+    for (uint32_t base_scan = 0;
+         base_scan < op->num_chunks;
+         base_scan += kChunkSchedulerSearchWarp) {
 
         if (chunk_scheduler_ready_full(sched)) {
             break;
         }
 
-        const bool slot_live = (scanned + lane) < op->num_chunks;
+        const bool slot_live = (base_scan + lane) < op->num_chunks;
+
         uint32_t cur = 0;
         uint32_t step = collective::kOperationInboundStepInvalid;
         bool valid = false;
 
         if (slot_live) {
-            cur = (base + lane) % op->num_chunks;
+            cur = (start + base_scan + lane) % op->num_chunks;
 
             if (!collective::chunk_state_is_in_flight(&chunk_states[cur])) {
                 step = chunk_scheduler_atomic_load_u32(&inbound_steps[cur]);
@@ -278,7 +280,8 @@ __device__ __forceinline__ void chunk_scheduler_refill_ready_cache_parallel(
 
         if (threadIdx.x == 0) {
             for (uint32_t src_lane = 0;
-                 src_lane < kChunkSchedulerSearchWarp && !chunk_scheduler_ready_full(sched);
+                 src_lane < kChunkSchedulerSearchWarp &&
+                 !chunk_scheduler_ready_full(sched);
                  ++src_lane) {
                 const ReadyCandidate cand = sched->search_found[src_lane];
                 if (cand.step == collective::kOperationInboundStepInvalid) {
@@ -286,18 +289,13 @@ __device__ __forceinline__ void chunk_scheduler_refill_ready_cache_parallel(
                 }
                 chunk_scheduler_ready_push(sched, cand.chunk_idx, cand.step);
             }
+
+            const uint32_t advanced = base_scan + kChunkSchedulerSearchWarp;
+            sched->next_search_idx =
+                (start + (advanced % op->num_chunks)) % op->num_chunks;
         }
 
         __syncwarp();
-
-        base += kChunkSchedulerSearchWarp;
-        if (base >= op->num_chunks) {
-            base %= op->num_chunks;
-        }
-    }
-
-    if (threadIdx.x == 0) {
-        sched->next_search_idx = base;
     }
 }
 
