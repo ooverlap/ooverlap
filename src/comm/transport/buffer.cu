@@ -1,5 +1,6 @@
 #include "comm/transport/buffer.h"
 
+#include "ooverlap/system/peer_buffer.cuh"
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/system/vmm.cuh"
 
@@ -16,27 +17,10 @@ namespace {
 
 void free_peer_visible_mappings(
     CommBuffer* buf) {
-    if (buf == nullptr) {
+    if (buf == nullptr || buf->ptr == nullptr || buf->bytes == 0) {
         return;
     }
-
-    std::vector<void*> seen{};
-    seen.reserve(buf->device_ptrs.size());
-
-    for (void* p : buf->device_ptrs) {
-        if (p == nullptr) {
-            continue;
-        }
-
-        const bool already_seen =
-            std::find(seen.begin(), seen.end(), p) != seen.end();
-        if (already_seen) {
-            continue;
-        }
-
-        system::vmm::vm_unmap(p, buf->bytes);
-        seen.push_back(p);
-    }
+    system::vmm::vm_unmap(buf->ptr, buf->bytes);
 }
 
 } // namespace
@@ -53,57 +37,16 @@ CommBuffer alloc_peer_visible_buffer_for_rank(
         throw std::invalid_argument("alloc_peer_visible_buffer_for_rank: bytes must be > 0");
     }
 
-    system::vmm::handle handle{};
-    size_t mapped_size = 0;
-
-    system::vmm::vm_alloc(
-        &handle,
-        &mapped_size,
-        bytes,
-        devices[owner_rank]);
+    auto mapped =
+        system::alloc_peer_visible_buffer(bytes, devices[owner_rank], devices);
 
     CommBuffer out{};
-    out.bytes = mapped_size;
+    out.ptr = mapped.ptr;
+    out.bytes = mapped.mapped_size;
     out.owner_rank = owner_rank;
     out.peer_visible = true;
-    out.device_ptrs.resize(devices.size(), nullptr);
-
-    try {
-        for (size_t rank = 0; rank < devices.size(); ++rank) {
-            system::runtime::set_device(devices[rank]);
-
-            void* mapped_ptr = nullptr;
-            system::vmm::vm_map(
-                &mapped_ptr,
-                handle,
-                mapped_size);
-
-            system::vmm::vm_set_access(
-                mapped_ptr,
-                mapped_size,
-                devices);
-
-            out.device_ptrs[rank] = mapped_ptr;
-        }
-
-        out.ptr = out.device_ptrs[static_cast<size_t>(owner_rank)];
-
-        // After all mappings are established, releasing the handle is fine.
-        system::vmm::vm_free(handle);
-        return out;
-    } catch (...) {
-        try {
-            free_peer_visible_mappings(&out);
-        } catch (...) {
-        }
-
-        try {
-            system::vmm::vm_free(handle);
-        } catch (...) {
-        }
-
-        throw;
-    }
+    out.device_ptrs.resize(devices.size(), mapped.ptr);
+    return out;
 }
 
 CommBuffer alloc_local_buffer_for_rank(

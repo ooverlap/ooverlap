@@ -300,6 +300,145 @@ static void dump_rank_chunk0_state(
     std::fflush(stdout);
 }
 
+static void print_peer_access_matrix_and_validate_ring(
+    const std::vector<int>& devices) {
+    const int n = static_cast<int>(devices.size());
+
+    std::printf("[smoke] cudaDeviceCanAccessPeer matrix (rows=src, cols=dst)\n");
+    std::printf("[smoke]        ");
+    for (int j = 0; j < n; ++j) {
+        std::printf(" %4d", devices[static_cast<size_t>(j)]);
+    }
+    std::printf("\n");
+
+    for (int i = 0; i < n; ++i) {
+        std::printf("[smoke] src=%2d:", devices[static_cast<size_t>(i)]);
+        for (int j = 0; j < n; ++j) {
+            int can_access = 0;
+            system::runtime::check_cuda(
+                cudaDeviceCanAccessPeer(
+                    &can_access,
+                    devices[static_cast<size_t>(i)],
+                    devices[static_cast<size_t>(j)]),
+                "cudaDeviceCanAccessPeer");
+            std::printf(" %4d", can_access);
+        }
+        std::printf("\n");
+    }
+    std::fflush(stdout);
+
+    // Validate the actual ring edges you are about to use:
+    // devices[0] -> devices[1] -> ... -> devices[n-1] -> devices[0]
+    for (int i = 0; i < n; ++i) {
+        const int src_dev = devices[static_cast<size_t>(i)];
+        const int dst_dev = devices[static_cast<size_t>((i + 1) % n)];
+
+        int can_access = 0;
+        system::runtime::check_cuda(
+            cudaDeviceCanAccessPeer(&can_access, src_dev, dst_dev),
+            "cudaDeviceCanAccessPeer(ring edge)");
+
+        std::printf(
+            "[smoke] ring edge %d -> %d peer_access=%d\n",
+            src_dev,
+            dst_dev,
+            can_access);
+        std::fflush(stdout);
+
+        if (can_access == 0) {
+            throw std::runtime_error(
+                std::string("endpoint_persistent_smoke_test: chosen ring edge is not peer-accessible: ") +
+                std::to_string(src_dev) + " -> " + std::to_string(dst_dev));
+        }
+    }
+}
+
+static void dump_accum_peer_views(
+    const std::vector<int>& devices,
+    const std::vector<comm::transport::CommBuffer>& accums,
+    const std::vector<std::vector<half>>& host_srcs,
+    int64_t numel,
+    int sample_count = 8) {
+    const int64_t n = std::min<int64_t>(numel, sample_count);
+
+    std::printf("[debug] prelaunch accum peer-view dump\n");
+    for (size_t owner = 0; owner < accums.size(); ++owner) {
+        std::printf("[debug] owner=%zu expected =", owner);
+        for (int64_t i = 0; i < n; ++i) {
+            std::printf(" %.6f", __half2float(host_srcs[owner][static_cast<size_t>(i)]));
+        }
+        std::printf("\n");
+
+        for (size_t view_rank = 0; view_rank < devices.size(); ++view_rank) {
+            std::vector<half> host(static_cast<size_t>(n));
+
+            system::runtime::set_device(devices[view_rank]);
+            system::runtime::check_cuda(
+                cudaMemcpy(
+                    host.data(),
+                    accums[owner].device_ptr_for_rank(view_rank),
+                    static_cast<size_t>(n) * sizeof(half),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy(accum peer-view -> host)");
+
+            std::printf(
+                "[debug] owner=%zu view_rank=%zu dev=%d ptr=0x%llx values =",
+                owner,
+                view_rank,
+                devices[view_rank],
+                static_cast<unsigned long long>(
+                    reinterpret_cast<uintptr_t>(
+                        accums[owner].device_ptr_for_rank(view_rank))));
+
+            for (int64_t i = 0; i < n; ++i) {
+                std::printf(" %.6f", __half2float(host[static_cast<size_t>(i)]));
+            }
+            std::printf("\n");
+        }
+    }
+    std::fflush(stdout);
+}
+
+static void validate_accum_peer_views_or_throw(
+    const std::vector<int>& devices,
+    const std::vector<comm::transport::CommBuffer>& accums,
+    const std::vector<std::vector<half>>& host_srcs,
+    int64_t numel,
+    int sample_count = 8) {
+    const int64_t n = std::min<int64_t>(numel, sample_count);
+
+    for (size_t owner = 0; owner < accums.size(); ++owner) {
+        for (size_t view_rank = 0; view_rank < devices.size(); ++view_rank) {
+            std::vector<half> host(static_cast<size_t>(n));
+
+            system::runtime::set_device(devices[view_rank]);
+            system::runtime::check_cuda(
+                cudaMemcpy(
+                    host.data(),
+                    accums[owner].device_ptr_for_rank(view_rank),
+                    static_cast<size_t>(n) * sizeof(half),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy(accum peer-view -> host)");
+
+            for (int64_t i = 0; i < n; ++i) {
+                const float got = __half2float(host[static_cast<size_t>(i)]);
+                const float ref = __half2float(host_srcs[owner][static_cast<size_t>(i)]);
+                const float err = std::fabs(got - ref);
+
+                if (err > 1.0e-3f) {
+                    throw std::runtime_error(
+                        std::string("prelaunch accum peer-view mismatch: owner=") +
+                        std::to_string(owner) +
+                        " view_rank=" + std::to_string(view_rank) +
+                        " idx=" + std::to_string(i) +
+                        " got=" + std::to_string(got) +
+                        " ref=" + std::to_string(ref));
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 bool endpoint_persistent_smoke_test(
@@ -315,6 +454,7 @@ bool endpoint_persistent_smoke_test(
 
     const std::vector<int> devices = normalize_devices(devices64);
     const int world_size = static_cast<int>(devices.size());
+    print_peer_access_matrix_and_validate_ring(devices);
 
     comm::Group group{};
     std::vector<comm::EndpointRuntime> runtimes(static_cast<size_t>(world_size));
@@ -377,6 +517,20 @@ bool endpoint_persistent_smoke_test(
                 "cudaMemcpy(host_src -> accum)");
         }
 
+        dump_accum_peer_views(
+    devices,
+    accums,
+    host_srcs,
+    numel,
+    8);
+
+validate_accum_peer_views_or_throw(
+    devices,
+    accums,
+    host_srcs,
+    numel,
+    8);
+
         for (int r = 0; r < world_size; ++r) {
             comm::collective::chunk_state_table_init(
                 &chunk_states[static_cast<size_t>(r)],
@@ -400,6 +554,17 @@ bool endpoint_persistent_smoke_test(
               done_flags[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
               chunk_states[static_cast<size_t>(r)].records,
               1);
+
+            std::printf(
+    "[smoke] op rank=%d accum=0x%llx next_accum=0x%llx inbound=0x%llx next_inbound=0x%llx done=0x%llx next_done=0x%llx\n",
+    r,
+    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].accum_ptr),
+    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_accum_ptr),
+    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].inbound_steps_ptr),
+    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_inbound_steps_ptr),
+    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].done_ptr),
+    static_cast<unsigned long long>(ops[static_cast<size_t>(r)].next_done_ptr));
+std::fflush(stdout);
             }
 
         for (int r = 0; r < world_size; ++r) {

@@ -22,6 +22,12 @@ __device__ __forceinline__ float endpoint_debug_half0(
     return __half2float(*reinterpret_cast<const half*>(ptr));
 }
 
+__device__ __forceinline__ unsigned long long endpoint_debug_ptr_u64(
+    const void* ptr) {
+    return static_cast<unsigned long long>(
+        reinterpret_cast<uintptr_t>(ptr));
+}
+
 static constexpr size_t kEndpointPersistentStaticSharedBytes =
     sizeof(sync::semaphore) +
     sizeof(exec::Chunk) +
@@ -257,19 +263,22 @@ __global__ void endpoint_persistent_kernel_sm90(
                     step);
 
                 if (idx == 0) {
-                    const float local0 =
-                        endpoint_debug_half0(
-                            collective::operation_desc_accum_chunk_ptr(operation, idx));
-                    const float next0 =
-                        endpoint_debug_half0(
-                            collective::operation_desc_next_accum_chunk_ptr(operation, idx));
+                    const unsigned char* local_ptr =
+                        collective::operation_desc_accum_chunk_ptr(operation, idx);
+                    const unsigned char* next_ptr =
+                        collective::operation_desc_next_accum_chunk_ptr(operation, idx);
+                
+                    const float local0 = endpoint_debug_half0(local_ptr);
+                    const float next0 = endpoint_debug_half0(next_ptr);
                 
                     printf(
-                        "[pk pick] rank=%d step=%u chunk=%u op=%u local0=%.6f next0_before=%.6f\n",
+                        "[pk pick] rank=%d step=%u chunk=%u op=%u src=0x%llx dst=0x%llx local0=%.6f next0_before=%.6f\n",
                         operation->rank,
                         step,
                         idx,
                         static_cast<unsigned>(shared_chunk.op),
+                        endpoint_debug_ptr_u64(local_ptr),
+                        endpoint_debug_ptr_u64(next_ptr),
                         local0,
                         next0);
                 }
@@ -338,19 +347,23 @@ __global__ void endpoint_persistent_kernel_sm90(
                 collective::kOperationInboundStepInvalid);
             __threadfence_system();
 
+            
             if (shared_chunk_idx == 0) {
-                const float local0_after =
-                    endpoint_debug_half0(
-                        collective::operation_desc_accum_chunk_ptr(operation, shared_chunk_idx));
-                const float next0_after =
-                    endpoint_debug_half0(
-                        collective::operation_desc_next_accum_chunk_ptr(operation, shared_chunk_idx));
+                const unsigned char* local_ptr_after =
+                    collective::operation_desc_accum_chunk_ptr(operation, shared_chunk_idx);
+                const unsigned char* next_ptr_after =
+                    collective::operation_desc_next_accum_chunk_ptr(operation, shared_chunk_idx);
+            
+                const float local0_after = endpoint_debug_half0(local_ptr_after);
+                const float next0_after = endpoint_debug_half0(next_ptr_after);
             
                 printf(
-                    "[pk done] rank=%d step=%u chunk=%u local0_after=%.6f next0_after=%.6f\n",
+                    "[pk done] rank=%d step=%u chunk=%u src=0x%llx dst=0x%llx local0_after=%.6f next0_after=%.6f\n",
                     operation->rank,
                     shared_chunk_step,
                     shared_chunk_idx,
+                    endpoint_debug_ptr_u64(local_ptr_after),
+                    endpoint_debug_ptr_u64(next_ptr_after),
                     local0_after,
                     next0_after);
             }
