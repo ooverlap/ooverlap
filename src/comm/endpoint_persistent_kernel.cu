@@ -84,21 +84,21 @@ __global__ void endpoint_persistent_kernel_sm90(
     const uint32_t total_steps =
         collective::operation_desc_total_ring_steps(operation);
 
-    for (uint32_t idx = static_cast<uint32_t>(threadIdx.x);
-         idx < operation->num_chunks;
-         idx += static_cast<uint32_t>(blockDim.x)) {
-        endpoint_persistent_init_chunk_state(
-            &chunk_states[idx],
-            operation,
-            idx);
+/*    for (uint32_t idx = static_cast<uint32_t>(threadIdx.x);*/
+         /*idx < operation->num_chunks;*/
+         /*idx += static_cast<uint32_t>(blockDim.x)) {*/
+        /*endpoint_persistent_init_chunk_state(*/
+            /*&chunk_states[idx],*/
+            /*operation,*/
+            /*idx);*/
 
-        if (total_steps == 0) {
-            atomicExch(
-                reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(&done[idx])),
-                1u);
-        }
-    }
-    __syncthreads();
+        /*if (total_steps == 0) {*/
+            /*atomicExch(*/
+                /*reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(&done[idx])),*/
+                /*1u);*/
+        /*}*/
+    /*}*/
+    /*__syncthreads();*/
 
     using Scheduler = exec::ChunkScheduler;
     using Pipe = exec::ChunkPipeline<
