@@ -103,17 +103,22 @@ __global__ void endpoint_persistent_kernel_sm90(
         exec::PipelineTMALoad,
         exec::PipelineTMAStepApplyNoFtzF16>;
 
-    Scheduler scheduler{};
-    exec::chunk_scheduler_init_operation(&scheduler, operation);
+    __shared__ Scheduler shared_scheduler;
+    __shared__ Pipe shared_pipe;
 
-    Pipe pipe{};
-    exec::chunk_pipeline_bind_stage_storage<
-        kPersistentStageDepth,
-        kEndpointPersistentChunkBytes>(
-        &pipe,
-        shared_raw,
-        stage_barriers);
-    exec::chunk_pipeline_init(&pipe, &scheduler);
+    if (threadIdx.x == 0) {
+        exec::chunk_scheduler_init_operation(&shared_scheduler, operation);
+
+        exec::chunk_pipeline_bind_stage_storage<
+            kPersistentStageDepth,
+            kEndpointPersistentChunkBytes>(
+            &shared_pipe,
+            shared_raw,
+            stage_barriers);
+
+        exec::chunk_pipeline_init(&shared_pipe, &shared_scheduler);
+    }
+    __syncthreads();
 
     while (true) {
         if (threadIdx.x == 0) {
@@ -125,7 +130,7 @@ __global__ void endpoint_persistent_kernel_sm90(
             return;
         }
 
-        if (!exec::chunk_pipeline_try_prime(&pipe)) {
+        if (!exec::chunk_pipeline_try_prime(&shared_pipe)) {
 #if defined(__CUDA_ARCH__)
             if (threadIdx.x == 0) {
                 __nanosleep(256);
@@ -136,20 +141,20 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
         __syncthreads();
 
-        exec::chunk_pipeline_wait_current_stage(&pipe);
+        exec::chunk_pipeline_wait_current_stage(&shared_pipe);
         __syncthreads();
 
-        exec::chunk_pipeline_issue_current_apply(&pipe);
+        exec::chunk_pipeline_issue_current_apply(&shared_pipe);
         __syncthreads();
 
-        exec::chunk_pipeline_finish_current_apply(&pipe);
+        exec::chunk_pipeline_finish_current_apply(&shared_pipe);
         __syncthreads();
 
-        exec::chunk_pipeline_wait_current_complete(&pipe);
+        exec::chunk_pipeline_wait_current_complete(&shared_pipe);
         __syncthreads();
 
         if (threadIdx.x == 0) {
-            exec::chunk_pipeline_retire_current(&pipe);
+            exec::chunk_pipeline_retire_current(&shared_pipe);
         }
         __syncthreads();
     }
