@@ -46,7 +46,6 @@ size_t endpoint_persistent_kernel_dynamic_smem_bytes();
 cudaError_t launch_endpoint_persistent_kernel_sm90(
     const DeviceEndpointRuntime* runtime,
     const collective::OperationDesc* operation,
-    collective::ChunkState* chunk_states,
     const EndpointPersistentControl* control,
     cudaStream_t stream = nullptr);
 

@@ -1,8 +1,11 @@
 #include "comm/endpoint_persistent_kernel.h"
 
+#include "comm/exec/pipeline_load.h"
+#include "comm/exec/pipeline_reduce.h"
+#include "comm/exec/pipeline_stage.h"
 #include "ooverlap/system/runtime_utils.cuh"
+#include "ooverlap/tma/tma_reduce.cuh"
 
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -13,98 +16,131 @@ namespace ooverlap {
 namespace comm {
 namespace {
 
+static constexpr size_t kEndpointPersistentStaticSharedBytes =
+    sizeof(sync::semaphore) +
+    sizeof(exec::Chunk) +
+    sizeof(uint32_t) * 4 +
+    sizeof(int) * 2;
+
 __device__ __forceinline__ bool endpoint_persistent_should_stop(
     const uint32_t* stop_flag) {
     return (*reinterpret_cast<volatile const uint32_t*>(stop_flag)) != 0u;
 }
 
-__device__ __forceinline__ void endpoint_persistent_seed_chunk_state(
+__device__ __forceinline__ bool endpoint_persistent_runtime_is_minimally_valid(
+    const DeviceEndpointRuntime* runtime) {
+    return runtime != nullptr &&
+           runtime->rank >= 0 &&
+           runtime->device >= 0 &&
+           runtime->stream != nullptr;
+}
+
+__device__ __forceinline__ void endpoint_persistent_init_chunk_state(
     collective::ChunkState* st,
-    const exec::Chunk* chunk,
-    const collective::OperationDesc* op) {
-    if (st == nullptr || chunk == nullptr || op == nullptr) {
-        return;
-    }
+    const collective::OperationDesc* op,
+    uint32_t chunk_idx) {
+    collective::chunk_state_clear(st);
+    st->chunk_idx = chunk_idx;
+    st->last_step_started = 0;
+    st->last_step_completed = 0;
+    st->flags = collective::kChunkStateFlagInitialized;
+    st->offset_bytes = collective::operation_desc_chunk_offset_bytes(op, chunk_idx);
+    st->bytes = collective::operation_desc_chunk_bytes_at(op, chunk_idx);
 
-    st->op_id = op->op_id;
-    st->epoch = op->epoch;
-    st->chunk_idx = static_cast<uint32_t>(chunk->chunk_idx);
-    st->flags = collective::kChunkStateFlagSeeded |
-                collective::kChunkStateFlagActive;
-    st->contributions_seen = 1;
-    st->expected_contributions = op->expected_contributions;
-    st->step = 0;
-    st->send_count = 0;
-    st->offset_bytes = chunk->range_offset_bytes;
-    st->bytes = chunk->bytes;
-
-    if (op->expected_contributions <= 1) {
+    if (collective::operation_desc_total_ring_steps(op) == 0) {
         st->flags |= collective::kChunkStateFlagDone;
-        st->flags &= ~collective::kChunkStateFlagActive;
     }
 }
 
-__device__ __forceinline__ void endpoint_persistent_copy_bytes(
-    unsigned char* dst,
-    const unsigned char* src,
-    size_t bytes) {
+__device__ __forceinline__ void endpoint_persistent_build_chunk_for_step(
+    exec::Chunk* chunk,
+    const collective::OperationDesc* op,
+    uint32_t chunk_idx,
+    uint32_t step) {
+    exec::chunk_clear(chunk);
+
+    chunk->src =
+        collective::operation_desc_accum_chunk_ptr(op, chunk_idx);
+    chunk->dst =
+        collective::operation_desc_next_accum_chunk_ptr(op, chunk_idx);
+    chunk->bytes =
+        collective::operation_desc_chunk_bytes_at(op, chunk_idx);
+    chunk->op_id = op->op_id;
+    chunk->dst_rank = op->next_rank;
+    chunk->user_tag = op->user_tag;
+    chunk->chunk_idx = static_cast<int>(chunk_idx);
+    chunk->range_offset_bytes =
+        collective::operation_desc_chunk_offset_bytes(op, chunk_idx);
+    chunk->op =
+        collective::operation_desc_chunk_op_for_step(op, step);
+}
+
+__device__ __forceinline__ void endpoint_persistent_copy_smem_to_gmem(
+    const exec::PipelineStage* stage) {
+    if (stage == nullptr || !exec::chunk_is_valid(&stage->chunk)) {
+        return;
+    }
+
+    unsigned char* dst = stage->chunk.dst;
+    const unsigned char* src = stage->smem;
+    const size_t bytes = stage->chunk.bytes;
+
     for (size_t i = threadIdx.x; i < bytes; i += blockDim.x) {
         dst[i] = src[i];
     }
 }
 
-__device__ __forceinline__ void endpoint_persistent_seed_local_partial(
-    const exec::Chunk* chunk,
-    const collective::OperationDesc* op) {
-    const unsigned char* src = chunk->src;
-    unsigned char* partial =
-        collective::operation_desc_partial_chunk_ptr(
-            op,
-            static_cast<uint32_t>(chunk->chunk_idx));
-
-    endpoint_persistent_copy_bytes(partial, src, chunk->bytes);
-}
-
-__device__ __forceinline__ void endpoint_persistent_finalize_chunk(
-    const exec::Chunk* chunk,
-    const collective::OperationDesc* op) {
-    const unsigned char* partial =
-        collective::operation_desc_partial_chunk_ptr(
-            op,
-            static_cast<uint32_t>(chunk->chunk_idx));
-    unsigned char* dst =
-        collective::operation_desc_dst_chunk_ptr(
-            op,
-            static_cast<uint32_t>(chunk->chunk_idx));
-
-    endpoint_persistent_copy_bytes(dst, partial, chunk->bytes);
-}
-
 __global__ void endpoint_persistent_kernel_sm90(
     DeviceEndpointRuntime runtime,
     const collective::OperationDesc* operation,
-    collective::ChunkState* chunk_states,
     const uint32_t* stop_flag) {
     if (blockIdx.x != 0) {
         return;
     }
+    if (!endpoint_persistent_runtime_is_minimally_valid(&runtime)) {
+        return;
+    }
+    if (!collective::operation_desc_is_active(operation)) {
+        return;
+    }
 
-    __shared__ int shared_should_stop;
-    __shared__ int shared_has_chunk;
+    extern __shared__ uint4 shared_storage_u4[];
+    unsigned char* shared_raw =
+        reinterpret_cast<unsigned char*>(shared_storage_u4);
+
+    __shared__ sync::semaphore load_barrier;
     __shared__ exec::Chunk shared_chunk;
-    __shared__ int shared_need_seed;
+    __shared__ uint32_t shared_chunk_idx;
+    __shared__ uint32_t shared_chunk_step;
+    __shared__ int shared_has_work;
+    __shared__ int shared_should_stop;
 
-    exec::ChunkScheduler<1> scheduler{};
+    collective::ChunkState* chunk_states =
+        collective::operation_desc_chunk_states(operation);
+    uint32_t* chunk_steps =
+        collective::operation_desc_chunk_steps(operation);
+    uint32_t* chunk_done =
+        collective::operation_desc_chunk_done(operation);
 
-    if (threadIdx.x == 0) {
-        exec::chunk_scheduler_init(
-            &scheduler,
-            runtime.submission,
-            kEndpointPersistentChunkBytes);
-        shared_has_chunk = 0;
-        shared_need_seed = 0;
+    const uint32_t total_steps =
+        collective::operation_desc_total_ring_steps(operation);
+
+    for (uint32_t idx = static_cast<uint32_t>(threadIdx.x);
+         idx < operation->num_chunks;
+         idx += static_cast<uint32_t>(blockDim.x)) {
+        endpoint_persistent_init_chunk_state(
+            &chunk_states[idx],
+            operation,
+            idx);
+
+        if (total_steps == 0) {
+            chunk_done[idx] = 1u;
+        }
     }
     __syncthreads();
+
+    exec::PipelineTMALoad load_op{};
+    exec::PipelineTMAReduceAddNoFtzF16 reduce_op{};
 
     while (true) {
         if (threadIdx.x == 0) {
@@ -117,25 +153,45 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
 
         if (threadIdx.x == 0) {
-            if (!exec::chunk_scheduler_try_prime_current(&scheduler)) {
-                shared_has_chunk = 0;
-            } else {
-                shared_chunk = *exec::chunk_scheduler_current(&scheduler);
-                shared_has_chunk = 1;
+            shared_has_work = 0;
 
-                if (shared_chunk.chunk_idx < 0 ||
-                    static_cast<uint32_t>(shared_chunk.chunk_idx) >= operation->num_chunks) {
-                    shared_need_seed = 0;
-                } else {
-                    const collective::ChunkState* st =
-                        &chunk_states[shared_chunk.chunk_idx];
-                    shared_need_seed = collective::chunk_state_is_seeded(st) ? 0 : 1;
+            for (uint32_t idx = 0; idx < operation->num_chunks; ++idx) {
+                const uint32_t step =
+                    *((volatile const uint32_t*)&chunk_steps[idx]);
+
+                if (step >= total_steps) {
+                    chunk_states[idx].flags |= collective::kChunkStateFlagDone;
+                    chunk_done[idx] = 1u;
+                    continue;
                 }
+
+                const int actor =
+                    collective::operation_desc_actor_rank_for_step(
+                        operation,
+                        idx,
+                        step);
+                if (actor != operation->rank) {
+                    continue;
+                }
+
+                endpoint_persistent_build_chunk_for_step(
+                    &shared_chunk,
+                    operation,
+                    idx,
+                    step);
+
+                shared_chunk_idx = idx;
+                shared_chunk_step = step;
+                shared_has_work = 1;
+
+                chunk_states[idx].last_step_started = step;
+                chunk_states[idx].flags |= collective::kChunkStateFlagInFlight;
+                break;
             }
         }
         __syncthreads();
 
-        if (!shared_has_chunk) {
+        if (!shared_has_work) {
 #if defined(__CUDA_ARCH__)
             if (threadIdx.x == 0) {
                 __nanosleep(256);
@@ -145,27 +201,58 @@ __global__ void endpoint_persistent_kernel_sm90(
             continue;
         }
 
-        if (shared_need_seed) {
-            endpoint_persistent_seed_local_partial(&shared_chunk, operation);
+        exec::PipelineStage stage{};
+        stage.smem = shared_raw;
+        stage.load_barrier = &load_barrier;
+        stage.chunk = shared_chunk;
+
+        if (threadIdx.x == 0) {
+            load_op.issue(&stage);
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            load_op.wait_ready(&stage);
+        }
+        __syncthreads();
+
+        if (stage.chunk.op == exec::ChunkOpKind::kReduceAddNoFtzF16) {
+            if (threadIdx.x == 0) {
+                reduce_op.issue_bulk(&stage);
+            }
             __syncthreads();
 
-            if (collective::operation_desc_is_active(operation) &&
-                operation->expected_contributions <= 1) {
-                endpoint_persistent_finalize_chunk(&shared_chunk, operation);
-            }
+            reduce_op.finish_tail(&stage);
             __syncthreads();
 
             if (threadIdx.x == 0) {
-                endpoint_persistent_seed_chunk_state(
-                    &chunk_states[shared_chunk.chunk_idx],
-                    &shared_chunk,
-                    operation);
+                tma::reduce_async_wait<0>();
             }
             __syncthreads();
+        } else if (stage.chunk.op == exec::ChunkOpKind::kCopy) {
+            endpoint_persistent_copy_smem_to_gmem(&stage);
+            __syncthreads();
+        } else {
+            __syncthreads();
+            continue;
         }
 
         if (threadIdx.x == 0) {
-            exec::chunk_scheduler_advance(&scheduler);
+            // Make sure remote/local writes for the current chunk are visible
+            // before publishing the next step.
+            __threadfence_system();
+
+            const uint32_t next_step = shared_chunk_step + 1;
+            *((volatile uint32_t*)&chunk_steps[shared_chunk_idx]) = next_step;
+            __threadfence_system();
+
+            chunk_states[shared_chunk_idx].last_step_completed = next_step;
+            chunk_states[shared_chunk_idx].flags &= ~collective::kChunkStateFlagInFlight;
+
+            if (next_step >= total_steps) {
+                chunk_states[shared_chunk_idx].flags |= collective::kChunkStateFlagDone;
+                chunk_done[shared_chunk_idx] = 1u;
+            }
         }
         __syncthreads();
     }
@@ -174,10 +261,6 @@ __global__ void endpoint_persistent_kernel_sm90(
 void configure_endpoint_persistent_kernel_smem(
     int device,
     size_t dynamic_smem_bytes) {
-    if (dynamic_smem_bytes == 0) {
-        return;
-    }
-
     system::runtime::set_device(device);
 
     cudaDeviceProp prop{};
@@ -185,13 +268,16 @@ void configure_endpoint_persistent_kernel_smem(
         cudaGetDeviceProperties(&prop, device),
         "cudaGetDeviceProperties(endpoint persistent)");
 
-    if (dynamic_smem_bytes >
+    const size_t total_smem_bytes =
+        dynamic_smem_bytes + kEndpointPersistentStaticSharedBytes;
+
+    if (total_smem_bytes >
         static_cast<size_t>(prop.sharedMemPerBlockOptin)) {
         throw std::runtime_error(
             "endpoint persistent kernel requested shared memory exceeds device opt-in limit");
     }
 
-    if (dynamic_smem_bytes >
+    if (total_smem_bytes >
         static_cast<size_t>(prop.sharedMemPerBlock)) {
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
@@ -320,22 +406,21 @@ void endpoint_persistent_control_destroy(
 }
 
 size_t endpoint_persistent_kernel_dynamic_smem_bytes() {
-    return 0;
+    return kEndpointPersistentChunkBytes;
 }
 
 cudaError_t launch_endpoint_persistent_kernel_sm90(
     const DeviceEndpointRuntime* runtime,
     const collective::OperationDesc* operation,
-    collective::ChunkState* chunk_states,
     const EndpointPersistentControl* control,
     cudaStream_t stream) {
-    if (!device_endpoint_runtime_is_valid(runtime)) {
+    if (runtime == nullptr ||
+        runtime->rank < 0 ||
+        runtime->device < 0 ||
+        runtime->stream == nullptr) {
         return cudaErrorInvalidValue;
     }
     if (operation == nullptr || !collective::operation_desc_is_active(operation)) {
-        return cudaErrorInvalidValue;
-    }
-    if (chunk_states == nullptr) {
         return cudaErrorInvalidValue;
     }
     if (!endpoint_persistent_control_is_valid(control)) {
@@ -343,9 +428,6 @@ cudaError_t launch_endpoint_persistent_kernel_sm90(
     }
     if (runtime->device != control->device) {
         return cudaErrorInvalidDevice;
-    }
-    if (!collective::operation_desc_matches_submission(operation, runtime->submission)) {
-        return cudaErrorInvalidValue;
     }
 
     const size_t dynamic_smem_bytes =
@@ -367,7 +449,6 @@ cudaError_t launch_endpoint_persistent_kernel_sm90(
         launch_stream>>>(
         *runtime,
         operation,
-        chunk_states,
         control->stop_flag);
 
     return cudaGetLastError();
