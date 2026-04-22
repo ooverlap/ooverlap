@@ -22,16 +22,6 @@ enum : uint32_t {
 };
 
 // Minimal ring all-reduce operation descriptor.
-//
-// Semantics:
-// - accum_ptr is this rank's local full buffer. It starts with the local partial
-//   and becomes the final all-reduced buffer after the two ring phases finish.
-// - next_accum_ptr is the next rank's mapped full buffer.
-// - chunk_steps_ptr is a global/shared array with one entry per chunk.
-//   Host must zero it before launch.
-// - chunk_done_ptr is a global/shared array with one entry per chunk.
-//   Host must zero it before launch.
-// - chunk_states_ptr is local per-rank bookkeeping storage.
 struct OperationDesc {
     uint32_t op_id = 0;
     uint32_t epoch = 0;
@@ -48,7 +38,6 @@ struct OperationDesc {
     uint32_t num_chunks = 0;
     uint32_t reserved1 = 0;
 
-    // Reduction op used in phase 1.
     exec::ChunkOpKind op = exec::ChunkOpKind::kInvalid;
     uint32_t reserved2 = 0;
     uint64_t user_tag = 0;
@@ -85,6 +74,11 @@ struct ChunkStateTable {
     int device = -1;
 };
 
+struct DeviceOperationDesc {
+    OperationDesc* ptr = nullptr;  // device pointer
+    int device = -1;
+};
+
 __host__ __device__ __forceinline__ uint32_t operation_desc_compute_num_chunks(
     size_t total_bytes,
     size_t chunk_bytes) {
@@ -95,9 +89,6 @@ __host__ __device__ __forceinline__ uint32_t operation_desc_compute_num_chunks(
         (total_bytes + chunk_bytes - 1) / chunk_bytes);
 }
 
-// Two-phase ring all-reduce:
-// phase 1: reduce to owner      => world_size - 1 steps
-// phase 2: copy full chunk out  => world_size - 1 steps
 __host__ __device__ __forceinline__ uint32_t operation_desc_total_ring_steps(
     const OperationDesc* op) {
     if (op == nullptr || op->world_size <= 1) {
@@ -233,7 +224,6 @@ __host__ __device__ __forceinline__ unsigned char* operation_desc_next_accum_chu
            operation_desc_chunk_offset_bytes(op, chunk_idx);
 }
 
-// Cyclic owner mapping for the reduce phase.
 __host__ __device__ __forceinline__ int operation_desc_chunk_owner_rank(
     const OperationDesc* op,
     uint32_t chunk_idx) {
@@ -243,10 +233,6 @@ __host__ __device__ __forceinline__ int operation_desc_chunk_owner_rank(
     return static_cast<int>(chunk_idx % static_cast<uint32_t>(op->world_size));
 }
 
-// Phase 1 (reduce): owner receives the final reduction.
-// The actor starts at owner+1 and walks around the ring until owner-1.
-//
-// Phase 2 (allgather/copy): owner starts disseminating the full chunk.
 __host__ __device__ __forceinline__ int operation_desc_actor_rank_for_step(
     const OperationDesc* op,
     uint32_t chunk_idx,
@@ -320,6 +306,50 @@ __host__ __device__ __forceinline__ bool chunk_state_table_is_configured(
            table->capacity > 0 &&
            table->device >= 0;
 }
+
+__host__ __device__ __forceinline__ bool device_operation_desc_is_configured(
+    const DeviceOperationDesc* op) {
+    return op != nullptr &&
+           op->ptr != nullptr &&
+           op->device >= 0;
+}
+
+bool operation_desc_build_ring_allreduce(
+    OperationDesc* out,
+    int rank,
+    int world_size,
+    size_t total_bytes,
+    size_t chunk_bytes,
+    exec::ChunkOpKind op,
+    void* accum_ptr,
+    void* next_accum_ptr,
+    void* chunk_steps_ptr,
+    void* chunk_done_ptr,
+    ChunkState* chunk_states_ptr,
+    uint32_t op_id,
+    uint32_t epoch = 1,
+    bool enabled = true,
+    uint64_t user_tag = 0);
+
+bool operation_desc_reset_local_chunk_state(
+    int device,
+    const OperationDesc* desc);
+
+bool operation_desc_reset_shared_progress(
+    int device,
+    const OperationDesc* desc);
+
+bool device_operation_desc_create(
+    DeviceOperationDesc* storage,
+    int device,
+    const OperationDesc* host_desc);
+
+bool device_operation_desc_write(
+    DeviceOperationDesc* storage,
+    const OperationDesc* host_desc);
+
+void device_operation_desc_destroy(
+    DeviceOperationDesc* storage);
 
 bool chunk_state_table_init(
     ChunkStateTable* table,

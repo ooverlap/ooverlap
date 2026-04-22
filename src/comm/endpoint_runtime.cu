@@ -19,6 +19,7 @@ void endpoint_runtime_reset_device_handle(
     }
 
     rt->device.rank = -1;
+    rt->device.world_size = 0;
     rt->device.device = -1;
     rt->device.stream = nullptr;
     rt->device.submission = nullptr;
@@ -31,6 +32,7 @@ void endpoint_runtime_reset_host_state(
     }
 
     rt->endpoint = Endpoint{};
+    rt->world_size = 0;
     exec::range_scheduler_submission_clear(&rt->submission_host);
     rt->submission_device = nullptr;
     endpoint_runtime_reset_device_handle(rt);
@@ -55,6 +57,7 @@ bool endpoint_runtime_init(
     endpoint_runtime_destroy(rt);
 
     rt->endpoint = *group_get_endpoint(group, rank);
+    rt->world_size = group->world_size;
     exec::range_scheduler_submission_clear(&rt->submission_host);
 
     system::runtime::set_device(rt->endpoint.device);
@@ -101,6 +104,9 @@ void endpoint_runtime_refresh_device(
     if (!endpoint_is_valid(rt->endpoint)) {
         throw std::invalid_argument("endpoint_runtime_refresh_device: endpoint is invalid");
     }
+    if (rt->world_size <= 0) {
+        throw std::invalid_argument("endpoint_runtime_refresh_device: world_size is invalid");
+    }
     if (rt->submission_device == nullptr) {
         throw std::invalid_argument("endpoint_runtime_refresh_device: submission_device is null");
     }
@@ -116,6 +122,7 @@ void endpoint_runtime_refresh_device(
         "cudaMemcpy(endpoint runtime submission)");
 
     rt->device.rank = rt->endpoint.rank;
+    rt->device.world_size = rt->world_size;
     rt->device.device = rt->endpoint.device;
     rt->device.stream = rt->endpoint.stream;
     rt->device.submission = rt->submission_device;
@@ -182,6 +189,48 @@ bool endpoint_runtime_clear_submission(
     exec::range_scheduler_submission_clear(&rt->submission_host);
     endpoint_runtime_refresh_device(rt);
     return true;
+}
+
+bool endpoint_runtime_build_ring_allreduce_operation(
+    const EndpointRuntime* rt,
+    collective::OperationDesc* out,
+    void* accum_ptr,
+    void* next_accum_ptr,
+    size_t total_bytes,
+    size_t chunk_bytes,
+    void* chunk_steps_ptr,
+    void* chunk_done_ptr,
+    collective::ChunkState* chunk_states_ptr,
+    uint32_t op_id,
+    uint32_t epoch,
+    bool enabled,
+    uint64_t user_tag) {
+    if (rt == nullptr) {
+        throw std::invalid_argument("endpoint_runtime_build_ring_allreduce_operation: rt is null");
+    }
+    if (!endpoint_is_valid(rt->endpoint)) {
+        throw std::invalid_argument("endpoint_runtime_build_ring_allreduce_operation: endpoint is invalid");
+    }
+    if (rt->world_size <= 0) {
+        throw std::invalid_argument("endpoint_runtime_build_ring_allreduce_operation: world_size is invalid");
+    }
+
+    return collective::operation_desc_build_ring_allreduce(
+        out,
+        rt->endpoint.rank,
+        rt->world_size,
+        total_bytes,
+        chunk_bytes,
+        exec::ChunkOpKind::kReduceAddNoFtzF16,
+        accum_ptr,
+        next_accum_ptr,
+        chunk_steps_ptr,
+        chunk_done_ptr,
+        chunk_states_ptr,
+        op_id,
+        epoch,
+        enabled,
+        user_tag);
 }
 
 } // namespace comm

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 
+#include "comm/collective/operation.h"
 #include "comm/endpoint.h"
 #include "comm/exec/chunk_scheduler.h"
 #include "comm/group.h"
@@ -13,6 +14,7 @@ namespace comm {
 
 struct DeviceEndpointRuntime {
     int rank = -1;
+    int world_size = 0;
     int device = -1;
     cudaStream_t stream = nullptr;
 
@@ -21,11 +23,9 @@ struct DeviceEndpointRuntime {
 
 struct EndpointRuntime {
     Endpoint endpoint{};
+    int world_size = 0;
 
-    // Host-side active submission.
     exec::RangeSchedulerSubmission submission_host{};
-
-    // Device-side copy of the active submission.
     exec::RangeSchedulerSubmission* submission_device = nullptr;
 
     DeviceEndpointRuntime device{};
@@ -35,6 +35,7 @@ __host__ __device__ __forceinline__ bool device_endpoint_runtime_is_valid(
     const DeviceEndpointRuntime* rt) {
     return rt != nullptr &&
            rt->rank >= 0 &&
+           rt->world_size > 0 &&
            rt->device >= 0 &&
            rt->stream != nullptr &&
            rt->submission != nullptr &&
@@ -64,6 +65,21 @@ bool endpoint_runtime_configure_submission(
 
 bool endpoint_runtime_clear_submission(
     EndpointRuntime* rt);
+
+bool endpoint_runtime_build_ring_allreduce_operation(
+    const EndpointRuntime* rt,
+    collective::OperationDesc* out,
+    void* accum_ptr,
+    void* next_accum_ptr,
+    size_t total_bytes,
+    size_t chunk_bytes,
+    void* chunk_steps_ptr,
+    void* chunk_done_ptr,
+    collective::ChunkState* chunk_states_ptr,
+    uint32_t op_id,
+    uint32_t epoch = 1,
+    bool enabled = true,
+    uint64_t user_tag = 0);
 
 inline const DeviceEndpointRuntime* endpoint_runtime_device_handle(
     const EndpointRuntime* rt) {

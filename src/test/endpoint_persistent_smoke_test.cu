@@ -71,30 +71,6 @@ void expect_half_vectors_close(
     }
 }
 
-void memset_u32_buffer_on_owner(
-    int owner_device,
-    void* ptr,
-    size_t count,
-    uint32_t value) {
-    system::runtime::set_device(owner_device);
-
-    if (value == 0u) {
-        system::runtime::check_cuda(
-            cudaMemset(ptr, 0, count * sizeof(uint32_t)),
-            "cudaMemset(u32 buffer)");
-        return;
-    }
-
-    std::vector<uint32_t> host(count, value);
-    system::runtime::check_cuda(
-        cudaMemcpy(
-            ptr,
-            host.data(),
-            count * sizeof(uint32_t),
-            cudaMemcpyHostToDevice),
-        "cudaMemcpy(u32 buffer init)");
-}
-
 void copy_u32_buffer_from_owner(
     int owner_device,
     const void* ptr,
@@ -111,73 +87,6 @@ void copy_u32_buffer_from_owner(
             out->size() * sizeof(uint32_t),
             cudaMemcpyDeviceToHost),
         "cudaMemcpy(u32 buffer -> host)");
-}
-
-void write_operation_desc_to_device(
-    int device,
-    const comm::collective::OperationDesc& host_desc,
-    comm::collective::OperationDesc** dev_desc_out) {
-    if (dev_desc_out == nullptr) {
-        throw std::invalid_argument("write_operation_desc_to_device: dev_desc_out is null");
-    }
-
-    system::runtime::set_device(device);
-    system::runtime::check_cuda(
-        cudaMalloc(dev_desc_out, sizeof(comm::collective::OperationDesc)),
-        "cudaMalloc(operation desc)");
-    system::runtime::check_cuda(
-        cudaMemcpy(
-            *dev_desc_out,
-            &host_desc,
-            sizeof(comm::collective::OperationDesc),
-            cudaMemcpyHostToDevice),
-        "cudaMemcpy(operation desc)");
-}
-
-comm::collective::OperationDesc make_allreduce_operation_desc(
-    int rank,
-    int world_size,
-    size_t bytes,
-    size_t chunk_bytes,
-    void* local_accum_ptr,
-    void* next_accum_ptr,
-    void* chunk_steps_ptr,
-    void* chunk_done_ptr,
-    comm::collective::ChunkState* chunk_states_ptr,
-    uint32_t op_id) {
-    comm::collective::OperationDesc op{};
-    op.op_id = op_id;
-    op.epoch = 1;
-    op.flags = comm::collective::kOperationFlagEnabled;
-
-    op.rank = rank;
-    op.world_size = world_size;
-    op.prev_rank = (rank - 1 + world_size) % world_size;
-    op.next_rank = (rank + 1) % world_size;
-
-    op.total_bytes = bytes;
-    op.chunk_bytes = chunk_bytes;
-    op.num_chunks =
-        comm::collective::operation_desc_compute_num_chunks(bytes, chunk_bytes);
-
-    op.op = comm::exec::ChunkOpKind::kReduceAddNoFtzF16;
-    op.user_tag = 0;
-
-    op.accum_ptr = reinterpret_cast<uint64_t>(local_accum_ptr);
-    op.accum_bytes = bytes;
-
-    op.next_accum_ptr = reinterpret_cast<uint64_t>(next_accum_ptr);
-    op.next_accum_bytes = bytes;
-
-    op.chunk_steps_ptr = reinterpret_cast<uint64_t>(chunk_steps_ptr);
-    op.chunk_done_ptr = reinterpret_cast<uint64_t>(chunk_done_ptr);
-    op.chunk_states_ptr = reinterpret_cast<uint64_t>(chunk_states_ptr);
-
-    if (!comm::collective::operation_desc_is_valid(&op)) {
-        throw std::runtime_error("make_allreduce_operation_desc: produced invalid operation");
-    }
-
-    return op;
 }
 
 } // namespace
@@ -207,8 +116,8 @@ bool endpoint_persistent_smoke_test(
     comm::collective::ChunkStateTable chunk_states0{};
     comm::collective::ChunkStateTable chunk_states1{};
 
-    comm::collective::OperationDesc* op0_dev = nullptr;
-    comm::collective::OperationDesc* op1_dev = nullptr;
+    comm::collective::DeviceOperationDesc op0_dev{};
+    comm::collective::DeviceOperationDesc op1_dev{};
 
     bool control0_initialized = false;
     bool control1_initialized = false;
@@ -238,7 +147,6 @@ bool endpoint_persistent_smoke_test(
         accum1 = comm::transport::alloc_peer_visible_buffer_for_rank(
             group.devices, 1, bytes);
 
-        // Put global/shared step+done arrays on rank 0 and map them peer-visible.
         chunk_steps = comm::transport::alloc_peer_visible_buffer_for_rank(
             group.devices,
             0,
@@ -258,41 +166,44 @@ bool endpoint_persistent_smoke_test(
             cudaMemcpy(accum1.ptr, host_src1.data(), bytes, cudaMemcpyHostToDevice),
             "cudaMemcpy(host_src1 -> accum1)");
 
-        memset_u32_buffer_on_owner(dev0, chunk_steps.ptr, num_chunks, 0u);
-        memset_u32_buffer_on_owner(dev0, chunk_done.ptr, num_chunks, 0u);
-
         comm::collective::chunk_state_table_init(&chunk_states0, dev0, num_chunks);
         comm::collective::chunk_state_table_init(&chunk_states1, dev1, num_chunks);
 
-        const auto op0 = make_allreduce_operation_desc(
-            0,
-            2,
-            bytes,
-            chunk_bytes,
+        comm::collective::OperationDesc op0{};
+        comm::collective::OperationDesc op1{};
+
+        comm::endpoint_runtime_build_ring_allreduce_operation(
+            &runtime0,
+            &op0,
             accum0.ptr,
             accum1.ptr,
+            bytes,
+            chunk_bytes,
             chunk_steps.ptr,
             chunk_done.ptr,
             chunk_states0.records,
             1);
 
-        const auto op1 = make_allreduce_operation_desc(
-            1,
-            2,
-            bytes,
-            chunk_bytes,
+        comm::endpoint_runtime_build_ring_allreduce_operation(
+            &runtime1,
+            &op1,
             accum1.ptr,
             accum0.ptr,
+            bytes,
+            chunk_bytes,
             chunk_steps.ptr,
             chunk_done.ptr,
             chunk_states1.records,
             1);
 
-        write_operation_desc_to_device(dev0, op0, &op0_dev);
-        write_operation_desc_to_device(dev1, op1, &op1_dev);
+        // One shared reset for progress arrays, then per-rank local chunk-state reset.
+        comm::collective::operation_desc_reset_shared_progress(dev0, &op0);
+        comm::collective::operation_desc_reset_local_chunk_state(dev0, &op0);
+        comm::collective::operation_desc_reset_local_chunk_state(dev1, &op1);
 
-        // Submission src is the local accumulator. dst is unused by the current
-        // operation-driven persistent kernel, but keep it valid.
+        comm::collective::device_operation_desc_create(&op0_dev, dev0, &op0);
+        comm::collective::device_operation_desc_create(&op1_dev, dev1, &op1);
+
         comm::endpoint_runtime_configure_submission(
             &runtime0,
             accum0.ptr,
@@ -324,7 +235,7 @@ bool endpoint_persistent_smoke_test(
         system::runtime::check_cuda(
             comm::launch_endpoint_persistent_kernel_sm90(
                 comm::endpoint_runtime_device_handle(&runtime0),
-                op0_dev,
+                op0_dev.ptr,
                 &control0,
                 runtime0.endpoint.stream),
             "launch_endpoint_persistent_kernel_sm90(rank0)");
@@ -333,7 +244,7 @@ bool endpoint_persistent_smoke_test(
         system::runtime::check_cuda(
             comm::launch_endpoint_persistent_kernel_sm90(
                 comm::endpoint_runtime_device_handle(&runtime1),
-                op1_dev,
+                op1_dev.ptr,
                 &control1,
                 runtime1.endpoint.stream),
             "launch_endpoint_persistent_kernel_sm90(rank1)");
@@ -390,16 +301,8 @@ bool endpoint_persistent_smoke_test(
         expect_half_vectors_close(host_out0, host_ref, "endpoint_persistent_smoke_test(rank0)");
         expect_half_vectors_close(host_out1, host_ref, "endpoint_persistent_smoke_test(rank1)");
 
-        if (op1_dev != nullptr) {
-            system::runtime::set_device(dev1);
-            cudaFree(op1_dev);
-            op1_dev = nullptr;
-        }
-        if (op0_dev != nullptr) {
-            system::runtime::set_device(dev0);
-            cudaFree(op0_dev);
-            op0_dev = nullptr;
-        }
+        comm::collective::device_operation_desc_destroy(&op1_dev);
+        comm::collective::device_operation_desc_destroy(&op0_dev);
 
         comm::collective::chunk_state_table_destroy(&chunk_states1);
         comm::collective::chunk_state_table_destroy(&chunk_states0);
@@ -439,14 +342,8 @@ bool endpoint_persistent_smoke_test(
         } catch (...) {
         }
 
-        if (op1_dev != nullptr) {
-            system::runtime::set_device(dev1);
-            cudaFree(op1_dev);
-        }
-        if (op0_dev != nullptr) {
-            system::runtime::set_device(dev0);
-            cudaFree(op0_dev);
-        }
+        comm::collective::device_operation_desc_destroy(&op1_dev);
+        comm::collective::device_operation_desc_destroy(&op0_dev);
 
         comm::collective::chunk_state_table_destroy(&chunk_states1);
         comm::collective::chunk_state_table_destroy(&chunk_states0);
