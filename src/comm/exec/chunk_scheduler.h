@@ -397,7 +397,7 @@ __device__ __forceinline__ void chunk_scheduler_retire_current(
         &local_inbound[chunk_idx],
         collective::kOperationInboundStepInvalid);
 
-    __threadfence_system();
+    __threadfence();
 
     if (current_step < reduce_steps) {
         if (next_step == reduce_steps) {
@@ -419,7 +419,7 @@ __device__ __forceinline__ void chunk_scheduler_retire_current(
         chunk_scheduler_atomic_store_u32(&local_done[chunk_idx], 1u);
     }
 
-    __threadfence_system();
+    __threadfence();
 
     chunk_states[chunk_idx].last_step_completed = next_step;
     chunk_states[chunk_idx].flags &= ~collective::kChunkStateFlagInFlight;
