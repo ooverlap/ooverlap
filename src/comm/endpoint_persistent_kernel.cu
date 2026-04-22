@@ -70,6 +70,7 @@ __global__ void endpoint_persistent_kernel_sm90(
 
     __shared__ sync::semaphore stage_barriers[kPersistentStageDepth];
     __shared__ int should_stop;
+    __shared__ int has_work;
 
     collective::ChunkState* chunk_states =
         collective::operation_desc_chunk_states(operation);
@@ -130,7 +131,12 @@ __global__ void endpoint_persistent_kernel_sm90(
             return;
         }
 
-        if (!exec::chunk_pipeline_try_prime(&shared_pipe)) {
+        if (threadIdx.x == 0) {
+            has_work = exec::chunk_pipeline_try_prime(&shared_pipe) ? 1 : 0;
+        }
+        __syncthreads();
+
+        if (!has_work) {
 #if defined(__CUDA_ARCH__)
             if (threadIdx.x == 0) {
                 __nanosleep(256);
@@ -138,8 +144,7 @@ __global__ void endpoint_persistent_kernel_sm90(
 #endif
             __syncthreads();
             continue;
-        }
-        __syncthreads();
+        } 
 
         exec::chunk_pipeline_wait_current_stage(&shared_pipe);
         __syncthreads();
