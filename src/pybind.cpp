@@ -259,14 +259,21 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         /*py::arg("dev1") = 1,*/
         /*"Benchmark persistent 2-GPU all-reduce vs basic TMA vs NCCL");*/
 
-  m.def("endpoint_persistent_smoke_test",
+  /*m.def("endpoint_persistent_smoke_test",*/
+        /*&ooverlap::endpoint_persistent_smoke_test,*/
+        /*py::arg("numel"),*/
+        /*py::arg("dev0") = 0,*/
+        /*py::arg("dev1") = 1,*/
+        /*"Endpoint-runtime persistent-kernel smoke test");*/
+
+    m.def("endpoint_persistent_smoke_test",
         &ooverlap::endpoint_persistent_smoke_test,
         py::arg("numel"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1,
-        "Endpoint-runtime persistent-kernel smoke test");
-
-  py::class_<OverlapImpl>(m, "OverlapImpl")
+        py::arg("devices") = std::vector<int64_t>{},
+        py::arg("timeout_ms") = 5000,
+        "Endpoint-runtime persistent-kernel smoke test over N GPUs");
+    
+    py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
       .def("cutlass_init", &OverlapImpl::CutlassInit)
       .def("nccl_init", &OverlapImpl::NcclInit)
