@@ -8,7 +8,7 @@
 #include <map>
 #include <string>
 
-#include "comm/communicator.h"
+#include "comm/endpoint.h"
 
 namespace ooverlap {
 
