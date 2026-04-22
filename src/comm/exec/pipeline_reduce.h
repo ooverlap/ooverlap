@@ -10,15 +10,6 @@
 namespace ooverlap {
 namespace comm {
 namespace exec {
-namespace {
-
-__device__ __forceinline__ void pipeline_reduce_fail_invalid_layout() {
-#if defined(__CUDA_ARCH__)
-    asm volatile("trap;");
-#endif
-}
-
-} // namespace
 
 struct PipelineTMAReduceAddNoFtzF16 {
     template <int StageDepth>
@@ -29,11 +20,6 @@ struct PipelineTMAReduceAddNoFtzF16 {
     __device__ __forceinline__ void issue_bulk(
         const PipelineStage* stage) const {
         if (stage == nullptr || !chunk_is_valid(&stage->chunk)) {
-            return;
-        }
-
-        if (!pipeline_stage_chunk_is_dense_packed(stage)) {
-            pipeline_reduce_fail_invalid_layout();
             return;
         }
 
@@ -51,11 +37,6 @@ struct PipelineTMAReduceAddNoFtzF16 {
     __device__ __forceinline__ void finish_tail(
         const PipelineStage* stage) const {
         if (stage == nullptr || !chunk_is_valid(&stage->chunk)) {
-            return;
-        }
-
-        if (!pipeline_stage_chunk_is_dense_packed(stage)) {
-            pipeline_reduce_fail_invalid_layout();
             return;
         }
 

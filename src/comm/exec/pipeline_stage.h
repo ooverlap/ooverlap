@@ -16,27 +16,6 @@ struct PipelineStage {
     Chunk chunk{};
 };
 
-__host__ __device__ __forceinline__ bool pipeline_stage_chunk_is_dense_packed(
-    const PipelineStage* stage) {
-    if (stage == nullptr || !chunk_is_valid(&stage->chunk)) {
-        return false;
-    }
-
-    size_t expected_offset = 0;
-    for (int i = 0; i < stage->chunk.num_tile_spans; ++i) {
-        const ChunkTileSpan& span = stage->chunk.tile_spans[i];
-        if (!chunk_tile_span_is_valid(&span)) {
-            return false;
-        }
-        if (span.dst_offset_bytes != expected_offset) {
-            return false;
-        }
-        expected_offset += span.bytes;
-    }
-
-    return expected_offset == stage->chunk.bytes;
-}
-
 __host__ __device__ __forceinline__ size_t pipeline_stage_bulk_bytes(
     const PipelineStage* stage) {
     return stage->chunk.bytes & ~static_cast<size_t>(0xF);
