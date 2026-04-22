@@ -380,11 +380,13 @@ void destroy_nccl_allreduce_state(
 
     try {
         if (st->comm0 != nullptr) {
+            system::runtime::set_device(st->dev0);
             ncclCommDestroy(st->comm0);
         }
     } catch (...) {}
     try {
         if (st->comm1 != nullptr) {
+            system::runtime::set_device(st->dev1);
             ncclCommDestroy(st->comm1);
         }
     } catch (...) {}
@@ -1266,17 +1268,28 @@ void init_nccl_allreduce_state(
     st->stream1 = system::runtime::create_stream_on_device(dev1);
 
     system::runtime::set_device(dev0);
-    system::runtime::check_cuda(cudaMalloc(&st->work0, st->bytes), "cudaMalloc(nccl work0)");
+    system::runtime::check_cuda(
+        cudaMalloc(&st->work0, st->bytes),
+        "cudaMalloc(nccl work0)");
 
     system::runtime::set_device(dev1);
-    system::runtime::check_cuda(cudaMalloc(&st->work1, st->bytes), "cudaMalloc(nccl work1)");
+    system::runtime::check_cuda(
+        cudaMalloc(&st->work1, st->bytes),
+        "cudaMalloc(nccl work1)");
 
     ncclUniqueId id{};
     OOVERLAP_PERSIST_NCCL_CHECK(ncclGetUniqueId(&id));
 
     OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
-    OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitRank(&st->comm0, 2, id, 0));
-    OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitRank(&st->comm1, 2, id, 1));
+
+    system::runtime::set_device(dev0);
+    OOVERLAP_PERSIST_NCCL_CHECK(
+        ncclCommInitRank(&st->comm0, 2, id, 0));
+
+    system::runtime::set_device(dev1);
+    OOVERLAP_PERSIST_NCCL_CHECK(
+        ncclCommInitRank(&st->comm1, 2, id, 1));
+
     OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
 
     st->initialized = true;
@@ -1319,6 +1332,8 @@ void run_nccl_allreduce(
     }
 
     OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
+
+    system::runtime::set_device(st->dev0);
     OOVERLAP_PERSIST_NCCL_CHECK(
         ncclAllReduce(
             st->work0,
@@ -1328,6 +1343,8 @@ void run_nccl_allreduce(
             ncclSum,
             st->comm0,
             st->stream0));
+
+    system::runtime::set_device(st->dev1);
     OOVERLAP_PERSIST_NCCL_CHECK(
         ncclAllReduce(
             st->work1,
@@ -1337,6 +1354,7 @@ void run_nccl_allreduce(
             ncclSum,
             st->comm1,
             st->stream1));
+
     OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
 
     sync_two_streams(
