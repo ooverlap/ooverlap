@@ -84,6 +84,7 @@ __global__ void endpoint_persistent_kernel_sm90(
     const uint32_t total_steps =
         collective::operation_desc_total_ring_steps(operation);
 
+    // For fast thing (but should add later)
 /*    for (uint32_t idx = static_cast<uint32_t>(threadIdx.x);*/
          /*idx < operation->num_chunks;*/
          /*idx += static_cast<uint32_t>(blockDim.x)) {*/

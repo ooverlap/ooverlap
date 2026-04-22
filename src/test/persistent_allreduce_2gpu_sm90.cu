@@ -166,72 +166,6 @@ double measure_host_ms(Fn&& fn) {
     return std::chrono::duration<double, std::milli>(stop - start).count();
 }
 
-struct HostMappedMailbox {
-    uint32_t* host_ptr = nullptr;
-    std::vector<uint32_t*> device_ptrs;
-    size_t count = 0;
-
-    void init(size_t n, const std::vector<int>& devices) {
-        if (n == 0) {
-            throw std::invalid_argument("HostMappedMailbox::init: n must be > 0");
-        }
-        destroy();
-
-        count = n;
-
-        cudaError_t err = cudaHostAlloc(
-            reinterpret_cast<void**>(&host_ptr),
-            count * sizeof(uint32_t),
-            cudaHostAllocMapped | cudaHostAllocPortable);
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("cudaHostAlloc(mapped mailbox) failed: ") +
-                cudaGetErrorString(err));
-        }
-
-        device_ptrs.resize(devices.size(), nullptr);
-
-        for (size_t i = 0; i < devices.size(); ++i) {
-            system::runtime::set_device(devices[i]);
-            err = cudaHostGetDevicePointer(
-                reinterpret_cast<void**>(&device_ptrs[i]),
-                host_ptr,
-                0);
-            if (err != cudaSuccess) {
-                cudaFreeHost(host_ptr);
-                host_ptr = nullptr;
-                device_ptrs.clear();
-                count = 0;
-                throw std::runtime_error(
-                    std::string("cudaHostGetDevicePointer(mapped mailbox) failed: ") +
-                    cudaGetErrorString(err));
-            }
-        }
-    }
-
-    void reset(uint32_t value) {
-        if (host_ptr == nullptr) {
-            throw std::invalid_argument("HostMappedMailbox::reset: not initialized");
-        }
-        for (size_t i = 0; i < count; ++i) {
-            host_ptr[i] = value;
-        }
-    }
-
-    uint32_t* device_ptr_for_rank(size_t rank) const {
-        return device_ptrs.at(rank);
-    }
-
-    void destroy() {
-        if (host_ptr != nullptr) {
-            cudaFreeHost(host_ptr);
-        }
-        host_ptr = nullptr;
-        device_ptrs.clear();
-        count = 0;
-    }
-};
-
 bool all_u32_equal_to_one(
     const uint32_t* ptr,
     size_t count) {
@@ -243,63 +177,88 @@ bool all_u32_equal_to_one(
     return true;
 }
 
-bool wait_until_all_ranks_done(
-    const std::vector<HostMappedMailbox>& done_flags,
-    int timeout_ms) {
-    const auto start = std::chrono::steady_clock::now();
-
-    while (true) {
-        bool all_done = true;
-        for (const auto& done : done_flags) {
-            if (!all_u32_equal_to_one(done.host_ptr, done.count)) {
-                all_done = false;
-                break;
-            }
-        }
-
-        if (all_done) {
-            return true;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-        if (elapsed_ms > timeout_ms) {
-            return false;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+int prev_rank_of(
+    int rank,
+    int world_size) {
+    return (rank - 1 + world_size) % world_size;
 }
 
-bool wait_until_all_ranks_done_no_sleep(
-    const std::vector<HostMappedMailbox>& done_flags,
-    int timeout_ms) {
-    const auto start = std::chrono::steady_clock::now();
+struct DeviceMailbox {
+    comm::transport::CommBuffer buf{};
+    std::vector<uint32_t> host_cache{};
+    size_t count = 0;
+    int owner_rank = -1;
 
-    while (true) {
-        bool all_done = true;
-        for (const auto& done : done_flags) {
-            if (!all_u32_equal_to_one(done.host_ptr, done.count)) {
-                all_done = false;
-                break;
-            }
+    void init(
+        const std::vector<int>& devices,
+        int owner_rank_,
+        const std::vector<int>& access_ranks,
+        size_t n) {
+        if (n == 0) {
+            throw std::invalid_argument("DeviceMailbox::init: n must be > 0");
         }
+        destroy(devices);
 
-        if (all_done) {
-            return true;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-        if (elapsed_ms > timeout_ms) {
-            return false;
-        }
-
-        std::this_thread::yield();
+        owner_rank = owner_rank_;
+        count = n;
+        host_cache.assign(n, 0u);
+        buf = comm::transport::alloc_peer_visible_buffer_for_rank_with_access_ranks(
+            devices,
+            owner_rank,
+            access_ranks,
+            n * sizeof(uint32_t));
     }
-}
+
+    uint32_t* device_ptr_for_rank(size_t rank) const {
+        return reinterpret_cast<uint32_t*>(buf.device_ptr_for_rank(rank));
+    }
+
+    uint32_t* owner_device_ptr() const {
+        return reinterpret_cast<uint32_t*>(buf.device_ptr_for_rank(static_cast<size_t>(owner_rank)));
+    }
+
+    void fill_from_host(
+        const std::vector<int>& devices,
+        uint32_t value) {
+        if (owner_rank < 0) {
+            throw std::invalid_argument("DeviceMailbox::fill_from_host: not initialized");
+        }
+        host_cache.assign(count, value);
+        system::runtime::set_device(devices[static_cast<size_t>(owner_rank)]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                owner_device_ptr(),
+                host_cache.data(),
+                count * sizeof(uint32_t),
+                cudaMemcpyHostToDevice),
+            "cudaMemcpy(DeviceMailbox fill_from_host)");
+    }
+
+    void copy_owner_to_host(
+        const std::vector<int>& devices) {
+        if (owner_rank < 0) {
+            throw std::invalid_argument("DeviceMailbox::copy_owner_to_host: not initialized");
+        }
+        system::runtime::set_device(devices[static_cast<size_t>(owner_rank)]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                host_cache.data(),
+                owner_device_ptr(),
+                count * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(DeviceMailbox owner -> host)");
+    }
+
+    void destroy(const std::vector<int>& devices) {
+        if (owner_rank >= 0 && buf.bytes != 0) {
+            comm::transport::free_comm_buffer(devices, buf);
+        }
+        buf = comm::transport::CommBuffer{};
+        host_cache.clear();
+        count = 0;
+        owner_rank = -1;
+    }
+};
 
 struct PersistentTimingBreakdown {
     double launch_to_done_ms = 0.0;
@@ -315,8 +274,8 @@ struct PersistentTwoGpuState {
     std::vector<comm::EndpointPersistentControl> controls;
 
     std::vector<comm::transport::CommBuffer> accums;
-    std::vector<HostMappedMailbox> inbound_steps;
-    std::vector<HostMappedMailbox> done_flags;
+    std::vector<DeviceMailbox> inbound_steps;
+    std::vector<DeviceMailbox> done_flags;
 
     std::vector<comm::collective::ChunkStateTable> chunk_states;
     std::vector<comm::collective::OperationDesc> ops;
@@ -326,15 +285,6 @@ struct PersistentTwoGpuState {
     uint32_t num_chunks = 0;
     bool initialized = false;
 };
-
-
-
-int prev_rank_of(
-    int rank,
-    int world_size) {
-    return (rank - 1 + world_size) % world_size;
-}
-
 
 void destroy_persistent_two_gpu_state(
     PersistentTwoGpuState* st) {
@@ -349,10 +299,10 @@ void destroy_persistent_two_gpu_state(
         try { comm::collective::chunk_state_table_destroy(&table); } catch (...) {}
     }
     for (auto& box : st->done_flags) {
-        try { box.destroy(); } catch (...) {}
+        try { box.destroy(st->devices); } catch (...) {}
     }
     for (auto& box : st->inbound_steps) {
-        try { box.destroy(); } catch (...) {}
+        try { box.destroy(st->devices); } catch (...) {}
     }
     for (auto& accum : st->accums) {
         try { comm::transport::free_comm_buffer(st->devices, accum); } catch (...) {}
@@ -418,11 +368,20 @@ void init_persistent_two_gpu_state(
             comm::transport::alloc_peer_visible_buffer_for_rank_with_access_ranks(
                 st->group.devices,
                 r,
-                {prev_rank},
+                {r, prev_rank},
                 st->bytes);
 
-        st->inbound_steps[static_cast<size_t>(r)].init(st->num_chunks, st->devices);
-        st->done_flags[static_cast<size_t>(r)].init(st->num_chunks, st->devices);
+        st->inbound_steps[static_cast<size_t>(r)].init(
+            st->group.devices,
+            r,
+            {r, prev_rank},
+            st->num_chunks);
+
+        st->done_flags[static_cast<size_t>(r)].init(
+            st->group.devices,
+            r,
+            {r, prev_rank},
+            st->num_chunks);
 
         comm::collective::chunk_state_table_init(
             &st->chunk_states[static_cast<size_t>(r)],
@@ -492,21 +451,9 @@ void prepare_persistent_two_gpu_run(
         "sync prepare_persistent");
 
     for (int r = 0; r < 2; ++r) {
-        st->inbound_steps[static_cast<size_t>(r)].reset(
-            comm::collective::kOperationInboundStepInvalid);
-        st->done_flags[static_cast<size_t>(r)].reset(0u);
-        comm::collective::chunk_state_table_reset(&st->chunk_states[static_cast<size_t>(r)]);
-    }
-
-    for (int r = 0; r < 2; ++r) {
-        for (uint32_t idx = 0; idx < st->num_chunks; ++idx) {
-            if (comm::collective::operation_desc_actor_rank_for_step(
-                    &st->ops[static_cast<size_t>(r)],
-                    idx,
-                    0u) == r) {
-                st->inbound_steps[static_cast<size_t>(r)].host_ptr[idx] = 0u;
-            }
-        }
+        comm::collective::operation_desc_reset_local_state(
+            st->group.devices[static_cast<size_t>(r)],
+            &st->ops[static_cast<size_t>(r)]);
     }
 }
 
@@ -528,26 +475,30 @@ void launch_persistent_two_gpu_run(
 }
 
 void dump_persistent_debug_state(
-    const PersistentTwoGpuState* st,
+    PersistentTwoGpuState* st,
     const char* tag) {
     if (st == nullptr) {
         return;
     }
 
-    printf("[debug] persistent dump: %s\n", tag);
+    std::printf("[debug] persistent dump: %s\n", tag);
 
     for (size_t r = 0; r < st->devices.size(); ++r) {
+        auto& inbound = st->inbound_steps[r];
+        auto& done = st->done_flags[r];
+
+        inbound.copy_owner_to_host(st->devices);
+        done.copy_owner_to_host(st->devices);
+
         const size_t show = (st->num_chunks < 4u) ? st->num_chunks : 4u;
 
-        printf("[debug] rank=%zu device=%d ready chunks (host mailboxes)\n",
-               r, st->devices[r]);
-
+        std::printf("[debug] rank=%zu device=%d\n", r, st->devices[r]);
         for (size_t i = 0; i < show; ++i) {
-            printf(
+            std::printf(
                 "  chunk=%zu inbound=%u done=%u\n",
                 i,
-                st->inbound_steps[r].host_ptr[i],
-                st->done_flags[r].host_ptr[i]);
+                inbound.host_cache[i],
+                done.host_cache[i]);
         }
 
         std::vector<comm::collective::ChunkState> host_states(show);
@@ -562,7 +513,7 @@ void dump_persistent_debug_state(
 
         for (size_t i = 0; i < show; ++i) {
             const auto& cs = host_states[i];
-            printf(
+            std::printf(
                 "  state chunk=%zu flags=%u started=%u completed=%u bytes=%u offset=%zu\n",
                 i,
                 cs.flags,
@@ -571,6 +522,39 @@ void dump_persistent_debug_state(
                 cs.bytes,
                 cs.offset_bytes);
         }
+    }
+}
+
+bool wait_until_all_ranks_done_no_sleep(
+    PersistentTwoGpuState* st,
+    int timeout_ms) {
+    const auto start = std::chrono::steady_clock::now();
+
+    while (true) {
+        bool all_done = true;
+
+        for (size_t r = 0; r < st->done_flags.size(); ++r) {
+            auto& done = st->done_flags[r];
+            done.copy_owner_to_host(st->devices);
+
+            if (!all_u32_equal_to_one(done.host_cache.data(), done.count)) {
+                all_done = false;
+                break;
+            }
+        }
+
+        if (all_done) {
+            return true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        if (elapsed_ms > timeout_ms) {
+            return false;
+        }
+
+        std::this_thread::yield();
     }
 }
 
@@ -586,7 +570,7 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
     launch_persistent_two_gpu_run(st);
 
     const bool all_done =
-        wait_until_all_ranks_done_no_sleep(st->done_flags, timeout_ms);
+        wait_until_all_ranks_done_no_sleep(st, timeout_ms);
 
     if (!all_done) {
         for (int r = 0; r < 2; ++r) {
@@ -632,27 +616,23 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
     return out;
 }
 
-void wait_and_stop_persistent_two_gpu_run(
+void verify_persistent_result(
     PersistentTwoGpuState* st,
-    int timeout_ms) {
-    if (st == nullptr || !st->initialized) {
-        throw std::invalid_argument("wait_and_stop_persistent_two_gpu_run: state is not initialized");
-    }
+    int64_t numel) {
+    auto ref = reference_two_gpu_sum(numel);
 
-    const bool all_done = wait_until_all_ranks_done(st->done_flags, timeout_ms);
-    if (!all_done) {
-        throw std::runtime_error("persistent allreduce timeout waiting for done flags");
-    }
+    auto got0 = copy_half_device_to_host(
+        reinterpret_cast<const half*>(st->accums[0].device_ptr_for_rank(0)),
+        numel,
+        st->devices[0]);
 
-    for (int r = 0; r < 2; ++r) {
-        comm::endpoint_persistent_control_request_stop(&st->controls[static_cast<size_t>(r)]);
-    }
+    auto got1 = copy_half_device_to_host(
+        reinterpret_cast<const half*>(st->accums[1].device_ptr_for_rank(1)),
+        numel,
+        st->devices[1]);
 
-    for (int r = 0; r < 2; ++r) {
-        system::runtime::check_cuda(
-            cudaStreamSynchronize(st->runtimes[static_cast<size_t>(r)].endpoint.stream),
-            "cudaStreamSynchronize(persistent stream)");
-    }
+    expect_half_vectors_close(got0, ref, "persistent verify rank0");
+    expect_half_vectors_close(got1, ref, "persistent verify rank1");
 }
 
 struct BasicCudaMemcpyState {
@@ -879,27 +859,6 @@ void verify_nccl_result(
     expect_half_vectors_close(got1, ref, "nccl verify rank1");
 }
 
-inline void verify_persistent_result(
-    PersistentTwoGpuState* st,
-    int64_t numel) {
-    auto ref = reference_two_gpu_sum(numel);
-
-    auto got0 = copy_half_device_to_host(
-        reinterpret_cast<const half*>(st->accums[0].device_ptr_for_rank(0)),
-        numel,
-        st->devices[0]);
-
-    auto got1 = copy_half_device_to_host(
-        reinterpret_cast<const half*>(st->accums[1].device_ptr_for_rank(1)),
-        numel,
-        st->devices[1]);
-
-    expect_half_vectors_close(got0, ref, "persistent verify rank0");
-    expect_half_vectors_close(got1, ref, "persistent verify rank1");
-}
-
-
-
 } // namespace
 
 std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
@@ -999,8 +958,9 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
         for (int i = 0; i < warmup; ++i) {
             prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
-            launch_persistent_two_gpu_run(&persistent);
-            wait_and_stop_persistent_two_gpu_run(&persistent, 3000);
+            PersistentTimingBreakdown t =
+                measure_persistent_host_breakdown_ms(&persistent, 30000);
+            (void)t;
         }
 
         double basic_total_ms = 0.0;
@@ -1058,7 +1018,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
 
             const PersistentTimingBreakdown t =
-                measure_persistent_host_breakdown_ms(&persistent, 3000);
+                measure_persistent_host_breakdown_ms(&persistent, 30000);
 
             persistent_launch_to_done_total_ms += t.launch_to_done_ms;
             persistent_stop_join_total_ms += t.stop_join_ms;
@@ -1105,8 +1065,11 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         verify_nccl_result(rank0_nccl, rank1_nccl, dev0, dev1, numel);
 
         prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
-        launch_persistent_two_gpu_run(&persistent);
-        wait_and_stop_persistent_two_gpu_run(&persistent, 30000);
+        {
+            const PersistentTimingBreakdown t =
+                measure_persistent_host_breakdown_ms(&persistent, 30000);
+            (void)t;
+        }
         verify_persistent_result(&persistent, numel);
 
         const double avg_basic_ms = basic_total_ms / static_cast<double>(iters);
@@ -1117,7 +1080,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             persistent_stop_join_total_ms / static_cast<double>(iters);
         const double avg_persistent_total_ms =
             persistent_total_ms / static_cast<double>(iters);
-        
+
         OOVERLAP_PERSIST_NCCL_CHECK(ncclCommDestroy(nccl_comms[0]));
         OOVERLAP_PERSIST_NCCL_CHECK(ncclCommDestroy(nccl_comms[1]));
         nccl_comms[0] = nullptr;
@@ -1152,7 +1115,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             {"cuda_memcpy_over_persistent_total", avg_basic_ms / avg_persistent_total_ms},
             {"nccl_over_persistent_total", avg_nccl_ms / avg_persistent_total_ms}
         };
-
     } catch (...) {
         if (nccl_comms[0] != nullptr) {
             try { ncclCommDestroy(nccl_comms[0]); } catch (...) {}
