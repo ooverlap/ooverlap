@@ -11,7 +11,7 @@ namespace ooverlap {
 namespace comm {
 namespace exec {
 
-struct PipelineTMAReduceAddNoFtzF16 {
+struct PipelineTMAStepApplyNoFtzF16 {
     template <int StageDepth>
     __device__ __forceinline__ void wait_before_stage_reuse() const {
         tma::reduce_async_read_wait<StageDepth - 1>();
@@ -20,6 +20,10 @@ struct PipelineTMAReduceAddNoFtzF16 {
     __device__ __forceinline__ void issue_bulk(
         const PipelineStage* stage) const {
         if (stage == nullptr || !chunk_is_valid(&stage->chunk)) {
+            return;
+        }
+
+        if (stage->chunk.op != ChunkOpKind::kReduceAddNoFtzF16) {
             return;
         }
 
@@ -37,6 +41,21 @@ struct PipelineTMAReduceAddNoFtzF16 {
     __device__ __forceinline__ void finish_tail(
         const PipelineStage* stage) const {
         if (stage == nullptr || !chunk_is_valid(&stage->chunk)) {
+            return;
+        }
+
+        if (stage->chunk.op == ChunkOpKind::kCopy) {
+            unsigned char* dst = stage->chunk.dst;
+            const unsigned char* src = stage->smem;
+            const size_t bytes = stage->chunk.bytes;
+
+            for (size_t i = threadIdx.x; i < bytes; i += blockDim.x) {
+                dst[i] = src[i];
+            }
+            return;
+        }
+
+        if (stage->chunk.op != ChunkOpKind::kReduceAddNoFtzF16) {
             return;
         }
 
@@ -60,7 +79,27 @@ struct PipelineTMAReduceAddNoFtzF16 {
             dst_half[idx] = __float2half_rn(oldv + addv);
         }
     }
+
+    __device__ __forceinline__ void wait_complete(
+        const PipelineStage* stage) const {
+        if (stage == nullptr || !chunk_is_valid(&stage->chunk)) {
+            return;
+        }
+
+        if (stage->chunk.op != ChunkOpKind::kReduceAddNoFtzF16) {
+            return;
+        }
+
+        if (pipeline_stage_bulk_bytes(stage) == 0) {
+            return;
+        }
+
+        tma::reduce_async_wait<0>();
+    }
 };
+
+// Keep the old name available for any sites that still include it.
+using PipelineTMAReduceAddNoFtzF16 = PipelineTMAStepApplyNoFtzF16;
 
 } // namespace exec
 } // namespace comm

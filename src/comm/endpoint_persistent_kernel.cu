@@ -1,12 +1,11 @@
 #include "comm/endpoint_persistent_kernel.h"
 
+#include "comm/exec/chunk_pipeline.h"
+#include "comm/exec/chunk_scheduler.h"
 #include "comm/exec/pipeline_load.h"
 #include "comm/exec/pipeline_reduce.h"
-#include "comm/exec/pipeline_stage.h"
 #include "ooverlap/system/runtime_utils.cuh"
-#include "ooverlap/tma/tma_reduce.cuh"
 
-#include <cmath>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -17,22 +16,9 @@ namespace ooverlap {
 namespace comm {
 namespace {
 
-__device__ __forceinline__ float endpoint_debug_half0(
-    const unsigned char* ptr) {
-    return __half2float(*reinterpret_cast<const half*>(ptr));
-}
-
-__device__ __forceinline__ unsigned long long endpoint_debug_ptr_u64(
-    const void* ptr) {
-    return static_cast<unsigned long long>(
-        reinterpret_cast<uintptr_t>(ptr));
-}
-
+static constexpr int kPersistentStageDepth = 1;
 static constexpr size_t kEndpointPersistentStaticSharedBytes =
-    sizeof(sync::semaphore) +
-    sizeof(exec::Chunk) +
-    sizeof(uint32_t) * 4 +
-    sizeof(int) * 2;
+    sizeof(sync::semaphore) * kPersistentStageDepth;
 
 __device__ __forceinline__ bool endpoint_persistent_should_stop(
     const uint32_t* stop_flag) {
@@ -45,21 +31,6 @@ __device__ __forceinline__ bool endpoint_persistent_runtime_is_minimally_valid(
            runtime->rank >= 0 &&
            runtime->device >= 0 &&
            runtime->stream != nullptr;
-}
-
-__device__ __forceinline__ uint32_t endpoint_persistent_atomic_load_u32(
-    volatile uint32_t* ptr) {
-    return atomicAdd(
-        reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(ptr)),
-        0u);
-}
-
-__device__ __forceinline__ void endpoint_persistent_atomic_store_u32(
-    volatile uint32_t* ptr,
-    uint32_t value) {
-    atomicExch(
-        reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(ptr)),
-        value);
 }
 
 __device__ __forceinline__ void endpoint_persistent_init_chunk_state(
@@ -77,92 +48,6 @@ __device__ __forceinline__ void endpoint_persistent_init_chunk_state(
     if (collective::operation_desc_total_ring_steps(op) == 0) {
         st->flags |= collective::kChunkStateFlagDone;
     }
-}
-
-__device__ __forceinline__ void endpoint_persistent_build_chunk_for_step(
-    exec::Chunk* chunk,
-    const collective::OperationDesc* op,
-    uint32_t chunk_idx,
-    uint32_t step) {
-    exec::chunk_clear(chunk);
-
-    chunk->src =
-        collective::operation_desc_accum_chunk_ptr(op, chunk_idx);
-    chunk->dst =
-        collective::operation_desc_next_accum_chunk_ptr(op, chunk_idx);
-    chunk->bytes =
-        collective::operation_desc_chunk_bytes_at(op, chunk_idx);
-    chunk->op_id = op->op_id;
-    chunk->dst_rank = op->next_rank;
-    chunk->user_tag = op->user_tag;
-    chunk->chunk_idx = static_cast<int>(chunk_idx);
-    chunk->range_offset_bytes =
-        collective::operation_desc_chunk_offset_bytes(op, chunk_idx);
-    chunk->op =
-        collective::operation_desc_chunk_op_for_step(op, step);
-}
-
-__device__ __forceinline__ void endpoint_persistent_copy_smem_to_gmem(
-    const exec::PipelineStage* stage) {
-    if (stage == nullptr || !exec::chunk_is_valid(&stage->chunk)) {
-        return;
-    }
-
-    unsigned char* dst = stage->chunk.dst;
-    const unsigned char* src = stage->smem;
-    const size_t bytes = stage->chunk.bytes;
-
-    for (size_t i = threadIdx.x; i < bytes; i += blockDim.x) {
-        dst[i] = src[i];
-    }
-}
-
-__device__ __forceinline__ void endpoint_persistent_publish_to_next(
-    const collective::OperationDesc* op,
-    uint32_t chunk_idx,
-    uint32_t current_step,
-    uint32_t total_steps) {
-    volatile uint32_t* next_done =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_next_done(op));
-    volatile uint32_t* next_inbound =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_next_inbound_steps(op));
-    volatile uint32_t* local_done =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_local_done(op));
-
-    const uint32_t next_step = current_step + 1;
-    const uint32_t reduce_steps =
-        static_cast<uint32_t>(op->world_size - 1);
-
-    // Make chunk data visible on the next rank before publishing tokens.
-    __threadfence_system();
-
-    if (current_step < reduce_steps) {
-        // The step that lands on the owner makes the owner's local chunk final.
-        if (next_step == reduce_steps) {
-            endpoint_persistent_atomic_store_u32(&next_done[chunk_idx], 1u);
-        }
-
-        if (next_step < total_steps) {
-            endpoint_persistent_atomic_store_u32(&next_inbound[chunk_idx], next_step);
-        }
-    } else {
-        // All-gather/copy phase: the next rank now has a final copy too.
-        endpoint_persistent_atomic_store_u32(&next_done[chunk_idx], 1u);
-
-        if (next_step < total_steps) {
-            endpoint_persistent_atomic_store_u32(&next_inbound[chunk_idx], next_step);
-        }
-    }
-
-    // Final actor marks itself done as well.
-    if (next_step >= total_steps) {
-        endpoint_persistent_atomic_store_u32(&local_done[chunk_idx], 1u);
-    }
-
-    __threadfence_system();
 }
 
 __global__ void endpoint_persistent_kernel_sm90(
@@ -183,18 +68,11 @@ __global__ void endpoint_persistent_kernel_sm90(
     unsigned char* shared_raw =
         reinterpret_cast<unsigned char*>(shared_storage_u4);
 
-    __shared__ sync::semaphore load_barrier;
-    __shared__ exec::Chunk shared_chunk;
-    __shared__ uint32_t shared_chunk_idx;
-    __shared__ uint32_t shared_chunk_step;
-    __shared__ int shared_has_work;
-    __shared__ int shared_should_stop;
+    __shared__ sync::semaphore stage_barriers[kPersistentStageDepth];
+    __shared__ int should_stop;
 
     collective::ChunkState* chunk_states =
         collective::operation_desc_chunk_states(operation);
-    volatile uint32_t* inbound_steps =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_local_inbound_steps(operation));
     volatile uint32_t* done =
         reinterpret_cast<volatile uint32_t*>(
             collective::operation_desc_local_done(operation));
@@ -211,90 +89,44 @@ __global__ void endpoint_persistent_kernel_sm90(
             idx);
 
         if (total_steps == 0) {
-            endpoint_persistent_atomic_store_u32(&done[idx], 1u);
+            atomicExch(
+                reinterpret_cast<unsigned int*>(
+                    const_cast<uint32_t*>(&done[idx])),
+                1u);
         }
     }
     __syncthreads();
 
-    exec::PipelineTMALoad load_op{};
-    exec::PipelineTMAReduceAddNoFtzF16 reduce_op{};
+    using Scheduler = exec::ChunkScheduler<1>;
+    using Pipe = exec::ChunkPipeline<
+        kPersistentStageDepth,
+        Scheduler,
+        exec::PipelineTMALoad,
+        exec::PipelineTMAStepApplyNoFtzF16>;
+
+    Scheduler scheduler{};
+    exec::chunk_scheduler_init_operation(&scheduler, operation);
+
+    Pipe pipe{};
+    exec::chunk_pipeline_bind_stage_storage<
+        kPersistentStageDepth,
+        kEndpointPersistentChunkBytes>(
+        &pipe,
+        shared_raw,
+        stage_barriers);
+    exec::chunk_pipeline_init(&pipe, &scheduler);
 
     while (true) {
         if (threadIdx.x == 0) {
-            shared_should_stop = endpoint_persistent_should_stop(stop_flag) ? 1 : 0;
+            should_stop = endpoint_persistent_should_stop(stop_flag) ? 1 : 0;
         }
         __syncthreads();
 
-        if (shared_should_stop) {
+        if (should_stop) {
             return;
         }
 
-        if (threadIdx.x == 0) {
-            shared_has_work = 0;
-
-            for (uint32_t idx = 0; idx < operation->num_chunks; ++idx) {
-                if (collective::chunk_state_is_in_flight(&chunk_states[idx])) {
-                    continue;
-                }
-
-                const uint32_t step =
-                    endpoint_persistent_atomic_load_u32(&inbound_steps[idx]);
-
-                if (step == collective::kOperationInboundStepInvalid) {
-                    continue;
-                }
-                if (step >= total_steps) {
-                    continue;
-                }
-
-                const int actor =
-                    collective::operation_desc_actor_rank_for_step(
-                        operation,
-                        idx,
-                        step);
-                if (actor != operation->rank) {
-                    continue;
-                }
-
-                endpoint_persistent_build_chunk_for_step(
-                    &shared_chunk,
-                    operation,
-                    idx,
-                    step);
-
-                if (idx == 0) {
-                    const unsigned char* local_ptr =
-                        collective::operation_desc_accum_chunk_ptr(operation, idx);
-                    const unsigned char* next_ptr =
-                        collective::operation_desc_next_accum_chunk_ptr(operation, idx);
-                
-                    const float local0 = endpoint_debug_half0(local_ptr);
-                    const float next0 = endpoint_debug_half0(next_ptr);
-                
-                    printf(
-                        "[pk pick] rank=%d step=%u chunk=%u op=%u src=0x%llx dst=0x%llx local0=%.6f next0_before=%.6f\n",
-                        operation->rank,
-                        step,
-                        idx,
-                        static_cast<unsigned>(shared_chunk.op),
-                        endpoint_debug_ptr_u64(local_ptr),
-                        endpoint_debug_ptr_u64(next_ptr),
-                        local0,
-                        next0);
-                }
-
-                shared_chunk_idx = idx;
-                shared_chunk_step = step;
-                shared_has_work = 1;
-
-                chunk_states[idx].last_step_started = step;
-                chunk_states[idx].flags |= collective::kChunkStateFlagInFlight;
-                break;
-            }
-        }
-        __syncthreads();
-
-        if (!shared_has_work) {
+        if (!exec::chunk_pipeline_try_prime(&pipe)) {
 #if defined(__CUDA_ARCH__)
             if (threadIdx.x == 0) {
                 __nanosleep(256);
@@ -303,104 +135,22 @@ __global__ void endpoint_persistent_kernel_sm90(
             __syncthreads();
             continue;
         }
+        __syncthreads();
 
-        exec::PipelineStage stage{};
-        stage.smem = shared_raw;
-        stage.load_barrier = &load_barrier;
-        stage.chunk = shared_chunk;
+        exec::chunk_pipeline_wait_current_stage(&pipe);
+        __syncthreads();
 
-        if (threadIdx.x == 0) {
-            load_op.issue(&stage);
-        }
+        exec::chunk_pipeline_issue_current_apply(&pipe);
+        __syncthreads();
+
+        exec::chunk_pipeline_finish_current_apply(&pipe);
+        __syncthreads();
+
+        exec::chunk_pipeline_wait_current_complete(&pipe);
         __syncthreads();
 
         if (threadIdx.x == 0) {
-            load_op.wait_ready(&stage);
-        }
-        __syncthreads();
-
-        if (stage.chunk.op == exec::ChunkOpKind::kReduceAddNoFtzF16) {
-            if (threadIdx.x == 0) {
-                reduce_op.issue_bulk(&stage);
-            }
-            __syncthreads();
-
-            reduce_op.finish_tail(&stage);
-            __syncthreads();
-
-            if (threadIdx.x == 0) {
-                tma::reduce_async_wait<0>();
-            }
-            __syncthreads();
-        } else if (stage.chunk.op == exec::ChunkOpKind::kCopy) {
-            endpoint_persistent_copy_smem_to_gmem(&stage);
-            __syncthreads();
-        } else {
-            __syncthreads();
-            continue;
-        }
-
-        if (threadIdx.x == 0) {
-            // Consume local inbound token only after this step is fully retired.
-            endpoint_persistent_atomic_store_u32(
-                &inbound_steps[shared_chunk_idx],
-                collective::kOperationInboundStepInvalid);
-            __threadfence_system();
-
-            
-            if (shared_chunk_idx == 0) {
-                const unsigned char* local_ptr_after =
-                    collective::operation_desc_accum_chunk_ptr(operation, shared_chunk_idx);
-                const unsigned char* next_ptr_after =
-                    collective::operation_desc_next_accum_chunk_ptr(operation, shared_chunk_idx);
-            
-                const float local0_after = endpoint_debug_half0(local_ptr_after);
-                const float next0_after = endpoint_debug_half0(next_ptr_after);
-            
-                printf(
-                    "[pk done] rank=%d step=%u chunk=%u src=0x%llx dst=0x%llx local0_after=%.6f next0_after=%.6f\n",
-                    operation->rank,
-                    shared_chunk_step,
-                    shared_chunk_idx,
-                    endpoint_debug_ptr_u64(local_ptr_after),
-                    endpoint_debug_ptr_u64(next_ptr_after),
-                    local0_after,
-                    next0_after);
-            }
-
-            endpoint_persistent_publish_to_next(
-                operation,
-                shared_chunk_idx,
-                shared_chunk_step,
-                total_steps);
-
-            if (shared_chunk_idx == 0) {
-                volatile uint32_t* next_inbound =
-                    reinterpret_cast<volatile uint32_t*>(
-                        collective::operation_desc_next_inbound_steps(operation));
-                volatile uint32_t* next_done =
-                    reinterpret_cast<volatile uint32_t*>(
-                        collective::operation_desc_next_done(operation));
-                volatile uint32_t* local_done =
-                    reinterpret_cast<volatile uint32_t*>(
-                        collective::operation_desc_local_done(operation));
-            
-                printf(
-                    "[pk pub ] rank=%d step=%u chunk=%u wrote next_inbound=%u next_done=%u local_done=%u\n",
-                    operation->rank,
-                    shared_chunk_step,
-                    shared_chunk_idx,
-                    next_inbound[shared_chunk_idx],
-                    next_done[shared_chunk_idx],
-                    local_done[shared_chunk_idx]);
-            }
-
-            chunk_states[shared_chunk_idx].last_step_completed = shared_chunk_step + 1u;
-            chunk_states[shared_chunk_idx].flags &= ~collective::kChunkStateFlagInFlight;
-
-            if (endpoint_persistent_atomic_load_u32(&done[shared_chunk_idx]) == 1u) {
-                chunk_states[shared_chunk_idx].flags |= collective::kChunkStateFlagDone;
-            }
+            exec::chunk_pipeline_retire_current(&pipe);
         }
         __syncthreads();
     }
@@ -554,7 +304,7 @@ void endpoint_persistent_control_destroy(
 }
 
 size_t endpoint_persistent_kernel_dynamic_smem_bytes() {
-    return kEndpointPersistentChunkBytes;
+    return kEndpointPersistentChunkBytes * kPersistentStageDepth;
 }
 
 cudaError_t launch_endpoint_persistent_kernel_sm90(
