@@ -45,6 +45,35 @@ __global__ void fp16_add_inplace_kernel(
     }
 }
 
+__global__ void wait_done_flags_kernel(
+    const uint32_t* done,
+    size_t count) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    volatile const uint32_t* vdone =
+        reinterpret_cast<volatile const uint32_t*>(done);
+
+    while (true) {
+        bool all_done = true;
+        for (size_t i = 0; i < count; ++i) {
+            if (vdone[i] != 1u) {
+                all_done = false;
+                break;
+            }
+        }
+
+        if (all_done) {
+            return;
+        }
+
+#if defined(__CUDA_ARCH__)
+        __nanosleep(256);
+#endif
+    }
+}
+
 cudaError_t enqueue_fp16_add_inplace(
     half* dst,
     const half* src,
@@ -512,6 +541,96 @@ void wait_and_stop_persistent_two_gpu_run(
     }
 }
 
+double measure_persistent_device_ms(
+    PersistentTwoGpuState* st,
+    cudaStream_t watch_stream0,
+    cudaStream_t watch_stream1,
+    cudaEvent_t start0,
+    cudaEvent_t stop0,
+    cudaEvent_t start1,
+    cudaEvent_t stop1,
+    int timeout_ms) {
+    if (st == nullptr || !st->initialized) {
+        throw std::invalid_argument("measure_persistent_device_ms: state is not initialized");
+    }
+
+    launch_persistent_two_gpu_run(st);
+
+    system::runtime::set_device(st->devices[0]);
+    system::runtime::check_cuda(
+        cudaEventRecord(start0, watch_stream0),
+        "cudaEventRecord(start0 persistent)");
+    wait_done_flags_kernel<<<1, 1, 0, watch_stream0>>>(
+        st->done_flags[0].device_ptr_for_rank(0),
+        st->num_chunks);
+    system::runtime::check_cuda(
+        cudaGetLastError(),
+        "launch wait_done_flags_kernel rank0");
+    system::runtime::check_cuda(
+        cudaEventRecord(stop0, watch_stream0),
+        "cudaEventRecord(stop0 persistent)");
+
+    system::runtime::set_device(st->devices[1]);
+    system::runtime::check_cuda(
+        cudaEventRecord(start1, watch_stream1),
+        "cudaEventRecord(start1 persistent)");
+    wait_done_flags_kernel<<<1, 1, 0, watch_stream1>>>(
+        st->done_flags[1].device_ptr_for_rank(1),
+        st->num_chunks);
+    system::runtime::check_cuda(
+        cudaGetLastError(),
+        "launch wait_done_flags_kernel rank1");
+    system::runtime::check_cuda(
+        cudaEventRecord(stop1, watch_stream1),
+        "cudaEventRecord(stop1 persistent)");
+
+    system::runtime::set_device(st->devices[0]);
+    cudaError_t err0 = cudaEventSynchronize(stop0);
+
+    system::runtime::set_device(st->devices[1]);
+    cudaError_t err1 = cudaEventSynchronize(stop1);
+
+    if (err0 == cudaErrorNotReady || err1 == cudaErrorNotReady) {
+        throw std::runtime_error("measure_persistent_device_ms: unexpected cudaErrorNotReady");
+    }
+    if (err0 != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("measure_persistent_device_ms: rank0 event sync failed: ") +
+            cudaGetErrorString(err0));
+    }
+    if (err1 != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("measure_persistent_device_ms: rank1 event sync failed: ") +
+            cudaGetErrorString(err1));
+    }
+
+    float ms0 = 0.0f;
+    float ms1 = 0.0f;
+
+    system::runtime::set_device(st->devices[0]);
+    system::runtime::check_cuda(
+        cudaEventElapsedTime(&ms0, start0, stop0),
+        "cudaEventElapsedTime persistent rank0");
+
+    system::runtime::set_device(st->devices[1]);
+    system::runtime::check_cuda(
+        cudaEventElapsedTime(&ms1, start1, stop1),
+        "cudaEventElapsedTime persistent rank1");
+
+    // Shutdown is intentionally NOT part of the measured region.
+    for (int r = 0; r < 2; ++r) {
+        comm::endpoint_persistent_control_request_stop(&st->controls[static_cast<size_t>(r)]);
+    }
+
+    for (int r = 0; r < 2; ++r) {
+        system::runtime::check_cuda(
+            cudaStreamSynchronize(st->runtimes[static_cast<size_t>(r)].endpoint.stream),
+            "cudaStreamSynchronize(persistent stream after timing)");
+    }
+
+    return static_cast<double>((ms0 > ms1) ? ms0 : ms1);
+}
+
 struct BasicCudaMemcpyState {
     int dev0 = -1;
     int dev1 = -1;
@@ -736,6 +855,25 @@ void verify_nccl_result(
     expect_half_vectors_close(got1, ref, "nccl verify rank1");
 }
 
+inline void verify_persistent_result(
+    PersistentTwoGpuState* st,
+    int64_t numel) {
+    auto ref = reference_two_gpu_sum(numel);
+
+    auto got0 = copy_half_device_to_host(
+        reinterpret_cast<const half*>(st->accums[0].device_ptr_for_rank(0)),
+        numel,
+        st->devices[0]);
+
+    auto got1 = copy_half_device_to_host(
+        reinterpret_cast<const half*>(st->accums[1].device_ptr_for_rank(1)),
+        numel,
+        st->devices[1]);
+
+    expect_half_vectors_close(got0, ref, "persistent verify rank0");
+    expect_half_vectors_close(got1, ref, "persistent verify rank1");
+}
+
 } // namespace
 
 std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
@@ -750,6 +888,13 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     if (dev0 == dev1) {
         throw std::invalid_argument("benchmark_persistent_two_gpu_allreduce_sm90: dev0 and dev1 must differ");
     }
+
+    cudaStream_t watch_stream0 = nullptr;
+    cudaStream_t watch_stream1 = nullptr;
+    cudaEvent_t persistent_start0 = nullptr;
+    cudaEvent_t persistent_stop0 = nullptr;
+    cudaEvent_t persistent_start1 = nullptr;
+    cudaEvent_t persistent_stop1 = nullptr;
 
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
     const auto host0 = make_host_pattern(numel, 0);
@@ -776,6 +921,25 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
         nccl_stream0 = system::runtime::create_stream_on_device(dev0);
         nccl_stream1 = system::runtime::create_stream_on_device(dev1);
+
+        watch_stream0 = system::runtime::create_stream_on_device(dev0);
+        watch_stream1 = system::runtime::create_stream_on_device(dev1);
+
+        system::runtime::set_device(dev0);
+        system::runtime::check_cuda(
+            cudaEventCreate(&persistent_start0),
+            "cudaEventCreate(persistent_start0)");
+        system::runtime::check_cuda(
+            cudaEventCreate(&persistent_stop0),
+            "cudaEventCreate(persistent_stop0)");
+
+        system::runtime::set_device(dev1);
+        system::runtime::check_cuda(
+            cudaEventCreate(&persistent_start1),
+            "cudaEventCreate(persistent_start1)");
+        system::runtime::check_cuda(
+            cudaEventCreate(&persistent_stop1),
+            "cudaEventCreate(persistent_stop1)");
 
         system::runtime::set_device(dev0);
         system::runtime::check_cuda(cudaMalloc(&rank0_src, bytes), "cudaMalloc(rank0_src)");
@@ -889,10 +1053,15 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         double persistent_total_ms = 0.0;
         for (int i = 0; i < iters; ++i) {
             prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
-            persistent_total_ms += measure_host_ms([&] {
-                launch_persistent_two_gpu_run(&persistent);
-                wait_and_stop_persistent_two_gpu_run(&persistent, 30000);
-            });
+            persistent_total_ms += measure_persistent_device_ms(
+                &persistent,
+                watch_stream0,
+                watch_stream1,
+                persistent_start0,
+                persistent_stop0,
+                persistent_start1,
+                persistent_stop1,
+                30000);
         }
 
         prepare_basic_cuda_memcpy_run(&basic, rank0_src, rank1_src);
@@ -952,6 +1121,31 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         system::runtime::destroy_stream_on_device(dev1, nccl_stream1);
         nccl_stream0 = nullptr;
         nccl_stream1 = nullptr;
+
+        system::runtime::set_device(dev0);
+        system::runtime::check_cuda(
+            cudaEventDestroy(persistent_start0),
+            "cudaEventDestroy(persistent_start0)");
+        system::runtime::check_cuda(
+            cudaEventDestroy(persistent_stop0),
+            "cudaEventDestroy(persistent_stop0)");
+        persistent_start0 = nullptr;
+        persistent_stop0 = nullptr;
+
+        system::runtime::set_device(dev1);
+        system::runtime::check_cuda(
+            cudaEventDestroy(persistent_start1),
+            "cudaEventDestroy(persistent_start1)");
+        system::runtime::check_cuda(
+            cudaEventDestroy(persistent_stop1),
+            "cudaEventDestroy(persistent_stop1)");
+        persistent_start1 = nullptr;
+        persistent_stop1 = nullptr;
+
+        system::runtime::destroy_stream_on_device(dev0, watch_stream0);
+        system::runtime::destroy_stream_on_device(dev1, watch_stream1);
+        watch_stream0 = nullptr;
+        watch_stream1 = nullptr;
 
         system::runtime::set_device(dev0);
         system::runtime::check_cuda(cudaFree(rank0_src), "cudaFree(rank0_src)");

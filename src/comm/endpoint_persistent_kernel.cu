@@ -16,7 +16,7 @@ namespace ooverlap {
 namespace comm {
 namespace {
 
-static constexpr int kPersistentStageDepth = 1;
+static constexpr int kPersistentStageDepth = 3;
 static constexpr size_t kEndpointPersistentStaticSharedBytes =
     sizeof(sync::semaphore) * kPersistentStageDepth;
 
