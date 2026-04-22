@@ -217,7 +217,7 @@ __device__ __forceinline__ bool chunk_scheduler_candidate_is_valid(
     return actor == op->rank;
 }
 
-__device__ __forceinline__ void chunk_scheduler_refill_ready_cache_parallel(
+__device__ __forceinline__ void chunk_scheduler_refill_ready_cache(
     ChunkScheduler* sched) {
     if (sched == nullptr || sched->operation == nullptr) {
         return;
@@ -242,6 +242,7 @@ __device__ __forceinline__ void chunk_scheduler_refill_ready_cache_parallel(
         collective::operation_desc_chunk_states(op);
 
     const uint32_t start = sched->next_search_idx;
+    uint32_t advanced = 0;
 
     for (uint32_t base_scan = 0;
          base_scan < op->num_chunks;
@@ -289,72 +290,21 @@ __device__ __forceinline__ void chunk_scheduler_refill_ready_cache_parallel(
                 }
                 chunk_scheduler_ready_push(sched, cand.chunk_idx, cand.step);
             }
-
-            const uint32_t advanced = base_scan + kChunkSchedulerSearchWarp;
-            sched->next_search_idx =
-                (start + (advanced % op->num_chunks)) % op->num_chunks;
         }
 
         __syncwarp();
-    }
-}
 
-__device__ __forceinline__ void chunk_scheduler_refill_ready_cache(
-    ChunkScheduler* sched) {
-    if (sched == nullptr || sched->operation == nullptr) {
-        return;
-    }
-    if (!chunk_scheduler_ready_empty(sched)) {
-        return;
+        advanced = base_scan + kChunkSchedulerSearchWarp;
     }
 
-    const collective::OperationDesc* op = sched->operation;
-    const uint32_t total_steps =
-        collective::operation_desc_total_ring_steps(op);
-
-    volatile uint32_t* inbound_steps =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_local_inbound_steps(op));
-    collective::ChunkState* chunk_states =
-        collective::operation_desc_chunk_states(op);
-
-    uint32_t idx = sched->next_search_idx;
-
-    for (uint32_t scanned = 0;
-         scanned < op->num_chunks && !chunk_scheduler_ready_full(sched);
-         ++scanned) {
-
-        const uint32_t cur = idx;
-
-        idx++;
-        if (idx == op->num_chunks) {
-            idx = 0;
+    if (threadIdx.x == 0) {
+        if (op->num_chunks > 0) {
+            sched->next_search_idx =
+                (start + (advanced % op->num_chunks)) % op->num_chunks;
+        } else {
+            sched->next_search_idx = 0;
         }
-
-        if (collective::chunk_state_is_in_flight(&chunk_states[cur])) {
-            continue;
-        }
-
-        const uint32_t step =
-            chunk_scheduler_atomic_load_u32(&inbound_steps[cur]);
-
-        if (step == collective::kOperationInboundStepInvalid) {
-            continue;
-        }
-        if (step >= total_steps) {
-            continue;
-        }
-
-        const int actor =
-            collective::operation_desc_actor_rank_for_step(op, cur, step);
-        if (actor != op->rank) {
-            continue;
-        }
-
-        chunk_scheduler_ready_push(sched, cur, step);
     }
-
-    sched->next_search_idx = idx;
 }
 
 __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
@@ -370,10 +320,6 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
     ReadyCandidate cand{};
 
     while (true) {
-        if (chunk_scheduler_ready_empty(sched)) {
-            chunk_scheduler_refill_ready_cache(sched);
-        }
-
         if (!chunk_scheduler_ready_pop(sched, &cand)) {
             return false;
         }

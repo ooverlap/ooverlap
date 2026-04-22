@@ -131,7 +131,7 @@ __global__ void endpoint_persistent_kernel_sm90(
             return;
         }
 
-        exec::chunk_scheduler_refill_ready_cache_parallel(&shared_pipe.scheduler);
+        exec::chunk_scheduler_refill_ready_cache(&shared_pipe.scheduler);
         __syncthreads();
 
         if (threadIdx.x == 0) {
