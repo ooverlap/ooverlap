@@ -251,15 +251,27 @@ __device__ __forceinline__ bool chunk_scheduler_try_prime_current(
     return chunk_scheduler_try_activate_next_chunk(sched);
 }
 
-__device__ __forceinline__ void chunk_scheduler_retire_current(
+__device__ __forceinline__ void chunk_scheduler_handoff_current(
     ChunkScheduler* sched) {
-    if (sched == nullptr || sched->operation == nullptr || !sched->has_active_chunk) {
+    if (sched == nullptr) {
+        return;
+    }
+
+    sched->has_active_chunk = false;
+    sched->active_chunk_idx = -1;
+    sched->active_step = 0;
+    chunk_clear(&sched->current);
+}
+
+__device__ __forceinline__ void chunk_scheduler_retire_stage(
+    ChunkScheduler* sched,
+    uint32_t chunk_idx,
+    uint32_t current_step) {
+    if (sched == nullptr || sched->operation == nullptr) {
         return;
     }
 
     const collective::OperationDesc* op = sched->operation;
-    const uint32_t chunk_idx = static_cast<uint32_t>(sched->active_chunk_idx);
-    const uint32_t current_step = sched->active_step;
     const uint32_t total_steps =
         collective::operation_desc_total_ring_steps(op);
     const uint32_t reduce_steps =
@@ -323,11 +335,21 @@ __device__ __forceinline__ void chunk_scheduler_retire_current(
         chunk_scheduler_atomic_load_u32(&next_done[chunk_idx]));
 #endif
 
-    sched->has_active_chunk = false;
-    sched->active_chunk_idx = -1;
-    sched->active_step = 0;
     sched->ready_count = 0;
-    chunk_clear(&sched->current);
+}
+
+__device__ __forceinline__ void chunk_scheduler_retire_current(
+    ChunkScheduler* sched) {
+    if (sched == nullptr || sched->operation == nullptr || !sched->has_active_chunk) {
+        return;
+    }
+
+    chunk_scheduler_retire_stage(
+        sched,
+        static_cast<uint32_t>(sched->active_chunk_idx),
+        sched->active_step);
+
+    chunk_scheduler_handoff_current(sched);
 }
 
 __device__ __forceinline__ void chunk_scheduler_advance(

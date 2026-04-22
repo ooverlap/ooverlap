@@ -14,6 +14,7 @@ struct PipelineStage {
     unsigned char* smem = nullptr;
     sync::semaphore* load_barrier = nullptr;
     Chunk chunk{};
+    uint32_t step = 0;
 };
 
 __host__ __device__ __forceinline__ size_t pipeline_stage_bulk_bytes(
@@ -35,6 +36,7 @@ __host__ __device__ __forceinline__ unsigned char* pipeline_stage_smem_ptr(
 __device__ __forceinline__ void pipeline_stage_reset(
     PipelineStage* stage) {
     chunk_clear(&stage->chunk);
+    stage->step = 0;
 }
 
 template <size_t StageBytes>
@@ -50,8 +52,10 @@ __device__ __forceinline__ void pipeline_stage_bind(
 
 __host__ __device__ __forceinline__ void pipeline_stage_set_chunk(
     PipelineStage* stage,
-    const Chunk* chunk) {
+    const Chunk* chunk,
+    uint32_t step) {
     stage->chunk = *chunk;
+    stage->step = step;
 }
 
 } // namespace exec

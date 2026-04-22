@@ -15,8 +15,9 @@ struct ChunkPipeline {
     LoadOp load_op{};
     ApplyOp apply_op{};
 
-    int local_iter = 0;
-    bool current_issued = false;
+    uint32_t retire_iter = 0;
+    uint32_t issue_iter = 0;
+    uint32_t issued_count = 0;
 };
 
 template <int StageDepth, size_t StageBytes, typename Scheduler, typename LoadOp, typename ApplyOp>
@@ -38,48 +39,58 @@ __device__ __forceinline__ void chunk_pipeline_init(
     ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe,
     const Scheduler* scheduler) {
     pipe->scheduler = *scheduler;
-    pipe->local_iter = 0;
-    pipe->current_issued = false;
+    pipe->retire_iter = 0;
+    pipe->issue_iter = 0;
+    pipe->issued_count = 0;
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
 __device__ __forceinline__ PipelineStage* chunk_pipeline_current_stage(
     ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe) {
-    return &pipe->stages[pipe->local_iter % StageDepth];
+    return &pipe->stages[pipe->retire_iter % StageDepth];
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
 __device__ __forceinline__ const PipelineStage* chunk_pipeline_current_stage(
     const ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe) {
-    return &pipe->stages[pipe->local_iter % StageDepth];
+    return &pipe->stages[pipe->retire_iter % StageDepth];
+}
+
+template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
+__device__ __forceinline__ PipelineStage* chunk_pipeline_next_issue_stage(
+    ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe) {
+    return &pipe->stages[pipe->issue_iter % StageDepth];
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
 __device__ __forceinline__ bool chunk_pipeline_try_prime(
     ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe) {
-    if (!chunk_scheduler_try_prime_current(&pipe->scheduler)) {
-        return false;
+    while (pipe->issued_count < static_cast<uint32_t>(StageDepth)) {
+        if (!chunk_scheduler_try_prime_current(&pipe->scheduler)) {
+            break;
+        }
+
+        PipelineStage* next = chunk_pipeline_next_issue_stage(pipe);
+        pipeline_stage_set_chunk(
+            next,
+            chunk_scheduler_current(&pipe->scheduler),
+            chunk_scheduler_active_step(&pipe->scheduler));
+
+        pipe->load_op.issue(next);
+        chunk_scheduler_handoff_current(&pipe->scheduler);
+
+        ++pipe->issue_iter;
+        ++pipe->issued_count;
     }
 
-    if (pipe->current_issued) {
-        return true;
-    }
-
-    PipelineStage* current = chunk_pipeline_current_stage(pipe);
-    pipeline_stage_set_chunk(current, chunk_scheduler_current(&pipe->scheduler));
-
-    if (threadIdx.x == 0) {
-        pipe->load_op.issue(current);
-    }
-
-    pipe->current_issued = true;
-    return true;
+    return pipe->issued_count > 0;
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
 __device__ __forceinline__ bool chunk_pipeline_has_current(
     const ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe) {
-    return chunk_scheduler_has_current(&pipe->scheduler);
+    return pipe->issued_count > 0 &&
+           chunk_is_valid(&chunk_pipeline_current_stage(pipe)->chunk);
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
@@ -115,15 +126,22 @@ __device__ __forceinline__ void chunk_pipeline_wait_current_complete(
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
 __device__ __forceinline__ void chunk_pipeline_schedule_next_load(
     ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe) {
-    (void)pipe;
+    chunk_pipeline_try_prime(pipe);
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
 __device__ __forceinline__ void chunk_pipeline_retire_current(
     ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe) {
-    chunk_scheduler_retire_current(&pipe->scheduler);
-    ++pipe->local_iter;
-    pipe->current_issued = false;
+    PipelineStage* current = chunk_pipeline_current_stage(pipe);
+
+    chunk_scheduler_retire_stage(
+        &pipe->scheduler,
+        static_cast<uint32_t>(current->chunk.chunk_idx),
+        current->step);
+
+    pipeline_stage_reset(current);
+    ++pipe->retire_iter;
+    --pipe->issued_count;
 }
 
 } // namespace exec
