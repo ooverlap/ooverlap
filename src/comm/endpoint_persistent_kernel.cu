@@ -35,6 +35,21 @@ __device__ __forceinline__ bool endpoint_persistent_runtime_is_minimally_valid(
            runtime->stream != nullptr;
 }
 
+__device__ __forceinline__ uint32_t endpoint_persistent_atomic_load_u32(
+    volatile uint32_t* ptr) {
+    return atomicAdd(
+        reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(ptr)),
+        0u);
+}
+
+__device__ __forceinline__ void endpoint_persistent_atomic_store_u32(
+    volatile uint32_t* ptr,
+    uint32_t value) {
+    atomicExch(
+        reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(ptr)),
+        value);
+}
+
 __device__ __forceinline__ void endpoint_persistent_init_chunk_state(
     collective::ChunkState* st,
     const collective::OperationDesc* op,
@@ -115,25 +130,24 @@ __device__ __forceinline__ void endpoint_persistent_publish_to_next(
     if (current_step < reduce_steps) {
         // The step that lands on the owner makes the owner's local chunk final.
         if (next_step == reduce_steps) {
-            next_done[chunk_idx] = 1u;
+            endpoint_persistent_atomic_store_u32(&next_done[chunk_idx], 1u);
         }
 
         if (next_step < total_steps) {
-            next_inbound[chunk_idx] = next_step;
+            endpoint_persistent_atomic_store_u32(&next_inbound[chunk_idx], next_step);
         }
     } else {
         // All-gather/copy phase: the next rank now has a final copy too.
-        next_done[chunk_idx] = 1u;
+        endpoint_persistent_atomic_store_u32(&next_done[chunk_idx], 1u);
 
         if (next_step < total_steps) {
-            next_inbound[chunk_idx] = next_step;
+            endpoint_persistent_atomic_store_u32(&next_inbound[chunk_idx], next_step);
         }
     }
 
-    // Final actor already had its local done bit set from the previous hop.
-    // World-size 1 is handled at init time.
+    // Final actor marks itself done as well.
     if (next_step >= total_steps) {
-        local_done[chunk_idx] = 1u;
+        endpoint_persistent_atomic_store_u32(&local_done[chunk_idx], 1u);
     }
 
     __threadfence_system();
@@ -185,7 +199,7 @@ __global__ void endpoint_persistent_kernel_sm90(
             idx);
 
         if (total_steps == 0) {
-            done[idx] = 1u;
+            endpoint_persistent_atomic_store_u32(&done[idx], 1u);
         }
     }
     __syncthreads();
@@ -211,7 +225,9 @@ __global__ void endpoint_persistent_kernel_sm90(
                     continue;
                 }
 
-                const uint32_t step = inbound_steps[idx];
+                const uint32_t step =
+                    endpoint_persistent_atomic_load_u32(&inbound_steps[idx]);
+
                 if (step == collective::kOperationInboundStepInvalid) {
                     continue;
                 }
@@ -292,8 +308,10 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
 
         if (threadIdx.x == 0) {
-            // Consume the local inbound token now that this step is retired.
-            inbound_steps[shared_chunk_idx] = collective::kOperationInboundStepInvalid;
+            // Consume local inbound token only after this step is fully retired.
+            endpoint_persistent_atomic_store_u32(
+                &inbound_steps[shared_chunk_idx],
+                collective::kOperationInboundStepInvalid);
             __threadfence_system();
 
             endpoint_persistent_publish_to_next(
@@ -305,7 +323,7 @@ __global__ void endpoint_persistent_kernel_sm90(
             chunk_states[shared_chunk_idx].last_step_completed = shared_chunk_step + 1u;
             chunk_states[shared_chunk_idx].flags &= ~collective::kChunkStateFlagInFlight;
 
-            if (done[shared_chunk_idx] == 1u) {
+            if (endpoint_persistent_atomic_load_u32(&done[shared_chunk_idx]) == 1u) {
                 chunk_states[shared_chunk_idx].flags |= collective::kChunkStateFlagDone;
             }
         }
