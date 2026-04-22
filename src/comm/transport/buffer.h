@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace ooverlap {
@@ -11,10 +12,27 @@ namespace comm {
 namespace transport {
 
 struct CommBuffer {
+    // Legacy/default pointer. For peer-visible buffers this is the owner's
+    // device view. Prefer device_ptr_for_rank() at callsites.
     void* ptr = nullptr;
+
+    // Device-visible pointer view per rank/device in the group.
+    // For local buffers only owner_rank is populated.
+    std::vector<void*> device_ptrs{};
+
     size_t bytes = 0;
     int owner_rank = -1;
     bool peer_visible = false;
+
+    inline void* device_ptr_for_rank(size_t rank) const {
+        if (rank >= device_ptrs.size()) {
+            throw std::out_of_range("CommBuffer::device_ptr_for_rank: rank out of range");
+        }
+        if (device_ptrs[rank] == nullptr) {
+            throw std::invalid_argument("CommBuffer::device_ptr_for_rank: pointer is null for this rank");
+        }
+        return device_ptrs[rank];
+    }
 };
 
 CommBuffer alloc_peer_visible_buffer_for_rank(

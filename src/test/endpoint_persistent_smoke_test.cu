@@ -245,6 +245,61 @@ std::string build_progress_debug_string(
     return out;
 }
 
+static void dump_rank_accum_samples(
+    const std::vector<int>& devices,
+    const std::vector<comm::transport::CommBuffer>& accums,
+    int64_t numel,
+    int sample_count = 8) {
+    const int64_t n = std::min<int64_t>(numel, sample_count);
+
+    for (size_t r = 0; r < accums.size(); ++r) {
+        std::vector<half> host(static_cast<size_t>(n));
+
+        system::runtime::set_device(devices[r]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+    host.data(),
+    accums[r].device_ptr_for_rank(r),
+                static_cast<size_t>(n) * sizeof(half),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(accum sample -> host)");
+
+        std::printf("[debug] rank=%zu accum[0:%lld] =", r, static_cast<long long>(n));
+        for (int64_t i = 0; i < n; ++i) {
+            std::printf(" %.6f", __half2float(host[static_cast<size_t>(i)]));
+        }
+        std::printf("\n");
+    }
+    std::fflush(stdout);
+}
+
+static void dump_rank_chunk0_state(
+    const std::vector<int>& devices,
+    const std::vector<comm::collective::ChunkStateTable>& chunk_states) {
+    for (size_t r = 0; r < chunk_states.size(); ++r) {
+        comm::collective::ChunkState host_state{};
+
+        system::runtime::set_device(devices[r]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                &host_state,
+                chunk_states[r].records,
+                sizeof(comm::collective::ChunkState),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(chunk state -> host)");
+
+        std::printf(
+            "[debug] rank=%zu chunk0_state flags=%u last_started=%u last_completed=%u bytes=%zu offset=%zu\n",
+            r,
+            host_state.flags,
+            host_state.last_step_started,
+            host_state.last_step_completed,
+            host_state.bytes,
+            host_state.offset_bytes);
+    }
+    std::fflush(stdout);
+}
+
 } // namespace
 
 bool endpoint_persistent_smoke_test(
@@ -314,9 +369,9 @@ bool endpoint_persistent_smoke_test(
         for (int r = 0; r < world_size; ++r) {
             system::runtime::set_device(group.devices[static_cast<size_t>(r)]);
             system::runtime::check_cuda(
-                cudaMemcpy(
-                    accums[static_cast<size_t>(r)].ptr,
-                    host_srcs[static_cast<size_t>(r)].data(),
+                    cudaMemcpy(
+    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+    host_srcs[static_cast<size_t>(r)].data(),
                     bytes,
                     cudaMemcpyHostToDevice),
                 "cudaMemcpy(host_src -> accum)");
@@ -333,19 +388,19 @@ bool endpoint_persistent_smoke_test(
             const int next_rank = (r + 1) % world_size;
 
             comm::endpoint_runtime_build_ring_allreduce_operation(
-                &runtimes[static_cast<size_t>(r)],
-                &ops[static_cast<size_t>(r)],
-                accums[static_cast<size_t>(r)].ptr,
-                accums[static_cast<size_t>(next_rank)].ptr,
-                bytes,
-                chunk_bytes,
-                inbound_steps[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-                inbound_steps[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
-                done_flags[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-                done_flags[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
-                chunk_states[static_cast<size_t>(r)].records,
-                1);
-        }
+              &runtimes[static_cast<size_t>(r)],
+              &ops[static_cast<size_t>(r)],
+              accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+              accums[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
+              bytes,
+              chunk_bytes,
+              inbound_steps[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+              inbound_steps[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
+              done_flags[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+              done_flags[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
+              chunk_states[static_cast<size_t>(r)].records,
+              1);
+            }
 
         for (int r = 0; r < world_size; ++r) {
             inbound_steps[static_cast<size_t>(r)].reset(
@@ -387,10 +442,10 @@ bool endpoint_persistent_smoke_test(
         for (int r = 0; r < world_size; ++r) {
             const int next_rank = (r + 1) % world_size;
             comm::endpoint_runtime_configure_submission(
-                &runtimes[static_cast<size_t>(r)],
-                accums[static_cast<size_t>(r)].ptr,
-                accums[static_cast<size_t>(r)].ptr,
-                bytes,
+    &runtimes[static_cast<size_t>(r)],
+    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+    bytes,
                 comm::exec::ChunkOpKind::kReduceAddNoFtzF16,
                 1,
                 next_rank,
@@ -404,6 +459,13 @@ bool endpoint_persistent_smoke_test(
                 &controls[static_cast<size_t>(r)],
                 group.devices[static_cast<size_t>(r)]);
             control_initialized[static_cast<size_t>(r)] = true;
+        }
+
+        for (int r = 0; r < world_size; ++r) {
+            system::runtime::set_device(group.devices[static_cast<size_t>(r)]);
+            system::runtime::check_cuda(
+                cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 8 * 1024 * 1024),
+                "cudaDeviceSetLimit(cudaLimitPrintfFifoSize)");
         }
 
         std::printf("[smoke] before persistent launch\n"); std::fflush(stdout);
@@ -423,12 +485,15 @@ bool endpoint_persistent_smoke_test(
         const bool all_done = wait_until_all_ranks_done(done_flags, timeout_ms);
 
         if (!all_done) {
+            dump_rank_chunk0_state(devices, chunk_states);
+            dump_rank_accum_samples(devices, accums, numel);
+        
             throw std::runtime_error(
                 std::string("endpoint_persistent_smoke_test: timeout waiting for done flags; ") +
                 build_progress_debug_string(
                     inbound_steps,
                     done_flags));
-        }
+        } 
 
         std::printf("[smoke] all chunks done\n"); std::fflush(stdout);
 
@@ -459,16 +524,22 @@ bool endpoint_persistent_smoke_test(
             system::runtime::set_device(group.devices[static_cast<size_t>(r)]);
             system::runtime::check_cuda(
                 cudaMemcpy(
-                    host_out.data(),
-                    accums[static_cast<size_t>(r)].ptr,
+    host_out.data(),
+    accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
                     bytes,
                     cudaMemcpyDeviceToHost),
                 "cudaMemcpy(accum -> host)");
 
-            expect_half_vectors_close(
-                host_out,
-                host_ref,
-                "endpoint_persistent_smoke_test");
+            try {
+                expect_half_vectors_close(
+                    host_out,
+                    host_ref,
+                    "endpoint_persistent_smoke_test");
+            } catch (...) {
+                dump_rank_chunk0_state(devices, chunk_states);
+                dump_rank_accum_samples(devices, accums, numel);
+                throw;
+            }
         }
 
         for (auto& op_dev : op_devs) {

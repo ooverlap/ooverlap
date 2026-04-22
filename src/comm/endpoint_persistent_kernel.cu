@@ -6,6 +6,7 @@
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/tma/tma_reduce.cuh"
 
+#include <cmath>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -15,6 +16,11 @@
 namespace ooverlap {
 namespace comm {
 namespace {
+
+__device__ __forceinline__ float endpoint_debug_half0(
+    const unsigned char* ptr) {
+    return __half2float(*reinterpret_cast<const half*>(ptr));
+}
 
 static constexpr size_t kEndpointPersistentStaticSharedBytes =
     sizeof(sync::semaphore) +
@@ -250,6 +256,24 @@ __global__ void endpoint_persistent_kernel_sm90(
                     idx,
                     step);
 
+                if (idx == 0) {
+                    const float local0 =
+                        endpoint_debug_half0(
+                            collective::operation_desc_accum_chunk_ptr(operation, idx));
+                    const float next0 =
+                        endpoint_debug_half0(
+                            collective::operation_desc_next_accum_chunk_ptr(operation, idx));
+                
+                    printf(
+                        "[pk pick] rank=%d step=%u chunk=%u op=%u local0=%.6f next0_before=%.6f\n",
+                        operation->rank,
+                        step,
+                        idx,
+                        static_cast<unsigned>(shared_chunk.op),
+                        local0,
+                        next0);
+                }
+
                 shared_chunk_idx = idx;
                 shared_chunk_step = step;
                 shared_has_work = 1;
@@ -314,11 +338,49 @@ __global__ void endpoint_persistent_kernel_sm90(
                 collective::kOperationInboundStepInvalid);
             __threadfence_system();
 
+            if (shared_chunk_idx == 0) {
+                const float local0_after =
+                    endpoint_debug_half0(
+                        collective::operation_desc_accum_chunk_ptr(operation, shared_chunk_idx));
+                const float next0_after =
+                    endpoint_debug_half0(
+                        collective::operation_desc_next_accum_chunk_ptr(operation, shared_chunk_idx));
+            
+                printf(
+                    "[pk done] rank=%d step=%u chunk=%u local0_after=%.6f next0_after=%.6f\n",
+                    operation->rank,
+                    shared_chunk_step,
+                    shared_chunk_idx,
+                    local0_after,
+                    next0_after);
+            }
+
             endpoint_persistent_publish_to_next(
                 operation,
                 shared_chunk_idx,
                 shared_chunk_step,
                 total_steps);
+
+            if (shared_chunk_idx == 0) {
+                volatile uint32_t* next_inbound =
+                    reinterpret_cast<volatile uint32_t*>(
+                        collective::operation_desc_next_inbound_steps(operation));
+                volatile uint32_t* next_done =
+                    reinterpret_cast<volatile uint32_t*>(
+                        collective::operation_desc_next_done(operation));
+                volatile uint32_t* local_done =
+                    reinterpret_cast<volatile uint32_t*>(
+                        collective::operation_desc_local_done(operation));
+            
+                printf(
+                    "[pk pub ] rank=%d step=%u chunk=%u wrote next_inbound=%u next_done=%u local_done=%u\n",
+                    operation->rank,
+                    shared_chunk_step,
+                    shared_chunk_idx,
+                    next_inbound[shared_chunk_idx],
+                    next_done[shared_chunk_idx],
+                    local_done[shared_chunk_idx]);
+            }
 
             chunk_states[shared_chunk_idx].last_step_completed = shared_chunk_step + 1u;
             chunk_states[shared_chunk_idx].flags &= ~collective::kChunkStateFlagInFlight;
