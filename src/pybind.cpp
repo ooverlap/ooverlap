@@ -15,7 +15,7 @@
 //#include "test/tma_basic_collective_sm90.h"
 #include "test/tma_vmm_smoke_test.h"
 //#include "test/tma_benchmark_sm90.h"
-//#include "test/persistent_allreduce_2gpu_sm90.h"
+#include "test/persistent_allreduce_2gpu_sm90.h"
 #include "test/endpoint_persistent_smoke_test.h"
 
 namespace py = pybind11;
@@ -257,7 +257,7 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("warmup"),
         py::arg("dev0") = 0,
         py::arg("dev1") = 1,
-        "Benchmark persistent 2-GPU all-reduce vs basic TMA vs NCCL");
+        "Benchmark current endpoint-runtime persistent kernel vs NCCL and cudaMemcpy+add baseline");
 
   /*m.def("endpoint_persistent_smoke_test",*/
         /*&ooverlap::endpoint_persistent_smoke_test,*/
