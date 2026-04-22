@@ -90,6 +90,55 @@ __device__ __forceinline__ void endpoint_persistent_copy_smem_to_gmem(
     }
 }
 
+__device__ __forceinline__ void endpoint_persistent_publish_to_next(
+    const collective::OperationDesc* op,
+    uint32_t chunk_idx,
+    uint32_t current_step,
+    uint32_t total_steps) {
+    volatile uint32_t* next_done =
+        reinterpret_cast<volatile uint32_t*>(
+            collective::operation_desc_next_done(op));
+    volatile uint32_t* next_inbound =
+        reinterpret_cast<volatile uint32_t*>(
+            collective::operation_desc_next_inbound_steps(op));
+    volatile uint32_t* local_done =
+        reinterpret_cast<volatile uint32_t*>(
+            collective::operation_desc_local_done(op));
+
+    const uint32_t next_step = current_step + 1;
+    const uint32_t reduce_steps =
+        static_cast<uint32_t>(op->world_size - 1);
+
+    // Make chunk data visible on the next rank before publishing tokens.
+    __threadfence_system();
+
+    if (current_step < reduce_steps) {
+        // The step that lands on the owner makes the owner's local chunk final.
+        if (next_step == reduce_steps) {
+            next_done[chunk_idx] = 1u;
+        }
+
+        if (next_step < total_steps) {
+            next_inbound[chunk_idx] = next_step;
+        }
+    } else {
+        // All-gather/copy phase: the next rank now has a final copy too.
+        next_done[chunk_idx] = 1u;
+
+        if (next_step < total_steps) {
+            next_inbound[chunk_idx] = next_step;
+        }
+    }
+
+    // Final actor already had its local done bit set from the previous hop.
+    // World-size 1 is handled at init time.
+    if (next_step >= total_steps) {
+        local_done[chunk_idx] = 1u;
+    }
+
+    __threadfence_system();
+}
+
 __global__ void endpoint_persistent_kernel_sm90(
     DeviceEndpointRuntime runtime,
     const collective::OperationDesc* operation,
@@ -117,10 +166,12 @@ __global__ void endpoint_persistent_kernel_sm90(
 
     collective::ChunkState* chunk_states =
         collective::operation_desc_chunk_states(operation);
-    uint32_t* chunk_steps =
-        collective::operation_desc_chunk_steps(operation);
-    uint32_t* chunk_done =
-        collective::operation_desc_chunk_done(operation);
+    volatile uint32_t* inbound_steps =
+        reinterpret_cast<volatile uint32_t*>(
+            collective::operation_desc_local_inbound_steps(operation));
+    volatile uint32_t* done =
+        reinterpret_cast<volatile uint32_t*>(
+            collective::operation_desc_local_done(operation));
 
     const uint32_t total_steps =
         collective::operation_desc_total_ring_steps(operation);
@@ -134,7 +185,7 @@ __global__ void endpoint_persistent_kernel_sm90(
             idx);
 
         if (total_steps == 0) {
-            chunk_done[idx] = 1u;
+            done[idx] = 1u;
         }
     }
     __syncthreads();
@@ -156,12 +207,15 @@ __global__ void endpoint_persistent_kernel_sm90(
             shared_has_work = 0;
 
             for (uint32_t idx = 0; idx < operation->num_chunks; ++idx) {
-                const uint32_t step =
-                    *((volatile const uint32_t*)&chunk_steps[idx]);
+                if (collective::chunk_state_is_in_flight(&chunk_states[idx])) {
+                    continue;
+                }
 
+                const uint32_t step = inbound_steps[idx];
+                if (step == collective::kOperationInboundStepInvalid) {
+                    continue;
+                }
                 if (step >= total_steps) {
-                    chunk_states[idx].flags |= collective::kChunkStateFlagDone;
-                    chunk_done[idx] = 1u;
                     continue;
                 }
 
@@ -238,18 +292,21 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
 
         if (threadIdx.x == 0) {
+            // Consume the local inbound token now that this step is retired.
+            inbound_steps[shared_chunk_idx] = collective::kOperationInboundStepInvalid;
             __threadfence_system();
 
-            const uint32_t next_step = shared_chunk_step + 1;
-            *((volatile uint32_t*)&chunk_steps[shared_chunk_idx]) = next_step;
-            __threadfence_system();
+            endpoint_persistent_publish_to_next(
+                operation,
+                shared_chunk_idx,
+                shared_chunk_step,
+                total_steps);
 
-            chunk_states[shared_chunk_idx].last_step_completed = next_step;
+            chunk_states[shared_chunk_idx].last_step_completed = shared_chunk_step + 1u;
             chunk_states[shared_chunk_idx].flags &= ~collective::kChunkStateFlagInFlight;
 
-            if (next_step >= total_steps) {
+            if (done[shared_chunk_idx] == 1u) {
                 chunk_states[shared_chunk_idx].flags |= collective::kChunkStateFlagDone;
-                chunk_done[shared_chunk_idx] = 1u;
             }
         }
         __syncthreads();
@@ -419,8 +476,6 @@ cudaError_t launch_endpoint_persistent_kernel_sm90(
         return cudaErrorInvalidValue;
     }
 
-    // IMPORTANT:
-    // `operation` is a device pointer. Host code must not dereference it here.
     if (operation == nullptr) {
         return cudaErrorInvalidValue;
     }

@@ -21,7 +21,20 @@ enum : uint32_t {
     kChunkStateFlagDone = 1u << 2,
 };
 
-// Minimal ring all-reduce operation descriptor.
+static constexpr uint32_t kOperationInboundStepInvalid = 0xffffffffu;
+
+// Minimal ring all-reduce operation descriptor using per-rank local progress.
+//
+// Each rank owns:
+// - accum_ptr                : local full buffer
+// - inbound_steps_ptr        : local inbound step mailbox (polled locally)
+// - done_ptr                 : local done flags (polled locally / by host)
+// - chunk_states_ptr         : local per-chunk bookkeeping
+//
+// Previous rank writes remotely into:
+// - next_accum_ptr
+// - next_inbound_steps_ptr
+// - next_done_ptr
 struct OperationDesc {
     uint32_t op_id = 0;
     uint32_t epoch = 0;
@@ -50,9 +63,21 @@ struct OperationDesc {
     uint64_t next_accum_ptr = 0;
     size_t next_accum_bytes = 0;
 
-    // Global/shared arrays, one uint32 per chunk.
-    uint64_t chunk_steps_ptr = 0;
-    uint64_t chunk_done_ptr = 0;
+    // Local inbound step mailbox: one uint32 per chunk.
+    uint64_t inbound_steps_ptr = 0;
+    size_t inbound_steps_bytes = 0;
+
+    // Mapped pointer to next rank's local inbound mailbox.
+    uint64_t next_inbound_steps_ptr = 0;
+    size_t next_inbound_steps_bytes = 0;
+
+    // Local done flags: one uint32 per chunk.
+    uint64_t done_ptr = 0;
+    size_t done_bytes = 0;
+
+    // Mapped pointer to next rank's local done flags.
+    uint64_t next_done_ptr = 0;
+    size_t next_done_bytes = 0;
 
     // Local per-rank bookkeeping, one ChunkState per chunk.
     uint64_t chunk_states_ptr = 0;
@@ -114,12 +139,22 @@ __host__ __device__ __forceinline__ void operation_desc_clear(
     op->op = exec::ChunkOpKind::kInvalid;
     op->reserved2 = 0;
     op->user_tag = 0;
+
     op->accum_ptr = 0;
     op->accum_bytes = 0;
     op->next_accum_ptr = 0;
     op->next_accum_bytes = 0;
-    op->chunk_steps_ptr = 0;
-    op->chunk_done_ptr = 0;
+
+    op->inbound_steps_ptr = 0;
+    op->inbound_steps_bytes = 0;
+    op->next_inbound_steps_ptr = 0;
+    op->next_inbound_steps_bytes = 0;
+
+    op->done_ptr = 0;
+    op->done_bytes = 0;
+    op->next_done_ptr = 0;
+    op->next_done_bytes = 0;
+
     op->chunk_states_ptr = 0;
 }
 
@@ -135,6 +170,10 @@ __host__ __device__ __forceinline__ bool operation_desc_is_valid(
         return false;
     }
 
+    const size_t num_chunks =
+        static_cast<size_t>(operation_desc_compute_num_chunks(op->total_bytes, op->chunk_bytes));
+    const size_t progress_bytes = num_chunks * sizeof(uint32_t);
+
     if (op->op_id == 0 ||
         op->rank < 0 ||
         op->world_size <= 0 ||
@@ -142,18 +181,25 @@ __host__ __device__ __forceinline__ bool operation_desc_is_valid(
         op->next_rank < 0 ||
         op->total_bytes == 0 ||
         op->chunk_bytes == 0 ||
-        op->num_chunks != operation_desc_compute_num_chunks(op->total_bytes, op->chunk_bytes) ||
+        op->num_chunks != num_chunks ||
         op->op == exec::ChunkOpKind::kInvalid ||
         op->accum_ptr == 0 ||
         op->accum_bytes < op->total_bytes ||
-        op->chunk_steps_ptr == 0 ||
-        op->chunk_done_ptr == 0 ||
+        op->inbound_steps_ptr == 0 ||
+        op->inbound_steps_bytes < progress_bytes ||
+        op->done_ptr == 0 ||
+        op->done_bytes < progress_bytes ||
         op->chunk_states_ptr == 0) {
         return false;
     }
 
     if (op->world_size > 1) {
-        if (op->next_accum_ptr == 0 || op->next_accum_bytes < op->total_bytes) {
+        if (op->next_accum_ptr == 0 ||
+            op->next_accum_bytes < op->total_bytes ||
+            op->next_inbound_steps_ptr == 0 ||
+            op->next_inbound_steps_bytes < progress_bytes ||
+            op->next_done_ptr == 0 ||
+            op->next_done_bytes < progress_bytes) {
             return false;
         }
     }
@@ -177,14 +223,24 @@ __host__ __device__ __forceinline__ unsigned char* operation_desc_next_accum_bas
     return reinterpret_cast<unsigned char*>(op->next_accum_ptr);
 }
 
-__host__ __device__ __forceinline__ uint32_t* operation_desc_chunk_steps(
+__host__ __device__ __forceinline__ uint32_t* operation_desc_local_inbound_steps(
     const OperationDesc* op) {
-    return reinterpret_cast<uint32_t*>(op->chunk_steps_ptr);
+    return reinterpret_cast<uint32_t*>(op->inbound_steps_ptr);
 }
 
-__host__ __device__ __forceinline__ uint32_t* operation_desc_chunk_done(
+__host__ __device__ __forceinline__ uint32_t* operation_desc_next_inbound_steps(
     const OperationDesc* op) {
-    return reinterpret_cast<uint32_t*>(op->chunk_done_ptr);
+    return reinterpret_cast<uint32_t*>(op->next_inbound_steps_ptr);
+}
+
+__host__ __device__ __forceinline__ uint32_t* operation_desc_local_done(
+    const OperationDesc* op) {
+    return reinterpret_cast<uint32_t*>(op->done_ptr);
+}
+
+__host__ __device__ __forceinline__ uint32_t* operation_desc_next_done(
+    const OperationDesc* op) {
+    return reinterpret_cast<uint32_t*>(op->next_done_ptr);
 }
 
 __host__ __device__ __forceinline__ ChunkState* operation_desc_chunk_states(
@@ -323,19 +379,17 @@ bool operation_desc_build_ring_allreduce(
     exec::ChunkOpKind op,
     void* accum_ptr,
     void* next_accum_ptr,
-    void* chunk_steps_ptr,
-    void* chunk_done_ptr,
+    void* inbound_steps_ptr,
+    void* next_inbound_steps_ptr,
+    void* done_ptr,
+    void* next_done_ptr,
     ChunkState* chunk_states_ptr,
     uint32_t op_id,
     uint32_t epoch = 1,
     bool enabled = true,
     uint64_t user_tag = 0);
 
-bool operation_desc_reset_local_chunk_state(
-    int device,
-    const OperationDesc* desc);
-
-bool operation_desc_reset_shared_progress(
+bool operation_desc_reset_local_state(
     int device,
     const OperationDesc* desc);
 

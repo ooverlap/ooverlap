@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 namespace ooverlap {
 namespace comm {
@@ -21,8 +22,10 @@ bool operation_desc_build_ring_allreduce(
     exec::ChunkOpKind op,
     void* accum_ptr,
     void* next_accum_ptr,
-    void* chunk_steps_ptr,
-    void* chunk_done_ptr,
+    void* inbound_steps_ptr,
+    void* next_inbound_steps_ptr,
+    void* done_ptr,
+    void* next_done_ptr,
     ChunkState* chunk_states_ptr,
     uint32_t op_id,
     uint32_t epoch,
@@ -52,11 +55,17 @@ bool operation_desc_build_ring_allreduce(
     if (world_size > 1 && next_accum_ptr == nullptr) {
         throw std::invalid_argument("operation_desc_build_ring_allreduce: next_accum_ptr is null");
     }
-    if (chunk_steps_ptr == nullptr) {
-        throw std::invalid_argument("operation_desc_build_ring_allreduce: chunk_steps_ptr is null");
+    if (inbound_steps_ptr == nullptr) {
+        throw std::invalid_argument("operation_desc_build_ring_allreduce: inbound_steps_ptr is null");
     }
-    if (chunk_done_ptr == nullptr) {
-        throw std::invalid_argument("operation_desc_build_ring_allreduce: chunk_done_ptr is null");
+    if (world_size > 1 && next_inbound_steps_ptr == nullptr) {
+        throw std::invalid_argument("operation_desc_build_ring_allreduce: next_inbound_steps_ptr is null");
+    }
+    if (done_ptr == nullptr) {
+        throw std::invalid_argument("operation_desc_build_ring_allreduce: done_ptr is null");
+    }
+    if (world_size > 1 && next_done_ptr == nullptr) {
+        throw std::invalid_argument("operation_desc_build_ring_allreduce: next_done_ptr is null");
     }
     if (chunk_states_ptr == nullptr) {
         throw std::invalid_argument("operation_desc_build_ring_allreduce: chunk_states_ptr is null");
@@ -66,6 +75,11 @@ bool operation_desc_build_ring_allreduce(
     }
 
     operation_desc_clear(out);
+
+    const uint32_t num_chunks =
+        operation_desc_compute_num_chunks(total_bytes, chunk_bytes);
+    const size_t progress_bytes =
+        static_cast<size_t>(num_chunks) * sizeof(uint32_t);
 
     out->op_id = op_id;
     out->epoch = epoch;
@@ -78,7 +92,7 @@ bool operation_desc_build_ring_allreduce(
 
     out->total_bytes = total_bytes;
     out->chunk_bytes = chunk_bytes;
-    out->num_chunks = operation_desc_compute_num_chunks(total_bytes, chunk_bytes);
+    out->num_chunks = num_chunks;
 
     out->op = op;
     out->user_tag = user_tag;
@@ -89,57 +103,71 @@ bool operation_desc_build_ring_allreduce(
     out->next_accum_ptr = reinterpret_cast<uint64_t>(next_accum_ptr);
     out->next_accum_bytes = total_bytes;
 
-    out->chunk_steps_ptr = reinterpret_cast<uint64_t>(chunk_steps_ptr);
-    out->chunk_done_ptr = reinterpret_cast<uint64_t>(chunk_done_ptr);
+    out->inbound_steps_ptr = reinterpret_cast<uint64_t>(inbound_steps_ptr);
+    out->inbound_steps_bytes = progress_bytes;
+
+    out->next_inbound_steps_ptr = reinterpret_cast<uint64_t>(next_inbound_steps_ptr);
+    out->next_inbound_steps_bytes = progress_bytes;
+
+    out->done_ptr = reinterpret_cast<uint64_t>(done_ptr);
+    out->done_bytes = progress_bytes;
+
+    out->next_done_ptr = reinterpret_cast<uint64_t>(next_done_ptr);
+    out->next_done_bytes = progress_bytes;
+
     out->chunk_states_ptr = reinterpret_cast<uint64_t>(chunk_states_ptr);
 
     return operation_desc_is_valid(out);
 }
 
-bool operation_desc_reset_local_chunk_state(
+bool operation_desc_reset_local_state(
     int device,
     const OperationDesc* desc) {
     if (device < 0) {
-        throw std::invalid_argument("operation_desc_reset_local_chunk_state: invalid device");
+        throw std::invalid_argument("operation_desc_reset_local_state: invalid device");
     }
     if (!operation_desc_is_valid(desc)) {
-        throw std::invalid_argument("operation_desc_reset_local_chunk_state: invalid desc");
+        throw std::invalid_argument("operation_desc_reset_local_state: invalid desc");
+    }
+
+    const uint32_t total_steps = operation_desc_total_ring_steps(desc);
+
+    std::vector<uint32_t> inbound(desc->num_chunks, kOperationInboundStepInvalid);
+    std::vector<uint32_t> done(desc->num_chunks, 0u);
+
+    if (total_steps == 0) {
+        std::fill(done.begin(), done.end(), 1u);
+    } else {
+        for (uint32_t idx = 0; idx < desc->num_chunks; ++idx) {
+            if (operation_desc_actor_rank_for_step(desc, idx, 0u) == desc->rank) {
+                inbound[static_cast<size_t>(idx)] = 0u;
+            }
+        }
     }
 
     system::runtime::set_device(device);
+    system::runtime::check_cuda(
+        cudaMemcpy(
+            reinterpret_cast<void*>(desc->inbound_steps_ptr),
+            inbound.data(),
+            static_cast<size_t>(desc->num_chunks) * sizeof(uint32_t),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy(operation inbound_steps init)");
+
+    system::runtime::check_cuda(
+        cudaMemcpy(
+            reinterpret_cast<void*>(desc->done_ptr),
+            done.data(),
+            static_cast<size_t>(desc->num_chunks) * sizeof(uint32_t),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy(operation done init)");
+
     system::runtime::check_cuda(
         cudaMemset(
             reinterpret_cast<void*>(desc->chunk_states_ptr),
             0,
             static_cast<size_t>(desc->num_chunks) * sizeof(ChunkState)),
-        "cudaMemset(operation local chunk state)");
-
-    return true;
-}
-
-bool operation_desc_reset_shared_progress(
-    int device,
-    const OperationDesc* desc) {
-    if (device < 0) {
-        throw std::invalid_argument("operation_desc_reset_shared_progress: invalid device");
-    }
-    if (!operation_desc_is_valid(desc)) {
-        throw std::invalid_argument("operation_desc_reset_shared_progress: invalid desc");
-    }
-
-    system::runtime::set_device(device);
-    system::runtime::check_cuda(
-        cudaMemset(
-            reinterpret_cast<void*>(desc->chunk_steps_ptr),
-            0,
-            static_cast<size_t>(desc->num_chunks) * sizeof(uint32_t)),
-        "cudaMemset(operation chunk steps)");
-    system::runtime::check_cuda(
-        cudaMemset(
-            reinterpret_cast<void*>(desc->chunk_done_ptr),
-            0,
-            static_cast<size_t>(desc->num_chunks) * sizeof(uint32_t)),
-        "cudaMemset(operation chunk done)");
+        "cudaMemset(operation chunk_states init)");
 
     return true;
 }
