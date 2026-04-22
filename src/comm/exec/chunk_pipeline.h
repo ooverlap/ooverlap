@@ -64,9 +64,19 @@ __device__ __forceinline__ PipelineStage* chunk_pipeline_next_issue_stage(
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>
 __device__ __forceinline__ bool chunk_pipeline_try_prime(
-    ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe) {
-    while (pipe->issued_count < static_cast<uint32_t>(StageDepth)) {
-        if (!chunk_scheduler_try_prime_current(&pipe->scheduler)) {
+    ChunkPipeline<StageDepth, Scheduler, LoadOp, ApplyOp>* pipe,
+    uint32_t max_issued = static_cast<uint32_t>(StageDepth)) {
+    if (max_issued == 0u) {
+        return pipe->issued_count > 0u;
+    }
+    
+    if (max_issued > static_cast<uint32_t>(StageDepth)) {
+        max_issued = static_cast<uint32_t>(StageDepth);
+    }
+
+    while (pipe->issued_count < max_issued) {
+
+       if (!chunk_scheduler_try_prime_current(&pipe->scheduler)) {
             break;
         }
 

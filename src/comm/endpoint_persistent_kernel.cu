@@ -19,6 +19,10 @@ namespace comm {
 namespace {
 
 static constexpr int kPersistentStageDepth = 4;
+static constexpr uint32_t kPersistentPrimeDepth =
+    (kPersistentStageDepth > 1)
+        ? static_cast<uint32_t>(kPersistentStageDepth - 1)
+        : 1u;
 static constexpr size_t kEndpointPersistentStaticSharedBytes =
     sizeof(sync::semaphore) * kPersistentStageDepth;
 
@@ -137,7 +141,12 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
 
         if (threadIdx.x == 0) {
-            has_work = exec::chunk_pipeline_try_prime(&shared_pipe) ? 1 : 0;
+            // Keep one stage empty before issuing the current bulk op.
+            // That empty slot is immediately refilled after issue, which
+            // gives us true "issue current / preload next" overlap.
+            has_work = exec::chunk_pipeline_try_prime(
+                &shared_pipe,
+                kPersistentPrimeDepth) ? 1 : 0;
         }
         __syncthreads();
 
@@ -188,6 +197,16 @@ __global__ void endpoint_persistent_kernel_sm90(
         __syncthreads();
 
         exec::chunk_pipeline_issue_current_apply(&shared_pipe);
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            // Refill the one reserved stage right after the current bulk op
+            // is issued, so the next load overlaps with the current
+            // store/store-reduce.
+            (void)exec::chunk_pipeline_try_prime(
+                &shared_pipe,
+                static_cast<uint32_t>(kPersistentStageDepth));
+        }
         __syncthreads();
 
         exec::chunk_pipeline_finish_current_apply(&shared_pipe);

@@ -215,6 +215,18 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
         collective::ChunkState* chunk_states =
             collective::operation_desc_chunk_states(op);
 
+        if (!collective::chunk_state_is_initialized(&chunk_states[cand.chunk_idx])) {
+            collective::chunk_state_clear(&chunk_states[cand.chunk_idx]);
+            chunk_states[cand.chunk_idx].chunk_idx = cand.chunk_idx;
+            chunk_states[cand.chunk_idx].offset_bytes =
+                collective::operation_desc_chunk_offset_bytes(op, cand.chunk_idx);
+            chunk_states[cand.chunk_idx].bytes =
+                collective::operation_desc_chunk_bytes_at(op, cand.chunk_idx);
+            chunk_states[cand.chunk_idx].flags |=
+                collective::kChunkStateFlagInitialized;
+        }
+ 
+
         chunk_scheduler_build_operation_chunk(
             op,
             cand.chunk_idx,
