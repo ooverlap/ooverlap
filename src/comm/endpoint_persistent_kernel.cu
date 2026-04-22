@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-#define OOVERLAP_ENDPOINT_DEBUG 1
+#define OOVERLAP_ENDPOINT_DEBUG 0
 
 namespace ooverlap {
 namespace comm {
@@ -134,9 +134,6 @@ __global__ void endpoint_persistent_kernel_sm90(
         if (should_stop) {
             return;
         }
-
-        exec::chunk_scheduler_refill_ready_cache(&shared_pipe.scheduler);
-        __syncthreads();
 
         if (threadIdx.x == 0) {
             has_work = exec::chunk_pipeline_try_prime(&shared_pipe) ? 1 : 0;
