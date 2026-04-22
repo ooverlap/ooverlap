@@ -15,7 +15,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -24,67 +23,6 @@
 
 namespace ooverlap {
 namespace {
-
-struct MappedHostU32Buffer {
-    uint32_t* host_ptr = nullptr;
-    uint32_t* device_ptr = nullptr;
-    size_t count = 0;
-
-    void allocate(size_t n) {
-        if (n == 0) {
-            throw std::invalid_argument("MappedHostU32Buffer::allocate: n must be > 0");
-        }
-        release();
-
-        count = n;
-        cudaError_t err = cudaHostAlloc(
-            reinterpret_cast<void**>(&host_ptr),
-            count * sizeof(uint32_t),
-            cudaHostAllocMapped | cudaHostAllocPortable);
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("cudaHostAlloc(mapped u32 buffer) failed: ") +
-                cudaGetErrorString(err));
-        }
-
-        std::memset(host_ptr, 0, count * sizeof(uint32_t));
-
-        err = cudaHostGetDevicePointer(
-            reinterpret_cast<void**>(&device_ptr),
-            host_ptr,
-            0);
-        if (err != cudaSuccess) {
-            cudaFreeHost(host_ptr);
-            host_ptr = nullptr;
-            device_ptr = nullptr;
-            count = 0;
-            throw std::runtime_error(
-                std::string("cudaHostGetDevicePointer(mapped u32 buffer) failed: ") +
-                cudaGetErrorString(err));
-        }
-    }
-
-    void reset_zero() {
-        if (host_ptr == nullptr) {
-            throw std::invalid_argument("MappedHostU32Buffer::reset_zero: buffer not allocated");
-        }
-        std::memset(host_ptr, 0, count * sizeof(uint32_t));
-    }
-
-    void release() {
-        if (host_ptr != nullptr) {
-            cudaError_t err = cudaFreeHost(host_ptr);
-            if (err != cudaSuccess) {
-                throw std::runtime_error(
-                    std::string("cudaFreeHost(mapped u32 buffer) failed: ") +
-                    cudaGetErrorString(err));
-            }
-        }
-        host_ptr = nullptr;
-        device_ptr = nullptr;
-        count = 0;
-    }
-};
 
 std::vector<int> normalize_devices(
     const std::vector<int64_t>& devices64) {
@@ -179,23 +117,53 @@ void expect_half_vectors_close(
 }
 
 bool all_u32_equal_to_one(
-    const uint32_t* ptr,
-    size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        if (ptr[i] != 1u) {
+    const std::vector<uint32_t>& values) {
+    for (uint32_t v : values) {
+        if (v != 1u) {
             return false;
         }
     }
     return true;
 }
 
+void copy_u32_buffer_from_owner(
+    int owner_device,
+    const void* ptr,
+    size_t count,
+    std::vector<uint32_t>* out) {
+    if (out == nullptr) {
+        throw std::invalid_argument("copy_u32_buffer_from_owner: out is null");
+    }
+    if (out->size() != count) {
+        out->resize(count);
+    }
+
+    system::runtime::set_device(owner_device);
+    system::runtime::check_cuda(
+        cudaMemcpy(
+            out->data(),
+            ptr,
+            count * sizeof(uint32_t),
+            cudaMemcpyDeviceToHost),
+        "cudaMemcpy(u32 buffer -> host)");
+}
+
 bool wait_until_all_chunks_done(
-    const MappedHostU32Buffer& chunk_done,
-    int timeout_ms) {
+    int owner_device,
+    const void* chunk_done_ptr,
+    size_t num_chunks,
+    int timeout_ms,
+    std::vector<uint32_t>* host_done_out) {
     const auto start = std::chrono::steady_clock::now();
 
     while (true) {
-        if (all_u32_equal_to_one(chunk_done.host_ptr, chunk_done.count)) {
+        copy_u32_buffer_from_owner(
+            owner_device,
+            chunk_done_ptr,
+            num_chunks,
+            host_done_out);
+
+        if (all_u32_equal_to_one(*host_done_out)) {
             return true;
         }
 
@@ -211,26 +179,33 @@ bool wait_until_all_chunks_done(
 }
 
 std::string build_progress_debug_string(
-    const MappedHostU32Buffer& chunk_steps,
-    const MappedHostU32Buffer& chunk_done,
+    int owner_device,
+    const void* chunk_steps_ptr,
+    const void* chunk_done_ptr,
+    size_t num_chunks,
     uint32_t expected_final_step) {
-    size_t first_bad = chunk_done.count;
-    for (size_t i = 0; i < chunk_done.count; ++i) {
-        if (chunk_done.host_ptr[i] != 1u ||
-            chunk_steps.host_ptr[i] != expected_final_step) {
+    std::vector<uint32_t> host_steps(num_chunks, 0u);
+    std::vector<uint32_t> host_done(num_chunks, 0u);
+
+    copy_u32_buffer_from_owner(owner_device, chunk_steps_ptr, num_chunks, &host_steps);
+    copy_u32_buffer_from_owner(owner_device, chunk_done_ptr, num_chunks, &host_done);
+
+    size_t first_bad = num_chunks;
+    for (size_t i = 0; i < num_chunks; ++i) {
+        if (host_done[i] != 1u || host_steps[i] != expected_final_step) {
             first_bad = i;
             break;
         }
     }
 
-    if (first_bad == chunk_done.count) {
+    if (first_bad == num_chunks) {
         return "all chunks complete";
     }
 
     return std::string("first incomplete chunk idx=") +
            std::to_string(first_bad) +
-           " step=" + std::to_string(chunk_steps.host_ptr[first_bad]) +
-           " done=" + std::to_string(chunk_done.host_ptr[first_bad]) +
+           " step=" + std::to_string(host_steps[first_bad]) +
+           " done=" + std::to_string(host_done[first_bad]) +
            " expected_step=" + std::to_string(expected_final_step);
 }
 
@@ -255,8 +230,8 @@ bool endpoint_persistent_smoke_test(
     std::vector<comm::EndpointPersistentControl> controls(static_cast<size_t>(world_size));
 
     std::vector<comm::transport::CommBuffer> accums(static_cast<size_t>(world_size));
-    MappedHostU32Buffer chunk_steps{};
-    MappedHostU32Buffer chunk_done{};
+    comm::transport::CommBuffer chunk_steps{};
+    comm::transport::CommBuffer chunk_done{};
 
     std::vector<comm::collective::ChunkStateTable> chunk_states(static_cast<size_t>(world_size));
     std::vector<comm::collective::DeviceOperationDesc> op_devs(static_cast<size_t>(world_size));
@@ -297,10 +272,15 @@ bool endpoint_persistent_smoke_test(
                     bytes);
         }
 
-        chunk_steps.allocate(num_chunks);
-        chunk_done.allocate(num_chunks);
-        chunk_steps.reset_zero();
-        chunk_done.reset_zero();
+        // Keep progress arrays on GPU-visible peer memory.
+        chunk_steps = comm::transport::alloc_peer_visible_buffer_for_rank(
+            group.devices,
+            0,
+            static_cast<size_t>(num_chunks) * sizeof(uint32_t));
+        chunk_done = comm::transport::alloc_peer_visible_buffer_for_rank(
+            group.devices,
+            0,
+            static_cast<size_t>(num_chunks) * sizeof(uint32_t));
 
         for (int r = 0; r < world_size; ++r) {
             system::runtime::set_device(group.devices[static_cast<size_t>(r)]);
@@ -312,6 +292,14 @@ bool endpoint_persistent_smoke_test(
                     cudaMemcpyHostToDevice),
                 "cudaMemcpy(host_src -> accum)");
         }
+
+        system::runtime::set_device(group.devices[0]);
+        system::runtime::check_cuda(
+            cudaMemset(chunk_steps.ptr, 0, static_cast<size_t>(num_chunks) * sizeof(uint32_t)),
+            "cudaMemset(chunk_steps)");
+        system::runtime::check_cuda(
+            cudaMemset(chunk_done.ptr, 0, static_cast<size_t>(num_chunks) * sizeof(uint32_t)),
+            "cudaMemset(chunk_done)");
 
         for (int r = 0; r < world_size; ++r) {
             comm::collective::chunk_state_table_init(
@@ -330,11 +318,16 @@ bool endpoint_persistent_smoke_test(
                 accums[static_cast<size_t>(next_rank)].ptr,
                 bytes,
                 chunk_bytes,
-                chunk_steps.device_ptr,
-                chunk_done.device_ptr,
+                chunk_steps.ptr,
+                chunk_done.ptr,
                 chunk_states[static_cast<size_t>(r)].records,
                 1);
         }
+
+        // One shared reset for progress arrays, then per-rank local chunk-state reset.
+        comm::collective::operation_desc_reset_shared_progress(
+            group.devices[0],
+            &ops[0]);
 
         for (int r = 0; r < world_size; ++r) {
             comm::collective::operation_desc_reset_local_chunk_state(
@@ -385,7 +378,13 @@ bool endpoint_persistent_smoke_test(
         std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
 
         std::printf("[smoke] waiting for chunk completion\n"); std::fflush(stdout);
-        const bool all_done = wait_until_all_chunks_done(chunk_done, timeout_ms);
+        std::vector<uint32_t> host_done(static_cast<size_t>(num_chunks), 0u);
+        const bool all_done = wait_until_all_chunks_done(
+            group.devices[0],
+            chunk_done.ptr,
+            num_chunks,
+            timeout_ms,
+            &host_done);
 
         if (!all_done) {
             const uint32_t expected_final_step =
@@ -393,7 +392,12 @@ bool endpoint_persistent_smoke_test(
 
             throw std::runtime_error(
                 std::string("endpoint_persistent_smoke_test: timeout waiting for chunk_done; ") +
-                build_progress_debug_string(chunk_steps, chunk_done, expected_final_step));
+                build_progress_debug_string(
+                    group.devices[0],
+                    chunk_steps.ptr,
+                    chunk_done.ptr,
+                    num_chunks,
+                    expected_final_step));
         }
 
         std::printf("[smoke] all chunks done\n"); std::fflush(stdout);
@@ -411,15 +415,18 @@ bool endpoint_persistent_smoke_test(
         }
         std::printf("[smoke] persistent streams joined\n"); std::fflush(stdout);
 
+        std::vector<uint32_t> host_steps(static_cast<size_t>(num_chunks), 0u);
+        copy_u32_buffer_from_owner(group.devices[0], chunk_steps.ptr, num_chunks, &host_steps);
+
         const uint32_t expected_final_step =
             comm::collective::operation_desc_total_ring_steps(&ops[0]);
 
         for (uint32_t i = 0; i < num_chunks; ++i) {
-            if (chunk_steps.host_ptr[static_cast<size_t>(i)] != expected_final_step) {
+            if (host_steps[static_cast<size_t>(i)] != expected_final_step) {
                 throw std::runtime_error(
                     "endpoint_persistent_smoke_test: chunk step did not reach final value");
             }
-            if (chunk_done.host_ptr[static_cast<size_t>(i)] != 1u) {
+            if (host_done[static_cast<size_t>(i)] != 1u) {
                 throw std::runtime_error(
                     "endpoint_persistent_smoke_test: chunk done flag was not set");
             }
@@ -450,9 +457,8 @@ bool endpoint_persistent_smoke_test(
             comm::collective::chunk_state_table_destroy(&table);
         }
 
-        chunk_done.release();
-        chunk_steps.release();
-
+        comm::transport::free_comm_buffer(group.devices, chunk_done);
+        comm::transport::free_comm_buffer(group.devices, chunk_steps);
         for (auto& accum : accums) {
             comm::transport::free_comm_buffer(group.devices, accum);
         }
@@ -488,9 +494,8 @@ bool endpoint_persistent_smoke_test(
             comm::collective::chunk_state_table_destroy(&table);
         }
 
-        try { chunk_done.release(); } catch (...) {}
-        try { chunk_steps.release(); } catch (...) {}
-
+        try { comm::transport::free_comm_buffer(group.devices, chunk_done); } catch (...) {}
+        try { comm::transport::free_comm_buffer(group.devices, chunk_steps); } catch (...) {}
         for (auto& accum : accums) {
             try {
                 comm::transport::free_comm_buffer(group.devices, accum);
