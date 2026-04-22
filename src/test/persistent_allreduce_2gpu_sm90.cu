@@ -1246,54 +1246,6 @@ void verify_basic_cuda_memcpy_result(
     expect_half_vectors_close(got1, ref, "basic memcpy verify rank1");
 }
 
-void init_nccl_allreduce_state(
-    NcclAllreduceState* st,
-    int dev0,
-    int dev1,
-    size_t numel) {
-    if (st == nullptr) {
-        throw std::invalid_argument("init_nccl_allreduce_state: st is null");
-    }
-
-    destroy_nccl_allreduce_state(st);
-
-    st->dev0 = dev0;
-    st->dev1 = dev1;
-    st->bytes = numel * sizeof(half);
-
-    system::runtime::ensure_context_on_device(dev0);
-    system::runtime::ensure_context_on_device(dev1);
-
-    st->stream0 = system::runtime::create_stream_on_device(dev0);
-    st->stream1 = system::runtime::create_stream_on_device(dev1);
-
-    system::runtime::set_device(dev0);
-    system::runtime::check_cuda(
-        cudaMalloc(&st->work0, st->bytes),
-        "cudaMalloc(nccl work0)");
-
-    system::runtime::set_device(dev1);
-    system::runtime::check_cuda(
-        cudaMalloc(&st->work1, st->bytes),
-        "cudaMalloc(nccl work1)");
-
-    ncclUniqueId id{};
-    OOVERLAP_PERSIST_NCCL_CHECK(ncclGetUniqueId(&id));
-
-    OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
-
-    system::runtime::set_device(dev0);
-    OOVERLAP_PERSIST_NCCL_CHECK(
-        ncclCommInitRank(&st->comm0, 2, id, 0));
-
-    system::runtime::set_device(dev1);
-    OOVERLAP_PERSIST_NCCL_CHECK(
-        ncclCommInitRank(&st->comm1, 2, id, 1));
-
-    OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
-
-    st->initialized = true;
-}
 
 void prepare_nccl_allreduce_run(
     NcclAllreduceState* st,
@@ -1322,6 +1274,49 @@ void prepare_nccl_allreduce_run(
             cudaMemcpyDeviceToDevice,
             st->stream1),
         "cudaMemcpyAsync(src1 -> nccl work1)");
+}
+
+void init_nccl_allreduce_state(
+    NcclAllreduceState* st,
+    int dev0,
+    int dev1,
+    size_t numel) {
+    if (st == nullptr) {
+        throw std::invalid_argument("init_nccl_allreduce_state: st is null");
+    }
+
+    destroy_nccl_allreduce_state(st);
+
+    st->dev0 = dev0;
+    st->dev1 = dev1;
+    st->bytes = numel * sizeof(half);
+
+    system::runtime::ensure_context_on_device(dev0);
+    system::runtime::ensure_context_on_device(dev1);
+
+    st->stream0 = system::runtime::create_stream_on_device(dev0);
+    st->stream1 = system::runtime::create_stream_on_device(dev1);
+
+    system::runtime::set_device(dev0);
+    system::runtime::check_cuda(cudaMalloc(&st->work0, st->bytes), "cudaMalloc(nccl work0)");
+
+    system::runtime::set_device(dev1);
+    system::runtime::check_cuda(cudaMalloc(&st->work1, st->bytes), "cudaMalloc(nccl work1)");
+
+    ncclUniqueId id{};
+    OOVERLAP_PERSIST_NCCL_CHECK(ncclGetUniqueId(&id));
+
+    OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
+
+    system::runtime::set_device(dev0);
+    OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitRank(&st->comm0, 2, id, 0));
+
+    system::runtime::set_device(dev1);
+    OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitRank(&st->comm1, 2, id, 1));
+
+    OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
+
+    st->initialized = true;
 }
 
 void run_nccl_allreduce(
@@ -1439,9 +1434,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         init_basic_cuda_memcpy_state(&basic, dev0, dev1, static_cast<size_t>(numel));
         init_nccl_allreduce_state(&nccl, dev0, dev1, static_cast<size_t>(numel));
 
-        // -----------------------------
-        // Phase 1: persistent benchmark
-        // -----------------------------
+        // Phase 1: persistent only
         launch_persistent_two_gpu_run(&persistent);
 
         for (int i = 0; i < warmup; ++i) {
@@ -1476,9 +1469,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
         verify_persistent_result(&persistent, numel);
 
-        // -----------------------------
-        // Phase 2: basic memcpy benchmark
-        // -----------------------------
+        // Phase 2: basic memcpy only
         for (int i = 0; i < warmup; ++i) {
             prepare_basic_cuda_memcpy_run(&basic, rank0_src, rank1_src);
             run_basic_cuda_memcpy_allreduce(&basic, static_cast<size_t>(numel));
@@ -1494,9 +1485,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
         verify_basic_cuda_memcpy_result(&basic, numel);
 
-        // -----------------------------
-        // Phase 3: NCCL benchmark
-        // -----------------------------
+        // Phase 3: NCCL only
         for (int i = 0; i < warmup; ++i) {
             prepare_nccl_allreduce_run(&nccl, rank0_src, rank1_src);
             run_nccl_allreduce(&nccl, static_cast<size_t>(numel));
