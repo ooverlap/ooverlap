@@ -21,6 +21,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define OOVERLAP_PERSIST_NCCL_CHECK(cmd)                                                     \
@@ -642,32 +643,33 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     try {
         system::runtime::set_device(dev0);
         system::runtime::check_cuda(cudaMalloc(&rank0_in, bytes), "cudaMalloc(rank0_in)");
-        testing::fill_pattern(rank0_in, numel, 0.25f, 1.0f, basic_comm.streams[0]);
+        testing::fill_pattern(rank0_in, numel, 0.25f, 1.0f, basic_state.streams[0]);
 
         system::runtime::set_device(dev1);
         system::runtime::check_cuda(cudaMalloc(&rank1_in, bytes), "cudaMalloc(rank1_in)");
-        testing::fill_pattern(rank1_in, numel, 0.50f, 2.0f, basic_comm.streams[1]);
+        testing::fill_pattern(rank1_in, numel, 0.50f, 2.0f, basic_state.streams[1]);
 
         sync_two_streams(
-            dev0, basic_comm.streams[0],
-            dev1, basic_comm.streams[1],
+            dev0, basic_state.streams[0],
+            dev1, basic_state.streams[1],
             "sync fill benchmark inputs");
 
         std::vector<half*> basic_inputs = {rank0_in, rank1_in};
 
-        OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitAll(nccl_comms, 2, persistent.devices.data()));
+        int nccl_devices[2] = {dev0, dev1};
+        OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitAll(nccl_comms, 2, nccl_devices));
 
         for (int i = 0; i < warmup; ++i) {
             system::runtime::check_cuda(
                 enqueue_basic_all_reduce_tma_sm90(
-                    &basic_comm,
+                    &basic_state,
                     basic_inputs,
                     static_cast<size_t>(numel)),
                 "basic warmup");
 
             sync_two_streams(
-                dev0, basic_comm.streams[0],
-                dev1, basic_comm.streams[1],
+                dev0, basic_state.streams[0],
+                dev1, basic_state.streams[1],
                 "sync basic warmup");
         }
 
@@ -676,26 +678,26 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             OOVERLAP_PERSIST_NCCL_CHECK(
                 ncclAllReduce(
                     rank0_in,
-                    buffer_as_half(communicator_get_local_full_buffer(&basic_comm, 0)),
+                    basic_collective_full_output_ptr(&basic_state, 0),
                     static_cast<size_t>(numel),
                     ncclFloat16,
                     ncclSum,
                     nccl_comms[0],
-                    basic_comm.streams[0]));
+                    basic_state.streams[0]));
             OOVERLAP_PERSIST_NCCL_CHECK(
                 ncclAllReduce(
                     rank1_in,
-                    buffer_as_half(communicator_get_local_full_buffer(&basic_comm, 1)),
+                    basic_collective_full_output_ptr(&basic_state, 1),
                     static_cast<size_t>(numel),
                     ncclFloat16,
                     ncclSum,
                     nccl_comms[1],
-                    basic_comm.streams[1]));
+                    basic_state.streams[1]));
             OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
 
             sync_two_streams(
-                dev0, basic_comm.streams[0],
-                dev1, basic_comm.streams[1],
+                dev0, basic_state.streams[0],
+                dev1, basic_state.streams[1],
                 "sync nccl warmup");
         }
 
@@ -710,14 +712,14 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             basic_total_ms += measure_host_ms([&] {
                 system::runtime::check_cuda(
                     enqueue_basic_all_reduce_tma_sm90(
-                        &basic_comm,
+                        &basic_state,
                         basic_inputs,
                         static_cast<size_t>(numel)),
                     "enqueue_basic_all_reduce_tma_sm90");
 
                 sync_two_streams(
-                    dev0, basic_comm.streams[0],
-                    dev1, basic_comm.streams[1],
+                    dev0, basic_state.streams[0],
+                    dev1, basic_state.streams[1],
                     "sync basic measured");
             });
         }
@@ -729,26 +731,26 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                 OOVERLAP_PERSIST_NCCL_CHECK(
                     ncclAllReduce(
                         rank0_in,
-                        buffer_as_half(communicator_get_local_full_buffer(&basic_comm, 0)),
+                        basic_collective_full_output_ptr(&basic_state, 0),
                         static_cast<size_t>(numel),
                         ncclFloat16,
                         ncclSum,
                         nccl_comms[0],
-                        basic_comm.streams[0]));
+                        basic_state.streams[0]));
                 OOVERLAP_PERSIST_NCCL_CHECK(
                     ncclAllReduce(
                         rank1_in,
-                        buffer_as_half(communicator_get_local_full_buffer(&basic_comm, 1)),
+                        basic_collective_full_output_ptr(&basic_state, 1),
                         static_cast<size_t>(numel),
                         ncclFloat16,
                         ncclSum,
                         nccl_comms[1],
-                        basic_comm.streams[1]));
+                        basic_state.streams[1]));
                 OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
 
                 sync_two_streams(
-                    dev0, basic_comm.streams[0],
-                    dev1, basic_comm.streams[1],
+                    dev0, basic_state.streams[0],
+                    dev1, basic_state.streams[1],
                     "sync nccl measured");
             });
         }
@@ -763,7 +765,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             });
         }
 
-        // One final correctness check for the persistent path.
         prepare_persistent_two_gpu_run(&persistent, rank0_in, rank1_in);
         launch_persistent_two_gpu_run(&persistent);
         wait_and_stop_persistent_two_gpu_run(&persistent, 30000);
@@ -786,7 +787,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         rank1_in = nullptr;
 
         destroy_persistent_two_gpu_state(&persistent);
-        communicator_destroy(&basic_comm);
+        destroy_basic_collective_same_process(&basic_state);
 
         return {
             {"numel", static_cast<double>(numel)},
@@ -820,7 +821,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         }
 
         destroy_persistent_two_gpu_state(&persistent);
-        communicator_destroy(&basic_comm);
+        destroy_basic_collective_same_process(&basic_state);
         throw;
     }
 }
