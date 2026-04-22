@@ -511,27 +511,32 @@ inline void verify_persistent_result(
 } // namespace
 
 cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
-    comm::Communicator* comm,
+    int dev0,
+    int dev1,
     half* rank0_in,
     half* rank1_in,
     half* rank0_out,
     half* rank1_out,
-    size_t numel) {
+    size_t numel,
+    int timeout_ms) {
 
-    if (comm == nullptr || comm->world_size != 2) {
+    if (dev0 < 0 || dev1 < 0 || dev0 == dev1) {
         return cudaErrorInvalidValue;
     }
     if (rank0_in == nullptr || rank1_in == nullptr ||
         rank0_out == nullptr || rank1_out == nullptr) {
         return cudaErrorInvalidDevicePointer;
     }
+    if (numel == 0) {
+        return cudaErrorInvalidValue;
+    }
 
     try {
         PersistentTwoGpuState st{};
-        init_persistent_two_gpu_state(&st, comm->devices[0], comm->devices[1], numel);
+        init_persistent_two_gpu_state(&st, dev0, dev1, numel);
         prepare_persistent_two_gpu_run(&st, rank0_in, rank1_in);
         launch_persistent_two_gpu_run(&st);
-        wait_and_stop_persistent_two_gpu_run(&st, 30000);
+        wait_and_stop_persistent_two_gpu_run(&st, timeout_ms);
         copy_persistent_outputs_to_device(&st, rank0_out, rank1_out);
         destroy_persistent_two_gpu_state(&st);
         return cudaSuccess;
@@ -620,8 +625,11 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
 
-    comm::Communicator basic_comm{};
-    communicator_init(&basic_comm, {dev0, dev1}, static_cast<size_t>(numel), 1);
+    BasicCollectiveState basic_state{};
+    init_basic_collective_same_process(
+        &basic_state,
+        {dev0, dev1},
+        static_cast<size_t>(numel));
 
     PersistentTwoGpuState persistent{};
     init_persistent_two_gpu_state(&persistent, dev0, dev1, static_cast<size_t>(numel));

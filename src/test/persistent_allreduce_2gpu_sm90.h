@@ -8,17 +8,17 @@
 #include <map>
 #include <string>
 
-#include "comm/endpoint.h"
-
 namespace ooverlap {
 
 cudaError_t enqueue_persistent_two_gpu_allreduce_sm90(
-    comm::Communicator* comm,
+    int dev0,
+    int dev1,
     half* rank0_in,
     half* rank1_in,
     half* rank0_out,
     half* rank1_out,
-    size_t numel);
+    size_t numel,
+    int timeout_ms = 30000);
 
 bool tma_persistent_two_gpu_allreduce_smoke_test(
     int64_t numel,
