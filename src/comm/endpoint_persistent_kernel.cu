@@ -4,6 +4,7 @@
 #include "comm/exec/chunk_scheduler.h"
 #include "comm/exec/pipeline_load.h"
 #include "comm/exec/pipeline_reduce.h"
+#include "comm/exec/pipeline_noop.h"
 #include "ooverlap/system/runtime_utils.cuh"
 
 #include <cuda_runtime.h>
@@ -13,6 +14,10 @@
 #include <stdexcept>
 
 #define OOVERLAP_ENDPOINT_DEBUG 0
+
+#ifndef OOVERLAP_ENDPOINT_DISABLE_DATAPATH
+#define OOVERLAP_ENDPOINT_DISABLE_DATAPATH 1
+#endif
 
 namespace ooverlap {
 namespace comm {
@@ -106,11 +111,19 @@ __global__ void endpoint_persistent_kernel_sm90(
     /*__syncthreads();*/
 
     using Scheduler = exec::ChunkScheduler;
+#if OOVERLAP_ENDPOINT_DISABLE_DATAPATH
+    using Pipe = exec::ChunkPipeline<
+        kPersistentStageDepth,
+        Scheduler,
+        exec::PipelineNoOpLoad,
+        exec::PipelineNoOpApply>;
+#else
     using Pipe = exec::ChunkPipeline<
         kPersistentStageDepth,
         Scheduler,
         exec::PipelineTMALoad,
         exec::PipelineTMAStepApplyNoFtzF16>;
+#endif
 
     __shared__ Scheduler shared_scheduler;
     __shared__ Pipe shared_pipe;
