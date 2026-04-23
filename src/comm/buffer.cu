@@ -1,80 +1,47 @@
 #include "comm/buffer.h"
 
-#include "ooverlap/system/runtime_utils.cuh"
-#include "ooverlap/system/peer_buffer.cuh"
-
-#include <cuda_runtime.h>
-
 #include <stdexcept>
-#include <vector>
 
 namespace ooverlap {
 namespace comm {
 
-CommBuffer alloc_peer_visible_buffer_for_rank(
-    const std::vector<int>& devices,
+void buffer_init(
+    Buffer* buf,
     int owner_rank,
-    size_t bytes) {
-
-    if (owner_rank < 0 || owner_rank >= static_cast<int>(devices.size())) {
-        throw std::invalid_argument("alloc_peer_visible_buffer_for_rank: invalid owner_rank");
+    int owner_device,
+    size_t bytes,
+    const std::vector<int>& visible_devices) {
+    if (buf == nullptr) {
+        throw std::invalid_argument("buffer_init: buffer is null");
+    }
+    if (bytes == 0) {
+        throw std::invalid_argument("buffer_init: bytes must be > 0");
+    }
+    if (visible_devices.empty()) {
+        throw std::invalid_argument("buffer_init: visible_devices must not be empty");
     }
 
-    system::mapped_peer_buffer mapped =
-        system::alloc_peer_visible_buffer(bytes, devices[owner_rank], devices);
+    buffer_destroy(buf);
 
-    CommBuffer out{};
-    out.ptr = mapped.ptr;
-    out.bytes = mapped.mapped_size;
-    out.owner_rank = owner_rank;
-    out.peer_visible = true;
-    return out;
+    buf->owner_rank = owner_rank;
+    buf->owner_device = owner_device;
+    buf->bytes = bytes;
+    buf->mapped = system::alloc_peer_visible_buffer(
+        bytes,
+        owner_device,
+        visible_devices);
 }
 
-CommBuffer alloc_local_buffer_for_rank(
-    const std::vector<int>& devices,
-    int owner_rank,
-    size_t bytes) {
-
-    if (owner_rank < 0 || owner_rank >= static_cast<int>(devices.size())) {
-        throw std::invalid_argument("alloc_local_buffer_for_rank: invalid owner_rank");
-    }
-
-    CommBuffer out{};
-    out.bytes = bytes;
-    out.owner_rank = owner_rank;
-    out.peer_visible = false;
-
-    system::runtime::set_device(devices[owner_rank]);
-    system::runtime::check_cuda(cudaMalloc(&out.ptr, bytes), "cudaMalloc(local buffer)");
-    return out;
-}
-
-void free_comm_buffer(
-    const std::vector<int>& devices,
-    CommBuffer& buf) {
-
-    if (buf.ptr == nullptr) {
+void buffer_destroy(
+    Buffer* buf) {
+    if (buf == nullptr) {
         return;
     }
 
-    if (buf.peer_visible) {
-        system::mapped_peer_buffer mapped{};
-        mapped.ptr = buf.ptr;
-        mapped.mapped_size = buf.bytes;
-        system::free_peer_visible_buffer(mapped);
-    } else {
-        if (buf.owner_rank < 0 || buf.owner_rank >= static_cast<int>(devices.size())) {
-            throw std::invalid_argument("free_comm_buffer: invalid owner_rank");
-        }
-        system::runtime::set_device(devices[buf.owner_rank]);
-        system::runtime::check_cuda(cudaFree(buf.ptr), "cudaFree(local buffer)");
-    }
-
-    buf.ptr = nullptr;
-    buf.bytes = 0;
-    buf.owner_rank = -1;
-    buf.peer_visible = false;
+    system::free_peer_visible_buffer(buf->mapped);
+    buf->owner_rank = -1;
+    buf->owner_device = -1;
+    buf->bytes = 0;
 }
 
 } // namespace comm

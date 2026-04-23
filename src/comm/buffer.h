@@ -1,53 +1,37 @@
 #pragma once
 
-#include <cuda_fp16.h>
+#include "ooverlap/system/peer_buffer.cuh"
 
 #include <cstddef>
-#include <cstdint>
 #include <vector>
 
 namespace ooverlap {
 namespace comm {
 
-struct CommBuffer {
-    void* ptr = nullptr;
-    size_t bytes = 0;
+struct Buffer {
     int owner_rank = -1;
-    bool peer_visible = false;
+    int owner_device = -1;
+    size_t bytes = 0;
+    system::mapped_peer_buffer mapped{};
 };
 
-CommBuffer alloc_peer_visible_buffer_for_rank(
-    const std::vector<int>& devices,
+void buffer_init(
+    Buffer* buf,
     int owner_rank,
-    size_t bytes);
+    int owner_device,
+    size_t bytes,
+    const std::vector<int>& visible_devices);
 
-CommBuffer alloc_local_buffer_for_rank(
-    const std::vector<int>& devices,
-    int owner_rank,
-    size_t bytes);
+void buffer_destroy(
+    Buffer* buf);
 
-void free_comm_buffer(
-    const std::vector<int>& devices,
-    CommBuffer& buf);
-
-inline half* buffer_as_half(CommBuffer* buf) {
-    return reinterpret_cast<half*>(buf->ptr);
+inline void* buffer_ptr(Buffer* buf) {
+    return (buf != nullptr) ? buf->mapped.ptr : nullptr;
 }
 
-inline const half* buffer_as_half(const CommBuffer* buf) {
-    return reinterpret_cast<const half*>(buf->ptr);
+inline const void* buffer_ptr(const Buffer* buf) {
+    return (buf != nullptr) ? buf->mapped.ptr : nullptr;
 }
-
-inline uint64_t* buffer_as_u64(CommBuffer* buf) {
-    return reinterpret_cast<uint64_t*>(buf->ptr);
-}
-
-inline const uint64_t* buffer_as_u64(const CommBuffer* buf) {
-    return reinterpret_cast<const uint64_t*>(buf->ptr);
-}
-
-// Compatibility alias for current code.
-using Buffer = CommBuffer;
 
 } // namespace comm
 } // namespace ooverlap
