@@ -13,10 +13,12 @@
 #include <cstdint>
 #include <stdexcept>
 
+#ifndef OOVERLAP_ENDPOINT_DEBUG
 #define OOVERLAP_ENDPOINT_DEBUG 0
+#endif
 
 #ifndef OOVERLAP_ENDPOINT_DISABLE_DATAPATH
-#define OOVERLAP_ENDPOINT_DISABLE_DATAPATH 1
+#define OOVERLAP_ENDPOINT_DISABLE_DATAPATH 0
 #endif
 
 namespace ooverlap {

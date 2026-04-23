@@ -6,6 +6,10 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifndef OOVERLAP_ENDPOINT_DEBUG
+#define OOVERLAP_ENDPOINT_DEBUG 0
+#endif
+
 #if OOVERLAP_ENDPOINT_DEBUG
 #include <cstdio>
 #define OOVERLAP_SCHED_DBG(...) printf(__VA_ARGS__)

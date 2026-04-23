@@ -606,6 +606,60 @@ void dump_persistent_debug_state(
     std::fflush(stdout);
 }
 
+static void dump_full_done_progress(
+    PersistentTwoGpuState* st,
+    const char* tag) {
+    std::printf("[debug] full done progress: %s\n", tag);
+
+    for (size_t r = 0; r < st->done_flags.size(); ++r) {
+        auto& done = st->done_flags[r];
+        done.copy_owner_to_host(st->devices);
+
+        size_t ones = 0;
+        size_t first_bad = done.count;
+        std::vector<size_t> bads;
+        bads.reserve(8);
+
+        for (size_t i = 0; i < done.count; ++i) {
+            if (done.host_cache[i] == 1u) {
+                ++ones;
+            } else {
+                if (first_bad == done.count) {
+                    first_bad = i;
+                }
+                if (bads.size() < 8) {
+                    bads.push_back(i);
+                }
+            }
+        }
+
+        uint32_t meta[2] = {0, 0};
+        system::runtime::set_device(st->devices[r]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                meta,
+                st->ready_queues[r].device_ptr_for_rank(r),
+                2 * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(queue meta -> host)");
+
+        std::printf(
+            "[debug] rank=%zu ones=%zu/%zu head=%u tail=%u",
+            r, ones, done.count, meta[0], meta[1]);
+
+        if (first_bad == done.count) {
+            std::printf(" first_bad=none");
+        } else {
+            std::printf(" first_bad=%zu bads=", first_bad);
+            for (size_t k = 0; k < bads.size(); ++k) {
+                std::printf("%s%zu", (k == 0 ? "" : ","), bads[k]);
+            }
+        }
+        std::printf("\n");
+    }
+    std::fflush(stdout);
+}
+
 bool wait_until_all_ranks_done_no_sleep(
     PersistentTwoGpuState* st,
     int timeout_ms) {
@@ -1075,6 +1129,7 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
 
         st->kernels_running = false;
         dump_persistent_debug_state(st, "timeout in measure_persistent_host_breakdown_ms");
+        dump_full_done_progress(st, "timeout");
         throw std::runtime_error(
             "measure_persistent_host_breakdown_ms: timeout waiting for done flags");
     }
