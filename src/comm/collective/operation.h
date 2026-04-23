@@ -173,6 +173,10 @@ __host__ __device__ __forceinline__ void operation_desc_clear(
     op->next_done_bytes = 0;
 
     op->chunk_states_ptr = 0;
+    op->completion_count_ptr = 0;
+    op->completion_flag_ptr = 0;
+    op->completion_target = 0;
+    op->reserved3 = 0;
 }
 
 __host__ __device__ __forceinline__ bool operation_desc_is_enabled(
@@ -389,6 +393,27 @@ __host__ __device__ __forceinline__ void chunk_state_clear(
     st->flags = 0;
     st->offset_bytes = 0;
     st->bytes = 0;
+}
+
+__host__ __device__ __forceinline__ uint32_t operation_desc_local_completion_target(
+    const OperationDesc* op) {
+    if (!operation_desc_is_valid(op)) {
+        return 0;
+    }
+
+    const uint32_t total_steps = operation_desc_total_ring_steps(op);
+    if (total_steps == 0) {
+        return op->num_chunks;
+    }
+
+    const uint32_t final_step = total_steps - 1u;
+    uint32_t target = 0;
+    for (uint32_t idx = 0; idx < op->num_chunks; ++idx) {
+        if (operation_desc_actor_rank_for_step(op, idx, final_step) == op->rank) {
+            ++target;
+        }
+    }
+    return target;
 }
 
 __host__ __device__ __forceinline__ bool chunk_state_is_initialized(

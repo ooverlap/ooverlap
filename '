@@ -1004,7 +1004,7 @@ void init_persistent_two_gpu_state(
             reinterpret_cast<uint64_t>(st->completion_counts[static_cast<size_t>(r)]);
         st->ops[static_cast<size_t>(r)].completion_flag_ptr =
             reinterpret_cast<uint64_t>(st->completion_flags[static_cast<size_t>(r)]);
-        st->ops[static_cast<size_t>(r)].completion_target = comm::collective::operation_desc_local_completion_target(&st->ops[r]);;
+        st->ops[static_cast<size_t>(r)].completion_target = comm::collective::operation_desc_local_completion_target(&st->ops[r]);
 
         comm::collective::device_operation_desc_create(
             &st->op_devs[static_cast<size_t>(r)],

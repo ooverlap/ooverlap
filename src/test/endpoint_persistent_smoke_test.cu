@@ -513,6 +513,47 @@ static void validate_accum_peer_views_or_throw(
     }
 }
 
+bool wait_until_all_ranks_operation_done(
+    const std::vector<int>& devices,
+    const std::vector<uint32_t*>& completion_flags,
+    std::vector<uint32_t>& host_completion_flags,
+    int timeout_ms) {
+    const auto start = std::chrono::steady_clock::now();
+
+    while (true) {
+        bool all_done = true;
+
+        for (size_t r = 0; r < completion_flags.size(); ++r) {
+            system::runtime::set_device(devices[r]);
+            system::runtime::check_cuda(
+                cudaMemcpy(
+                    &host_completion_flags[r],
+                    completion_flags[r],
+                    sizeof(uint32_t),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy(smoke completion flag -> host)");
+
+            if (host_completion_flags[r] != 1u) {
+                all_done = false;
+                break;
+            }
+        }
+
+        if (all_done) {
+            return true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        if (elapsed_ms > timeout_ms) {
+            return false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 } // namespace
 
 bool endpoint_persistent_smoke_test(
@@ -545,6 +586,10 @@ bool endpoint_persistent_smoke_test(
 
     std::vector<bool> control_initialized(static_cast<size_t>(world_size), false);
     std::vector<bool> kernel_launched(static_cast<size_t>(world_size), false);
+
+    std::vector<uint32_t*> completion_counts(world_size, nullptr);
+    std::vector<uint32_t*> completion_flags(world_size, nullptr);
+    std::vector<uint32_t> host_completion_flags(world_size, 0u);
 
     try {
         const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
@@ -648,6 +693,21 @@ bool endpoint_persistent_smoke_test(
         std::fflush(stdout);
 
         for (int r = 0; r < world_size; ++r) {
+            system::runtime::set_device(group.devices[r]);
+            system::runtime::check_cuda(
+                cudaMalloc(&completion_counts[r], sizeof(uint32_t)),
+                "cudaMalloc(smoke completion count)");
+            system::runtime::check_cuda(
+                cudaMalloc(&completion_flags[r], sizeof(uint32_t)),
+                "cudaMalloc(smoke completion flag)");
+            
+            ops[r].completion_count_ptr =
+                reinterpret_cast<uint64_t>(completion_counts[r]);
+            ops[r].completion_flag_ptr =
+                reinterpret_cast<uint64_t>(completion_flags[r]);
+            ops[r].completion_target =
+                comm::collective::operation_desc_local_completion_target(&ops[r]);
+
             comm::collective::device_operation_desc_create(
                 &op_devs[static_cast<size_t>(r)],
                 group.devices[static_cast<size_t>(r)],
@@ -692,7 +752,11 @@ bool endpoint_persistent_smoke_test(
         std::printf("[smoke] after persistent launch\n"); std::fflush(stdout);
 
         std::printf("[smoke] waiting for chunk completion\n"); std::fflush(stdout);
-        const bool all_done = wait_until_all_ranks_done(done_flags, devices, timeout_ms);
+        const bool all_done = wait_until_all_ranks_operation_done(
+            devices,
+            completion_flags,
+            host_completion_flags,
+            timeout_ms);
 
         if (!all_done) {
             dump_rank_queue_meta(devices, ready_queues);
@@ -718,14 +782,6 @@ bool endpoint_persistent_smoke_test(
                 "cudaStreamSynchronize(persistent stream)");
         }
         std::printf("[smoke] persistent streams joined\n"); std::fflush(stdout);
-
-        for (auto& done : done_flags) {
-            done.copy_owner_to_host(devices);
-            if (!all_u32_equal_to_one(done.host_cache.data(), done.count)) {
-                throw std::runtime_error(
-                    "endpoint_persistent_smoke_test: done flag was not set");
-            }
-        }
 
         for (int r = 0; r < world_size; ++r) {
             std::vector<half> host_out(static_cast<size_t>(numel));
