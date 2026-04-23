@@ -117,7 +117,7 @@ double elapsed_ms_host_avg(
     return total_ms / static_cast<double>(iters);
 }
 
-double elapsed_ms_peer_kernel_only(
+double elapsed_ms_peer_persistent(
     TmaTwoGpuPeerAllreduceState* st,
     const half* rank0_in,
     const half* rank1_in,
@@ -490,7 +490,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                     "enqueue_two_gpu_all_reduce_tma_sm90");
             });
 
-        // Warm up peer e2e.
+        // Warm up persistent path.
         for (int i = 0; i < warmup; ++i) {
             system::runtime::check_cuda(
                 enqueue_tma_two_gpu_peer_allreduce_sm90(
@@ -506,52 +506,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             sync_two_streams(node0->device, node0->stream, node1->device, node1->stream, "sync peer allreduce warmup");
         }
 
-        const double persistent_e2e_total_ms = elapsed_ms_two_stream_max(
-            node0->device, node0->stream, node1->device, node1->stream, iters,
-            [&](int) {
-                system::runtime::check_cuda(
-                    enqueue_tma_two_gpu_peer_allreduce_sm90(
-                        &st,
-                        rank0_in,
-                        rank1_in,
-                        reinterpret_cast<half*>(comm::buffer_ptr(out0)),
-                        reinterpret_cast<half*>(comm::buffer_ptr(out1)),
-                        static_cast<size_t>(numel),
-                        node0->stream,
-                        node1->stream),
-                    "enqueue_tma_two_gpu_peer_allreduce_sm90");
-            });
-
-        // Warm up peer kernel-only.
-        for (int i = 0; i < warmup; ++i) {
-            system::runtime::check_cuda(
-                prime_tma_two_gpu_peer_allreduce_outputs_sm90(
-                    &st,
-                    rank0_in,
-                    rank1_in,
-                    reinterpret_cast<half*>(comm::buffer_ptr(out0)),
-                    reinterpret_cast<half*>(comm::buffer_ptr(out1)),
-                    static_cast<size_t>(numel),
-                    node0->stream,
-                    node1->stream),
-                "prime_tma_two_gpu_peer_allreduce_outputs_sm90 warmup");
-
-            system::runtime::check_cuda(
-                enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
-                    &st,
-                    rank0_in,
-                    rank1_in,
-                    reinterpret_cast<half*>(comm::buffer_ptr(out0)),
-                    reinterpret_cast<half*>(comm::buffer_ptr(out1)),
-                    static_cast<size_t>(numel),
-                    node0->stream,
-                    node1->stream),
-                "enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90 warmup");
-
-            sync_two_streams(node0->device, node0->stream, node1->device, node1->stream, "sync peer kernel-only warmup");
-        }
-
-        const double persistent_kernel_only_total_ms = elapsed_ms_peer_kernel_only(
+        const double persistent_total_ms = elapsed_ms_peer_persistent(
             &st,
             rank0_in,
             rank1_in,
@@ -638,26 +593,18 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         tma_two_gpu_peer_allreduce_state_destroy(&st);
         comm::group_destroy(&group);
 
-        const double avg_persistent_e2e_ms =
-            persistent_e2e_total_ms / static_cast<double>(iters);
-        const double avg_persistent_kernel_only_ms =
-            persistent_kernel_only_total_ms / static_cast<double>(iters);
+        const double avg_persistent_ms =
+            persistent_total_ms / static_cast<double>(iters);
         const double avg_nccl_ms =
             nccl_total_ms / static_cast<double>(iters);
 
         return {
             {"numel", static_cast<double>(numel)},
             {"avg_ms_basic", avg_basic_ms},
-            {"avg_ms_persistent", avg_persistent_kernel_only_ms},
-            {"avg_ms_persistent_kernel_only", avg_persistent_kernel_only_ms},
-            {"avg_ms_persistent_e2e", avg_persistent_e2e_ms},
+            {"avg_ms_persistent", avg_persistent_ms},
             {"avg_ms_nccl", avg_nccl_ms},
-            {"speedup_basic_over_persistent", avg_basic_ms / avg_persistent_kernel_only_ms},
-            {"speedup_basic_over_persistent_kernel_only", avg_basic_ms / avg_persistent_kernel_only_ms},
-            {"speedup_basic_over_persistent_e2e", avg_basic_ms / avg_persistent_e2e_ms},
-            {"speedup_nccl_over_persistent", avg_nccl_ms / avg_persistent_kernel_only_ms},
-            {"speedup_nccl_over_persistent_kernel_only", avg_nccl_ms / avg_persistent_kernel_only_ms},
-            {"speedup_nccl_over_persistent_e2e", avg_nccl_ms / avg_persistent_e2e_ms}
+            {"speedup_basic_over_persistent", avg_basic_ms / avg_persistent_ms},
+            {"speedup_nccl_over_persistent", avg_nccl_ms / avg_persistent_ms}
         };
     } catch (...) {
         if (comms[0] != nullptr) {
