@@ -83,6 +83,12 @@ struct OperationDesc {
     size_t next_done_bytes = 0;
 
     uint64_t chunk_states_ptr = 0;
+
+    // Tracking
+    uint64_t completion_count_ptr = 0;
+    uint64_t completion_flag_ptr = 0;
+    uint32_t completion_target = 0;
+    uint32_t reserved3 = 0;
 };
 
 struct ChunkState {
@@ -290,6 +296,16 @@ __host__ __device__ __forceinline__ size_t operation_desc_chunk_offset_bytes(
     const OperationDesc* op,
     uint32_t chunk_idx) {
     return static_cast<size_t>(chunk_idx) * op->chunk_bytes;
+}
+
+__host__ __device__ __forceinline__ uint32_t* operation_desc_completion_count(
+    const OperationDesc* op) {
+    return reinterpret_cast<uint32_t*>(op->completion_count_ptr);
+}
+
+__host__ __device__ __forceinline__ uint32_t* operation_desc_completion_flag(
+    const OperationDesc* op) {
+    return reinterpret_cast<uint32_t*>(op->completion_flag_ptr);
 }
 
 __host__ __device__ __forceinline__ size_t operation_desc_chunk_bytes_at(

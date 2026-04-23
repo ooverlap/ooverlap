@@ -299,6 +299,10 @@ struct PersistentTwoGpuState {
     std::vector<cudaEvent_t> timing_start_events;
     std::vector<cudaEvent_t> timing_stop_events;
 
+    std::vector<uint32_t*> completion_counts;
+    std::vector<uint32_t*> completion_flags;
+    std::vector<uint32_t> host_completion_flags;
+
     size_t bytes = 0;
     uint32_t num_chunks = 0;
     bool initialized = false;
@@ -664,16 +668,21 @@ bool wait_until_all_ranks_done_no_sleep(
     PersistentTwoGpuState* st,
     int timeout_ms) {
     const auto start = std::chrono::steady_clock::now();
-    uint64_t spins = 0;
 
     while (true) {
         bool all_done = true;
 
-        for (size_t r = 0; r < st->done_flags.size(); ++r) {
-            auto& done = st->done_flags[r];
-            done.copy_owner_to_host(st->devices);
+        for (size_t r = 0; r < st->devices.size(); ++r) {
+            system::runtime::set_device(st->devices[r]);
+            system::runtime::check_cuda(
+                cudaMemcpy(
+                    &st->host_completion_flags[r],
+                    st->completion_flags[r],
+                    sizeof(uint32_t),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy(operation completion flag -> host)");
 
-            if (!all_u32_equal_to_one(done.host_cache.data(), done.count)) {
+            if (st->host_completion_flags[r] != 1u) {
                 all_done = false;
                 break;
             }
@@ -681,14 +690,6 @@ bool wait_until_all_ranks_done_no_sleep(
 
         if (all_done) {
             return true;
-        }
-
-        ++spins;
-        if ((spins & ((1ull << 18) - 1ull)) == 0ull) {
-            std::printf("[bench] wait done flags: still waiting spins=%llu\n",
-                        static_cast<unsigned long long>(spins));
-            std::fflush(stdout);
-            //dump_persistent_debug_state(st, "wait_until_all_ranks_done_no_sleep");
         }
 
         const auto now = std::chrono::steady_clock::now();
@@ -857,6 +858,23 @@ st->prep_streams.clear();
         } catch (...) {
         }
     }
+    for (size_t r = 0; r < st->completion_counts.size(); ++r) {
+        try {
+            if (st->completion_counts[r] != nullptr) {
+                system::runtime::set_device(st->devices[r]);
+                cudaFree(st->completion_counts[r]);
+            }
+        } catch (...) {}
+    }
+    for (size_t r = 0; r < st->completion_flags.size(); ++r) {
+        try {
+            if (st->completion_flags[r] != nullptr) {
+                system::runtime::set_device(st->devices[r]);
+                cudaFree(st->completion_flags[r]);
+            }
+        } catch (...) {}
+    }
+
     try {
         comm::group_destroy(&st->group);
     } catch (...) {
@@ -874,6 +892,9 @@ st->prep_streams.clear();
     st->timing_streams.clear();
     st->timing_start_events.clear();
     st->timing_stop_events.clear();
+    st->completion_counts.clear();
+    st->completion_flags.clear();
+    st->host_completion_flags.clear();
     st->bytes = 0;
     st->num_chunks = 0;
     st->initialized = false;
@@ -909,6 +930,9 @@ void init_persistent_two_gpu_state(
     st->timing_start_events.resize(2, nullptr);
     st->timing_stop_events.resize(2, nullptr);
     st->prep_streams.resize(2, nullptr);
+    st->completion_counts.resize(2, nullptr);
+    st->completion_flags.resize(2, nullptr);
+    st->host_completion_flags.assign(2, 0u);
 
     comm::group_init(&st->group, st->devices, comm::kEndpointPersistentChunkBytes);
 
@@ -965,6 +989,22 @@ void init_persistent_two_gpu_state(
             st->done_flags[static_cast<size_t>(next_rank)].device_ptr_for_rank(static_cast<size_t>(r)),
             st->chunk_states[static_cast<size_t>(r)].records,
             1);
+
+        system::runtime::set_device(st->group.devices[static_cast<size_t>(r)]);
+
+        system::runtime::check_cuda(
+            cudaMalloc(&st->completion_counts[static_cast<size_t>(r)], sizeof(uint32_t)),
+            "cudaMalloc(completion count)");
+        
+        system::runtime::check_cuda(
+            cudaMalloc(&st->completion_flags[static_cast<size_t>(r)], sizeof(uint32_t)),
+            "cudaMalloc(completion flag)");
+        
+        st->ops[static_cast<size_t>(r)].completion_count_ptr =
+            reinterpret_cast<uint64_t>(st->completion_counts[static_cast<size_t>(r)]);
+        st->ops[static_cast<size_t>(r)].completion_flag_ptr =
+            reinterpret_cast<uint64_t>(st->completion_flags[static_cast<size_t>(r)]);
+        st->ops[static_cast<size_t>(r)].completion_target = st->num_chunks;
 
         comm::collective::device_operation_desc_create(
             &st->op_devs[static_cast<size_t>(r)],

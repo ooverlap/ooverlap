@@ -184,6 +184,24 @@ bool operation_desc_reset_local_state(
             static_cast<size_t>(desc->num_chunks) * sizeof(ChunkState)),
         "cudaMemset(operation chunk_states init)");
 
+    if (desc->completion_count_ptr != 0) {
+        system::runtime::check_cuda(
+            cudaMemset(
+                reinterpret_cast<void*>(desc->completion_count_ptr),
+                0,
+                sizeof(uint32_t)),
+            "cudaMemset(operation completion count init)");
+    }
+    
+    if (desc->completion_flag_ptr != 0) {
+        system::runtime::check_cuda(
+            cudaMemset(
+                reinterpret_cast<void*>(desc->completion_flag_ptr),
+                0,
+                sizeof(uint32_t)),
+            "cudaMemset(operation completion flag init)");
+    }
+
     return true;
 }
 

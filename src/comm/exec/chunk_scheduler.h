@@ -326,6 +326,27 @@ __device__ __forceinline__ void chunk_scheduler_retire_stage(
 
     if (next_step >= total_steps) {
         chunk_scheduler_atomic_store_u32(&local_done[chunk_idx], 1u);
+        if (op->completion_count_ptr != 0 &&
+           op->completion_flag_ptr != 0 &&
+           op->completion_target != 0) {
+           volatile uint32_t* completion_count =
+               reinterpret_cast<volatile uint32_t*>(
+                   collective::operation_desc_completion_count(op));
+           volatile uint32_t* completion_flag =
+               reinterpret_cast<volatile uint32_t*>(
+                   collective::operation_desc_completion_flag(op));
+     
+           const uint32_t completed =
+             atomicAdd(
+                 reinterpret_cast<unsigned int*>(
+                     const_cast<uint32_t*>(completion_count)),
+                 1u) + 1u;
+     
+           if (completed >= op->completion_target) {
+               __threadfence_system();
+               chunk_scheduler_atomic_store_u32(completion_flag, 1u);
+           }
+        }
     }
 
     __threadfence_system();
