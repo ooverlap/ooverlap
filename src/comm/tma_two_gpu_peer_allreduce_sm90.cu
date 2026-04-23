@@ -2,6 +2,7 @@
 
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/tma/tma.cuh"
+#include "ooverlap/tma/tma_prefetch.cuh"
 #include "ooverlap/tma/tma_reduce.cuh"
 
 #include <cuda_runtime.h>
@@ -26,13 +27,13 @@ constexpr int kTwoGpuPeerThreads = 16;
 constexpr int kTwoGpuPeerMaxBlocks = 16;
 
 // Phase 1: local_in -> local_out copy path
-constexpr size_t kTwoGpuPeerCopyChunkBytes = 16 * 1024;
-constexpr int kTwoGpuPeerCopyStageDepth = 8;
+constexpr size_t kTwoGpuPeerCopyChunkBytes = 32 * 1024;
+constexpr int kTwoGpuPeerCopyStageDepth = 4;
 constexpr int kTwoGpuPeerCopyStageGap = kTwoGpuPeerCopyStageDepth / 2;
 
 // Phase 2: peer_out -> local_out reduce path
-constexpr size_t kTwoGpuPeerReduceChunkBytes = 32 * 1024;
-constexpr int kTwoGpuPeerReduceStageDepth = 4;
+constexpr size_t kTwoGpuPeerReduceChunkBytes = 16 * 1024;
+constexpr int kTwoGpuPeerReduceStageDepth = 8;
 constexpr int kTwoGpuPeerReduceStageGap = kTwoGpuPeerReduceStageDepth / 2;
 
 static_assert(kTwoGpuPeerCopyStageDepth % 2 == 0,
@@ -129,6 +130,21 @@ __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
                 min_sz(kTwoGpuPeerCopyChunkBytes, total_bytes - offset);
 
             if (threadIdx.x == 0) {
+                const int prefetch_iter = warm + kTwoGpuPeerCopyStageDepth;
+                const int prefetch_chunk = start_chunk + prefetch_iter * chunk_stride;
+                if (prefetch_chunk < copy_num_chunks) {
+                    const size_t prefetch_offset =
+                        static_cast<size_t>(prefetch_chunk) * kTwoGpuPeerCopyChunkBytes;
+                    const size_t prefetch_bytes =
+                        min_sz(kTwoGpuPeerCopyChunkBytes, total_bytes - prefetch_offset);
+                    const size_t prefetch_bulk_bytes =
+                        prefetch_bytes & ~static_cast<size_t>(0xF);
+                    if (prefetch_bulk_bytes > 0) {
+                        tma::prefetch_L2(local_in_bytes + prefetch_offset,
+                                         static_cast<uint32_t>(prefetch_bulk_bytes));
+                    }
+                }
+
                 sync::init_semaphore(barriers[slot], 1);
                 tma::expect_bytes(barriers[slot], static_cast<uint32_t>(bytes));
                 tma::load_async(
@@ -172,6 +188,21 @@ __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
                     min_sz(kTwoGpuPeerCopyChunkBytes, total_bytes - future_offset);
 
                 if (threadIdx.x == 0) {
+                    const int prefetch_iter = iter + kTwoGpuPeerCopyStageDepth;
+                    const int prefetch_chunk = start_chunk + prefetch_iter * chunk_stride;
+                    if (prefetch_chunk < copy_num_chunks) {
+                        const size_t prefetch_offset =
+                            static_cast<size_t>(prefetch_chunk) * kTwoGpuPeerCopyChunkBytes;
+                        const size_t prefetch_bytes =
+                            min_sz(kTwoGpuPeerCopyChunkBytes, total_bytes - prefetch_offset);
+                        const size_t prefetch_bulk_bytes =
+                            prefetch_bytes & ~static_cast<size_t>(0xF);
+                        if (prefetch_bulk_bytes > 0) {
+                            tma::prefetch_L2(local_in_bytes + prefetch_offset,
+                                             static_cast<uint32_t>(prefetch_bulk_bytes));
+                        }
+                    }
+
                     if (iter >= kTwoGpuPeerCopyStageGap) {
                         tma::store_async_read_wait<kTwoGpuPeerCopyStageGap - 1>();
                     }
@@ -255,6 +286,21 @@ __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
                 min_sz(kTwoGpuPeerReduceChunkBytes, total_bytes - offset);
 
             if (threadIdx.x == 0) {
+                const int prefetch_iter = warm + kTwoGpuPeerReduceStageDepth;
+                const int prefetch_chunk = start_chunk + prefetch_iter * chunk_stride;
+                if (prefetch_chunk < reduce_num_chunks) {
+                    const size_t prefetch_offset =
+                        static_cast<size_t>(prefetch_chunk) * kTwoGpuPeerReduceChunkBytes;
+                    const size_t prefetch_bytes =
+                        min_sz(kTwoGpuPeerReduceChunkBytes, total_bytes - prefetch_offset);
+                    const size_t prefetch_bulk_bytes =
+                        prefetch_bytes & ~static_cast<size_t>(0xF);
+                    if (prefetch_bulk_bytes > 0) {
+                        tma::prefetch_L2(peer_out_bytes + prefetch_offset,
+                                         static_cast<uint32_t>(prefetch_bulk_bytes));
+                    }
+                }
+
                 sync::init_semaphore(barriers[slot], 1);
                 tma::expect_bytes(barriers[slot], static_cast<uint32_t>(bytes));
                 tma::load_async(
@@ -298,6 +344,21 @@ __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
                     min_sz(kTwoGpuPeerReduceChunkBytes, total_bytes - future_offset);
 
                 if (threadIdx.x == 0) {
+                    const int prefetch_iter = iter + kTwoGpuPeerReduceStageDepth;
+                    const int prefetch_chunk = start_chunk + prefetch_iter * chunk_stride;
+                    if (prefetch_chunk < reduce_num_chunks) {
+                        const size_t prefetch_offset =
+                            static_cast<size_t>(prefetch_chunk) * kTwoGpuPeerReduceChunkBytes;
+                        const size_t prefetch_bytes =
+                            min_sz(kTwoGpuPeerReduceChunkBytes, total_bytes - prefetch_offset);
+                        const size_t prefetch_bulk_bytes =
+                            prefetch_bytes & ~static_cast<size_t>(0xF);
+                        if (prefetch_bulk_bytes > 0) {
+                            tma::prefetch_L2(peer_out_bytes + prefetch_offset,
+                                             static_cast<uint32_t>(prefetch_bulk_bytes));
+                        }
+                    }
+
                     if (iter >= kTwoGpuPeerReduceStageGap) {
                         tma::reduce_async_read_wait<kTwoGpuPeerReduceStageGap - 1>();
                     }
