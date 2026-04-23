@@ -320,7 +320,7 @@ __device__ __forceinline__ void chunk_scheduler_retire_stage(
         const uint32_t tail = chunk_scheduler_atomic_load_u32(next_tail);
         next_items[tail % op->num_chunks].chunk_idx = chunk_idx;
         next_items[tail % op->num_chunks].step = next_step;
-        __threadfence_system();
+        __threadfence();
         chunk_scheduler_atomic_store_u32(next_tail, tail + 1u);
     }
 
@@ -343,13 +343,13 @@ __device__ __forceinline__ void chunk_scheduler_retire_stage(
                  1u) + 1u;
      
            if (completed >= op->completion_target) {
-               __threadfence_system();
+               __threadfence();
                chunk_scheduler_atomic_store_u32(completion_flag, 1u);
            }
         }
     }
 
-    __threadfence_system();
+    __threadfence();
 
     chunk_states[chunk_idx].last_step_completed = next_step;
     chunk_states[chunk_idx].flags &= ~collective::kChunkStateFlagInFlight;
