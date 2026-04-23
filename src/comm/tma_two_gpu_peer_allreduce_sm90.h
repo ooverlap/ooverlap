@@ -15,10 +15,11 @@ struct TmaTwoGpuPeerAllreduceState {
     int dev1 = -1;
     int num_chunks = 0;
 
-    cudaEvent_t init_done0 = nullptr;
-    cudaEvent_t init_done1 = nullptr;
-    cudaEvent_t reduce_done0 = nullptr;
-    cudaEvent_t reduce_done1 = nullptr;
+    // Each control buffer stores:
+    //   [0] = whole-buffer ready flag
+    //   [1] = number of blocks that finished copy phase
+    system::mapped_peer_buffer progress0{};
+    system::mapped_peer_buffer progress1{};
 };
 
 struct TmaTwoGpuPeerAllreduceOutputs {
