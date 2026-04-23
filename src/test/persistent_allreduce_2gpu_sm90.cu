@@ -664,14 +664,21 @@ static void dump_full_done_progress(
     std::fflush(stdout);
 }
 
+struct WaitPollStats {
+    uint64_t polls = 0;
+    double memcpy_ms = 0.0;
+};
+
 bool wait_until_all_ranks_done_no_sleep(
     PersistentTwoGpuState* st,
-    int timeout_ms) {
+    int timeout_ms,
+    WaitPollStats* stats) {
     const auto start = std::chrono::steady_clock::now();
 
     while (true) {
         bool all_done = true;
 
+        const auto copy_begin = std::chrono::steady_clock::now();
         for (size_t r = 0; r < st->devices.size(); ++r) {
             system::runtime::set_device(st->devices[r]);
             system::runtime::check_cuda(
@@ -684,8 +691,14 @@ bool wait_until_all_ranks_done_no_sleep(
 
             if (st->host_completion_flags[r] != 1u) {
                 all_done = false;
-                break;
             }
+        }
+        const auto copy_end = std::chrono::steady_clock::now();
+
+        if (stats != nullptr) {
+            ++stats->polls;
+            stats->memcpy_ms +=
+                std::chrono::duration<double, std::milli>(copy_end - copy_begin).count();
         }
 
         if (all_done) {
@@ -1004,7 +1017,7 @@ void init_persistent_two_gpu_state(
             reinterpret_cast<uint64_t>(st->completion_counts[static_cast<size_t>(r)]);
         st->ops[static_cast<size_t>(r)].completion_flag_ptr =
             reinterpret_cast<uint64_t>(st->completion_flags[static_cast<size_t>(r)]);
-        st->ops[static_cast<size_t>(r)].completion_target = comm::collective::operation_desc_local_completion_target(&st->ops[r]);;
+        st->ops[static_cast<size_t>(r)].completion_target = comm::collective::operation_desc_local_completion_target(&st->ops[r]);
 
         comm::collective::device_operation_desc_create(
             &st->op_devs[static_cast<size_t>(r)],
@@ -1147,14 +1160,21 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
         throw std::invalid_argument("measure_persistent_host_breakdown_ms: state is not initialized");
     }
 
+    WaitPollStats stats{};
     const auto t0 = std::chrono::steady_clock::now();
 
     launch_persistent_two_gpu_run(st);
 
     const bool all_done =
-        wait_until_all_ranks_done_no_sleep(st, timeout_ms);
+        wait_until_all_ranks_done_no_sleep(st, timeout_ms, &stats);
 
     const auto t1 = std::chrono::steady_clock::now();
+
+    printf("[wait-prof] polls=%llu memcpy_ms=%.6f avg_copy_us=%.3f\n",
+           (unsigned long long)stats.polls,
+           stats.memcpy_ms,
+           stats.polls ? (1000.0 * stats.memcpy_ms / (double)stats.polls) : 0.0);
+    fflush(stdout);
 
     if (!all_done) {
         for (int r = 0; r < 2; ++r) {
