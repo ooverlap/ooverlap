@@ -35,6 +35,11 @@
 namespace ooverlap {
 namespace {
 
+void bench_log(const char* msg) {
+    std::printf("[bench] %s\n", msg);
+    std::fflush(stdout);
+}
+
 int prev_rank_of(
     int rank,
     int world_size) {
@@ -1052,6 +1057,9 @@ void launch_persistent_kernels(
     }
 
     for (int r = 0; r < 2; ++r) {
+        std::printf("[bench] launch rank=%d\n", r);
+        std::fflush(stdout);
+
         system::runtime::check_cuda(
             comm::launch_endpoint_persistent_kernel_sm90(
                 comm::endpoint_runtime_device_handle(&st->runtimes[static_cast<size_t>(r)]),
@@ -1059,6 +1067,23 @@ void launch_persistent_kernels(
                 &st->controls[static_cast<size_t>(r)],
                 st->runtimes[static_cast<size_t>(r)].endpoint.stream),
             "launch_endpoint_persistent_kernel_sm90(bench)");
+
+        // Persistent kernels should keep the stream busy.
+        // cudaStreamQuery() == cudaErrorNotReady is expected here.
+        system::runtime::set_device(st->devices[static_cast<size_t>(r)]);
+        const cudaError_t q =
+            cudaStreamQuery(st->runtimes[static_cast<size_t>(r)].endpoint.stream);
+        if (q == cudaErrorNotReady) {
+            cudaGetLastError();
+            std::printf("[bench] launch rank=%d stream-running\n", r);
+            std::fflush(stdout);
+        } else {
+            system::runtime::check_cuda(
+                q,
+                "cudaStreamQuery(after persistent launch)");
+            std::printf("[bench] launch rank=%d stream-idle\n", r);
+            std::fflush(stdout);
+        }
     }
     st->kernels_running = true;
 }
