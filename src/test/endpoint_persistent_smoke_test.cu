@@ -25,6 +25,30 @@
 namespace ooverlap {
 namespace {
 
+void smoke_log(const char* msg) {
+    std::printf("[smoke] %s\n", msg);
+    std::fflush(stdout);
+}
+
+void smoke_log_rank_ptrs(
+    int rank,
+    const comm::collective::OperationDesc& op) {
+    std::printf(
+        "[smoke] rank=%d op_id=%u accum=0x%llx next_accum=0x%llx local_progress=0x%llx prev_progress=0x%llx completion_count=0x%llx completion_flag=0x%llx completion_target=%u total_steps=%u num_chunks=%u\n",
+        rank,
+        op.op_id,
+        static_cast<unsigned long long>(op.accum_ptr),
+        static_cast<unsigned long long>(op.next_accum_ptr),
+        static_cast<unsigned long long>(op.done_ptr),
+        static_cast<unsigned long long>(op.next_done_ptr),
+        static_cast<unsigned long long>(op.completion_count_ptr),
+        static_cast<unsigned long long>(op.completion_flag_ptr),
+        op.completion_target,
+        comm::collective::operation_desc_total_ring_steps(&op),
+        op.num_chunks);
+    std::fflush(stdout);
+}
+
 int prev_rank_of(
     int rank,
     int world_size) {
@@ -41,6 +65,8 @@ void ensure_ring_peer_access_or_throw(
     const std::vector<int>& devices) {
     const int world_size = static_cast<int>(devices.size());
 
+    smoke_log("checking ring peer access");
+
     for (int r = 0; r < world_size; ++r) {
         const int src_dev = devices[static_cast<size_t>(r)];
         const int dst_dev = devices[static_cast<size_t>(next_rank_of(r, world_size))];
@@ -49,6 +75,15 @@ void ensure_ring_peer_access_or_throw(
         system::runtime::check_cuda(
             cudaDeviceCanAccessPeer(&can_access, src_dev, dst_dev),
             "cudaDeviceCanAccessPeer(smoke ring edge)");
+
+        std::printf(
+            "[smoke] peer access rank=%d dev=%d -> rank=%d dev=%d : %d\n",
+            r,
+            src_dev,
+            next_rank_of(r, world_size),
+            dst_dev,
+            can_access);
+        std::fflush(stdout);
 
         if (can_access == 0) {
             throw std::runtime_error(
@@ -66,6 +101,8 @@ void ensure_ring_peer_access_or_throw(
                 "cudaDeviceEnablePeerAccess(smoke)");
         }
     }
+
+    smoke_log("peer access ok");
 }
 
 struct DeviceMailbox {
@@ -228,44 +265,60 @@ void expect_half_vectors_close(
     }
 }
 
-bool wait_until_all_ranks_operation_done(
+void dump_progress_mailboxes(
     const std::vector<int>& devices,
-    const std::vector<uint32_t*>& completion_flags,
-    std::vector<uint32_t>& host_completion_flags,
-    int timeout_ms) {
-    const auto start = std::chrono::steady_clock::now();
+    std::vector<DeviceMailbox>& progress_mailboxes,
+    const std::vector<comm::collective::OperationDesc>& ops,
+    const char* tag) {
+    std::printf("[smoke] progress dump: %s\n", tag);
+    for (size_t r = 0; r < progress_mailboxes.size(); ++r) {
+        progress_mailboxes[r].copy_owner_to_host(devices);
 
-    while (true) {
-        bool all_done = true;
+        const uint32_t total_steps =
+            comm::collective::operation_desc_total_ring_steps(&ops[r]);
+        std::printf(
+            "[smoke] rank=%zu total_steps=%u progress:",
+            r,
+            total_steps);
 
-        for (size_t r = 0; r < completion_flags.size(); ++r) {
-            system::runtime::set_device(devices[r]);
-            system::runtime::check_cuda(
-                cudaMemcpy(
-                    &host_completion_flags[r],
-                    completion_flags[r],
-                    sizeof(uint32_t),
-                    cudaMemcpyDeviceToHost),
-                "cudaMemcpy(smoke completion flag -> host)");
-
-            if (host_completion_flags[r] != 1u) {
-                all_done = false;
-            }
+        const size_t show = std::min<size_t>(progress_mailboxes[r].count, 8);
+        for (size_t i = 0; i < show; ++i) {
+            std::printf(" %u", progress_mailboxes[r].host_cache[i]);
         }
-
-        if (all_done) {
-            return true;
+        if (progress_mailboxes[r].count > show) {
+            std::printf(" ...");
         }
-
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-        if (elapsed_ms > timeout_ms) {
-            return false;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::printf("\n");
     }
+    std::fflush(stdout);
+}
+
+void dump_chunk_states(
+    const std::vector<int>& devices,
+    const std::vector<comm::collective::ChunkStateTable>& chunk_states,
+    const char* tag) {
+    std::printf("[smoke] chunk-state dump: %s\n", tag);
+    for (size_t r = 0; r < chunk_states.size(); ++r) {
+        comm::collective::ChunkState st{};
+        system::runtime::set_device(devices[r]);
+        system::runtime::check_cuda(
+            cudaMemcpy(
+                &st,
+                chunk_states[r].records,
+                sizeof(comm::collective::ChunkState),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(smoke chunk state -> host)");
+
+        std::printf(
+            "[smoke] rank=%zu chunk0 flags=%u started=%u completed=%u bytes=%zu offset=%zu\n",
+            r,
+            st.flags,
+            st.last_step_started,
+            st.last_step_completed,
+            st.bytes,
+            st.offset_bytes);
+    }
+    std::fflush(stdout);
 }
 
 std::string build_progress_debug_string(
@@ -317,6 +370,75 @@ std::string build_progress_debug_string(
     return out;
 }
 
+bool wait_until_all_ranks_operation_done(
+    const std::vector<int>& devices,
+    const std::vector<uint32_t*>& completion_flags,
+    std::vector<uint32_t>& host_completion_flags,
+    std::vector<DeviceMailbox>& progress_mailboxes,
+    const std::vector<comm::collective::ChunkStateTable>& chunk_states,
+    const std::vector<comm::collective::OperationDesc>& ops,
+    int timeout_ms) {
+    const auto start = std::chrono::steady_clock::now();
+    uint64_t polls = 0;
+
+    smoke_log("enter wait loop for completion flags");
+
+    while (true) {
+        bool all_done = true;
+
+        for (size_t r = 0; r < completion_flags.size(); ++r) {
+            system::runtime::set_device(devices[r]);
+            system::runtime::check_cuda(
+                cudaMemcpy(
+                    &host_completion_flags[r],
+                    completion_flags[r],
+                    sizeof(uint32_t),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy(smoke completion flag -> host)");
+
+            if (host_completion_flags[r] != 1u) {
+                all_done = false;
+            }
+        }
+
+        ++polls;
+        if (polls <= 8 || (polls % 1024u) == 0u) {
+            std::printf(
+                "[smoke] poll=%llu completion_flags=[",
+                static_cast<unsigned long long>(polls));
+            for (size_t r = 0; r < host_completion_flags.size(); ++r) {
+                std::printf("%s%u", (r == 0 ? "" : ","), host_completion_flags[r]);
+            }
+            std::printf("]\n");
+            std::fflush(stdout);
+
+            if (polls <= 4 || (polls % 4096u) == 0u) {
+                dump_progress_mailboxes(devices, progress_mailboxes, ops, "wait-loop");
+                dump_chunk_states(devices, chunk_states, "wait-loop");
+            }
+        }
+
+        if (all_done) {
+            smoke_log("all completion flags observed");
+            return true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        if (elapsed_ms > timeout_ms) {
+            std::printf(
+                "[smoke] wait timeout after %lld ms and %llu polls\n",
+                static_cast<long long>(elapsed_ms),
+                static_cast<unsigned long long>(polls));
+            std::fflush(stdout);
+            return false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 struct SmokeRunState {
     std::vector<int> devices{};
 
@@ -344,7 +466,10 @@ void destroy_smoke_run_state(
         return;
     }
 
+    smoke_log("destroy_smoke_run_state begin");
+
     if (st->kernels_running) {
+        smoke_log("requesting stop during destroy");
         for (size_t r = 0; r < st->controls.size(); ++r) {
             try {
                 comm::endpoint_persistent_control_request_stop(&st->controls[r]);
@@ -440,6 +565,8 @@ void destroy_smoke_run_state(
     st->completion_counts.clear();
     st->completion_flags.clear();
     st->host_completion_flags.clear();
+
+    smoke_log("destroy_smoke_run_state end");
 }
 
 } // namespace
@@ -464,9 +591,23 @@ bool endpoint_persistent_smoke_test(
     const uint32_t num_chunks =
         comm::collective::operation_desc_compute_num_chunks(bytes, chunk_bytes);
 
+    std::printf(
+        "[smoke] start numel=%lld bytes=%zu chunk_bytes=%zu num_chunks=%u world_size=%d devices=",
+        static_cast<long long>(numel),
+        bytes,
+        chunk_bytes,
+        num_chunks,
+        world_size);
+    for (size_t i = 0; i < st.devices.size(); ++i) {
+        std::printf("%s%d", (i == 0 ? "" : ","), st.devices[i]);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+
     try {
         ensure_ring_peer_access_or_throw(st.devices);
 
+        smoke_log("resizing state vectors");
         st.runtimes.resize(static_cast<size_t>(world_size));
         st.controls.resize(static_cast<size_t>(world_size));
         st.accums.resize(static_cast<size_t>(world_size));
@@ -478,28 +619,38 @@ bool endpoint_persistent_smoke_test(
         st.completion_flags.assign(static_cast<size_t>(world_size), nullptr);
         st.host_completion_flags.assign(static_cast<size_t>(world_size), 0u);
 
+        smoke_log("building host inputs");
         std::vector<std::vector<half>> host_srcs(static_cast<size_t>(world_size));
         for (int r = 0; r < world_size; ++r) {
             host_srcs[static_cast<size_t>(r)] = make_host_pattern(numel, r);
         }
         const auto host_ref = sum_host_vectors(host_srcs);
 
+        smoke_log("group_init begin");
         comm::group_init(&st.group, st.devices, comm::kEndpointPersistentChunkBytes);
+        smoke_log("group_init end");
 
+        smoke_log("endpoint_runtime_init begin");
         for (int r = 0; r < world_size; ++r) {
             comm::endpoint_runtime_init(
                 &st.runtimes[static_cast<size_t>(r)],
                 &st.group,
                 r);
+            std::printf(
+                "[smoke] runtime rank=%d device=%d stream=0x%llx\n",
+                r,
+                st.runtimes[static_cast<size_t>(r)].device.device,
+                static_cast<unsigned long long>(
+                    reinterpret_cast<uintptr_t>(st.runtimes[static_cast<size_t>(r)].device.stream)));
+            std::fflush(stdout);
         }
+        smoke_log("endpoint_runtime_init end");
 
+        smoke_log("allocating peer-visible buffers begin");
         for (int r = 0; r < world_size; ++r) {
             const int prev_rank = prev_rank_of(r, world_size);
             const int next_rank = next_rank_of(r, world_size);
 
-            // Accum owner r must be visible to:
-            // - r itself
-            // - prev rank, which writes into r's buffer
             st.accums[static_cast<size_t>(r)] =
                 comm::transport::alloc_peer_visible_buffer_for_rank_with_access_ranks(
                     st.group.devices,
@@ -507,16 +658,28 @@ bool endpoint_persistent_smoke_test(
                     {r, prev_rank},
                     bytes);
 
-            // Progress owner r must be visible to:
-            // - r itself, which publishes local progress
-            // - next rank, which polls it as prev_progress
             st.progress_mailboxes[static_cast<size_t>(r)].init(
                 st.group.devices,
                 r,
                 {r, next_rank},
                 num_chunks);
-        }
 
+            std::printf(
+                "[smoke] rank=%d accum(owner-view)=0x%llx progress(owner-view)=0x%llx prev_rank=%d next_rank=%d\n",
+                r,
+                static_cast<unsigned long long>(
+                    reinterpret_cast<uintptr_t>(
+                        st.accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)))),
+                static_cast<unsigned long long>(
+                    reinterpret_cast<uintptr_t>(
+                        st.progress_mailboxes[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)))),
+                prev_rank,
+                next_rank);
+            std::fflush(stdout);
+        }
+        smoke_log("allocating peer-visible buffers end");
+
+        smoke_log("copying host inputs to device begin");
         for (int r = 0; r < world_size; ++r) {
             system::runtime::set_device(st.group.devices[static_cast<size_t>(r)]);
             system::runtime::check_cuda(
@@ -526,15 +689,26 @@ bool endpoint_persistent_smoke_test(
                     bytes,
                     cudaMemcpyHostToDevice),
                 "cudaMemcpy(smoke host_src -> accum)");
+            std::printf("[smoke] copied input for rank=%d\n", r);
+            std::fflush(stdout);
         }
+        smoke_log("copying host inputs to device end");
 
+        smoke_log("chunk_state_table_init begin");
         for (int r = 0; r < world_size; ++r) {
             comm::collective::chunk_state_table_init(
                 &st.chunk_states[static_cast<size_t>(r)],
                 st.group.devices[static_cast<size_t>(r)],
                 num_chunks);
+            std::printf("[smoke] chunk state table ready rank=%d ptr=0x%llx\n",
+                        r,
+                        static_cast<unsigned long long>(
+                            reinterpret_cast<uintptr_t>(st.chunk_states[static_cast<size_t>(r)].records)));
+            std::fflush(stdout);
         }
+        smoke_log("chunk_state_table_init end");
 
+        smoke_log("building operation descriptors begin");
         for (int r = 0; r < world_size; ++r) {
             const int next_rank = next_rank_of(r, world_size);
             const int prev_rank = prev_rank_of(r, world_size);
@@ -569,24 +743,51 @@ bool endpoint_persistent_smoke_test(
                 comm::collective::operation_desc_local_completion_target(
                     &st.ops[static_cast<size_t>(r)]);
 
+            smoke_log_rank_ptrs(r, st.ops[static_cast<size_t>(r)]);
+
             comm::collective::device_operation_desc_create(
                 &st.op_devs[static_cast<size_t>(r)],
                 st.group.devices[static_cast<size_t>(r)],
                 &st.ops[static_cast<size_t>(r)]);
-        }
 
+            std::printf(
+                "[smoke] rank=%d device-op ptr=0x%llx\n",
+                r,
+                static_cast<unsigned long long>(
+                    reinterpret_cast<uintptr_t>(st.op_devs[static_cast<size_t>(r)].ptr)));
+            std::fflush(stdout);
+        }
+        smoke_log("building operation descriptors end");
+
+        smoke_log("resetting operation local state begin");
         for (int r = 0; r < world_size; ++r) {
             comm::collective::operation_desc_reset_local_state(
                 st.group.devices[static_cast<size_t>(r)],
                 &st.ops[static_cast<size_t>(r)]);
+            std::printf("[smoke] local state reset rank=%d\n", r);
+            std::fflush(stdout);
         }
+        smoke_log("resetting operation local state end");
 
+        dump_progress_mailboxes(st.devices, st.progress_mailboxes, st.ops, "after-reset");
+
+        smoke_log("persistent control init begin");
         for (int r = 0; r < world_size; ++r) {
             comm::endpoint_persistent_control_init(
                 &st.controls[static_cast<size_t>(r)],
                 st.group.devices[static_cast<size_t>(r)]);
+            std::printf(
+                "[smoke] control rank=%d stop_flag=0x%llx control_stream=0x%llx\n",
+                r,
+                static_cast<unsigned long long>(
+                    reinterpret_cast<uintptr_t>(st.controls[static_cast<size_t>(r)].stop_flag)),
+                static_cast<unsigned long long>(
+                    reinterpret_cast<uintptr_t>(st.controls[static_cast<size_t>(r)].control_stream)));
+            std::fflush(stdout);
         }
+        smoke_log("persistent control init end");
 
+        smoke_log("setting printf fifo limits");
         for (int r = 0; r < world_size; ++r) {
             system::runtime::set_device(st.group.devices[static_cast<size_t>(r)]);
             system::runtime::check_cuda(
@@ -594,7 +795,11 @@ bool endpoint_persistent_smoke_test(
                 "cudaDeviceSetLimit(cudaLimitPrintfFifoSize)");
         }
 
+        smoke_log("launching persistent kernels begin");
         for (int r = 0; r < world_size; ++r) {
+            std::printf("[smoke] launch rank=%d\n", r);
+            std::fflush(stdout);
+
             system::runtime::check_cuda(
                 comm::launch_endpoint_persistent_kernel_sm90(
                     comm::endpoint_runtime_device_handle(
@@ -603,16 +808,30 @@ bool endpoint_persistent_smoke_test(
                     &st.controls[static_cast<size_t>(r)],
                     st.runtimes[static_cast<size_t>(r)].endpoint.stream),
                 "launch_endpoint_persistent_kernel_sm90(smoke)");
+
+            system::runtime::set_device(st.group.devices[static_cast<size_t>(r)]);
+            system::runtime::check_cuda(
+                cudaStreamQuery(st.runtimes[static_cast<size_t>(r)].endpoint.stream),
+                "cudaStreamQuery(after persistent launch)");
+            std::printf("[smoke] launch rank=%d ok\n", r);
+            std::fflush(stdout);
         }
         st.kernels_running = true;
+        smoke_log("launching persistent kernels end");
 
         const bool all_done = wait_until_all_ranks_operation_done(
             st.devices,
             st.completion_flags,
             st.host_completion_flags,
+            st.progress_mailboxes,
+            st.chunk_states,
+            st.ops,
             timeout_ms);
 
         if (!all_done) {
+            dump_progress_mailboxes(st.devices, st.progress_mailboxes, st.ops, "timeout");
+            dump_chunk_states(st.devices, st.chunk_states, "timeout");
+
             throw std::runtime_error(
                 "endpoint_persistent_smoke_test: timeout waiting for completion;" +
                 build_progress_debug_string(
@@ -622,18 +841,27 @@ bool endpoint_persistent_smoke_test(
                     st.ops));
         }
 
+        smoke_log("requesting stop begin");
         for (int r = 0; r < world_size; ++r) {
             comm::endpoint_persistent_control_request_stop(
                 &st.controls[static_cast<size_t>(r)]);
+            std::printf("[smoke] stop requested rank=%d\n", r);
+            std::fflush(stdout);
         }
+        smoke_log("requesting stop end");
 
+        smoke_log("joining persistent streams begin");
         for (int r = 0; r < world_size; ++r) {
             system::runtime::check_cuda(
                 cudaStreamSynchronize(st.runtimes[static_cast<size_t>(r)].endpoint.stream),
                 "cudaStreamSynchronize(smoke persistent stream)");
+            std::printf("[smoke] joined rank=%d\n", r);
+            std::fflush(stdout);
         }
         st.kernels_running = false;
+        smoke_log("joining persistent streams end");
 
+        smoke_log("copying outputs and validating begin");
         for (int r = 0; r < world_size; ++r) {
             std::vector<half> host_out(static_cast<size_t>(numel));
             system::runtime::set_device(st.group.devices[static_cast<size_t>(r)]);
@@ -649,11 +877,17 @@ bool endpoint_persistent_smoke_test(
                 host_out,
                 host_ref,
                 "endpoint_persistent_smoke_test");
+
+            std::printf("[smoke] validated rank=%d\n", r);
+            std::fflush(stdout);
         }
+        smoke_log("copying outputs and validating end");
 
         destroy_smoke_run_state(&st);
+        smoke_log("success");
         return true;
     } catch (...) {
+        smoke_log("exception path entered");
         destroy_smoke_run_state(&st);
         throw;
     }
