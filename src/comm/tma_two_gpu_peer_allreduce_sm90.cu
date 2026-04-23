@@ -19,7 +19,7 @@ namespace ooverlap {
 namespace {
 
 constexpr int kTwoGpuPeerThreads = 16;
-constexpr size_t kTwoGpuPeerChunkBytes = 32 * 1024;
+constexpr size_t kTwoGpuPeerChunkBytes = 16 * 1024;
 constexpr int kTwoGpuPeerMaxBlocks = 16;
 
 // Use one shared ring for both phases.
