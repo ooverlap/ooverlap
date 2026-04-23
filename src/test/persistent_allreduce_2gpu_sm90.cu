@@ -1046,56 +1046,6 @@ void prepare_persistent_two_gpu_run(
     }
 }
 
-sync_two_streams(
-    st->group.devices[0], st->prep_streams[0],
-    st->group.devices[1], st->prep_streams[1],
-    "sync prepare_persistent accum copy");
-
-    for (int r = 0; r < 2; ++r) {
-        operation_desc_write_local_state(
-            st->group.devices[static_cast<size_t>(r)],
-            &st->ops[static_cast<size_t>(r)],
-            false,
-            false);
-    }
-
-    arm_persistent_timing_for_current_run(st);
-
-    for (int r = 0; r < 2; ++r) {
-        operation_desc_seed_step0_only(
-            st->group.devices[static_cast<size_t>(r)],
-            &st->ops[static_cast<size_t>(r)]);
-    }
-
-    {
-        uint32_t meta0[2] = {0, 0};
-        uint32_t meta1[2] = {0, 0};
-
-        system::runtime::set_device(st->devices[0]);
-        system::runtime::check_cuda(
-            cudaMemcpy(
-                meta0,
-                st->ready_queues[0].device_ptr_for_rank(0),
-                2 * sizeof(uint32_t),
-                cudaMemcpyDeviceToHost),
-            "cudaMemcpy(prepare queue meta0 -> host)");
-
-        system::runtime::set_device(st->devices[1]);
-        system::runtime::check_cuda(
-            cudaMemcpy(
-                meta1,
-                st->ready_queues[1].device_ptr_for_rank(1),
-                2 * sizeof(uint32_t),
-                cudaMemcpyDeviceToHost),
-            "cudaMemcpy(prepare queue meta1 -> host)");
-
-        /*std::printf(*/
-            /*"[bench] prepare persistent queue meta r0=(head=%u tail=%u) r1=(head=%u tail=%u)\n",*/
-            /*meta0[0], meta0[1], meta1[0], meta1[1]);*/
-        /*std::fflush(stdout);*/
-    }
-}
-
 PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
     PersistentTwoGpuState* st,
     int timeout_ms) {
@@ -1158,6 +1108,25 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
     return out;
 }
 
+void verify_persistent_result(
+    PersistentTwoGpuState* st,
+    int64_t numel) {
+    auto ref = reference_two_gpu_sum(numel);
+
+    auto got0 = copy_half_device_to_host(
+        reinterpret_cast<const half*>(st->accums[0].device_ptr_for_rank(0)),
+        numel,
+        st->devices[0]);
+
+    auto got1 = copy_half_device_to_host(
+        reinterpret_cast<const half*>(st->accums[1].device_ptr_for_rank(1)),
+        numel,
+        st->devices[1]);
+
+    expect_half_vectors_close(got0, ref, "persistent verify rank0");
+    expect_half_vectors_close(got1, ref, "persistent verify rank1");
+}
+
 PersistentTimingBreakdown run_one_fresh_persistent_iteration(
     int dev0,
     int dev1,
@@ -1185,25 +1154,6 @@ PersistentTimingBreakdown run_one_fresh_persistent_iteration(
         destroy_persistent_two_gpu_state(&st);
         throw;
     }
-}
-
-void verify_persistent_result(
-    PersistentTwoGpuState* st,
-    int64_t numel) {
-    auto ref = reference_two_gpu_sum(numel);
-
-    auto got0 = copy_half_device_to_host(
-        reinterpret_cast<const half*>(st->accums[0].device_ptr_for_rank(0)),
-        numel,
-        st->devices[0]);
-
-    auto got1 = copy_half_device_to_host(
-        reinterpret_cast<const half*>(st->accums[1].device_ptr_for_rank(1)),
-        numel,
-        st->devices[1]);
-
-    expect_half_vectors_close(got0, ref, "persistent verify rank0");
-    expect_half_vectors_close(got1, ref, "persistent verify rank1");
 }
 
 void init_basic_cuda_memcpy_state(

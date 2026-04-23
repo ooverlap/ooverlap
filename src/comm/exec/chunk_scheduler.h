@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#if defined(OOVERLAP_ENDPOINT_DEBUG)
+#if OOVERLAP_ENDPOINT_DEBUG
 #include <cstdio>
 #define OOVERLAP_SCHED_DBG(...) printf(__VA_ARGS__)
 #else
@@ -201,7 +201,7 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
         chunk_scheduler_atomic_store_u32(head_ptr, head + 1u);
 
         if (!chunk_scheduler_candidate_is_valid(sched, cand.chunk_idx, cand.step)) {
-#if defined(OOVERLAP_ENDPOINT_DEBUG)
+#if OOVERLAP_ENDPOINT_DEBUG
             OOVERLAP_SCHED_DBG(
                 "[stale] rank=%d chunk=%u step=%u ready_count=%u\n",
                 sched->operation->rank,
@@ -240,7 +240,7 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
         chunk_states[cand.chunk_idx].last_step_started = cand.step;
         chunk_states[cand.chunk_idx].flags |= collective::kChunkStateFlagInFlight;
 
-#if defined(OOVERLAP_ENDPOINT_DEBUG)
+#if OOVERLAP_ENDPOINT_DEBUG
         OOVERLAP_SCHED_DBG(
             "[activate] rank=%d chunk=%u step=%u queue_count=%u\n",
             op->rank,
@@ -333,7 +333,7 @@ __device__ __forceinline__ void chunk_scheduler_retire_stage(
         chunk_states[chunk_idx].flags |= collective::kChunkStateFlagDone;
     }
 
-#if defined(OOVERLAP_ENDPOINT_DEBUG)
+#if OOVERLAP_ENDPOINT_DEBUG
     OOVERLAP_SCHED_DBG(
         "[retire] rank=%d chunk=%u cur_step=%u next_step=%u local_done=%u next_tail=%u next_done=%u\n",
         op->rank,
