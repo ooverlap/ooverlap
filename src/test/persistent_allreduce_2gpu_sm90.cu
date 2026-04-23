@@ -1022,16 +1022,28 @@ void prepare_persistent_two_gpu_run(
         comm::endpoint_persistent_control_reset(&st->controls[static_cast<size_t>(r)]);
     }
 
-   for (int r = 0; r < 2; ++r) {
-    system::runtime::set_device(st->group.devices[static_cast<size_t>(r)]);
-    system::runtime::check_cuda(
-        cudaMemcpyAsync(
-            st->accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-            inputs[static_cast<size_t>(r)],
-            st->bytes,
-            cudaMemcpyDeviceToDevice,
-            st->prep_streams[static_cast<size_t>(r)]),
-        "cudaMemcpyAsync(src -> accum on prep stream)");
+    for (int r = 0; r < 2; ++r) {
+        system::runtime::set_device(st->group.devices[static_cast<size_t>(r)]);
+        system::runtime::check_cuda(
+            cudaMemcpyAsync(
+                st->accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+                inputs[static_cast<size_t>(r)],
+                st->bytes,
+                cudaMemcpyDeviceToDevice,
+                st->runtimes[static_cast<size_t>(r)].endpoint.stream),
+            "cudaMemcpyAsync(src -> accum)");
+    }
+
+    sync_two_streams(
+        st->group.devices[0], st->runtimes[0].endpoint.stream,
+        st->group.devices[1], st->runtimes[1].endpoint.stream,
+        "sync prepare_persistent");
+
+    for (int r = 0; r < 2; ++r) {
+        comm::collective::operation_desc_reset_local_state(
+            st->group.devices[static_cast<size_t>(r)],
+            &st->ops[static_cast<size_t>(r)]);
+    }
 }
 
 sync_two_streams(
@@ -1091,57 +1103,12 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
         throw std::invalid_argument("measure_persistent_host_breakdown_ms: state is not initialized");
     }
 
-    const auto host_wait_start = std::chrono::steady_clock::now();
+    const auto t0 = std::chrono::steady_clock::now();
 
-    bench_trace("persistent measure: enter wait_until_all_timing_events_complete");
-
-    const bool timing_done =
-        wait_until_all_timing_events_complete(st, timeout_ms);
-
-    bench_trace(timing_done
-        ? "persistent measure: timing events complete"
-        : "persistent measure: timing events timeout");
-
-    const auto host_wait_stop = std::chrono::steady_clock::now();
-
-    if (!timing_done) {
-        for (int r = 0; r < 2; ++r) {
-            comm::endpoint_persistent_control_request_stop(
-                &st->controls[static_cast<size_t>(r)]);
-        }
-
-        for (int r = 0; r < 2; ++r) {
-            system::runtime::check_cuda(
-                cudaStreamSynchronize(
-                    st->runtimes[static_cast<size_t>(r)].endpoint.stream),
-                "cudaStreamSynchronize(persistent stream timeout flush)");
-        }
-        st->kernels_running = false;
-
-        dump_persistent_debug_state(st, "timeout in measure_persistent_host_breakdown_ms (timing events)");
-        throw std::runtime_error(
-            "measure_persistent_host_breakdown_ms: timeout waiting for timing events");
-    }
-
-    float rank_ms[2] = {0.0f, 0.0f};
-    for (int r = 0; r < 2; ++r) {
-        system::runtime::set_device(st->devices[static_cast<size_t>(r)]);
-        system::runtime::check_cuda(
-            cudaEventElapsedTime(
-                &rank_ms[static_cast<size_t>(r)],
-                st->timing_start_events[static_cast<size_t>(r)],
-                st->timing_stop_events[static_cast<size_t>(r)]),
-            "cudaEventElapsedTime(persistent timing)");
-    }
-
-    bench_trace("persistent measure: enter wait_until_all_ranks_done_no_sleep");
+    launch_persistent_two_gpu_run(st);
 
     const bool all_done =
         wait_until_all_ranks_done_no_sleep(st, timeout_ms);
-
-    bench_trace(all_done
-        ? "persistent measure: all done flags complete"
-        : "persistent measure: all done flags timeout");
 
     if (!all_done) {
         for (int r = 0; r < 2; ++r) {
@@ -1153,28 +1120,71 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
             system::runtime::check_cuda(
                 cudaStreamSynchronize(
                     st->runtimes[static_cast<size_t>(r)].endpoint.stream),
-                "cudaStreamSynchronize(persistent stream timeout flush after event)");
+                "cudaStreamSynchronize(persistent stream timeout flush)");
         }
-        st->kernels_running = false;
 
-        dump_persistent_debug_state(st, "timeout in measure_persistent_host_breakdown_ms (all-done check)");
+        st->kernels_running = false;
+        dump_persistent_debug_state(st, "timeout in measure_persistent_host_breakdown_ms");
         throw std::runtime_error(
-            "measure_persistent_host_breakdown_ms: event timing completed but all done flags did not");
+            "measure_persistent_host_breakdown_ms: timeout waiting for done flags");
     }
+
+    const auto t1 = std::chrono::steady_clock::now();
+
+    for (int r = 0; r < 2; ++r) {
+        comm::endpoint_persistent_control_request_stop(
+            &st->controls[static_cast<size_t>(r)]);
+    }
+
+    for (int r = 0; r < 2; ++r) {
+        system::runtime::check_cuda(
+            cudaStreamSynchronize(
+                st->runtimes[static_cast<size_t>(r)].endpoint.stream),
+            "cudaStreamSynchronize(persistent stream after timing)");
+    }
+
+    st->kernels_running = false;
+
+    const auto t2 = std::chrono::steady_clock::now();
 
     PersistentTimingBreakdown out{};
     out.device_done_ms =
-        static_cast<double>(rank_ms[0] > rank_ms[1] ? rank_ms[0] : rank_ms[1]);
-    out.host_wait_done_ms =
-        std::chrono::duration<double, std::milli>(host_wait_stop - host_wait_start).count();
-    out.stop_join_ms = 0.0;
-    out.total_ms = out.device_done_ms;
-    /*std::printf(*/
-        /*"[bench] persistent measure: device_done_ms=%.6f host_wait_done_ms=%.6f\n",*/
-        /*out.device_done_ms,*/
-        /*out.host_wait_done_ms);*/
-    //std::fflush(stdout);
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    out.host_wait_done_ms = out.device_done_ms;
+    out.stop_join_ms =
+        std::chrono::duration<double, std::milli>(t2 - t1).count();
+    out.total_ms =
+        std::chrono::duration<double, std::milli>(t2 - t0).count();
     return out;
+}
+
+PersistentTimingBreakdown run_one_fresh_persistent_iteration(
+    int dev0,
+    int dev1,
+    size_t numel,
+    half* rank0_src,
+    half* rank1_src,
+    int timeout_ms,
+    bool verify_result) {
+    PersistentTwoGpuState st{};
+
+    try {
+        init_persistent_two_gpu_state(&st, dev0, dev1, numel);
+        prepare_persistent_two_gpu_run(&st, rank0_src, rank1_src);
+
+        const auto timing =
+            measure_persistent_host_breakdown_ms(&st, timeout_ms);
+
+        if (verify_result) {
+            verify_persistent_result(&st, static_cast<int64_t>(numel));
+        }
+
+        destroy_persistent_two_gpu_state(&st);
+        return timing;
+    } catch (...) {
+        destroy_persistent_two_gpu_state(&st);
+        throw;
+    }
 }
 
 void verify_persistent_result(
@@ -1487,7 +1497,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     cudaStream_t upload0 = nullptr;
     cudaStream_t upload1 = nullptr;
 
-    PersistentTwoGpuState persistent{};
     BasicCudaMemcpyState basic{};
     NcclAllreduceState nccl{};
 
@@ -1522,48 +1531,54 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             dev1, upload1,
             "sync source upload");
 
-        init_persistent_two_gpu_state(&persistent, dev0, dev1, static_cast<size_t>(numel));
         init_basic_cuda_memcpy_state(&basic, dev0, dev1, static_cast<size_t>(numel));
         init_nccl_allreduce_state(&nccl, dev0, dev1, static_cast<size_t>(numel));
 
-        // Phase 1: persistent only
-        launch_persistent_two_gpu_run(&persistent);
-
-        bench_trace("benchmark: persistent warmup begin");
-
-        for (int i = 0; i < warmup; ++i) {
-            prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
-            (void)measure_persistent_host_breakdown_ms(&persistent, 5000);
-        }
-
+        // Persistent warmup: fresh state every iteration
         double persistent_device_done_ms = 0.0;
         double persistent_host_wait_done_ms = 0.0;
+        double persistent_stop_join_ms = 0.0;
+        double persistent_total_ms = 0.0;
 
-        for (int i = 0; i < iters; ++i) {
-            prepare_persistent_two_gpu_run(&persistent, rank0_src, rank1_src);
-            const auto timing =
-                measure_persistent_host_breakdown_ms(&persistent, 5000);
-            persistent_device_done_ms += timing.device_done_ms;
-            persistent_host_wait_done_ms += timing.host_wait_done_ms;
+        for (int i = 0; i < warmup; ++i) {
+            (void)run_one_fresh_persistent_iteration(
+                dev0,
+                dev1,
+                static_cast<size_t>(numel),
+                rank0_src,
+                rank1_src,
+                5000,
+                false);
         }
 
-        const double persistent_stop_join_total_ms = measure_host_ms([&]() {
-            for (int r = 0; r < 2; ++r) {
-                comm::endpoint_persistent_control_request_stop(
-                    &persistent.controls[static_cast<size_t>(r)]);
-            }
-            for (int r = 0; r < 2; ++r) {
-                system::runtime::check_cuda(
-                    cudaStreamSynchronize(
-                        persistent.runtimes[static_cast<size_t>(r)].endpoint.stream),
-                    "cudaStreamSynchronize(persistent stream final join)");
-            }
-            persistent.kernels_running = false;
-        });
+        for (int i = 0; i < iters; ++i) {
+            const auto timing =
+                run_one_fresh_persistent_iteration(
+                    dev0,
+                    dev1,
+                    static_cast<size_t>(numel),
+                    rank0_src,
+                    rank1_src,
+                    5000,
+                    false);
 
-        verify_persistent_result(&persistent, numel);
+            persistent_device_done_ms += timing.device_done_ms;
+            persistent_host_wait_done_ms += timing.host_wait_done_ms;
+            persistent_stop_join_ms += timing.stop_join_ms;
+            persistent_total_ms += timing.total_ms;
+        }
 
-        // Phase 2: basic memcpy only
+        // One extra untimed correctness check with a fresh run.
+        (void)run_one_fresh_persistent_iteration(
+            dev0,
+            dev1,
+            static_cast<size_t>(numel),
+            rank0_src,
+            rank1_src,
+            5000,
+            true);
+
+        // Basic memcpy baseline
         for (int i = 0; i < warmup; ++i) {
             prepare_basic_cuda_memcpy_run(&basic, rank0_src, rank1_src);
             run_basic_cuda_memcpy_allreduce(&basic, static_cast<size_t>(numel));
@@ -1579,7 +1594,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
         verify_basic_cuda_memcpy_result(&basic, numel);
 
-        // Phase 3: NCCL only
+        // NCCL baseline
         for (int i = 0; i < warmup; ++i) {
             prepare_nccl_allreduce_run(&nccl, rank0_src, rank1_src);
             run_nccl_allreduce(&nccl, static_cast<size_t>(numel));
@@ -1597,7 +1612,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
         destroy_nccl_allreduce_state(&nccl);
         destroy_basic_cuda_memcpy_state(&basic);
-        destroy_persistent_two_gpu_state(&persistent);
 
         if (upload0 != nullptr) {
             system::runtime::destroy_stream_on_device(dev0, upload0);
@@ -1624,9 +1638,9 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         const double avg_ms_persistent_host_wait_done =
             persistent_host_wait_done_ms / static_cast<double>(iters);
         const double avg_ms_persistent_stop_join =
-            persistent_stop_join_total_ms / static_cast<double>(iters);
+            persistent_stop_join_ms / static_cast<double>(iters);
         const double avg_ms_persistent_total =
-            avg_ms_persistent_launch_to_done + avg_ms_persistent_stop_join;
+            persistent_total_ms / static_cast<double>(iters);
 
         const double avg_ms_cuda_memcpy =
             basic_ms / static_cast<double>(iters);
@@ -1636,8 +1650,8 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         return {
             {"avg_ms_cuda_memcpy", avg_ms_cuda_memcpy},
             {"avg_ms_nccl", avg_ms_nccl},
-            {"avg_ms_persistent_launch_to_done", avg_ms_persistent_launch_to_done},
             {"avg_ms_persistent_host_wait_done", avg_ms_persistent_host_wait_done},
+            {"avg_ms_persistent_launch_to_done", avg_ms_persistent_launch_to_done},
             {"avg_ms_persistent_stop_join", avg_ms_persistent_stop_join},
             {"avg_ms_persistent_total", avg_ms_persistent_total},
             {"cuda_memcpy_over_persistent_total",
@@ -1653,7 +1667,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     } catch (...) {
         destroy_nccl_allreduce_state(&nccl);
         destroy_basic_cuda_memcpy_state(&basic);
-        destroy_persistent_two_gpu_state(&persistent);
 
         try {
             if (upload0 != nullptr) {
