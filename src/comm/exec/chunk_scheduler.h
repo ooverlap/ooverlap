@@ -32,6 +32,10 @@ struct ChunkScheduler {
     uint32_t next_search_idx = 0;
     uint32_t ready_count = 0;
 
+    // Batched local completion tracking.
+    uint32_t local_completed_count = 0;
+    bool completion_flag_published = false;
+
     Chunk current{};
 };
 
@@ -43,6 +47,8 @@ __host__ __device__ __forceinline__ void chunk_scheduler_reset(
     sched->active_step = 0;
     sched->next_search_idx = 0;
     sched->ready_count = 0;
+    sched->local_completed_count = 0;
+    sched->completion_flag_published = false;
     chunk_clear(&sched->current);
 }
 
@@ -324,30 +330,36 @@ __device__ __forceinline__ void chunk_scheduler_retire_stage(
         chunk_scheduler_atomic_store_u32(next_tail, tail + 1u);
     }
 
-    if (next_step >= total_steps) {
+   if (next_step >= total_steps) {
         chunk_scheduler_atomic_store_u32(&local_done[chunk_idx], 1u);
-        if (op->completion_count_ptr != 0 &&
-           op->completion_flag_ptr != 0 &&
-           op->completion_target != 0) {
-           volatile uint32_t* completion_count =
-               reinterpret_cast<volatile uint32_t*>(
-                   collective::operation_desc_completion_count(op));
-           volatile uint32_t* completion_flag =
-               reinterpret_cast<volatile uint32_t*>(
-                   collective::operation_desc_completion_flag(op));
-     
-           const uint32_t completed =
-             atomicAdd(
-                 reinterpret_cast<unsigned int*>(
-                     const_cast<uint32_t*>(completion_count)),
-                 1u) + 1u;
-     
-           if (completed >= op->completion_target) {
-               __threadfence();
-               chunk_scheduler_atomic_store_u32(completion_flag, 1u);
-           }
+        if (op->completion_flag_ptr != 0 && op->completion_target != 0) {
+            // Single scheduler thread owns local completion accounting.
+            ++sched->local_completed_count;
+    
+            if (!sched->completion_flag_published &&
+                sched->local_completed_count >= op->completion_target) {
+    
+                // Optional debug/host-readable count mirror.
+                if (op->completion_count_ptr != 0) {
+                    volatile uint32_t* completion_count =
+                        reinterpret_cast<volatile uint32_t*>(
+                            collective::operation_desc_completion_count(op));
+                    *const_cast<uint32_t*>(completion_count) =
+                        sched->local_completed_count;
+                }
+    
+                // Make all prior writes visible before publishing the host-polled flag.
+                __threadfence_system();
+    
+                volatile uint32_t* completion_flag =
+                    reinterpret_cast<volatile uint32_t*>(
+                        collective::operation_desc_completion_flag(op));
+                chunk_scheduler_atomic_store_u32(completion_flag, 1u);
+    
+                sched->completion_flag_published = true;
+            }
         }
-    }
+    } 
 
     __threadfence();
 
