@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 
 #ifndef OOVERLAP_ENDPOINT_DEBUG
@@ -19,6 +20,14 @@
 
 #ifndef OOVERLAP_ENDPOINT_DISABLE_DATAPATH
 #define OOVERLAP_ENDPOINT_DISABLE_DATAPATH 1
+#endif
+
+#ifndef OOVERLAP_ENDPOINT_PROFILE_SCHEDULER
+#define OOVERLAP_ENDPOINT_PROFILE_SCHEDULER 1
+#endif
+
+#ifndef OOVERLAP_ENDPOINT_PROFILE_SCHEDULER_PRINT
+#define OOVERLAP_ENDPOINT_PROFILE_SCHEDULER_PRINT 1
 #endif
 
 namespace ooverlap {
@@ -77,6 +86,81 @@ __global__ void endpoint_persistent_kernel_sm90(
         return;
     }
 
+#if OOVERLAP_ENDPOINT_PROFILE_SCHEDULER
+
+    using Scheduler = exec::ChunkScheduler;
+    __shared__ Scheduler shared_scheduler;
+
+    __shared__ uint32_t debug_idle_loops;
+    __shared__ unsigned int dbg_retired;
+    __shared__ unsigned long long dbg_cycles_activate;
+    __shared__ unsigned long long dbg_cycles_retire;
+
+    if (threadIdx.x == 0) {
+        exec::chunk_scheduler_init_operation(&shared_scheduler, operation);
+        debug_idle_loops = 0;
+        dbg_retired = 0u;
+        dbg_cycles_activate = 0ull;
+        dbg_cycles_retire = 0ull;
+    }
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    while (true) {
+        if (endpoint_persistent_should_stop(stop_flag)) {
+#if OOVERLAP_ENDPOINT_PROFILE_SCHEDULER_PRINT
+            if (dbg_retired > 0u) {
+                const unsigned long long avg_activate =
+                    dbg_cycles_activate / static_cast<unsigned long long>(dbg_retired);
+                const unsigned long long avg_retire =
+                    dbg_cycles_retire / static_cast<unsigned long long>(dbg_retired);
+
+                printf(
+                    "[sched-prof] rank=%d retired=%u avg_activate_cycles=%llu avg_retire_cycles=%llu total_activate_cycles=%llu total_retire_cycles=%llu idle_loops=%u\n",
+                    operation->rank,
+                    dbg_retired,
+                    avg_activate,
+                    avg_retire,
+                    dbg_cycles_activate,
+                    dbg_cycles_retire,
+                    debug_idle_loops);
+            } else {
+                printf(
+                    "[sched-prof] rank=%d retired=0 avg_activate_cycles=0 avg_retire_cycles=0 total_activate_cycles=0 total_retire_cycles=0 idle_loops=%u\n",
+                    operation->rank,
+                    debug_idle_loops);
+            }
+#endif
+            return;
+        }
+
+        const unsigned long long t0 = clock64();
+        const bool has_work =
+            exec::chunk_scheduler_try_activate_next_chunk(&shared_scheduler);
+        const unsigned long long t1 = clock64();
+
+        if (!has_work) {
+            ++debug_idle_loops;
+#if defined(__CUDA_ARCH__)
+            __nanosleep(256);
+#endif
+            continue;
+        }
+
+        debug_idle_loops = 0;
+
+        exec::chunk_scheduler_retire_current(&shared_scheduler);
+        const unsigned long long t2 = clock64();
+
+        dbg_cycles_activate += (t1 - t0);
+        dbg_cycles_retire += (t2 - t1);
+        ++dbg_retired;
+    }
+
+#else
+
     extern __shared__ uint4 shared_storage_u4[];
     unsigned char* shared_raw =
         reinterpret_cast<unsigned char*>(shared_storage_u4);
@@ -84,7 +168,7 @@ __global__ void endpoint_persistent_kernel_sm90(
     __shared__ sync::semaphore stage_barriers[kPersistentStageDepth];
     __shared__ int should_stop;
     __shared__ int has_work;
-        __shared__ uint32_t debug_idle_loops;
+    __shared__ uint32_t debug_idle_loops;
 
     collective::ChunkState* chunk_states =
         collective::operation_desc_chunk_states(operation);
@@ -95,22 +179,9 @@ __global__ void endpoint_persistent_kernel_sm90(
     const uint32_t total_steps =
         collective::operation_desc_total_ring_steps(operation);
 
-    // For fast thing (but should add later)
-/*    for (uint32_t idx = static_cast<uint32_t>(threadIdx.x);*/
-         /*idx < operation->num_chunks;*/
-         /*idx += static_cast<uint32_t>(blockDim.x)) {*/
-        /*endpoint_persistent_init_chunk_state(*/
-            /*&chunk_states[idx],*/
-            /*operation,*/
-            /*idx);*/
-
-        /*if (total_steps == 0) {*/
-            /*atomicExch(*/
-                /*reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(&done[idx])),*/
-                /*1u);*/
-        /*}*/
-    /*}*/
-    /*__syncthreads();*/
+    (void)chunk_states;
+    (void)done;
+    (void)total_steps;
 
     using Scheduler = exec::ChunkScheduler;
 #if OOVERLAP_ENDPOINT_DISABLE_DATAPATH
@@ -156,16 +227,12 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
 
         if (threadIdx.x == 0) {
-            // Keep one stage empty before issuing the current bulk op.
-            // That empty slot is immediately refilled after issue, which
-            // gives us true "issue current / preload next" overlap.
             has_work = exec::chunk_pipeline_try_prime(
                 &shared_pipe,
                 kPersistentPrimeDepth) ? 1 : 0;
         }
         __syncthreads();
 
-        
         if (!has_work) {
 #if OOVERLAP_ENDPOINT_DEBUG
             if (threadIdx.x == 0) {
@@ -215,9 +282,6 @@ __global__ void endpoint_persistent_kernel_sm90(
         __syncthreads();
 
         if (threadIdx.x == 0) {
-            // Refill the one reserved stage right after the current bulk op
-            // is issued, so the next load overlaps with the current
-            // store/store-reduce.
             (void)exec::chunk_pipeline_try_prime(
                 &shared_pipe,
                 static_cast<uint32_t>(kPersistentStageDepth));
@@ -235,6 +299,8 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
         __syncthreads();
     }
+
+#endif
 }
 
 void configure_endpoint_persistent_kernel_smem(
@@ -247,8 +313,12 @@ void configure_endpoint_persistent_kernel_smem(
         cudaGetDeviceProperties(&prop, device),
         "cudaGetDeviceProperties(endpoint persistent)");
 
+#if OOVERLAP_ENDPOINT_PROFILE_SCHEDULER
+    const size_t total_smem_bytes = dynamic_smem_bytes;
+#else
     const size_t total_smem_bytes =
         dynamic_smem_bytes + kEndpointPersistentStaticSharedBytes;
+#endif
 
     if (total_smem_bytes >
         static_cast<size_t>(prop.sharedMemPerBlockOptin)) {
@@ -385,7 +455,11 @@ void endpoint_persistent_control_destroy(
 }
 
 size_t endpoint_persistent_kernel_dynamic_smem_bytes() {
+#if OOVERLAP_ENDPOINT_PROFILE_SCHEDULER
+    return 0;
+#else
     return kEndpointPersistentChunkBytes * kPersistentStageDepth;
+#endif
 }
 
 cudaError_t launch_endpoint_persistent_kernel_sm90(
