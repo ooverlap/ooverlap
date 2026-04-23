@@ -10,6 +10,10 @@
 #define OOVERLAP_ENDPOINT_DEBUG 0
 #endif
 
+#ifndef OOVERLAP_ENDPOINT_TRACK_CHUNK_STATE
+#define OOVERLAP_ENDPOINT_TRACK_CHUNK_STATE OOVERLAP_ENDPOINT_DEBUG
+#endif
+
 #if OOVERLAP_ENDPOINT_DEBUG
 #include <cstdio>
 #define OOVERLAP_SCHED_DBG(...) printf(__VA_ARGS__)
@@ -28,8 +32,13 @@ struct ChunkScheduler {
     int active_chunk_idx = -1;
     uint32_t active_step = 0;
 
-    // Kept for current kernel debug prints.
+    // Deterministic schedule cursor:
+    // - step_cursor walks global ring steps
+    // - next_search_idx walks chunk_idx in ascending order for the current step
+    uint32_t step_cursor = 0;
     uint32_t next_search_idx = 0;
+
+    // Debug / visibility only.
     uint32_t ready_count = 0;
 
     Chunk current{};
@@ -41,6 +50,7 @@ __host__ __device__ __forceinline__ void chunk_scheduler_reset(
     sched->has_active_chunk = false;
     sched->active_chunk_idx = -1;
     sched->active_step = 0;
+    sched->step_cursor = 0;
     sched->next_search_idx = 0;
     sched->ready_count = 0;
     chunk_clear(&sched->current);
@@ -84,19 +94,16 @@ __host__ __device__ __forceinline__ int chunk_scheduler_active_dst_rank(
     return sched->operation->next_rank;
 }
 
-__device__ __forceinline__ uint32_t chunk_scheduler_atomic_load_u32(
-    volatile uint32_t* ptr) {
-    return atomicAdd(
-        reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(ptr)),
-        0u);
+__device__ __forceinline__ uint32_t chunk_scheduler_volatile_load_u32(
+    const volatile uint32_t* ptr) {
+    return *ptr;
 }
 
-__device__ __forceinline__ void chunk_scheduler_atomic_store_u32(
+__device__ __forceinline__ void chunk_scheduler_store_release_u32(
     volatile uint32_t* ptr,
     uint32_t value) {
-    atomicExch(
-        reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(ptr)),
-        value);
+    *const_cast<uint32_t*>(ptr) = value;
+    __threadfence_system();
 }
 
 __device__ __forceinline__ void chunk_scheduler_build_operation_chunk(
@@ -122,39 +129,21 @@ __device__ __forceinline__ void chunk_scheduler_build_operation_chunk(
         collective::operation_desc_chunk_op_for_step(op, step);
 }
 
-__device__ __forceinline__ bool chunk_scheduler_candidate_is_valid(
-    const ChunkScheduler* sched,
-    uint32_t chunk_idx,
-    uint32_t expected_step) {
-    if (sched == nullptr || sched->operation == nullptr) {
-        return false;
+__device__ __forceinline__ uint32_t chunk_scheduler_count_remaining_local_chunks_for_step(
+    const collective::OperationDesc* op,
+    uint32_t step,
+    uint32_t begin_idx) {
+    if (op == nullptr || begin_idx >= op->num_chunks) {
+        return 0u;
     }
 
-    const collective::OperationDesc* op = sched->operation;
-    if (chunk_idx >= op->num_chunks) {
-        return false;
+    uint32_t count = 0u;
+    for (uint32_t idx = begin_idx; idx < op->num_chunks; ++idx) {
+        if (collective::operation_desc_actor_rank_for_step(op, idx, step) == op->rank) {
+            ++count;
+        }
     }
-
-    const uint32_t total_steps =
-        collective::operation_desc_total_ring_steps(op);
-
-    if (expected_step == collective::kOperationInboundStepInvalid) {
-        return false;
-    }
-    if (expected_step >= total_steps) {
-        return false;
-    }
-
-    collective::ChunkState* chunk_states =
-        collective::operation_desc_chunk_states(op);
-    if (collective::chunk_state_is_in_flight(&chunk_states[chunk_idx])) {
-        return false;
-    }
-
-    const int actor =
-        collective::operation_desc_actor_rank_for_step(op, chunk_idx, expected_step);
-
-    return actor == op->rank;
+    return count;
 }
 
 __device__ __forceinline__ void chunk_scheduler_refill_ready_cache(
@@ -163,16 +152,19 @@ __device__ __forceinline__ void chunk_scheduler_refill_ready_cache(
         return;
     }
 
-    volatile uint32_t* head_ptr =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_local_ready_head(sched->operation));
-    volatile uint32_t* tail_ptr =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_local_ready_tail(sched->operation));
+    const collective::OperationDesc* op = sched->operation;
+    const uint32_t total_steps =
+        collective::operation_desc_total_ring_steps(op);
 
-    const uint32_t head = chunk_scheduler_atomic_load_u32(head_ptr);
-    const uint32_t tail = chunk_scheduler_atomic_load_u32(tail_ptr);
-    sched->ready_count = tail - head;
+    if (sched->step_cursor >= total_steps) {
+        sched->ready_count = 0u;
+        return;
+    }
+
+    sched->ready_count = chunk_scheduler_count_remaining_local_chunks_for_step(
+        op,
+        sched->step_cursor,
+        sched->next_search_idx);
 }
 
 __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
@@ -186,74 +178,93 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
     }
 
     const collective::OperationDesc* op = sched->operation;
-    collective::ReadyItem* local_items = collective::operation_desc_local_ready_items(op);
-    volatile uint32_t* head_ptr =
-        reinterpret_cast<volatile uint32_t*>(collective::operation_desc_local_ready_head(op));
-    volatile uint32_t* tail_ptr =
-        reinterpret_cast<volatile uint32_t*>(collective::operation_desc_local_ready_tail(op));
+    const uint32_t total_steps =
+        collective::operation_desc_total_ring_steps(op);
 
-    while (true) {
-        const uint32_t head = chunk_scheduler_atomic_load_u32(head_ptr);
-        const uint32_t tail = chunk_scheduler_atomic_load_u32(tail_ptr);
+    while (sched->step_cursor < total_steps) {
+        while (sched->next_search_idx < op->num_chunks) {
+            const uint32_t idx = sched->next_search_idx;
+            const int actor =
+                collective::operation_desc_actor_rank_for_step(
+                    op, idx, sched->step_cursor);
 
-        sched->ready_count = tail - head;
-        if (head == tail) {
-            return false;
-        }
+            if (actor != op->rank) {
+                ++sched->next_search_idx;
+                continue;
+            }
 
-        const collective::ReadyItem cand = local_items[head % op->num_chunks];
-        chunk_scheduler_atomic_store_u32(head_ptr, head + 1u);
+            sched->ready_count =
+                chunk_scheduler_count_remaining_local_chunks_for_step(
+                    op,
+                    sched->step_cursor,
+                    idx);
 
-        if (!chunk_scheduler_candidate_is_valid(sched, cand.chunk_idx, cand.step)) {
+            if (sched->step_cursor > 0u) {
+                const volatile uint32_t* prev_progress =
+                    reinterpret_cast<volatile uint32_t*>(
+                        collective::operation_desc_prev_progress(op));
+
+                const uint32_t prev_value =
+                    chunk_scheduler_volatile_load_u32(&prev_progress[idx]);
+
+                if (!collective::operation_desc_step_ready_from_prev(
+                        op,
+                        idx,
+                        sched->step_cursor,
+                        prev_value)) {
+                    return false;
+                }
+            }
+
+            chunk_scheduler_build_operation_chunk(
+                op,
+                idx,
+                sched->step_cursor,
+                &sched->current);
+
+            sched->has_active_chunk = true;
+            sched->active_chunk_idx = static_cast<int>(idx);
+            sched->active_step = sched->step_cursor;
+            ++sched->next_search_idx;
+
+#if OOVERLAP_ENDPOINT_TRACK_CHUNK_STATE
+            collective::ChunkState* chunk_states =
+                collective::operation_desc_chunk_states(op);
+            collective::ChunkState* st = &chunk_states[idx];
+
+            if (!collective::chunk_state_is_initialized(st)) {
+                collective::chunk_state_clear(st);
+                st->chunk_idx = idx;
+                st->offset_bytes =
+                    collective::operation_desc_chunk_offset_bytes(op, idx);
+                st->bytes =
+                    collective::operation_desc_chunk_bytes_at(op, idx);
+                st->flags |= collective::kChunkStateFlagInitialized;
+            }
+
+            st->last_step_started = sched->step_cursor;
+            st->flags |= collective::kChunkStateFlagInFlight;
+#endif
+
 #if OOVERLAP_ENDPOINT_DEBUG
             OOVERLAP_SCHED_DBG(
-                "[stale] rank=%d chunk=%u step=%u ready_count=%u\n",
-                sched->operation->rank,
-                cand.chunk_idx,
-                cand.step,
+                "[activate] rank=%d chunk=%u step=%u step_cursor=%u next_search_idx=%u remaining=%u\n",
+                op->rank,
+                idx,
+                sched->step_cursor,
+                sched->step_cursor,
+                sched->next_search_idx,
                 sched->ready_count);
 #endif
-            continue;
+            return true;
         }
 
-        collective::ChunkState* chunk_states =
-            collective::operation_desc_chunk_states(op);
-
-        if (!collective::chunk_state_is_initialized(&chunk_states[cand.chunk_idx])) {
-            collective::chunk_state_clear(&chunk_states[cand.chunk_idx]);
-            chunk_states[cand.chunk_idx].chunk_idx = cand.chunk_idx;
-            chunk_states[cand.chunk_idx].offset_bytes =
-                collective::operation_desc_chunk_offset_bytes(op, cand.chunk_idx);
-            chunk_states[cand.chunk_idx].bytes =
-                collective::operation_desc_chunk_bytes_at(op, cand.chunk_idx);
-            chunk_states[cand.chunk_idx].flags |=
-                collective::kChunkStateFlagInitialized;
-        }
- 
-
-        chunk_scheduler_build_operation_chunk(
-            op,
-            cand.chunk_idx,
-            cand.step,
-            &sched->current);
-
-        sched->has_active_chunk = true;
-        sched->active_chunk_idx = static_cast<int>(cand.chunk_idx);
-        sched->active_step = cand.step;
-
-        chunk_states[cand.chunk_idx].last_step_started = cand.step;
-        chunk_states[cand.chunk_idx].flags |= collective::kChunkStateFlagInFlight;
-
-#if OOVERLAP_ENDPOINT_DEBUG
-        OOVERLAP_SCHED_DBG(
-            "[activate] rank=%d chunk=%u step=%u queue_count=%u\n",
-            op->rank,
-            cand.chunk_idx,
-            cand.step,
-            sched->ready_count);
-#endif
-        return true;
+        ++sched->step_cursor;
+        sched->next_search_idx = 0u;
+        sched->ready_count = 0u;
     }
+
+    return false;
 }
 
 __device__ __forceinline__ bool chunk_scheduler_try_prime_current(
@@ -275,7 +286,7 @@ __device__ __forceinline__ void chunk_scheduler_handoff_current(
 
     sched->has_active_chunk = false;
     sched->active_chunk_idx = -1;
-    sched->active_step = 0;
+    sched->active_step = 0u;
     chunk_clear(&sched->current);
 }
 
@@ -290,89 +301,63 @@ __device__ __forceinline__ void chunk_scheduler_retire_stage(
     const collective::OperationDesc* op = sched->operation;
     const uint32_t total_steps =
         collective::operation_desc_total_ring_steps(op);
-    const uint32_t reduce_steps =
-        static_cast<uint32_t>(op->world_size - 1);
-    const uint32_t next_step = current_step + 1u;
+    const uint32_t next_progress = current_step + 1u;
 
-    volatile uint32_t* local_done =
+    volatile uint32_t* local_progress =
         reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_local_done(op));
-    volatile uint32_t* next_done =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_next_done(op));
-    volatile uint32_t* next_tail =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_next_ready_tail(op));
-    collective::ReadyItem* next_items =
-        collective::operation_desc_next_ready_items(op);
+            collective::operation_desc_local_progress(op));
+
+    chunk_scheduler_store_release_u32(&local_progress[chunk_idx], next_progress);
+
+    if (next_progress >= total_steps) {
+        if (op->completion_count_ptr != 0 &&
+            op->completion_flag_ptr != 0 &&
+            op->completion_target != 0) {
+            volatile uint32_t* completion_count =
+                reinterpret_cast<volatile uint32_t*>(
+                    collective::operation_desc_completion_count(op));
+            volatile uint32_t* completion_flag =
+                reinterpret_cast<volatile uint32_t*>(
+                    collective::operation_desc_completion_flag(op));
+
+            const uint32_t completed =
+                atomicAdd(
+                    reinterpret_cast<unsigned int*>(
+                        const_cast<uint32_t*>(completion_count)),
+                    1u) + 1u;
+
+            if (completed >= op->completion_target) {
+                __threadfence_system();
+                *const_cast<uint32_t*>(completion_flag) = 1u;
+                __threadfence_system();
+            }
+        }
+    }
+
+#if OOVERLAP_ENDPOINT_TRACK_CHUNK_STATE
     collective::ChunkState* chunk_states =
         collective::operation_desc_chunk_states(op);
+    collective::ChunkState* st = &chunk_states[chunk_idx];
 
-    if (current_step < reduce_steps) {
-        if (next_step == reduce_steps) {
-            chunk_scheduler_atomic_store_u32(&next_done[chunk_idx], 1u);
-        }
-    } else {
-        chunk_scheduler_atomic_store_u32(&next_done[chunk_idx], 1u);
+    st->last_step_completed = next_progress;
+    st->flags &= ~collective::kChunkStateFlagInFlight;
+
+    if (next_progress >= total_steps) {
+        st->flags |= collective::kChunkStateFlagDone;
     }
-
-    if (next_step < total_steps) {
-        const uint32_t tail = chunk_scheduler_atomic_load_u32(next_tail);
-        next_items[tail % op->num_chunks].chunk_idx = chunk_idx;
-        next_items[tail % op->num_chunks].step = next_step;
-        __threadfence();
-        chunk_scheduler_atomic_store_u32(next_tail, tail + 1u);
-    }
-
-    if (next_step >= total_steps) {
-        chunk_scheduler_atomic_store_u32(&local_done[chunk_idx], 1u);
-        if (op->completion_count_ptr != 0 &&
-           op->completion_flag_ptr != 0 &&
-           op->completion_target != 0) {
-           volatile uint32_t* completion_count =
-               reinterpret_cast<volatile uint32_t*>(
-                   collective::operation_desc_completion_count(op));
-           volatile uint32_t* completion_flag =
-               reinterpret_cast<volatile uint32_t*>(
-                   collective::operation_desc_completion_flag(op));
-     
-           const uint32_t completed =
-             atomicAdd(
-                 reinterpret_cast<unsigned int*>(
-                     const_cast<uint32_t*>(completion_count)),
-                 1u) + 1u;
-     
-           if (completed >= op->completion_target) {
-               __threadfence();
-               chunk_scheduler_atomic_store_u32(completion_flag, 1u);
-           }
-        }
-    }
-
-    __threadfence();
-
-    chunk_states[chunk_idx].last_step_completed = next_step;
-    chunk_states[chunk_idx].flags &= ~collective::kChunkStateFlagInFlight;
-
-    if (chunk_scheduler_atomic_load_u32(&local_done[chunk_idx]) == 1u) {
-        chunk_states[chunk_idx].flags |= collective::kChunkStateFlagDone;
-    }
+#endif
 
 #if OOVERLAP_ENDPOINT_DEBUG
     OOVERLAP_SCHED_DBG(
-        "[retire] rank=%d chunk=%u cur_step=%u next_step=%u local_done=%u next_tail=%u next_done=%u\n",
+        "[retire] rank=%d chunk=%u cur_step=%u progress=%u total_steps=%u\n",
         op->rank,
         chunk_idx,
         current_step,
-        next_step,
-        chunk_scheduler_atomic_load_u32(&local_done[chunk_idx]),
-        (next_step < total_steps)
-            ? chunk_scheduler_atomic_load_u32(next_tail)
-            : 0u,
-        chunk_scheduler_atomic_load_u32(&next_done[chunk_idx]));
+        next_progress,
+        total_steps);
 #endif
 
-    sched->ready_count = 0;
+    sched->ready_count = 0u;
 }
 
 __device__ __forceinline__ void chunk_scheduler_retire_current(

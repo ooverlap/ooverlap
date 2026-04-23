@@ -69,14 +69,15 @@ __device__ __forceinline__ bool chunk_pipeline_try_prime(
     if (max_issued == 0u) {
         return pipe->issued_count > 0u;
     }
-    
+
     if (max_issued > static_cast<uint32_t>(StageDepth)) {
         max_issued = static_cast<uint32_t>(StageDepth);
     }
 
     while (pipe->issued_count < max_issued) {
+        chunk_scheduler_refill_ready_cache(&pipe->scheduler);
 
-       if (!chunk_scheduler_try_prime_current(&pipe->scheduler)) {
+        if (!chunk_scheduler_try_prime_current(&pipe->scheduler)) {
             break;
         }
 
@@ -87,13 +88,17 @@ __device__ __forceinline__ bool chunk_pipeline_try_prime(
             chunk_scheduler_active_step(&pipe->scheduler));
 
         pipe->load_op.issue(next);
+
+        // The scheduler now consumes deterministic static work, not a queue.
+        // Once the chunk is handed to a pipeline stage, the scheduler advances
+        // only by cursor state; retirement publishes monotonic progress.
         chunk_scheduler_handoff_current(&pipe->scheduler);
 
         ++pipe->issue_iter;
         ++pipe->issued_count;
     }
 
-    return pipe->issued_count > 0;
+    return pipe->issued_count > 0u;
 }
 
 template <int StageDepth, typename Scheduler, typename LoadOp, typename ApplyOp>

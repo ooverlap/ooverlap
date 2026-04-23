@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
-#include <vector>
 
 namespace ooverlap {
 namespace comm {
@@ -24,8 +23,8 @@ bool operation_desc_build_ring_allreduce(
     void* next_accum_ptr,
     void* ready_queue_ptr,
     void* next_ready_queue_ptr,
-    void* done_ptr,
-    void* next_done_ptr,
+    void* progress_ptr,
+    void* prev_progress_ptr,
     ChunkState* chunk_states_ptr,
     uint32_t op_id,
     uint32_t epoch,
@@ -55,17 +54,11 @@ bool operation_desc_build_ring_allreduce(
     if (world_size > 1 && next_accum_ptr == nullptr) {
         throw std::invalid_argument("operation_desc_build_ring_allreduce: next_accum_ptr is null");
     }
-    if (ready_queue_ptr == nullptr) {
-        throw std::invalid_argument("operation_desc_build_ring_allreduce: ready_queue_ptr is null");
+    if (progress_ptr == nullptr) {
+        throw std::invalid_argument("operation_desc_build_ring_allreduce: progress_ptr is null");
     }
-    if (world_size > 1 && next_ready_queue_ptr == nullptr) {
-        throw std::invalid_argument("operation_desc_build_ring_allreduce: next_ready_queue_ptr is null");
-    }
-    if (done_ptr == nullptr) {
-        throw std::invalid_argument("operation_desc_build_ring_allreduce: done_ptr is null");
-    }
-    if (world_size > 1 && next_done_ptr == nullptr) {
-        throw std::invalid_argument("operation_desc_build_ring_allreduce: next_done_ptr is null");
+    if (world_size > 1 && prev_progress_ptr == nullptr) {
+        throw std::invalid_argument("operation_desc_build_ring_allreduce: prev_progress_ptr is null");
     }
     if (chunk_states_ptr == nullptr) {
         throw std::invalid_argument("operation_desc_build_ring_allreduce: chunk_states_ptr is null");
@@ -105,16 +98,18 @@ bool operation_desc_build_ring_allreduce(
     out->next_accum_ptr = reinterpret_cast<uint64_t>(next_accum_ptr);
     out->next_accum_bytes = total_bytes;
 
+    // Retained only for compatibility during migration.
     out->ready_queue_ptr = reinterpret_cast<uint64_t>(ready_queue_ptr);
-    out->ready_queue_bytes = queue_bytes;
+    out->ready_queue_bytes = (ready_queue_ptr != nullptr) ? queue_bytes : 0u;
 
     out->next_ready_queue_ptr = reinterpret_cast<uint64_t>(next_ready_queue_ptr);
-    out->next_ready_queue_bytes = queue_bytes;
+    out->next_ready_queue_bytes = (next_ready_queue_ptr != nullptr) ? queue_bytes : 0u;
 
-    out->done_ptr = reinterpret_cast<uint64_t>(done_ptr);
+    // New signaling semantics.
+    out->done_ptr = reinterpret_cast<uint64_t>(progress_ptr);
     out->done_bytes = progress_bytes;
 
-    out->next_done_ptr = reinterpret_cast<uint64_t>(next_done_ptr);
+    out->next_done_ptr = reinterpret_cast<uint64_t>(prev_progress_ptr);
     out->next_done_bytes = progress_bytes;
 
     out->chunk_states_ptr = reinterpret_cast<uint64_t>(chunk_states_ptr);
@@ -133,73 +128,59 @@ bool operation_desc_reset_local_state(
     }
 
     const uint32_t total_steps = operation_desc_total_ring_steps(desc);
-
-    std::vector<uint32_t> done(desc->num_chunks, 0u);
-
-    const size_t queue_words = 2u + 2u * static_cast<size_t>(desc->num_chunks);
-    std::vector<uint32_t> queue(queue_words, 0u);
-
-    uint32_t* head_ptr = queue.data();
-    uint32_t* tail_ptr = queue.data() + 1;
-    ReadyItem* items = reinterpret_cast<ReadyItem*>(queue.data() + 2);
-
-    *head_ptr = 0u;
-    *tail_ptr = 0u;
-
-    if (total_steps == 0) {
-        std::fill(done.begin(), done.end(), 1u);
-    } else {
-        uint32_t tail = 0u;
-        for (uint32_t idx = 0; idx < desc->num_chunks; ++idx) {
-            if (operation_desc_actor_rank_for_step(desc, idx, 0u) == desc->rank) {
-                items[tail].chunk_idx = idx;
-                items[tail].step = 0u;
-                ++tail;
-            }
-        }
-        *tail_ptr = tail;
-    }
+    const size_t progress_bytes = operation_desc_progress_storage_bytes(desc);
 
     system::runtime::set_device(device);
-    system::runtime::check_cuda(
-        cudaMemcpy(
-            reinterpret_cast<void*>(desc->ready_queue_ptr),
-            queue.data(),
-            queue.size() * sizeof(uint32_t),
-            cudaMemcpyHostToDevice),
-        "cudaMemcpy(operation ready_queue init)");
+
+    if (desc->ready_queue_ptr != 0 && desc->ready_queue_bytes != 0) {
+        system::runtime::check_cuda(
+            cudaMemset(
+                reinterpret_cast<void*>(desc->ready_queue_ptr),
+                0,
+                desc->ready_queue_bytes),
+            "cudaMemset(operation ready_queue reset)");
+    }
 
     system::runtime::check_cuda(
-        cudaMemcpy(
+        cudaMemset(
             reinterpret_cast<void*>(desc->done_ptr),
-            done.data(),
-            static_cast<size_t>(desc->num_chunks) * sizeof(uint32_t),
-            cudaMemcpyHostToDevice),
-        "cudaMemcpy(operation done init)");
+            0,
+            progress_bytes),
+        "cudaMemset(operation progress reset)");
 
     system::runtime::check_cuda(
         cudaMemset(
             reinterpret_cast<void*>(desc->chunk_states_ptr),
             0,
             static_cast<size_t>(desc->num_chunks) * sizeof(ChunkState)),
-        "cudaMemset(operation chunk_states init)");
+        "cudaMemset(operation chunk_states reset)");
+
+    uint32_t host_completion_count = 0u;
+    uint32_t host_completion_flag = 0u;
+
+    if (total_steps == 0u) {
+        host_completion_count = desc->completion_target;
+        host_completion_flag = (desc->completion_target > 0u) ? 1u : 0u;
+    }
 
     if (desc->completion_count_ptr != 0) {
         system::runtime::check_cuda(
-            cudaMemset(
+            cudaMemcpy(
                 reinterpret_cast<void*>(desc->completion_count_ptr),
-                0,
-                sizeof(uint32_t)),
-            "cudaMemset(operation completion count init)");
+                &host_completion_count,
+                sizeof(uint32_t),
+                cudaMemcpyHostToDevice),
+            "cudaMemcpy(operation completion count reset)");
     }
-    
+
     if (desc->completion_flag_ptr != 0) {
         system::runtime::check_cuda(
-            cudaMemset(
+            cudaMemcpy(
                 reinterpret_cast<void*>(desc->completion_flag_ptr),
-                0,
-                sizeof(uint32_t)),
-            "cudaMemset(operation completion flag init)");
+                &host_completion_flag,
+                sizeof(uint32_t),
+                cudaMemcpyHostToDevice),
+            "cudaMemcpy(operation completion flag reset)");
     }
 
     return true;

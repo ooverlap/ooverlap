@@ -55,23 +55,6 @@ __device__ __forceinline__ bool endpoint_persistent_runtime_is_minimally_valid(
            runtime->stream != nullptr;
 }
 
-__device__ __forceinline__ void endpoint_persistent_init_chunk_state(
-    collective::ChunkState* st,
-    const collective::OperationDesc* op,
-    uint32_t chunk_idx) {
-    collective::chunk_state_clear(st);
-    st->chunk_idx = chunk_idx;
-    st->last_step_started = 0;
-    st->last_step_completed = 0;
-    st->flags = collective::kChunkStateFlagInitialized;
-    st->offset_bytes = collective::operation_desc_chunk_offset_bytes(op, chunk_idx);
-    st->bytes = collective::operation_desc_chunk_bytes_at(op, chunk_idx);
-
-    if (collective::operation_desc_total_ring_steps(op) == 0) {
-        st->flags |= collective::kChunkStateFlagDone;
-    }
-}
-
 __global__ void endpoint_persistent_kernel_sm90(
     DeviceEndpointRuntime runtime,
     const collective::OperationDesc* operation,
@@ -98,7 +81,7 @@ __global__ void endpoint_persistent_kernel_sm90(
 
     if (threadIdx.x == 0) {
         exec::chunk_scheduler_init_operation(&shared_scheduler, operation);
-        debug_idle_loops = 0;
+        debug_idle_loops = 0u;
         dbg_retired = 0u;
         dbg_cycles_activate = 0ull;
         dbg_cycles_retire = 0ull;
@@ -149,7 +132,7 @@ __global__ void endpoint_persistent_kernel_sm90(
             continue;
         }
 
-        debug_idle_loops = 0;
+        debug_idle_loops = 0u;
 
         exec::chunk_scheduler_retire_current(&shared_scheduler);
         const unsigned long long t2 = clock64();
@@ -169,19 +152,6 @@ __global__ void endpoint_persistent_kernel_sm90(
     __shared__ int should_stop;
     __shared__ int has_work;
     __shared__ uint32_t debug_idle_loops;
-
-    collective::ChunkState* chunk_states =
-        collective::operation_desc_chunk_states(operation);
-    volatile uint32_t* done =
-        reinterpret_cast<volatile uint32_t*>(
-            collective::operation_desc_local_done(operation));
-
-    const uint32_t total_steps =
-        collective::operation_desc_total_ring_steps(operation);
-
-    (void)chunk_states;
-    (void)done;
-    (void)total_steps;
 
     using Scheduler = exec::ChunkScheduler;
 #if OOVERLAP_ENDPOINT_DISABLE_DATAPATH
@@ -212,7 +182,7 @@ __global__ void endpoint_persistent_kernel_sm90(
             stage_barriers);
 
         exec::chunk_pipeline_init(&shared_pipe, &shared_scheduler);
-        debug_idle_loops = 0;
+        debug_idle_loops = 0u;
     }
     __syncthreads();
 
@@ -238,26 +208,23 @@ __global__ void endpoint_persistent_kernel_sm90(
             if (threadIdx.x == 0) {
                 ++debug_idle_loops;
                 if ((debug_idle_loops & 0x3ffffu) == 0u) {
-                    volatile uint32_t* local_done =
+                    volatile uint32_t* local_progress =
                         reinterpret_cast<volatile uint32_t*>(
-                            collective::operation_desc_local_done(operation));
-                    volatile uint32_t* local_head =
-                        reinterpret_cast<volatile uint32_t*>(
-                            collective::operation_desc_local_ready_head(operation));
-                    volatile uint32_t* local_tail =
-                        reinterpret_cast<volatile uint32_t*>(
-                            collective::operation_desc_local_ready_tail(operation));
+                            collective::operation_desc_local_progress(operation));
+
+                    const uint32_t progress0 =
+                        (operation->num_chunks > 0)
+                            ? exec::chunk_scheduler_volatile_load_u32(&local_progress[0])
+                            : 0u;
 
                     printf(
-                        "[idle] rank=%d idle_loops=%u queue_count=%u head=%u tail=%u done0=%u\n",
+                        "[idle] rank=%d idle_loops=%u step_cursor=%u next_search_idx=%u remaining_local=%u progress0=%u\n",
                         operation->rank,
                         debug_idle_loops,
+                        shared_pipe.scheduler.step_cursor,
+                        shared_pipe.scheduler.next_search_idx,
                         shared_pipe.scheduler.ready_count,
-                        exec::chunk_scheduler_atomic_load_u32(local_head),
-                        exec::chunk_scheduler_atomic_load_u32(local_tail),
-                        (operation->num_chunks > 0)
-                            ? exec::chunk_scheduler_atomic_load_u32(&local_done[0])
-                            : 0u);
+                        progress0);
                 }
             }
 #endif
@@ -271,7 +238,7 @@ __global__ void endpoint_persistent_kernel_sm90(
         }
 
         if (threadIdx.x == 0) {
-            debug_idle_loops = 0;
+            debug_idle_loops = 0u;
         }
         __syncthreads();
 
