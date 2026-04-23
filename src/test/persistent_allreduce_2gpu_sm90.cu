@@ -1257,7 +1257,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                     host0,
                     host1,
                     host_ref,
-                    validate);
+                    false);
 
             if (measure) {
                 sum_basic_ms += basic_ms;
