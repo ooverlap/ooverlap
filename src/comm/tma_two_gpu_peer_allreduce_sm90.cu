@@ -346,14 +346,14 @@ cudaError_t prime_tma_two_gpu_peer_allreduce_outputs_sm90(
     }
 
     system::runtime::set_device(st->dev0);
-    system::runtime::check_cuda(
-        cudaMemset(st->progress0.ptr, 0, kTwoGpuPeerProgressBytes),
-        "cudaMemset(progress0)");
+        system::runtime::check_cuda(
+        cudaMemsetAsync(st->progress0.ptr, 0, kTwoGpuPeerProgressBytes, stream0),
+        "cudaMemsetAsync(progress0)");
 
     system::runtime::set_device(st->dev1);
     system::runtime::check_cuda(
-        cudaMemset(st->progress1.ptr, 0, kTwoGpuPeerProgressBytes),
-        "cudaMemset(progress1)");
+        cudaMemsetAsync(st->progress1.ptr, 0, kTwoGpuPeerProgressBytes, stream1),
+        "cudaMemsetAsync(progress1)");
 
     return cudaSuccess;
 }
