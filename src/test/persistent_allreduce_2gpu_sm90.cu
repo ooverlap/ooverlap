@@ -7,13 +7,9 @@
 #include "comm/transport/buffer.h"
 #include "ooverlap/system/runtime_utils.cuh"
 
-#include <cuda.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <nccl.h>
 
 #include <chrono>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -23,22 +19,8 @@
 #include <thread>
 #include <vector>
 
-#define OOVERLAP_PERSIST_NCCL_CHECK(cmd)                                                     \
-    do {                                                                                     \
-        ncclResult_t result__ = (cmd);                                                       \
-        if (result__ != ncclSuccess) {                                                       \
-            throw std::runtime_error(                                                        \
-                std::string("NCCL error: ") + ncclGetErrorString(result__));                 \
-        }                                                                                    \
-    } while (0)
-
 namespace ooverlap {
 namespace {
-
-void bench_log(const char* msg) {
-    std::printf("[bench] %s\n", msg);
-    std::fflush(stdout);
-}
 
 int prev_rank_of(
     int rank,
@@ -85,132 +67,6 @@ void ensure_bidirectional_peer_access_or_throw(
     } else {
         system::runtime::check_cuda(err10, "cudaDeviceEnablePeerAccess(dev1 -> dev0)");
     }
-}
-
-__global__ void fp16_add_inplace_kernel(
-    half* dst,
-    const half* src,
-    int64_t n) {
-    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         idx < n;
-         idx += static_cast<int64_t>(blockDim.x) * gridDim.x) {
-        const float a = __half2float(dst[idx]);
-        const float b = __half2float(src[idx]);
-        dst[idx] = __float2half_rn(a + b);
-    }
-}
-
-cudaError_t enqueue_fp16_add_inplace(
-    half* dst,
-    const half* src,
-    size_t numel,
-    cudaStream_t stream) {
-    if (dst == nullptr || src == nullptr) {
-        return cudaErrorInvalidDevicePointer;
-    }
-    if (numel == 0) {
-        return cudaSuccess;
-    }
-
-    constexpr int kThreads = 256;
-    const int blocks = static_cast<int>((numel + kThreads - 1) / kThreads);
-    fp16_add_inplace_kernel<<<blocks, kThreads, 0, stream>>>(
-        dst, src, static_cast<int64_t>(numel));
-    return cudaGetLastError();
-}
-
-std::vector<half> make_host_pattern(
-    int64_t numel,
-    int rank) {
-    const float base = 0.125f * static_cast<float>(rank + 1);
-    const float step = 0.010f + 0.002f * static_cast<float>(rank);
-
-    std::vector<half> out(static_cast<size_t>(numel));
-    for (int64_t i = 0; i < numel; ++i) {
-        const float x = base + step * static_cast<float>(i % 97);
-        out[static_cast<size_t>(i)] = __float2half_rn(x);
-    }
-    return out;
-}
-
-std::vector<half> reference_two_gpu_sum(
-    int64_t numel) {
-    auto a = make_host_pattern(numel, 0);
-    auto b = make_host_pattern(numel, 1);
-
-    std::vector<half> out(static_cast<size_t>(numel));
-    for (int64_t i = 0; i < numel; ++i) {
-        const float acc =
-            __half2float(a[static_cast<size_t>(i)]) +
-            __half2float(b[static_cast<size_t>(i)]);
-        out[static_cast<size_t>(i)] = __float2half_rn(acc);
-    }
-    return out;
-}
-
-std::vector<half> copy_half_device_to_host(
-    const half* src,
-    int64_t numel,
-    int device) {
-    std::vector<half> host(static_cast<size_t>(numel));
-    system::runtime::set_device(device);
-    system::runtime::check_cuda(
-        cudaMemcpy(
-            host.data(),
-            src,
-            static_cast<size_t>(numel) * sizeof(half),
-            cudaMemcpyDeviceToHost),
-        "cudaMemcpy(device -> host)");
-    return host;
-}
-
-void expect_half_vectors_close(
-    const std::vector<half>& got,
-    const std::vector<half>& ref,
-    const char* what) {
-    if (got.size() != ref.size()) {
-        throw std::runtime_error(std::string(what) + ": size mismatch");
-    }
-
-    for (size_t i = 0; i < got.size(); ++i) {
-        const float g = __half2float(got[i]);
-        const float r = __half2float(ref[i]);
-        const float err = std::fabs(g - r);
-        if (err > 1.0e-3f) {
-            throw std::runtime_error(
-                std::string(what) +
-                ": mismatch at idx=" + std::to_string(i) +
-                " got=" + std::to_string(g) +
-                " ref=" + std::to_string(r));
-        }
-    }
-}
-
-void upload_host_half_vector(
-    half* dst,
-    const std::vector<half>& src,
-    int device,
-    cudaStream_t stream,
-    const char* what) {
-    system::runtime::set_device(device);
-    system::runtime::check_cuda(
-        cudaMemcpyAsync(
-            dst,
-            src.data(),
-            src.size() * sizeof(half),
-            cudaMemcpyHostToDevice,
-            stream),
-        what);
-}
-
-void sync_two_streams(
-    int dev0,
-    cudaStream_t stream0,
-    int dev1,
-    cudaStream_t stream1,
-    const char* what) {
-    system::runtime::sync_stream_on_device(dev0, stream0, what);
-    system::runtime::sync_stream_on_device(dev1, stream1, what);
 }
 
 template <typename Fn>
@@ -381,8 +237,8 @@ std::string build_persistent_progress_debug_string(
 }
 
 struct PersistentTimingBreakdown {
-    double device_done_ms = 0.0;
     double host_wait_done_ms = 0.0;
+    double launch_to_done_ms = 0.0;
     double stop_join_ms = 0.0;
     double total_ms = 0.0;
 };
@@ -409,392 +265,6 @@ struct PersistentTwoGpuState {
     uint32_t num_chunks = 0;
     bool kernels_running = false;
 };
-
-struct BasicCudaMemcpyState {
-    int dev0 = -1;
-    int dev1 = -1;
-    cudaStream_t stream0 = nullptr;
-    cudaStream_t stream1 = nullptr;
-    half* work0 = nullptr;
-    half* work1 = nullptr;
-    half* inbox0 = nullptr;
-    half* inbox1 = nullptr;
-    size_t bytes = 0;
-    bool initialized = false;
-};
-
-struct NcclAllreduceState {
-    int dev0 = -1;
-    int dev1 = -1;
-    cudaStream_t stream0 = nullptr;
-    cudaStream_t stream1 = nullptr;
-    ncclComm_t comm0 = nullptr;
-    ncclComm_t comm1 = nullptr;
-    half* work0 = nullptr;
-    half* work1 = nullptr;
-    size_t bytes = 0;
-    bool initialized = false;
-};
-
-void destroy_basic_cuda_memcpy_state(
-    BasicCudaMemcpyState* st) {
-    if (st == nullptr) {
-        return;
-    }
-
-    try {
-        if (st->work0 != nullptr) {
-            system::runtime::set_device(st->dev0);
-            cudaFree(st->work0);
-        }
-    } catch (...) {}
-    try {
-        if (st->inbox0 != nullptr) {
-            system::runtime::set_device(st->dev0);
-            cudaFree(st->inbox0);
-        }
-    } catch (...) {}
-    try {
-        if (st->work1 != nullptr) {
-            system::runtime::set_device(st->dev1);
-            cudaFree(st->work1);
-        }
-    } catch (...) {}
-    try {
-        if (st->inbox1 != nullptr) {
-            system::runtime::set_device(st->dev1);
-            cudaFree(st->inbox1);
-        }
-    } catch (...) {}
-
-    try {
-        if (st->stream0 != nullptr) {
-            system::runtime::set_device(st->dev0);
-            cudaStreamDestroy(st->stream0);
-        }
-    } catch (...) {}
-    try {
-        if (st->stream1 != nullptr) {
-            system::runtime::set_device(st->dev1);
-            cudaStreamDestroy(st->stream1);
-        }
-    } catch (...) {}
-
-    st->dev0 = -1;
-    st->dev1 = -1;
-    st->stream0 = nullptr;
-    st->stream1 = nullptr;
-    st->work0 = nullptr;
-    st->work1 = nullptr;
-    st->inbox0 = nullptr;
-    st->inbox1 = nullptr;
-    st->bytes = 0;
-    st->initialized = false;
-}
-
-void init_basic_cuda_memcpy_state(
-    BasicCudaMemcpyState* st,
-    int dev0,
-    int dev1,
-    size_t bytes) {
-    if (st == nullptr) {
-        throw std::invalid_argument("init_basic_cuda_memcpy_state: st is null");
-    }
-
-    destroy_basic_cuda_memcpy_state(st);
-
-    st->dev0 = dev0;
-    st->dev1 = dev1;
-    st->bytes = bytes;
-
-    system::runtime::set_device(dev0);
-    system::runtime::check_cuda(
-        cudaStreamCreateWithFlags(&st->stream0, cudaStreamNonBlocking),
-        "cudaStreamCreateWithFlags(basic stream0)");
-    system::runtime::check_cuda(
-        cudaMalloc(&st->work0, bytes),
-        "cudaMalloc(basic work0)");
-    system::runtime::check_cuda(
-        cudaMalloc(&st->inbox0, bytes),
-        "cudaMalloc(basic inbox0)");
-
-    system::runtime::set_device(dev1);
-    system::runtime::check_cuda(
-        cudaStreamCreateWithFlags(&st->stream1, cudaStreamNonBlocking),
-        "cudaStreamCreateWithFlags(basic stream1)");
-    system::runtime::check_cuda(
-        cudaMalloc(&st->work1, bytes),
-        "cudaMalloc(basic work1)");
-    system::runtime::check_cuda(
-        cudaMalloc(&st->inbox1, bytes),
-        "cudaMalloc(basic inbox1)");
-
-    st->initialized = true;
-}
-
-double run_basic_cuda_memcpy_once(
-    BasicCudaMemcpyState* st,
-    const std::vector<half>& host0,
-    const std::vector<half>& host1,
-    const std::vector<half>& host_ref,
-    bool validate) {
-    if (st == nullptr || !st->initialized) {
-        throw std::invalid_argument("run_basic_cuda_memcpy_once: state not initialized");
-    }
-
-    const size_t numel = host0.size();
-
-    upload_host_half_vector(
-        st->work0,
-        host0,
-        st->dev0,
-        st->stream0,
-        "cudaMemcpyAsync(basic host0 -> work0)");
-    upload_host_half_vector(
-        st->work1,
-        host1,
-        st->dev1,
-        st->stream1,
-        "cudaMemcpyAsync(basic host1 -> work1)");
-
-    sync_two_streams(
-        st->dev0,
-        st->stream0,
-        st->dev1,
-        st->stream1,
-        "sync basic uploads");
-
-    const double ms = measure_host_ms([&]() {
-        system::runtime::set_device(st->dev0);
-        system::runtime::check_cuda(
-            cudaMemcpyPeerAsync(
-                st->inbox0,
-                st->dev0,
-                st->work1,
-                st->dev1,
-                st->bytes,
-                st->stream0),
-            "cudaMemcpyPeerAsync(basic inbox0 <- work1)");
-        system::runtime::check_cuda(
-            enqueue_fp16_add_inplace(
-                st->work0,
-                st->inbox0,
-                numel,
-                st->stream0),
-            "enqueue_fp16_add_inplace(basic work0)");
-
-        system::runtime::set_device(st->dev1);
-        system::runtime::check_cuda(
-            cudaMemcpyPeerAsync(
-                st->inbox1,
-                st->dev1,
-                st->work0,
-                st->dev0,
-                st->bytes,
-                st->stream1),
-            "cudaMemcpyPeerAsync(basic inbox1 <- work0)");
-        system::runtime::check_cuda(
-            enqueue_fp16_add_inplace(
-                st->work1,
-                st->inbox1,
-                numel,
-                st->stream1),
-            "enqueue_fp16_add_inplace(basic work1)");
-
-        sync_two_streams(
-            st->dev0,
-            st->stream0,
-            st->dev1,
-            st->stream1,
-            "sync basic allreduce");
-    });
-
-    if (validate) {
-        const auto out0 = copy_half_device_to_host(st->work0, static_cast<int64_t>(numel), st->dev0);
-        const auto out1 = copy_half_device_to_host(st->work1, static_cast<int64_t>(numel), st->dev1);
-        expect_half_vectors_close(out0, host_ref, "basic cudaMemcpy allreduce rank0");
-        expect_half_vectors_close(out1, host_ref, "basic cudaMemcpy allreduce rank1");
-    }
-
-    return ms;
-}
-
-void destroy_nccl_allreduce_state(
-    NcclAllreduceState* st) {
-    if (st == nullptr) {
-        return;
-    }
-
-    try {
-        if (st->comm0 != nullptr) {
-            system::runtime::set_device(st->dev0);
-            ncclCommDestroy(st->comm0);
-        }
-    } catch (...) {}
-    try {
-        if (st->comm1 != nullptr) {
-            system::runtime::set_device(st->dev1);
-            ncclCommDestroy(st->comm1);
-        }
-    } catch (...) {}
-
-    try {
-        if (st->work0 != nullptr) {
-            system::runtime::set_device(st->dev0);
-            cudaFree(st->work0);
-        }
-    } catch (...) {}
-    try {
-        if (st->work1 != nullptr) {
-            system::runtime::set_device(st->dev1);
-            cudaFree(st->work1);
-        }
-    } catch (...) {}
-
-    try {
-        if (st->stream0 != nullptr) {
-            system::runtime::set_device(st->dev0);
-            cudaStreamDestroy(st->stream0);
-        }
-    } catch (...) {}
-    try {
-        if (st->stream1 != nullptr) {
-            system::runtime::set_device(st->dev1);
-            cudaStreamDestroy(st->stream1);
-        }
-    } catch (...) {}
-
-    st->dev0 = -1;
-    st->dev1 = -1;
-    st->stream0 = nullptr;
-    st->stream1 = nullptr;
-    st->comm0 = nullptr;
-    st->comm1 = nullptr;
-    st->work0 = nullptr;
-    st->work1 = nullptr;
-    st->bytes = 0;
-    st->initialized = false;
-}
-
-void init_nccl_allreduce_state(
-    NcclAllreduceState* st,
-    int dev0,
-    int dev1,
-    size_t bytes) {
-    if (st == nullptr) {
-        throw std::invalid_argument("init_nccl_allreduce_state: st is null");
-    }
-
-    destroy_nccl_allreduce_state(st);
-
-    st->dev0 = dev0;
-    st->dev1 = dev1;
-    st->bytes = bytes;
-
-    system::runtime::set_device(dev0);
-    system::runtime::check_cuda(
-        cudaStreamCreateWithFlags(&st->stream0, cudaStreamNonBlocking),
-        "cudaStreamCreateWithFlags(nccl stream0)");
-    system::runtime::check_cuda(
-        cudaMalloc(&st->work0, bytes),
-        "cudaMalloc(nccl work0)");
-
-    system::runtime::set_device(dev1);
-    system::runtime::check_cuda(
-        cudaStreamCreateWithFlags(&st->stream1, cudaStreamNonBlocking),
-        "cudaStreamCreateWithFlags(nccl stream1)");
-    system::runtime::check_cuda(
-        cudaMalloc(&st->work1, bytes),
-        "cudaMalloc(nccl work1)");
-
-    ncclUniqueId id{};
-    OOVERLAP_PERSIST_NCCL_CHECK(ncclGetUniqueId(&id));
-
-    system::runtime::set_device(dev0);
-    OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitRank(&st->comm0, 2, id, 0));
-
-    system::runtime::set_device(dev1);
-    OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitRank(&st->comm1, 2, id, 1));
-
-    st->initialized = true;
-}
-
-double run_nccl_allreduce_once(
-    NcclAllreduceState* st,
-    const std::vector<half>& host0,
-    const std::vector<half>& host1,
-    const std::vector<half>& host_ref,
-    bool validate) {
-    if (st == nullptr || !st->initialized) {
-        throw std::invalid_argument("run_nccl_allreduce_once: state not initialized");
-    }
-
-    const size_t numel = host0.size();
-
-    upload_host_half_vector(
-        st->work0,
-        host0,
-        st->dev0,
-        st->stream0,
-        "cudaMemcpyAsync(nccl host0 -> work0)");
-    upload_host_half_vector(
-        st->work1,
-        host1,
-        st->dev1,
-        st->stream1,
-        "cudaMemcpyAsync(nccl host1 -> work1)");
-
-    sync_two_streams(
-        st->dev0,
-        st->stream0,
-        st->dev1,
-        st->stream1,
-        "sync nccl uploads");
-
-    const double ms = measure_host_ms([&]() {
-        OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
-
-        system::runtime::set_device(st->dev0);
-        OOVERLAP_PERSIST_NCCL_CHECK(
-            ncclAllReduce(
-                st->work0,
-                st->work0,
-                numel,
-                ncclHalf,
-                ncclSum,
-                st->comm0,
-                st->stream0));
-
-        system::runtime::set_device(st->dev1);
-        OOVERLAP_PERSIST_NCCL_CHECK(
-            ncclAllReduce(
-                st->work1,
-                st->work1,
-                numel,
-                ncclHalf,
-                ncclSum,
-                st->comm1,
-                st->stream1));
-
-        OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
-
-        sync_two_streams(
-            st->dev0,
-            st->stream0,
-            st->dev1,
-            st->stream1,
-            "sync nccl allreduce");
-    });
-
-    if (validate) {
-        const auto out0 = copy_half_device_to_host(st->work0, static_cast<int64_t>(numel), st->dev0);
-        const auto out1 = copy_half_device_to_host(st->work1, static_cast<int64_t>(numel), st->dev1);
-        expect_half_vectors_close(out0, host_ref, "NCCL allreduce rank0");
-        expect_half_vectors_close(out1, host_ref, "NCCL allreduce rank1");
-    }
-
-    return ms;
-}
 
 void destroy_persistent_two_gpu_state(
     PersistentTwoGpuState* st) {
@@ -854,7 +324,8 @@ void destroy_persistent_two_gpu_state(
                 system::runtime::set_device(st->devices[r]);
                 cudaFree(st->completion_counts[r]);
             }
-        } catch (...) {}
+        } catch (...) {
+        }
     }
 
     for (size_t r = 0; r < st->completion_flags.size(); ++r) {
@@ -863,7 +334,8 @@ void destroy_persistent_two_gpu_state(
                 system::runtime::set_device(st->devices[r]);
                 cudaFree(st->completion_flags[r]);
             }
-        } catch (...) {}
+        } catch (...) {
+        }
     }
 
     for (auto& ctl : st->controls) {
@@ -913,7 +385,7 @@ void init_persistent_two_gpu_state(
     destroy_persistent_two_gpu_state(st);
 
     st->devices = {dev0, dev1};
-    st->bytes = numel * sizeof(half);
+    st->bytes = numel * sizeof(uint16_t);
     st->num_chunks = comm::collective::operation_desc_compute_num_chunks(
         st->bytes,
         comm::kEndpointPersistentChunkBytes);
@@ -1008,40 +480,23 @@ void init_persistent_two_gpu_state(
             &st->controls[static_cast<size_t>(r)],
             st->group.devices[static_cast<size_t>(r)]);
     }
-
-    for (int r = 0; r < 2; ++r) {
-        system::runtime::set_device(st->group.devices[static_cast<size_t>(r)]);
-        system::runtime::check_cuda(
-            cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 8 * 1024 * 1024),
-            "cudaDeviceSetLimit(cudaLimitPrintfFifoSize)");
-    }
 }
 
-void upload_persistent_inputs(
-    PersistentTwoGpuState* st,
-    const std::vector<half>& host0,
-    const std::vector<half>& host1) {
+void reset_persistent_two_gpu_state(
+    PersistentTwoGpuState* st) {
     if (st == nullptr) {
-        throw std::invalid_argument("upload_persistent_inputs: st is null");
+        throw std::invalid_argument("reset_persistent_two_gpu_state: st is null");
     }
 
-    system::runtime::set_device(st->devices[0]);
-    system::runtime::check_cuda(
-        cudaMemcpy(
-            st->accums[0].device_ptr_for_rank(0),
-            host0.data(),
-            st->bytes,
-            cudaMemcpyHostToDevice),
-        "cudaMemcpy(persistent host0 -> accum0)");
-
-    system::runtime::set_device(st->devices[1]);
-    system::runtime::check_cuda(
-        cudaMemcpy(
-            st->accums[1].device_ptr_for_rank(1),
-            host1.data(),
-            st->bytes,
-            cudaMemcpyHostToDevice),
-        "cudaMemcpy(persistent host1 -> accum1)");
+    for (int r = 0; r < 2; ++r) {
+        system::runtime::set_device(st->devices[static_cast<size_t>(r)]);
+        system::runtime::check_cuda(
+            cudaMemset(
+                st->accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+                0,
+                st->bytes),
+            "cudaMemset(persistent accum)");
+    }
 
     for (int r = 0; r < 2; ++r) {
         comm::collective::operation_desc_reset_local_state(
@@ -1057,9 +512,6 @@ void launch_persistent_kernels(
     }
 
     for (int r = 0; r < 2; ++r) {
-        std::printf("[bench] launch rank=%d\n", r);
-        std::fflush(stdout);
-
         system::runtime::check_cuda(
             comm::launch_endpoint_persistent_kernel_sm90(
                 comm::endpoint_runtime_device_handle(&st->runtimes[static_cast<size_t>(r)]),
@@ -1068,23 +520,18 @@ void launch_persistent_kernels(
                 st->runtimes[static_cast<size_t>(r)].endpoint.stream),
             "launch_endpoint_persistent_kernel_sm90(bench)");
 
-        // Persistent kernels should keep the stream busy.
-        // cudaStreamQuery() == cudaErrorNotReady is expected here.
         system::runtime::set_device(st->devices[static_cast<size_t>(r)]);
         const cudaError_t q =
             cudaStreamQuery(st->runtimes[static_cast<size_t>(r)].endpoint.stream);
         if (q == cudaErrorNotReady) {
             cudaGetLastError();
-            std::printf("[bench] launch rank=%d stream-running\n", r);
-            std::fflush(stdout);
         } else {
             system::runtime::check_cuda(
                 q,
                 "cudaStreamQuery(after persistent launch)");
-            std::printf("[bench] launch rank=%d stream-idle\n", r);
-            std::fflush(stdout);
         }
     }
+
     st->kernels_running = true;
 }
 
@@ -1092,17 +539,13 @@ PersistentTimingBreakdown run_persistent_once(
     int dev0,
     int dev1,
     int64_t numel,
-    const std::vector<half>& host0,
-    const std::vector<half>& host1,
-    const std::vector<half>& host_ref,
-    bool validate,
     int timeout_ms = 5000) {
     PersistentTimingBreakdown out{};
     PersistentTwoGpuState st;
 
     try {
         init_persistent_two_gpu_state(&st, dev0, dev1, static_cast<size_t>(numel));
-        upload_persistent_inputs(&st, host0, host1);
+        reset_persistent_two_gpu_state(&st);
 
         const auto launch_begin = std::chrono::steady_clock::now();
         launch_persistent_kernels(&st);
@@ -1118,7 +561,7 @@ PersistentTimingBreakdown run_persistent_once(
 
             if (!all_done) {
                 throw std::runtime_error(
-                    "persistent allreduce timeout;" +
+                    "persistent control-only timeout;" +
                     build_persistent_progress_debug_string(
                         st.devices,
                         st.progress_mailboxes,
@@ -1127,18 +570,9 @@ PersistentTimingBreakdown run_persistent_once(
             }
         });
 
-        const auto launch_done = std::chrono::steady_clock::now();
-        out.device_done_ms =
-            std::chrono::duration<double, std::milli>(launch_done - launch_begin).count();
-
-        std::printf(
-            "[wait-prof] polls=%llu memcpy_ms=%.6f avg_copy_us=%.3f\n",
-            static_cast<unsigned long long>(wait_stats.polls),
-            wait_stats.memcpy_ms,
-            (wait_stats.polls == 0)
-                ? 0.0
-                : (1000.0 * wait_stats.memcpy_ms / static_cast<double>(wait_stats.polls)));
-        std::fflush(stdout);
+        const auto done_time = std::chrono::steady_clock::now();
+        out.launch_to_done_ms =
+            std::chrono::duration<double, std::milli>(done_time - launch_begin).count();
 
         out.stop_join_ms = measure_host_ms([&]() {
             for (int r = 0; r < 2; ++r) {
@@ -1151,24 +585,20 @@ PersistentTimingBreakdown run_persistent_once(
                     cudaStreamSynchronize(st.runtimes[static_cast<size_t>(r)].endpoint.stream),
                     "cudaStreamSynchronize(persistent bench stream)");
             }
+
             st.kernels_running = false;
         });
 
-        out.total_ms = out.device_done_ms;
+        out.total_ms = out.launch_to_done_ms;
 
-        if (validate) {
-            const auto out0 = copy_half_device_to_host(
-                reinterpret_cast<const half*>(st.accums[0].device_ptr_for_rank(0)),
-                numel,
-                dev0);
-            const auto out1 = copy_half_device_to_host(
-                reinterpret_cast<const half*>(st.accums[1].device_ptr_for_rank(1)),
-                numel,
-                dev1);
-
-            expect_half_vectors_close(out0, host_ref, "persistent allreduce rank0");
-            expect_half_vectors_close(out1, host_ref, "persistent allreduce rank1");
-        }
+        std::printf(
+            "[wait-prof] polls=%llu memcpy_ms=%.6f avg_copy_us=%.3f\n",
+            static_cast<unsigned long long>(wait_stats.polls),
+            wait_stats.memcpy_ms,
+            (wait_stats.polls == 0)
+                ? 0.0
+                : (1000.0 * wait_stats.memcpy_ms / static_cast<double>(wait_stats.polls)));
+        std::fflush(stdout);
 
         destroy_persistent_two_gpu_state(&st);
         return out;
@@ -1205,81 +635,30 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
     ensure_bidirectional_peer_access_or_throw(dev0, dev1);
 
-    const auto host0 = make_host_pattern(numel, 0);
-    const auto host1 = make_host_pattern(numel, 1);
-    const auto host_ref = reference_two_gpu_sum(numel);
-
-    BasicCudaMemcpyState basic{};
-    NcclAllreduceState nccl{};
-
-    init_basic_cuda_memcpy_state(
-        &basic,
-        dev0,
-        dev1,
-        static_cast<size_t>(numel) * sizeof(half));
-    init_nccl_allreduce_state(
-        &nccl,
-        dev0,
-        dev1,
-        static_cast<size_t>(numel) * sizeof(half));
-
-    double sum_basic_ms = 0.0;
-    double sum_nccl_ms = 0.0;
     double sum_persistent_wait_ms = 0.0;
     double sum_persistent_launch_to_done_ms = 0.0;
     double sum_persistent_stop_join_ms = 0.0;
     double sum_persistent_total_ms = 0.0;
 
-    try {
-        for (int iter = 0; iter < warmup + iters; ++iter) {
-            const bool measure = iter >= warmup;
-            const bool validate = (iter == 0);
+    for (int iter = 0; iter < warmup + iters; ++iter) {
+        const bool measure = iter >= warmup;
 
-            const double basic_ms = run_basic_cuda_memcpy_once(
-                &basic,
-                host0,
-                host1,
-                host_ref,
-                validate);
+        const PersistentTimingBreakdown persistent =
+            run_persistent_once(
+                dev0,
+                dev1,
+                numel,
+                5000);
 
-            const double nccl_ms = run_nccl_allreduce_once(
-                &nccl,
-                host0,
-                host1,
-                host_ref,
-                validate);
-
-            const PersistentTimingBreakdown persistent =
-                run_persistent_once(
-                    dev0,
-                    dev1,
-                    numel,
-                    host0,
-                    host1,
-                    host_ref,
-                    false);
-
-            if (measure) {
-                sum_basic_ms += basic_ms;
-                sum_nccl_ms += nccl_ms;
-                sum_persistent_wait_ms += persistent.host_wait_done_ms;
-                sum_persistent_launch_to_done_ms += persistent.device_done_ms;
-                sum_persistent_stop_join_ms += persistent.stop_join_ms;
-                sum_persistent_total_ms += persistent.total_ms;
-            }
+        if (measure) {
+            sum_persistent_wait_ms += persistent.host_wait_done_ms;
+            sum_persistent_launch_to_done_ms += persistent.launch_to_done_ms;
+            sum_persistent_stop_join_ms += persistent.stop_join_ms;
+            sum_persistent_total_ms += persistent.total_ms;
         }
-
-        destroy_basic_cuda_memcpy_state(&basic);
-        destroy_nccl_allreduce_state(&nccl);
-    } catch (...) {
-        destroy_basic_cuda_memcpy_state(&basic);
-        destroy_nccl_allreduce_state(&nccl);
-        throw;
     }
 
     const double denom = static_cast<double>(iters);
-    const double avg_basic_ms = sum_basic_ms / denom;
-    const double avg_nccl_ms = sum_nccl_ms / denom;
     const double avg_persistent_wait_ms = sum_persistent_wait_ms / denom;
     const double avg_persistent_launch_to_done_ms =
         sum_persistent_launch_to_done_ms / denom;
@@ -1289,17 +668,15 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         sum_persistent_total_ms / denom;
 
     std::map<std::string, double> out;
-    out["avg_ms_cuda_memcpy"] = avg_basic_ms;
-    out["avg_ms_nccl"] = avg_nccl_ms;
     out["avg_ms_persistent_host_wait_done"] = avg_persistent_wait_ms;
     out["avg_ms_persistent_launch_to_done"] = avg_persistent_launch_to_done_ms;
     out["avg_ms_persistent_stop_join"] = avg_persistent_stop_join_ms;
     out["avg_ms_persistent_total"] = avg_persistent_total_ms;
-    out["cuda_memcpy_over_persistent_total"] =
-        (avg_persistent_total_ms > 0.0) ? (avg_basic_ms / avg_persistent_total_ms) : 0.0;
-    out["nccl_over_persistent_total"] =
-        (avg_persistent_total_ms > 0.0) ? (avg_nccl_ms / avg_persistent_total_ms) : 0.0;
+    out["avg_ms_cuda_memcpy"] = 0.0;
+    out["avg_ms_nccl"] = 0.0;
     out["numel"] = static_cast<double>(numel);
+    out["iters"] = static_cast<double>(iters);
+    out["warmup"] = static_cast<double>(warmup);
 
     return out;
 }
