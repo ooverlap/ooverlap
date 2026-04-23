@@ -152,7 +152,7 @@ __global__ void endpoint_persistent_kernel_sm90(
 
         
         if (!has_work) {
-#if defined(OOVERLAP_ENDPOINT_DEBUG)
+#if OOVERLAP_ENDPOINT_DEBUG
             if (threadIdx.x == 0) {
                 ++debug_idle_loops;
                 if ((debug_idle_loops & 0x3ffffu) == 0u) {

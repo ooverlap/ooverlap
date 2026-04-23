@@ -36,11 +36,13 @@ namespace ooverlap {
 namespace {
 
 void bench_trace(const char* msg) {
+    return;
     std::printf("[bench] %s\n", msg);
     std::fflush(stdout);
 }
 
 void bench_trace_iter(const char* phase, int iter, const char* msg) {
+    return;
     std::printf("[bench] phase=%s iter=%d %s\n", phase, iter, msg);
     std::fflush(stdout);
 }
@@ -292,6 +294,7 @@ struct PersistentTwoGpuState {
     std::vector<comm::collective::OperationDesc> ops;
     std::vector<comm::collective::DeviceOperationDesc> op_devs;
 
+    std::vector<cudaStream_t> prep_streams;
     std::vector<cudaStream_t> timing_streams;
     std::vector<cudaEvent_t> timing_start_events;
     std::vector<cudaEvent_t> timing_stop_events;
@@ -736,6 +739,17 @@ void destroy_persistent_two_gpu_state(
         } catch (...) {
         }
     }
+    for (size_t r = 0; r < st->prep_streams.size(); ++r) {
+    try {
+        if (st->prep_streams[r] != nullptr) {
+            system::runtime::destroy_stream_on_device(
+                st->devices[r],
+                st->prep_streams[r]);
+        }
+    } catch (...) {
+    }
+}
+st->prep_streams.clear();
     for (size_t r = 0; r < st->timing_streams.size(); ++r) {
         try {
             if (st->timing_streams[r] != nullptr) {
@@ -840,6 +854,7 @@ void init_persistent_two_gpu_state(
     st->timing_streams.resize(2, nullptr);
     st->timing_start_events.resize(2, nullptr);
     st->timing_stop_events.resize(2, nullptr);
+    st->prep_streams.resize(2, nullptr);
 
     comm::group_init(&st->group, st->devices, comm::kEndpointPersistentChunkBytes);
 
@@ -905,6 +920,10 @@ void init_persistent_two_gpu_state(
         comm::endpoint_persistent_control_init(
             &st->controls[static_cast<size_t>(r)],
             st->group.devices[static_cast<size_t>(r)]);
+
+        st->prep_streams[static_cast<size_t>(r)] =
+            system::runtime::create_stream_on_device(
+                st->group.devices[static_cast<size_t>(r)]);
 
         st->timing_streams[static_cast<size_t>(r)] =
             system::runtime::create_stream_on_device(st->group.devices[static_cast<size_t>(r)]);
@@ -1003,22 +1022,22 @@ void prepare_persistent_two_gpu_run(
         comm::endpoint_persistent_control_reset(&st->controls[static_cast<size_t>(r)]);
     }
 
-    for (int r = 0; r < 2; ++r) {
-        system::runtime::set_device(st->group.devices[static_cast<size_t>(r)]);
-        system::runtime::check_cuda(
-            cudaMemcpyAsync(
-                st->accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
-                inputs[static_cast<size_t>(r)],
-                st->bytes,
-                cudaMemcpyDeviceToDevice,
-                st->runtimes[static_cast<size_t>(r)].endpoint.stream),
-            "cudaMemcpyAsync(src -> accum)");
-    }
+   for (int r = 0; r < 2; ++r) {
+    system::runtime::set_device(st->group.devices[static_cast<size_t>(r)]);
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(
+            st->accums[static_cast<size_t>(r)].device_ptr_for_rank(static_cast<size_t>(r)),
+            inputs[static_cast<size_t>(r)],
+            st->bytes,
+            cudaMemcpyDeviceToDevice,
+            st->prep_streams[static_cast<size_t>(r)]),
+        "cudaMemcpyAsync(src -> accum on prep stream)");
+}
 
-    sync_two_streams(
-        st->group.devices[0], st->runtimes[0].endpoint.stream,
-        st->group.devices[1], st->runtimes[1].endpoint.stream,
-        "sync prepare_persistent accum copy");
+sync_two_streams(
+    st->group.devices[0], st->prep_streams[0],
+    st->group.devices[1], st->prep_streams[1],
+    "sync prepare_persistent accum copy");
 
     for (int r = 0; r < 2; ++r) {
         operation_desc_write_local_state(
@@ -1058,10 +1077,10 @@ void prepare_persistent_two_gpu_run(
                 cudaMemcpyDeviceToHost),
             "cudaMemcpy(prepare queue meta1 -> host)");
 
-        std::printf(
-            "[bench] prepare persistent queue meta r0=(head=%u tail=%u) r1=(head=%u tail=%u)\n",
-            meta0[0], meta0[1], meta1[0], meta1[1]);
-        std::fflush(stdout);
+        /*std::printf(*/
+            /*"[bench] prepare persistent queue meta r0=(head=%u tail=%u) r1=(head=%u tail=%u)\n",*/
+            /*meta0[0], meta0[1], meta1[0], meta1[1]);*/
+        /*std::fflush(stdout);*/
     }
 }
 
@@ -1150,11 +1169,11 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
         std::chrono::duration<double, std::milli>(host_wait_stop - host_wait_start).count();
     out.stop_join_ms = 0.0;
     out.total_ms = out.device_done_ms;
-    std::printf(
-        "[bench] persistent measure: device_done_ms=%.6f host_wait_done_ms=%.6f\n",
-        out.device_done_ms,
-        out.host_wait_done_ms);
-    std::fflush(stdout);
+    /*std::printf(*/
+        /*"[bench] persistent measure: device_done_ms=%.6f host_wait_done_ms=%.6f\n",*/
+        /*out.device_done_ms,*/
+        /*out.host_wait_done_ms);*/
+    //std::fflush(stdout);
     return out;
 }
 
