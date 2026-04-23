@@ -799,7 +799,7 @@ bool endpoint_persistent_smoke_test(
         for (int r = 0; r < world_size; ++r) {
             std::printf("[smoke] launch rank=%d\n", r);
             std::fflush(stdout);
-
+        
             system::runtime::check_cuda(
                 comm::launch_endpoint_persistent_kernel_sm90(
                     comm::endpoint_runtime_device_handle(
@@ -808,14 +808,25 @@ bool endpoint_persistent_smoke_test(
                     &st.controls[static_cast<size_t>(r)],
                     st.runtimes[static_cast<size_t>(r)].endpoint.stream),
                 "launch_endpoint_persistent_kernel_sm90(smoke)");
-
+        
+            // A persistent kernel should leave the stream in a running state.
+            // cudaStreamQuery() returning cudaErrorNotReady is expected here.
             system::runtime::set_device(st.group.devices[static_cast<size_t>(r)]);
-            system::runtime::check_cuda(
-                cudaStreamQuery(st.runtimes[static_cast<size_t>(r)].endpoint.stream),
-                "cudaStreamQuery(after persistent launch)");
-            std::printf("[smoke] launch rank=%d ok\n", r);
-            std::fflush(stdout);
+            const cudaError_t q =
+                cudaStreamQuery(st.runtimes[static_cast<size_t>(r)].endpoint.stream);
+            if (q == cudaErrorNotReady) {
+                cudaGetLastError();  // clear sticky status
+                std::printf("[smoke] launch rank=%d stream-running\n", r);
+                std::fflush(stdout);
+            } else {
+                system::runtime::check_cuda(
+                    q,
+                    "cudaStreamQuery(after persistent launch)");
+                std::printf("[smoke] launch rank=%d stream-idle\n", r);
+                std::fflush(stdout);
+            }
         }
+        
         st.kernels_running = true;
         smoke_log("launching persistent kernels end");
 
