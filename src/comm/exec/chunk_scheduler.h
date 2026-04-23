@@ -5,17 +5,21 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 #ifndef OOVERLAP_ENDPOINT_DEBUG
-#define OOVERLAP_ENDPOINT_DEBUG 0
+#define OOVERLAP_ENDPOINT_DEBUG 1
 #endif
 
 #ifndef OOVERLAP_ENDPOINT_TRACK_CHUNK_STATE
-#define OOVERLAP_ENDPOINT_TRACK_CHUNK_STATE OOVERLAP_ENDPOINT_DEBUG
+#define OOVERLAP_ENDPOINT_TRACK_CHUNK_STATE 1
+#endif
+
+#ifndef OOVERLAP_ENDPOINT_DEBUG_WAIT_PRINT_EVERY
+#define OOVERLAP_ENDPOINT_DEBUG_WAIT_PRINT_EVERY 65536u
 #endif
 
 #if OOVERLAP_ENDPOINT_DEBUG
-#include <cstdio>
 #define OOVERLAP_SCHED_DBG(...) printf(__VA_ARGS__)
 #else
 #define OOVERLAP_SCHED_DBG(...) ((void)0)
@@ -32,14 +36,16 @@ struct ChunkScheduler {
     int active_chunk_idx = -1;
     uint32_t active_step = 0;
 
-    // Deterministic schedule cursor:
-    // - step_cursor walks global ring steps
-    // - next_search_idx walks chunk_idx in ascending order for the current step
     uint32_t step_cursor = 0;
     uint32_t next_search_idx = 0;
 
-    // Debug / visibility only.
     uint32_t ready_count = 0;
+
+    // Debug state for blocked progress waits.
+    uint32_t blocked_spins = 0;
+    int blocked_chunk_idx = -1;
+    uint32_t blocked_step = 0;
+    uint32_t blocked_prev_progress = 0;
 
     Chunk current{};
 };
@@ -53,6 +59,10 @@ __host__ __device__ __forceinline__ void chunk_scheduler_reset(
     sched->step_cursor = 0;
     sched->next_search_idx = 0;
     sched->ready_count = 0;
+    sched->blocked_spins = 0;
+    sched->blocked_chunk_idx = -1;
+    sched->blocked_step = 0;
+    sched->blocked_prev_progress = 0;
     chunk_clear(&sched->current);
 }
 
@@ -61,6 +71,25 @@ __device__ __forceinline__ void chunk_scheduler_init_operation(
     const collective::OperationDesc* operation) {
     chunk_scheduler_reset(sched);
     sched->operation = operation;
+
+#if OOVERLAP_ENDPOINT_DEBUG
+    if (threadIdx.x == 0 && operation != nullptr) {
+        OOVERLAP_SCHED_DBG(
+            "[sched-init] rank=%d world=%d op_id=%u num_chunks=%u total_bytes=%zu chunk_bytes=%zu total_steps=%u accum=0x%llx next_accum=0x%llx local_progress=0x%llx prev_progress=0x%llx completion_target=%u\n",
+            operation->rank,
+            operation->world_size,
+            operation->op_id,
+            operation->num_chunks,
+            operation->total_bytes,
+            operation->chunk_bytes,
+            collective::operation_desc_total_ring_steps(operation),
+            static_cast<unsigned long long>(operation->accum_ptr),
+            static_cast<unsigned long long>(operation->next_accum_ptr),
+            static_cast<unsigned long long>(operation->done_ptr),
+            static_cast<unsigned long long>(operation->next_done_ptr),
+            operation->completion_target);
+    }
+#endif
 }
 
 __host__ __device__ __forceinline__ bool chunk_scheduler_has_current(
@@ -212,8 +241,56 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
                         idx,
                         sched->step_cursor,
                         prev_value)) {
+                    sched->blocked_chunk_idx = static_cast<int>(idx);
+                    sched->blocked_step = sched->step_cursor;
+                    sched->blocked_prev_progress = prev_value;
+                    ++sched->blocked_spins;
+
+#if OOVERLAP_ENDPOINT_DEBUG
+                    if (sched->blocked_spins <= 8u ||
+                        (sched->blocked_spins % OOVERLAP_ENDPOINT_DEBUG_WAIT_PRINT_EVERY) == 0u) {
+                        const volatile uint32_t* local_progress =
+                            reinterpret_cast<volatile uint32_t*>(
+                                collective::operation_desc_local_progress(op));
+
+                        const uint32_t local_value =
+                            chunk_scheduler_volatile_load_u32(&local_progress[idx]);
+
+                        OOVERLAP_SCHED_DBG(
+                            "[wait] rank=%d chunk=%u step=%u prev_progress=%u local_progress=%u blocked_spins=%u step_cursor=%u next_search_idx=%u ready_count=%u prev_progress_ptr=0x%llx local_progress_ptr=0x%llx\n",
+                            op->rank,
+                            idx,
+                            sched->step_cursor,
+                            prev_value,
+                            local_value,
+                            sched->blocked_spins,
+                            sched->step_cursor,
+                            sched->next_search_idx,
+                            sched->ready_count,
+                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&prev_progress[idx])),
+                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&local_progress[idx])));
+                    }
+#endif
                     return false;
                 }
+            }
+
+            if (sched->blocked_chunk_idx == static_cast<int>(idx) &&
+                sched->blocked_step == sched->step_cursor &&
+                sched->blocked_spins > 0u) {
+#if OOVERLAP_ENDPOINT_DEBUG
+                OOVERLAP_SCHED_DBG(
+                    "[unblock] rank=%d chunk=%u step=%u prev_progress=%u blocked_spins=%u\n",
+                    op->rank,
+                    idx,
+                    sched->step_cursor,
+                    sched->blocked_prev_progress,
+                    sched->blocked_spins);
+#endif
+                sched->blocked_spins = 0u;
+                sched->blocked_chunk_idx = -1;
+                sched->blocked_step = 0u;
+                sched->blocked_prev_progress = 0u;
             }
 
             chunk_scheduler_build_operation_chunk(
@@ -247,22 +324,51 @@ __device__ __forceinline__ bool chunk_scheduler_try_activate_next_chunk(
 #endif
 
 #if OOVERLAP_ENDPOINT_DEBUG
-            OOVERLAP_SCHED_DBG(
-                "[activate] rank=%d chunk=%u step=%u step_cursor=%u next_search_idx=%u remaining=%u\n",
-                op->rank,
-                idx,
-                sched->step_cursor,
-                sched->step_cursor,
-                sched->next_search_idx,
-                sched->ready_count);
+            {
+                uint32_t prev_value = 0u;
+                if (sched->step_cursor > 0u) {
+                    const volatile uint32_t* prev_progress =
+                        reinterpret_cast<volatile uint32_t*>(
+                            collective::operation_desc_prev_progress(op));
+                    prev_value = chunk_scheduler_volatile_load_u32(&prev_progress[idx]);
+                }
+
+                OOVERLAP_SCHED_DBG(
+                    "[activate] rank=%d chunk=%u step=%u next_search_idx=%u remaining=%u prev_progress=%u bytes=%zu src=0x%llx dst=0x%llx op=%d\n",
+                    op->rank,
+                    idx,
+                    sched->step_cursor,
+                    sched->next_search_idx,
+                    sched->ready_count,
+                    prev_value,
+                    sched->current.bytes,
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(sched->current.src)),
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(sched->current.dst)),
+                    static_cast<int>(sched->current.op));
+            }
 #endif
             return true;
         }
+
+#if OOVERLAP_ENDPOINT_DEBUG
+        OOVERLAP_SCHED_DBG(
+            "[advance-step] rank=%d old_step=%u -> new_step=%u\n",
+            op->rank,
+            sched->step_cursor,
+            sched->step_cursor + 1u);
+#endif
 
         ++sched->step_cursor;
         sched->next_search_idx = 0u;
         sched->ready_count = 0u;
     }
+
+#if OOVERLAP_ENDPOINT_DEBUG
+    OOVERLAP_SCHED_DBG(
+        "[drain] rank=%d no-more-work total_steps=%u\n",
+        op->rank,
+        total_steps);
+#endif
 
     return false;
 }
@@ -309,6 +415,17 @@ __device__ __forceinline__ void chunk_scheduler_retire_stage(
 
     chunk_scheduler_store_release_u32(&local_progress[chunk_idx], next_progress);
 
+#if OOVERLAP_ENDPOINT_DEBUG
+    OOVERLAP_SCHED_DBG(
+        "[retire] rank=%d chunk=%u cur_step=%u published_progress=%u total_steps=%u local_progress_ptr=0x%llx\n",
+        op->rank,
+        chunk_idx,
+        current_step,
+        next_progress,
+        total_steps,
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&local_progress[chunk_idx])));
+#endif
+
     if (next_progress >= total_steps) {
         if (op->completion_count_ptr != 0 &&
             op->completion_flag_ptr != 0 &&
@@ -326,10 +443,28 @@ __device__ __forceinline__ void chunk_scheduler_retire_stage(
                         const_cast<uint32_t*>(completion_count)),
                     1u) + 1u;
 
+#if OOVERLAP_ENDPOINT_DEBUG
+            OOVERLAP_SCHED_DBG(
+                "[complete-count] rank=%d chunk=%u completed=%u target=%u completion_count_ptr=0x%llx completion_flag_ptr=0x%llx\n",
+                op->rank,
+                chunk_idx,
+                completed,
+                op->completion_target,
+                static_cast<unsigned long long>(op->completion_count_ptr),
+                static_cast<unsigned long long>(op->completion_flag_ptr));
+#endif
+
             if (completed >= op->completion_target) {
                 __threadfence_system();
                 *const_cast<uint32_t*>(completion_flag) = 1u;
                 __threadfence_system();
+
+#if OOVERLAP_ENDPOINT_DEBUG
+                OOVERLAP_SCHED_DBG(
+                    "[complete-flag] rank=%d chunk=%u completion_flag=1\n",
+                    op->rank,
+                    chunk_idx);
+#endif
             }
         }
     }
@@ -345,16 +480,6 @@ __device__ __forceinline__ void chunk_scheduler_retire_stage(
     if (next_progress >= total_steps) {
         st->flags |= collective::kChunkStateFlagDone;
     }
-#endif
-
-#if OOVERLAP_ENDPOINT_DEBUG
-    OOVERLAP_SCHED_DBG(
-        "[retire] rank=%d chunk=%u cur_step=%u progress=%u total_steps=%u\n",
-        op->rank,
-        chunk_idx,
-        current_step,
-        next_progress,
-        total_steps);
 #endif
 
     sched->ready_count = 0u;
