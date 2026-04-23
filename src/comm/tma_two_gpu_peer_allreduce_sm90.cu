@@ -18,27 +18,55 @@
 namespace ooverlap {
 namespace {
 
+// -----------------------------------------------------------------------------
+// Tunables
+// -----------------------------------------------------------------------------
+
 constexpr int kTwoGpuPeerThreads = 16;
-constexpr size_t kTwoGpuPeerChunkBytes = 16 * 1024;
 constexpr int kTwoGpuPeerMaxBlocks = 16;
 
-// Use one shared ring for both phases.
-// We keep producer/consumer half a ring apart.
-constexpr int kTwoGpuPeerStageDepth = 4;
-constexpr int kTwoGpuPeerStageGap = kTwoGpuPeerStageDepth / 2;
+// Phase 1: local_in -> local_out copy path
+constexpr size_t kTwoGpuPeerCopyChunkBytes = 32 * 1024;
+constexpr int kTwoGpuPeerCopyStageDepth = 4;
+constexpr int kTwoGpuPeerCopyStageGap = kTwoGpuPeerCopyStageDepth / 2;
 
-static_assert(kTwoGpuPeerStageDepth % 2 == 0,
-              "kTwoGpuPeerStageDepth must be even");
-static_assert(kTwoGpuPeerStageGap >= 1,
-              "kTwoGpuPeerStageGap must be >= 1");
+// Phase 2: peer_out -> local_out reduce path
+constexpr size_t kTwoGpuPeerReduceChunkBytes = 16 * 1024;
+constexpr int kTwoGpuPeerReduceStageDepth = 8;
+constexpr int kTwoGpuPeerReduceStageGap = kTwoGpuPeerReduceStageDepth / 2;
+
+static_assert(kTwoGpuPeerCopyStageDepth % 2 == 0,
+              "kTwoGpuPeerCopyStageDepth must be even");
+static_assert(kTwoGpuPeerReduceStageDepth % 2 == 0,
+              "kTwoGpuPeerReduceStageDepth must be even");
+static_assert(kTwoGpuPeerCopyStageGap >= 1,
+              "kTwoGpuPeerCopyStageGap must be >= 1");
+static_assert(kTwoGpuPeerReduceStageGap >= 1,
+              "kTwoGpuPeerReduceStageGap must be >= 1");
+
+constexpr int kTwoGpuPeerMaxStageDepth =
+    (kTwoGpuPeerCopyStageDepth > kTwoGpuPeerReduceStageDepth)
+        ? kTwoGpuPeerCopyStageDepth
+        : kTwoGpuPeerReduceStageDepth;
+
+constexpr size_t kTwoGpuPeerMaxChunkBytes =
+    (kTwoGpuPeerCopyChunkBytes > kTwoGpuPeerReduceChunkBytes)
+        ? kTwoGpuPeerCopyChunkBytes
+        : kTwoGpuPeerReduceChunkBytes;
 
 constexpr size_t kTwoGpuPeerStaticSharedBytes =
-    static_cast<size_t>(kTwoGpuPeerStageDepth) * sizeof(sync::semaphore);
+    static_cast<size_t>(kTwoGpuPeerMaxStageDepth) * sizeof(sync::semaphore);
 
 constexpr size_t kTwoGpuPeerProgressBytes = 2 * sizeof(int);
 
 __host__ __device__ __forceinline__ size_t min_sz(size_t a, size_t b) {
     return (a < b) ? a : b;
+}
+
+__host__ __device__ __forceinline__ int ceil_div_int64_to_int(
+    size_t num,
+    size_t den) {
+    return static_cast<int>((num + den - 1) / den);
 }
 
 __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
@@ -48,23 +76,22 @@ __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
     int* local_progress,
     const int* peer_progress,
     size_t numel,
-    int num_chunks,
+    int copy_num_chunks,
+    int reduce_num_chunks,
     int num_blocks) {
 
     const int start_chunk = static_cast<int>(blockIdx.x);
     const int chunk_stride = static_cast<int>(gridDim.x);
 
-    if (start_chunk >= num_chunks) {
-        return;
-    }
+    const size_t total_bytes = numel * sizeof(half);
 
     extern __shared__ uint4 shared_storage_u4[];
     unsigned char* shared_raw = reinterpret_cast<unsigned char*>(shared_storage_u4);
 
-    __shared__ sync::semaphore barriers[kTwoGpuPeerStageDepth];
+    __shared__ sync::semaphore barriers[kTwoGpuPeerMaxStageDepth];
 
     auto stage_ptr = [&](int stage) -> unsigned char* {
-        return shared_raw + static_cast<size_t>(stage) * kTwoGpuPeerChunkBytes;
+        return shared_raw + static_cast<size_t>(stage) * kTwoGpuPeerMaxChunkBytes;
     };
 
     const unsigned char* local_in_bytes =
@@ -74,95 +101,105 @@ __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
     const unsigned char* peer_out_bytes =
         reinterpret_cast<const unsigned char*>(peer_out);
 
-    const size_t total_bytes = numel * sizeof(half);
-
     // -------------------------------------------------------------------------
-    // Phase 1:
-    // copy local input into our own peer-visible output buffer.
-    // publish one whole-buffer ready flag after all blocks finish.
+    // Phase 1: copy local input into local peer-visible output buffer
+    // Tuned by:
+    //   kTwoGpuPeerCopyChunkBytes
+    //   kTwoGpuPeerCopyStageDepth
+    //   kTwoGpuPeerCopyStageGap
     // -------------------------------------------------------------------------
 
-    // Prefill first half of the ring.
-    for (int warm = 0; warm < kTwoGpuPeerStageGap; ++warm) {
-        const int chunk = start_chunk + warm * chunk_stride;
-        if (chunk >= num_chunks) {
-            break;
-        }
+    if (start_chunk < copy_num_chunks) {
+        for (int warm = 0; warm < kTwoGpuPeerCopyStageGap; ++warm) {
+            const int chunk = start_chunk + warm * chunk_stride;
+            if (chunk >= copy_num_chunks) {
+                break;
+            }
 
-        const int slot = warm;
-        const size_t offset = static_cast<size_t>(chunk) * kTwoGpuPeerChunkBytes;
-        const size_t bytes = min_sz(kTwoGpuPeerChunkBytes, total_bytes - offset);
-
-        if (threadIdx.x == 0) {
-            sync::init_semaphore(barriers[slot], 1);
-            tma::expect_bytes(barriers[slot], static_cast<uint32_t>(bytes));
-            tma::load_async(
-                stage_ptr(slot),
-                local_in_bytes + offset,
-                static_cast<uint32_t>(bytes),
-                barriers[slot]);
-        }
-        __syncthreads();
-    }
-
-    for (int iter = 0;; ++iter) {
-        const int cur_chunk = start_chunk + iter * chunk_stride;
-        if (cur_chunk >= num_chunks) {
-            break;
-        }
-
-        const int cur_slot = iter % kTwoGpuPeerStageDepth;
-        const size_t cur_offset = static_cast<size_t>(cur_chunk) * kTwoGpuPeerChunkBytes;
-        const size_t cur_bytes = min_sz(kTwoGpuPeerChunkBytes, total_bytes - cur_offset);
-        const size_t cur_bulk_bytes = cur_bytes & ~static_cast<size_t>(0xF);
-        const size_t cur_tail_bytes = cur_bytes - cur_bulk_bytes;
-
-        if (threadIdx.x == 0) {
-            sync::wait(barriers[cur_slot], 0);
-        }
-        __syncthreads();
-
-        const int future_iter = iter + kTwoGpuPeerStageGap;
-        const int future_chunk = start_chunk + future_iter * chunk_stride;
-        if (future_chunk < num_chunks) {
-            const int future_slot = future_iter % kTwoGpuPeerStageDepth;
-            const size_t future_offset =
-                static_cast<size_t>(future_chunk) * kTwoGpuPeerChunkBytes;
-            const size_t future_bytes =
-                min_sz(kTwoGpuPeerChunkBytes, total_bytes - future_offset);
+            const int slot = warm;
+            const size_t offset =
+                static_cast<size_t>(chunk) * kTwoGpuPeerCopyChunkBytes;
+            const size_t bytes =
+                min_sz(kTwoGpuPeerCopyChunkBytes, total_bytes - offset);
 
             if (threadIdx.x == 0) {
-                if (iter >= kTwoGpuPeerStageGap) {
-                    tma::store_async_read_wait<kTwoGpuPeerStageGap - 1>();
-                }
-
-                sync::init_semaphore(barriers[future_slot], 1);
-                tma::expect_bytes(barriers[future_slot], static_cast<uint32_t>(future_bytes));
+                sync::init_semaphore(barriers[slot], 1);
+                tma::expect_bytes(barriers[slot], static_cast<uint32_t>(bytes));
                 tma::load_async(
-                    stage_ptr(future_slot),
-                    local_in_bytes + future_offset,
-                    static_cast<uint32_t>(future_bytes),
-                    barriers[future_slot]);
+                    stage_ptr(slot),
+                    local_in_bytes + offset,
+                    static_cast<uint32_t>(bytes),
+                    barriers[slot]);
             }
+            __syncthreads();
         }
 
-        __syncthreads();
-
-        if (threadIdx.x == 0 && cur_bulk_bytes > 0) {
-            tma::store_async(
-                local_out_bytes + cur_offset,
-                stage_ptr(cur_slot),
-                static_cast<uint32_t>(cur_bulk_bytes));
-        }
-
-        if (cur_tail_bytes > 0) {
-            for (size_t i = threadIdx.x; i < cur_tail_bytes; i += blockDim.x) {
-                local_out_bytes[cur_offset + cur_bulk_bytes + i] =
-                    stage_ptr(cur_slot)[cur_bulk_bytes + i];
+        for (int iter = 0;; ++iter) {
+            const int cur_chunk = start_chunk + iter * chunk_stride;
+            if (cur_chunk >= copy_num_chunks) {
+                break;
             }
-        }
 
-        __syncthreads();
+            const int cur_slot = iter % kTwoGpuPeerCopyStageDepth;
+            const size_t cur_offset =
+                static_cast<size_t>(cur_chunk) * kTwoGpuPeerCopyChunkBytes;
+            const size_t cur_bytes =
+                min_sz(kTwoGpuPeerCopyChunkBytes, total_bytes - cur_offset);
+            const size_t cur_bulk_bytes =
+                cur_bytes & ~static_cast<size_t>(0xF);
+            const size_t cur_tail_bytes =
+                cur_bytes - cur_bulk_bytes;
+
+            if (threadIdx.x == 0) {
+                sync::wait(barriers[cur_slot], 0);
+            }
+            __syncthreads();
+
+            const int future_iter = iter + kTwoGpuPeerCopyStageGap;
+            const int future_chunk = start_chunk + future_iter * chunk_stride;
+            if (future_chunk < copy_num_chunks) {
+                const int future_slot =
+                    future_iter % kTwoGpuPeerCopyStageDepth;
+                const size_t future_offset =
+                    static_cast<size_t>(future_chunk) * kTwoGpuPeerCopyChunkBytes;
+                const size_t future_bytes =
+                    min_sz(kTwoGpuPeerCopyChunkBytes, total_bytes - future_offset);
+
+                if (threadIdx.x == 0) {
+                    if (iter >= kTwoGpuPeerCopyStageGap) {
+                        tma::store_async_read_wait<kTwoGpuPeerCopyStageGap - 1>();
+                    }
+
+                    sync::init_semaphore(barriers[future_slot], 1);
+                    tma::expect_bytes(
+                        barriers[future_slot],
+                        static_cast<uint32_t>(future_bytes));
+                    tma::load_async(
+                        stage_ptr(future_slot),
+                        local_in_bytes + future_offset,
+                        static_cast<uint32_t>(future_bytes),
+                        barriers[future_slot]);
+                }
+            }
+
+            __syncthreads();
+
+            if (threadIdx.x == 0 && cur_bulk_bytes > 0) {
+                tma::store_async(
+                    local_out_bytes + cur_offset,
+                    stage_ptr(cur_slot),
+                    static_cast<uint32_t>(cur_bulk_bytes));
+            }
+
+            if (cur_tail_bytes > 0) {
+                for (size_t i = threadIdx.x; i < cur_tail_bytes; i += blockDim.x) {
+                    local_out_bytes[cur_offset + cur_bulk_bytes + i] =
+                        stage_ptr(cur_slot)[cur_bulk_bytes + i];
+                }
+            }
+
+            __syncthreads();
+        }
     }
 
     if (threadIdx.x == 0) {
@@ -180,7 +217,7 @@ __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
     __syncthreads();
 
     // -------------------------------------------------------------------------
-    // Whole-buffer barrier.
+    // Whole-buffer barrier
     // -------------------------------------------------------------------------
 
     if (threadIdx.x == 0) {
@@ -195,98 +232,112 @@ __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
     __syncthreads();
 
     // -------------------------------------------------------------------------
-    // Phase 2:
-    // reduce peer buffer into our local output buffer.
-    // Same D/2 producer-consumer separation as phase 1.
+    // Phase 2: reduce peer buffer into local output buffer
+    // Tuned by:
+    //   kTwoGpuPeerReduceChunkBytes
+    //   kTwoGpuPeerReduceStageDepth
+    //   kTwoGpuPeerReduceStageGap
     // -------------------------------------------------------------------------
 
-    // Prefill first half of the ring from the peer buffer.
-    for (int warm = 0; warm < kTwoGpuPeerStageGap; ++warm) {
-        const int chunk = start_chunk + warm * chunk_stride;
-        if (chunk >= num_chunks) {
-            break;
-        }
+    if (start_chunk < reduce_num_chunks) {
+        for (int warm = 0; warm < kTwoGpuPeerReduceStageGap; ++warm) {
+            const int chunk = start_chunk + warm * chunk_stride;
+            if (chunk >= reduce_num_chunks) {
+                break;
+            }
 
-        const int slot = warm;
-        const size_t offset = static_cast<size_t>(chunk) * kTwoGpuPeerChunkBytes;
-        const size_t bytes = min_sz(kTwoGpuPeerChunkBytes, total_bytes - offset);
-
-        if (threadIdx.x == 0) {
-            sync::init_semaphore(barriers[slot], 1);
-            tma::expect_bytes(barriers[slot], static_cast<uint32_t>(bytes));
-            tma::load_async(
-                stage_ptr(slot),
-                peer_out_bytes + offset,
-                static_cast<uint32_t>(bytes),
-                barriers[slot]);
-        }
-        __syncthreads();
-    }
-
-    for (int iter = 0;; ++iter) {
-        const int cur_chunk = start_chunk + iter * chunk_stride;
-        if (cur_chunk >= num_chunks) {
-            break;
-        }
-
-        const int cur_slot = iter % kTwoGpuPeerStageDepth;
-        const size_t cur_offset = static_cast<size_t>(cur_chunk) * kTwoGpuPeerChunkBytes;
-        const size_t cur_bytes = min_sz(kTwoGpuPeerChunkBytes, total_bytes - cur_offset);
-        const size_t cur_bulk_bytes = cur_bytes & ~static_cast<size_t>(0xF);
-        const size_t cur_tail_bytes = cur_bytes - cur_bulk_bytes;
-
-        if (threadIdx.x == 0) {
-            sync::wait(barriers[cur_slot], 0);
-        }
-        __syncthreads();
-
-        const int future_iter = iter + kTwoGpuPeerStageGap;
-        const int future_chunk = start_chunk + future_iter * chunk_stride;
-        if (future_chunk < num_chunks) {
-            const int future_slot = future_iter % kTwoGpuPeerStageDepth;
-            const size_t future_offset =
-                static_cast<size_t>(future_chunk) * kTwoGpuPeerChunkBytes;
-            const size_t future_bytes =
-                min_sz(kTwoGpuPeerChunkBytes, total_bytes - future_offset);
+            const int slot = warm;
+            const size_t offset =
+                static_cast<size_t>(chunk) * kTwoGpuPeerReduceChunkBytes;
+            const size_t bytes =
+                min_sz(kTwoGpuPeerReduceChunkBytes, total_bytes - offset);
 
             if (threadIdx.x == 0) {
-                if (iter >= kTwoGpuPeerStageGap) {
-                    tma::reduce_async_read_wait<kTwoGpuPeerStageGap - 1>();
-                }
-
-                sync::init_semaphore(barriers[future_slot], 1);
-                tma::expect_bytes(barriers[future_slot], static_cast<uint32_t>(future_bytes));
+                sync::init_semaphore(barriers[slot], 1);
+                tma::expect_bytes(barriers[slot], static_cast<uint32_t>(bytes));
                 tma::load_async(
-                    stage_ptr(future_slot),
-                    peer_out_bytes + future_offset,
-                    static_cast<uint32_t>(future_bytes),
-                    barriers[future_slot]);
+                    stage_ptr(slot),
+                    peer_out_bytes + offset,
+                    static_cast<uint32_t>(bytes),
+                    barriers[slot]);
             }
+            __syncthreads();
         }
 
-        __syncthreads();
-
-        if (threadIdx.x == 0 && cur_bulk_bytes > 0) {
-            tma::reduce_add_noftz_f16_async(
-                local_out_bytes + cur_offset,
-                stage_ptr(cur_slot),
-                static_cast<uint32_t>(cur_bulk_bytes));
-        }
-
-        if (cur_tail_bytes > 0) {
-            const size_t bulk_elems = cur_bulk_bytes / sizeof(half);
-            const size_t tail_elems = cur_tail_bytes / sizeof(half);
-            const half* smem_half = reinterpret_cast<const half*>(stage_ptr(cur_slot));
-            half* out_half = reinterpret_cast<half*>(local_out_bytes + cur_offset);
-
-            for (size_t i = threadIdx.x; i < tail_elems; i += blockDim.x) {
-                const float oldv = __half2float(out_half[bulk_elems + i]);
-                const float addv = __half2float(smem_half[bulk_elems + i]);
-                out_half[bulk_elems + i] = __float2half_rn(oldv + addv);
+        for (int iter = 0;; ++iter) {
+            const int cur_chunk = start_chunk + iter * chunk_stride;
+            if (cur_chunk >= reduce_num_chunks) {
+                break;
             }
-        }
 
-        __syncthreads();
+            const int cur_slot = iter % kTwoGpuPeerReduceStageDepth;
+            const size_t cur_offset =
+                static_cast<size_t>(cur_chunk) * kTwoGpuPeerReduceChunkBytes;
+            const size_t cur_bytes =
+                min_sz(kTwoGpuPeerReduceChunkBytes, total_bytes - cur_offset);
+            const size_t cur_bulk_bytes =
+                cur_bytes & ~static_cast<size_t>(0xF);
+            const size_t cur_tail_bytes =
+                cur_bytes - cur_bulk_bytes;
+
+            if (threadIdx.x == 0) {
+                sync::wait(barriers[cur_slot], 0);
+            }
+            __syncthreads();
+
+            const int future_iter = iter + kTwoGpuPeerReduceStageGap;
+            const int future_chunk = start_chunk + future_iter * chunk_stride;
+            if (future_chunk < reduce_num_chunks) {
+                const int future_slot =
+                    future_iter % kTwoGpuPeerReduceStageDepth;
+                const size_t future_offset =
+                    static_cast<size_t>(future_chunk) * kTwoGpuPeerReduceChunkBytes;
+                const size_t future_bytes =
+                    min_sz(kTwoGpuPeerReduceChunkBytes, total_bytes - future_offset);
+
+                if (threadIdx.x == 0) {
+                    if (iter >= kTwoGpuPeerReduceStageGap) {
+                        tma::reduce_async_read_wait<kTwoGpuPeerReduceStageGap - 1>();
+                    }
+
+                    sync::init_semaphore(barriers[future_slot], 1);
+                    tma::expect_bytes(
+                        barriers[future_slot],
+                        static_cast<uint32_t>(future_bytes));
+                    tma::load_async(
+                        stage_ptr(future_slot),
+                        peer_out_bytes + future_offset,
+                        static_cast<uint32_t>(future_bytes),
+                        barriers[future_slot]);
+                }
+            }
+
+            __syncthreads();
+
+            if (threadIdx.x == 0 && cur_bulk_bytes > 0) {
+                tma::reduce_add_noftz_f16_async(
+                    local_out_bytes + cur_offset,
+                    stage_ptr(cur_slot),
+                    static_cast<uint32_t>(cur_bulk_bytes));
+            }
+
+            if (cur_tail_bytes > 0) {
+                const size_t bulk_elems = cur_bulk_bytes / sizeof(half);
+                const size_t tail_elems = cur_tail_bytes / sizeof(half);
+                const half* smem_half =
+                    reinterpret_cast<const half*>(stage_ptr(cur_slot));
+                half* out_half =
+                    reinterpret_cast<half*>(local_out_bytes + cur_offset);
+
+                for (size_t i = threadIdx.x; i < tail_elems; i += blockDim.x) {
+                    const float oldv = __half2float(out_half[bulk_elems + i]);
+                    const float addv = __half2float(smem_half[bulk_elems + i]);
+                    out_half[bulk_elems + i] = __float2half_rn(oldv + addv);
+                }
+            }
+
+            __syncthreads();
+        }
     }
 
     if (threadIdx.x == 0) {
@@ -299,8 +350,11 @@ __global__ void tma_two_gpu_copy_then_reduce_kernel_sm90(
 
 int tma_two_gpu_peer_allreduce_compute_num_chunks(size_t numel) {
     const size_t total_bytes = numel * sizeof(half);
-    return static_cast<int>(
-        (total_bytes + kTwoGpuPeerChunkBytes - 1) / kTwoGpuPeerChunkBytes);
+    const int copy_chunks =
+        ceil_div_int64_to_int(total_bytes, kTwoGpuPeerCopyChunkBytes);
+    const int reduce_chunks =
+        ceil_div_int64_to_int(total_bytes, kTwoGpuPeerReduceChunkBytes);
+    return (copy_chunks > reduce_chunks) ? copy_chunks : reduce_chunks;
 }
 
 void tma_two_gpu_peer_allreduce_configure_kernel_once(int device) {
@@ -313,7 +367,7 @@ void tma_two_gpu_peer_allreduce_configure_kernel_once(int device) {
     static std::unordered_map<int, CacheEntry> cache;
 
     const size_t dynamic_smem_bytes =
-        static_cast<size_t>(kTwoGpuPeerStageDepth) * kTwoGpuPeerChunkBytes;
+        static_cast<size_t>(kTwoGpuPeerMaxStageDepth) * kTwoGpuPeerMaxChunkBytes;
     const size_t total_smem_bytes =
         dynamic_smem_bytes + kTwoGpuPeerStaticSharedBytes;
 
@@ -500,14 +554,21 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
         return cudaErrorInvalidValue;
     }
 
-    const int num_chunks = tma_two_gpu_peer_allreduce_compute_num_chunks(numel);
-    if (num_chunks != st->num_chunks) {
+    const size_t total_bytes = numel * sizeof(half);
+    const int copy_num_chunks =
+        ceil_div_int64_to_int(total_bytes, kTwoGpuPeerCopyChunkBytes);
+    const int reduce_num_chunks =
+        ceil_div_int64_to_int(total_bytes, kTwoGpuPeerReduceChunkBytes);
+    const int expected_num_chunks =
+        (copy_num_chunks > reduce_num_chunks) ? copy_num_chunks : reduce_num_chunks;
+
+    if (expected_num_chunks != st->num_chunks) {
         return cudaErrorInvalidValue;
     }
 
-    const int num_blocks = std::min(kTwoGpuPeerMaxBlocks, num_chunks);
+    const int num_blocks = std::min(kTwoGpuPeerMaxBlocks, expected_num_chunks);
     const size_t smem_bytes =
-        static_cast<size_t>(kTwoGpuPeerStageDepth) * kTwoGpuPeerChunkBytes;
+        static_cast<size_t>(kTwoGpuPeerMaxStageDepth) * kTwoGpuPeerMaxChunkBytes;
 
     system::runtime::set_device(st->dev0);
     tma_two_gpu_copy_then_reduce_kernel_sm90<<<num_blocks, kTwoGpuPeerThreads, smem_bytes, stream0>>>(
@@ -517,7 +578,8 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
         reinterpret_cast<int*>(st->progress0.ptr),
         reinterpret_cast<const int*>(st->progress1.ptr),
         numel,
-        num_chunks,
+        copy_num_chunks,
+        reduce_num_chunks,
         num_blocks);
     cudaError_t err0 = cudaGetLastError();
     if (err0 != cudaSuccess) {
@@ -532,7 +594,8 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
         reinterpret_cast<int*>(st->progress1.ptr),
         reinterpret_cast<const int*>(st->progress0.ptr),
         numel,
-        num_chunks,
+        copy_num_chunks,
+        reduce_num_chunks,
         num_blocks);
     cudaError_t err1 = cudaGetLastError();
     if (err1 != cudaSuccess) {
