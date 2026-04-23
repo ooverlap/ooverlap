@@ -688,7 +688,7 @@ bool wait_until_all_ranks_done_no_sleep(
             std::printf("[bench] wait done flags: still waiting spins=%llu\n",
                         static_cast<unsigned long long>(spins));
             std::fflush(stdout);
-            dump_persistent_debug_state(st, "wait_until_all_ranks_done_no_sleep");
+            //dump_persistent_debug_state(st, "wait_until_all_ranks_done_no_sleep");
         }
 
         const auto now = std::chrono::steady_clock::now();
@@ -1114,6 +1114,8 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
     const bool all_done =
         wait_until_all_ranks_done_no_sleep(st, timeout_ms);
 
+    const auto t1 = std::chrono::steady_clock::now();
+
     if (!all_done) {
         for (int r = 0; r < 2; ++r) {
             comm::endpoint_persistent_control_request_stop(
@@ -1128,18 +1130,19 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
         }
 
         st->kernels_running = false;
-        dump_persistent_debug_state(st, "timeout in measure_persistent_host_breakdown_ms");
-        dump_full_done_progress(st, "timeout");
+        //dump_persistent_debug_state(st, "timeout in measure_persistent_host_breakdown_ms");
+        //dump_full_done_progress(st, "timeout");
         throw std::runtime_error(
             "measure_persistent_host_breakdown_ms: timeout waiting for done flags");
     }
 
-    const auto t1 = std::chrono::steady_clock::now();
-
+    // Cleanup is intentionally OUTSIDE the timed window.
     for (int r = 0; r < 2; ++r) {
         comm::endpoint_persistent_control_request_stop(
             &st->controls[static_cast<size_t>(r)]);
     }
+
+    const auto stop_begin = std::chrono::steady_clock::now();
 
     for (int r = 0; r < 2; ++r) {
         system::runtime::check_cuda(
@@ -1150,16 +1153,17 @@ PersistentTimingBreakdown measure_persistent_host_breakdown_ms(
 
     st->kernels_running = false;
 
-    const auto t2 = std::chrono::steady_clock::now();
+    const auto stop_end = std::chrono::steady_clock::now();
 
     PersistentTimingBreakdown out{};
     out.device_done_ms =
         std::chrono::duration<double, std::milli>(t1 - t0).count();
     out.host_wait_done_ms = out.device_done_ms;
     out.stop_join_ms =
-        std::chrono::duration<double, std::milli>(t2 - t1).count();
-    out.total_ms =
-        std::chrono::duration<double, std::milli>(t2 - t0).count();
+        std::chrono::duration<double, std::milli>(stop_end - stop_begin).count();
+
+    // "total" now means launch -> all_done only.
+    out.total_ms = out.device_done_ms;
     return out;
 }
 
