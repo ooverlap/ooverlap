@@ -13,7 +13,7 @@
 // -----------------------------------------------------------------------------
 
 #define TMA_TWO_GPU_PEER_THREADS 16
-#define TMA_TWO_GPU_PEER_MAX_WINDOWS 16
+#define TMA_TWO_GPU_PEER_MAX_WINDOWS 4
 #define TMA_TWO_GPU_PEER_CHUNK_BYTES (32 * 1024)
 
 // Phase 1: owner rank reduces its local window into peer buffer.
