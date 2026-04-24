@@ -23,15 +23,15 @@ namespace {
 // -----------------------------------------------------------------------------
 
 constexpr int kTwoGpuPeerThreads = 16;
-constexpr int kTwoGpuPeerMaxWindows = 4;
-constexpr size_t kTwoGpuPeerChunkBytes = 16 * 1024;
+constexpr int kTwoGpuPeerMaxWindows = 16;
+constexpr size_t kTwoGpuPeerChunkBytes = 32 * 1024;
 
 // phase 1: owner rank reduces its local window into peer buffer
-constexpr int kTwoGpuPeerReduceStageDepth = 8;
+constexpr int kTwoGpuPeerReduceStageDepth = 4;
 constexpr int kTwoGpuPeerReduceStageGap = kTwoGpuPeerReduceStageDepth / 2;
 
 // phase 2: non-owner rank copies finalized local window back to peer buffer
-constexpr int kTwoGpuPeerCopyStageDepth = 8;
+constexpr int kTwoGpuPeerCopyStageDepth = 4;
 constexpr int kTwoGpuPeerCopyStageGap = kTwoGpuPeerCopyStageDepth / 2;
 
 static_assert(kTwoGpuPeerReduceStageDepth % 2 == 0,
