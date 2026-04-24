@@ -23,14 +23,14 @@ namespace {
 // -----------------------------------------------------------------------------
 
 constexpr int kTwoGpuPeerThreads = 16;
-constexpr int kTwoGpuPeerMaxWindows = 16;
+constexpr int kTwoGpuPeerMaxWindows = 4;
 constexpr size_t kTwoGpuPeerChunkBytes = 16 * 1024;
 
-// GPU0 reduce pipeline: rank0_in -> rank1_in
+// phase 1: owner rank reduces its local window into peer buffer
 constexpr int kTwoGpuPeerReduceStageDepth = 8;
 constexpr int kTwoGpuPeerReduceStageGap = kTwoGpuPeerReduceStageDepth / 2;
 
-// GPU1 copy-back pipeline: rank1_in -> rank0_in
+// phase 2: non-owner rank copies finalized local window back to peer buffer
 constexpr int kTwoGpuPeerCopyStageDepth = 8;
 constexpr int kTwoGpuPeerCopyStageGap = kTwoGpuPeerCopyStageDepth / 2;
 
@@ -130,6 +130,9 @@ __global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
         return;
     }
 
+    const int owner_rank = window_idx & 1;
+    const bool i_own_this_window = (rank == owner_rank);
+
     const size_t total_bytes = numel * sizeof(half);
 
     extern __shared__ uint4 shared_storage_u4[];
@@ -161,10 +164,10 @@ __global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
         reinterpret_cast<const volatile int*>(peer_progress + kTwoGpuPeerMaxWindows);
 
     // -------------------------------------------------------------------------
-    // Rank 0: reduce local rank0_in directly into peer rank1_in
+    // Phase 1: owner rank reduces local input window into peer buffer
     // -------------------------------------------------------------------------
 
-    if (rank == 0) {
+    if (i_own_this_window) {
         for (int warm = 0; warm < kTwoGpuPeerReduceStageGap; ++warm) {
             if (warm >= win_chunk_count) {
                 break;
@@ -271,7 +274,8 @@ __global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
     }
 
     // -------------------------------------------------------------------------
-    // Rank 1: wait for reduce-done, then copy local final window back to peer
+    // Phase 2: non-owner waits for owner to finish, then copies finalized local
+    // window back into peer buffer
     // -------------------------------------------------------------------------
 
     if (threadIdx.x == 0) {
@@ -592,7 +596,6 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
     const int num_blocks = num_windows;
     const size_t smem_bytes = kTwoGpuPeerDynamicSharedBytes;
 
-    // GPU0: reducer. Reduces rank0_in directly into rank1_out_peer.
     system::runtime::set_device(st->dev0);
     tma_two_gpu_reduce_or_copy_windows_kernel_sm90<<<num_blocks, kTwoGpuPeerThreads, smem_bytes, stream0>>>(
         rank0_in,
@@ -609,8 +612,6 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
         return err0;
     }
 
-    // GPU1: copier. Waits for each window reduce-done, then copies local final
-    // rank1_out_peer window back into peer rank0_out_peer.
     system::runtime::set_device(st->dev1);
     tma_two_gpu_reduce_or_copy_windows_kernel_sm90<<<num_blocks, kTwoGpuPeerThreads, smem_bytes, stream1>>>(
         rank1_in,
