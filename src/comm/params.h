@@ -1,47 +1,67 @@
 #pragma once
 
+#include "ooverlap/sync/sync.cuh"
+
+#include <cstddef>
+
 // -----------------------------------------------------------------------------
 // Tunables
 // -----------------------------------------------------------------------------
+//
+// Keep these as preprocessor defines so they can be used uniformly in host code,
+// device code, template arguments, shared-memory array sizes, and launch config.
+// -----------------------------------------------------------------------------
 
-constexpr int kTwoGpuPeerThreads = 16;
-constexpr int kTwoGpuPeerMaxWindows = 16;
-constexpr size_t kTwoGpuPeerChunkBytes = 32 * 1024;
+#define TMA_TWO_GPU_PEER_THREADS 16
+#define TMA_TWO_GPU_PEER_MAX_WINDOWS 16
+#define TMA_TWO_GPU_PEER_CHUNK_BYTES (32 * 1024)
 
-// phase 1: owner rank reduces its local window into peer buffer
-constexpr int kTwoGpuPeerReduceStageDepth = 4;
-constexpr int kTwoGpuPeerReduceStageGap = kTwoGpuPeerReduceStageDepth / 2;
+// Phase 1: owner rank reduces its local window into peer buffer.
+#define TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH 4
+#define TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP \
+    (TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH / 2)
 
-// phase 2: non-owner rank copies finalized local window back to peer buffer
-constexpr int kTwoGpuPeerCopyStageDepth = 4;
-constexpr int kTwoGpuPeerCopyStageGap = kTwoGpuPeerCopyStageDepth / 2;
+// Phase 2: non-owner rank copies finalized local window back to peer buffer.
+#define TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH 4
+#define TMA_TWO_GPU_PEER_COPY_STAGE_GAP \
+    (TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH / 2)
 
-static_assert(kTwoGpuPeerReduceStageDepth % 2 == 0,
-              "kTwoGpuPeerReduceStageDepth must be even");
-static_assert(kTwoGpuPeerCopyStageDepth % 2 == 0,
-              "kTwoGpuPeerCopyStageDepth must be even");
-static_assert(kTwoGpuPeerReduceStageGap >= 1,
-              "kTwoGpuPeerReduceStageGap must be >= 1");
-static_assert(kTwoGpuPeerCopyStageGap >= 1,
-              "kTwoGpuPeerCopyStageGap must be >= 1");
+static_assert(TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH % 2 == 0,
+              "TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH must be even");
+static_assert(TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH % 2 == 0,
+              "TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH must be even");
+static_assert(TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP >= 1,
+              "TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP must be >= 1");
+static_assert(TMA_TWO_GPU_PEER_COPY_STAGE_GAP >= 1,
+              "TMA_TWO_GPU_PEER_COPY_STAGE_GAP must be >= 1");
 
-constexpr size_t kTwoGpuPeerReduceSharedBytes =
-    static_cast<size_t>(kTwoGpuPeerReduceStageDepth) * kTwoGpuPeerChunkBytes;
+#define TMA_TWO_GPU_PEER_REDUCE_SHARED_BYTES \
+    (static_cast<size_t>(TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH) * \
+     TMA_TWO_GPU_PEER_CHUNK_BYTES)
 
-constexpr size_t kTwoGpuPeerCopySharedBytes =
-    static_cast<size_t>(kTwoGpuPeerCopyStageDepth) * kTwoGpuPeerChunkBytes;
+#define TMA_TWO_GPU_PEER_COPY_SHARED_BYTES \
+    (static_cast<size_t>(TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH) * \
+     TMA_TWO_GPU_PEER_CHUNK_BYTES)
 
-constexpr size_t kTwoGpuPeerDynamicSharedBytes =
-    (kTwoGpuPeerReduceSharedBytes > kTwoGpuPeerCopySharedBytes)
-        ? kTwoGpuPeerReduceSharedBytes
-        : kTwoGpuPeerCopySharedBytes;
+#define TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES \
+    ((TMA_TWO_GPU_PEER_REDUCE_SHARED_BYTES > \
+      TMA_TWO_GPU_PEER_COPY_SHARED_BYTES) \
+         ? TMA_TWO_GPU_PEER_REDUCE_SHARED_BYTES \
+         : TMA_TWO_GPU_PEER_COPY_SHARED_BYTES)
 
-constexpr int kTwoGpuPeerBarrierCount =
-    (kTwoGpuPeerReduceStageDepth > kTwoGpuPeerCopyStageDepth)
-        ? kTwoGpuPeerReduceStageDepth
-        : kTwoGpuPeerCopyStageDepth;
+#define TMA_TWO_GPU_PEER_BARRIER_COUNT \
+    ((TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH > \
+      TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH) \
+         ? TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH \
+         : TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH)
 
-constexpr size_t kTwoGpuPeerStaticSharedBytes =
-    static_cast<size_t>(kTwoGpuPeerBarrierCount) * sizeof(sync::semaphore);
+#define TMA_TWO_GPU_PEER_STATIC_SHARED_BYTES \
+    (static_cast<size_t>(TMA_TWO_GPU_PEER_BARRIER_COUNT) * \
+     sizeof(::ooverlap::sync::semaphore))
 
-
+// progress0 / progress1 layout:
+//   [0 .. TMA_TWO_GPU_PEER_MAX_WINDOWS-1] = reduce-done flags
+//   [TMA_TWO_GPU_PEER_MAX_WINDOWS .. 2*TMA_TWO_GPU_PEER_MAX_WINDOWS-1]
+//       = copy-done flags
+#define TMA_TWO_GPU_PEER_PROGRESS_BYTES \
+    (static_cast<size_t>(2 * TMA_TWO_GPU_PEER_MAX_WINDOWS) * sizeof(int))
