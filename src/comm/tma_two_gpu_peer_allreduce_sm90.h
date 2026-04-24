@@ -15,9 +15,9 @@ struct TmaTwoGpuPeerAllreduceState {
     int dev1 = -1;
     int num_chunks = 0;
 
-    // Each control buffer stores:
-    //   [0] = whole-buffer ready flag
-    //   [1] = number of blocks that finished copy phase
+    // Each control buffer stores 2 * kMaxWindows ints:
+    //   [0 .. kMaxWindows-1]                 = local-init-done flags
+    //   [kMaxWindows .. 2*kMaxWindows - 1]   = peer-reduce-done flags
     system::mapped_peer_buffer progress0{};
     system::mapped_peer_buffer progress1{};
 };
