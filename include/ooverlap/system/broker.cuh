@@ -30,8 +30,8 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
-#include <vector>
 #include <type_traits>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -459,41 +459,13 @@ public:
     Broker(const Broker&) = delete;
     Broker& operator=(const Broker&) = delete;
 
-    Broker(Broker&& other) noexcept
-        : local_rank_(other.local_rank_),
-          local_world_size_(other.local_world_size_),
-          shm_key_(std::move(other.shm_key_)),
-          socket_prefix_(std::move(other.socket_prefix_)),
-          shm_raw_(other.shm_raw_),
-          shm_(other.shm_),
-          sock_(other.sock_) {
-        other.local_rank_ = -1;
-        other.local_world_size_ = -1;
-        other.shm_raw_ = nullptr;
-        other.shm_ = nullptr;
-        other.sock_ = -1;
-    }
-
-    Broker& operator=(Broker&& other) noexcept {
-        if (this != &other) {
-            destroy();
-
-            local_rank_ = other.local_rank_;
-            local_world_size_ = other.local_world_size_;
-            shm_key_ = std::move(other.shm_key_);
-            socket_prefix_ = std::move(other.socket_prefix_);
-            shm_raw_ = other.shm_raw_;
-            shm_ = other.shm_;
-            sock_ = other.sock_;
-
-            other.local_rank_ = -1;
-            other.local_world_size_ = -1;
-            other.shm_raw_ = nullptr;
-            other.shm_ = nullptr;
-            other.sock_ = -1;
-        }
-        return *this;
-    }
+    /*
+     * Do not allow moving Broker objects. std::unique_ptr<Broker> can move the
+     * pointer safely; moving the object itself can leave a moved-from Broker
+     * whose shm_ is null and later used during cleanup/error paths.
+     */
+    Broker(Broker&&) = delete;
+    Broker& operator=(Broker&&) = delete;
 
     ~Broker() {
         destroy();
@@ -508,12 +480,15 @@ public:
     }
 
     void sync(int num_ranks = -1) {
+        ensure_vault_mapped("Broker::sync");
+
         if (num_ranks == -1) {
             num_ranks = local_world_size_;
         }
         if (num_ranks <= 0 || num_ranks > local_world_size_) {
             throw std::runtime_error("Broker: invalid num_ranks");
         }
+
         broker_detail::sync(num_ranks, shm_);
     }
 
@@ -523,6 +498,8 @@ public:
      * dst must have local_world_size * size bytes.
      */
     void exchange_data(void* dst, const void* src, size_t size) {
+        ensure_vault_mapped("Broker::exchange_data");
+
         if (dst == nullptr || src == nullptr) {
             throw std::runtime_error("Broker: exchange_data got null pointer");
         }
@@ -569,6 +546,8 @@ public:
      * to -1 because you do not import your own fd.
      */
     void exchange_fds(int* dst_fds, int src_fd) {
+        ensure_vault_mapped("Broker::exchange_fds");
+
         if (dst_fds == nullptr) {
             throw std::runtime_error("Broker: exchange_fds dst is null");
         }
@@ -592,7 +571,9 @@ public:
                 broker_detail::recv_fd(sock_, &received_fd, &src_rank);
 
                 if (src_rank <= 0 || src_rank >= local_world_size_) {
-                    if (received_fd >= 0) close(received_fd);
+                    if (received_fd >= 0) {
+                        close(received_fd);
+                    }
                     throw std::runtime_error("Broker: invalid received source rank");
                 }
 
@@ -636,7 +617,9 @@ public:
 
                 if (src_rank < 0 || src_rank >= local_world_size_ ||
                     src_rank == local_rank_) {
-                    if (received_fd >= 0) close(received_fd);
+                    if (received_fd >= 0) {
+                        close(received_fd);
+                    }
                     throw std::runtime_error("Broker: invalid received source rank");
                 }
 
@@ -653,6 +636,8 @@ public:
      * consumed/closed by this function on src_rank.
      */
     void broadcast_fd(int* dst_fd, int src_fd, int src_rank) {
+        ensure_vault_mapped("Broker::broadcast_fd");
+
         if (src_rank < 0 || src_rank >= local_world_size_) {
             throw std::runtime_error("Broker: invalid broadcast source rank");
         }
@@ -686,7 +671,9 @@ public:
             broker_detail::recv_fd(sock_, dst_fd, &received_src);
 
             if (*dst_fd < 0 || received_src != src_rank) {
-                if (*dst_fd >= 0) close(*dst_fd);
+                if (*dst_fd >= 0) {
+                    close(*dst_fd);
+                }
                 throw std::runtime_error("Broker: invalid broadcast fd receive");
             }
         }
@@ -698,18 +685,15 @@ public:
         const int old_rank = local_rank_;
 
         /*
-         * Best-effort final barrier. This keeps rank 0 from unlinking the shm
-         * name while a peer is still inside broker operations.
+         * No barrier in destructor.
+         *
+         * Destructors can run during failed init/error paths where the peer rank
+         * may already have exited or may be stuck in another phase. A destructor
+         * barrier can turn the original error into a broker error or deadlock.
+         *
+         * Tests should do explicit broker syncs before normal teardown.
          */
-        try {
-            if (shm_ != nullptr && local_world_size_ > 0) {
-                broker_detail::sync(local_world_size_, shm_);
-            }
-        } catch (...) {
-            // Cleanup should be best-effort.
-        }
-
-        if (old_rank == 0) {
+        if (old_rank == 0 && !shm_key_.empty()) {
             broker_detail::unlink_shm(shm_key_.c_str());
         }
 
@@ -727,9 +711,49 @@ public:
 
         local_rank_ = -1;
         local_world_size_ = -1;
-    } 
+    }
 
 private:
+    void ensure_vault_mapped(const char* where) {
+        if (shm_ != nullptr) {
+            return;
+        }
+
+        /*
+         * This should normally never happen after the constructor succeeds.
+         * But if a moved-from/partially-cleaned Broker path or failed init path
+         * leaves shm_ null, recover by reopening the shm by name. The shm name
+         * is kept alive until rank 0 destroy(), so this is safe for tests.
+         */
+        std::fprintf(
+            stderr,
+            "[ooverlap][broker] remapping null vault in %s rank=%d world=%d key=%s\n",
+            where ? where : "unknown",
+            local_rank_,
+            local_world_size_,
+            shm_key_.c_str());
+        std::fflush(stderr);
+
+        if (local_world_size_ <= 0 || local_rank_ < 0) {
+            throw std::runtime_error("Broker: cannot remap invalid broker state");
+        }
+
+        if (shm_raw_ != nullptr) {
+            shm_ = reinterpret_cast<volatile broker_detail::Vault*>(shm_raw_);
+            return;
+        }
+
+        shm_raw_ = broker_detail::open_shm(
+            shm_key_.c_str(),
+            broker_detail::SHM_SIZE);
+
+        shm_ = reinterpret_cast<volatile broker_detail::Vault*>(shm_raw_);
+
+        if (shm_ == nullptr) {
+            throw std::runtime_error("Broker: failed to remap vault");
+        }
+    }
+
     int local_rank_;
     int local_world_size_;
 
