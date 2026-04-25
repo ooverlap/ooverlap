@@ -8,6 +8,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -16,6 +18,45 @@
 namespace {
 
 constexpr size_t kOoReadySignalBytes = sizeof(int);
+
+struct oo_ready_signal_ipc_desc {
+    cudaIpcMemHandle_t handle{};
+    std::uint64_t bytes = 0;
+    int owner_rank = -1;
+    int owner_device = -1;
+};
+
+oo_status_t report_cuda_error(cudaError_t err, const char* what) {
+    if (err != cudaSuccess) {
+        std::fprintf(
+            stderr,
+            "[ooverlap][ipc] %s failed: %s\n",
+            what,
+            cudaGetErrorString(err));
+        std::fflush(stderr);
+        return OO_ERROR_CUDA;
+    }
+    return OO_SUCCESS;
+}
+
+oo_status_t report_exception(const char* where, const std::exception& e) {
+    std::fprintf(
+        stderr,
+        "[ooverlap][ipc] %s threw: %s\n",
+        where,
+        e.what());
+    std::fflush(stderr);
+    return OO_ERROR_INTERNAL;
+}
+
+oo_status_t report_unknown_exception(const char* where) {
+    std::fprintf(
+        stderr,
+        "[ooverlap][ipc] %s threw unknown exception\n",
+        where);
+    std::fflush(stderr);
+    return OO_ERROR_INTERNAL;
+}
 
 oo_status_t cuda_status_to_oo(cudaError_t err) {
     return (err == cudaSuccess) ? OO_SUCCESS : OO_ERROR_CUDA;
@@ -115,8 +156,13 @@ void free_ready_signal_slot(oo_ready_signal& slot) {
                 slot.owned_legacy_ptr = nullptr;
             }
             break;
-
+            
         case oo_ready_signal_kind::imported_legacy:
+            if (slot.ptr != nullptr) {
+                cudaIpcCloseMemHandle(slot.ptr);
+            }
+            break;
+
         case oo_ready_signal_kind::imported_vmm:
             slot.imported.reset();
             break;
@@ -300,29 +346,29 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
     const int local_rank = group->local_rank;
     const int local_device = group->devices[local_rank];
 
-    try {
-        std::vector<int> access_devices = group_devices_vector(group);
+    void* local_signal = nullptr;
+    bool local_signal_recorded = false;
 
-        cudaError_t set_err = cudaSetDevice(local_device);
-        if (set_err != cudaSuccess) {
-            return OO_ERROR_CUDA;
+    try {
+        cudaError_t err = cudaSetDevice(local_device);
+        if (err != cudaSuccess) {
+            return report_cuda_error(err, "cudaSetDevice(local_device)");
         }
 
         /*
-         * Use legacy CUDA IPC for ready signals first. This avoids needing FD
-         * passing for the signal path and keeps the broker exchange as a simple
-         * all-gather of small POD descriptors.
+         * Keep ready signals as plain cudaMalloc allocations for now.
+         * They are tiny, but cudaIpcGetMemHandle is valid for cudaMalloc
+         * allocations.
          */
-        void* local_signal = nullptr;
-        cudaError_t malloc_err = cudaMalloc(&local_signal, kOoReadySignalBytes);
-        if (malloc_err != cudaSuccess) {
-            return OO_ERROR_CUDA;
+        err = cudaMalloc(&local_signal, kOoReadySignalBytes);
+        if (err != cudaSuccess) {
+            return report_cuda_error(err, "cudaMalloc(local ready signal)");
         }
 
-        cudaError_t memset_err = cudaMemset(local_signal, 0, kOoReadySignalBytes);
-        if (memset_err != cudaSuccess) {
+        err = cudaMemset(local_signal, 0, kOoReadySignalBytes);
+        if (err != cudaSuccess) {
             cudaFree(local_signal);
-            return OO_ERROR_CUDA;
+            return report_cuda_error(err, "cudaMemset(local ready signal)");
         }
 
         oo_ready_signal& local_slot = group->ready_signal_slots[local_rank];
@@ -333,16 +379,27 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
         local_slot.owner_device = local_device;
         local_slot.kind = oo_ready_signal_kind::owned_legacy;
         local_slot.owned_legacy_ptr = local_signal;
+        local_signal_recorded = true;
+
         mirror_ready_signal_for_compat(group, local_rank);
 
-        ooverlap::system::legacy_peer_buffer_descriptor local_desc =
-            ooverlap::system::export_legacy_peer_buffer(
-                local_signal,
-                kOoReadySignalBytes,
-                local_device,
-                kOoReadySignalBytes);
+        oo_ready_signal_ipc_desc local_desc{};
+        local_desc.bytes = static_cast<std::uint64_t>(kOoReadySignalBytes);
+        local_desc.owner_rank = local_rank;
+        local_desc.owner_device = local_device;
 
-        std::vector<ooverlap::system::legacy_peer_buffer_descriptor> all_desc(
+        err = cudaIpcGetMemHandle(&local_desc.handle, local_signal);
+        if (err != cudaSuccess) {
+            free_ready_signal_slot(local_slot);
+            return report_cuda_error(err, "cudaIpcGetMemHandle(local ready signal)");
+        }
+
+        static_assert(
+            sizeof(oo_ready_signal_ipc_desc) <=
+                ooverlap::system::broker_detail::VAULT_SIZE_PER_RANK,
+            "oo_ready_signal_ipc_desc does not fit in Broker exchange vault");
+
+        std::vector<oo_ready_signal_ipc_desc> all_desc(
             static_cast<size_t>(group->num_devices));
 
         group->broker->exchange_data(
@@ -350,15 +407,9 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
             &local_desc,
             sizeof(local_desc));
 
-        /*
-         * Open peer ready signals in the local CUDA context. The allreduce
-         * kernel launched by this process will write local_signal and read peer
-         * imported signal pointer(s).
-         */
-        set_err = cudaSetDevice(local_device);
-        if (set_err != cudaSuccess) {
-            free_group_ready_signals_ipc(group);
-            return OO_ERROR_CUDA;
+        err = cudaSetDevice(local_device);
+        if (err != cudaSuccess) {
+            return report_cuda_error(err, "cudaSetDevice(before peer ready import)");
         }
 
         for (int rank = 0; rank < group->num_devices; ++rank) {
@@ -366,37 +417,87 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
                 continue;
             }
 
+            const oo_ready_signal_ipc_desc& peer_desc = all_desc[rank];
+
+            if (peer_desc.bytes != kOoReadySignalBytes ||
+                peer_desc.owner_rank != rank ||
+                peer_desc.owner_device != group->devices[rank]) {
+                std::fprintf(
+                    stderr,
+                    "[ooverlap][ipc] bad ready-signal descriptor: "
+                    "rank=%d desc.bytes=%llu desc.owner_rank=%d "
+                    "desc.owner_device=%d expected_device=%d\n",
+                    rank,
+                    static_cast<unsigned long long>(peer_desc.bytes),
+                    peer_desc.owner_rank,
+                    peer_desc.owner_device,
+                    group->devices[rank]);
+                std::fflush(stderr);
+                return OO_ERROR_INTERNAL;
+            }
+
+            void* imported_ptr = nullptr;
+            err = cudaIpcOpenMemHandle(
+                &imported_ptr,
+                peer_desc.handle,
+                cudaIpcMemLazyEnablePeerAccess);
+
+            if (err != cudaSuccess) {
+                std::fprintf(
+                    stderr,
+                    "[ooverlap][ipc] cudaIpcOpenMemHandle(peer ready signal) "
+                    "failed on local_rank=%d local_device=%d peer_rank=%d "
+                    "peer_device=%d: %s\n",
+                    local_rank,
+                    local_device,
+                    rank,
+                    peer_desc.owner_device,
+                    cudaGetErrorString(err));
+                std::fflush(stderr);
+                return OO_ERROR_CUDA;
+            }
+
             oo_ready_signal& peer_slot = group->ready_signal_slots[rank];
-
-            ooverlap::system::imported_peer_buffer imported =
-                ooverlap::system::import_legacy_peer_buffer(
-                    all_desc[rank],
-                    access_devices);
-
-            peer_slot.ptr = imported.ptr;
-            peer_slot.bytes = imported.bytes;
-            peer_slot.mapped_bytes = imported.mapped_size;
+            peer_slot.ptr = imported_ptr;
+            peer_slot.bytes = kOoReadySignalBytes;
+            peer_slot.mapped_bytes = kOoReadySignalBytes;
             peer_slot.owner_rank = rank;
-            peer_slot.owner_device = imported.owner_device;
+            peer_slot.owner_device = peer_desc.owner_device;
             peer_slot.kind = oo_ready_signal_kind::imported_legacy;
-            peer_slot.imported = std::move(imported);
 
+            /*
+             * Do NOT put this into peer_slot.imported. That RAII object closes
+             * through peer_buffer.cuh and uses the generic descriptor path.
+             * Ready signals are special internal comm state, so we close them
+             * directly in free_ready_signal_slot().
+             */
             mirror_ready_signal_for_compat(group, rank);
         }
 
         group->broker->sync();
-    } catch (const std::bad_alloc&) {
-        free_group_ready_signals_ipc(group);
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception&) {
-        free_group_ready_signals_ipc(group);
-        return OO_ERROR_CUDA;
-    } catch (...) {
-        free_group_ready_signals_ipc(group);
-        return OO_ERROR_INTERNAL;
-    }
+        return OO_SUCCESS;
 
-    return OO_SUCCESS;
+    } catch (const std::bad_alloc&) {
+        if (!local_signal_recorded && local_signal != nullptr) {
+            cudaSetDevice(local_device);
+            cudaFree(local_signal);
+        }
+        return OO_ERROR_INTERNAL;
+
+    } catch (const std::exception& e) {
+        if (!local_signal_recorded && local_signal != nullptr) {
+            cudaSetDevice(local_device);
+            cudaFree(local_signal);
+        }
+        return report_exception("init_group_ready_signals_ipc", e);
+
+    } catch (...) {
+        if (!local_signal_recorded && local_signal != nullptr) {
+            cudaSetDevice(local_device);
+            cudaFree(local_signal);
+        }
+        return report_unknown_exception("init_group_ready_signals_ipc");
+    }
 }
 
 oo_status_t init_group_ready_signals(oo_group_t* group) {
