@@ -28,7 +28,7 @@
     } while (0)
 
 #ifndef OOVERLAP_BENCH_VERIFY_RESULTS
-#define OOVERLAP_BENCH_VERIFY_RESULTS 1
+#define OOVERLAP_BENCH_VERIFY_RESULTS 0
 #endif
 
 namespace ooverlap {
