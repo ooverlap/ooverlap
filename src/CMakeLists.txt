@@ -413,7 +413,25 @@ if(OOVERLAP_BUILD_PYTHON)
     message(FATAL_ERROR "src/pybind.cpp not found")
   endif()
 
-  add_library(ooverlap_ext MODULE ${OOVERLAP_SRC_DIR}/pybind.cpp)
+  set(OOVERLAP_EXT_SOURCES
+    ${OOVERLAP_SRC_DIR}/pybind.cpp
+  )
+
+  # pybind.cpp binds the persistent allreduce benchmark/smoke functions
+  # directly, so compile their implementation directly into the extension.
+  # Do not rely on the optional ooverlap_tests static library for these symbols.
+  if(EXISTS ${OOVERLAP_SRC_DIR}/test/persistent_allreduce_2gpu_sm90.cu)
+    list(APPEND OOVERLAP_EXT_SOURCES
+      ${OOVERLAP_SRC_DIR}/test/persistent_allreduce_2gpu_sm90.cu
+    )
+  else()
+    message(FATAL_ERROR
+      "pybind.cpp requires src/test/persistent_allreduce_2gpu_sm90.cu, but it was not found")
+  endif()
+
+  add_library(ooverlap_ext MODULE ${OOVERLAP_EXT_SOURCES})
+
+  ooverlap_force_sm90a(ooverlap_ext)
 
   set_target_properties(ooverlap_ext PROPERTIES
     PREFIX ""
@@ -431,9 +449,6 @@ if(OOVERLAP_BUILD_PYTHON)
     ${PROJECT_SOURCE_DIR}/include
   )
 
-  if(TARGET ooverlap_tests)
-    target_link_libraries(ooverlap_ext PRIVATE ooverlap_tests)
-  endif()
   if(TARGET ooverlap_comm)
     target_link_libraries(ooverlap_ext PRIVATE ooverlap_comm)
   endif()
