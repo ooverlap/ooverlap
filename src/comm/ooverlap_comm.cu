@@ -12,6 +12,8 @@
 
 namespace {
 
+constexpr size_t kOoReadySignalBytes = sizeof(int);
+
 oo_status_t cuda_status_to_oo(cudaError_t err) {
     return (err == cudaSuccess) ? OO_SUCCESS : OO_ERROR_CUDA;
 }
@@ -47,6 +49,64 @@ size_t dtype_size(oo_dtype_t dtype) {
 
 bool same_group(const oo_group_t* a, const oo_group_t* b) {
     return a != nullptr && b != nullptr && a == b;
+}
+
+void free_group_ready_signals(oo_group_t* group) {
+    if (group == nullptr) {
+        return;
+    }
+
+    for (int i = 0; i < group->num_devices; ++i) {
+        ooverlap::system::free_peer_visible_buffer(group->ready_signals[i]);
+    }
+}
+
+oo_status_t init_group_ready_signals(oo_group_t* group) {
+    if (group == nullptr || group->num_devices <= 0) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::vector<int> access_devices;
+        access_devices.reserve(static_cast<size_t>(group->num_devices));
+        for (int i = 0; i < group->num_devices; ++i) {
+            access_devices.push_back(group->devices[i]);
+        }
+
+        for (int rank = 0; rank < group->num_devices; ++rank) {
+            group->ready_signals[rank] =
+                ooverlap::system::alloc_peer_visible_buffer(
+                    kOoReadySignalBytes,
+                    group->devices[rank],
+                    access_devices);
+
+            cudaError_t set_err = cudaSetDevice(group->devices[rank]);
+            if (set_err != cudaSuccess) {
+                free_group_ready_signals(group);
+                return OO_ERROR_CUDA;
+            }
+
+            cudaError_t memset_err = cudaMemset(
+                group->ready_signals[rank].ptr,
+                0,
+                group->ready_signals[rank].mapped_size);
+            if (memset_err != cudaSuccess) {
+                free_group_ready_signals(group);
+                return OO_ERROR_CUDA;
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        free_group_ready_signals(group);
+        return OO_ERROR_INTERNAL;
+    } catch (const std::exception&) {
+        free_group_ready_signals(group);
+        return OO_ERROR_CUDA;
+    } catch (...) {
+        free_group_ready_signals(group);
+        return OO_ERROR_INTERNAL;
+    }
+
+    return OO_SUCCESS;
 }
 
 } // namespace
@@ -95,12 +155,23 @@ oo_status_t oo_group_create(
         group->devices[i] = devices[i];
     }
 
+    oo_status_t sig_status = init_group_ready_signals(group);
+    if (sig_status != OO_SUCCESS) {
+        delete group;
+        return sig_status;
+    }
+
     *out_group = group;
     return OO_SUCCESS;
 }
 
 void oo_group_destroy(
     oo_group_t* group) {
+    if (group == nullptr) {
+        return;
+    }
+
+    free_group_ready_signals(group);
     delete group;
 }
 
@@ -142,6 +213,7 @@ oo_status_t oo_node_create(
     node->group = group;
     node->rank = rank;
     node->device = group->devices[rank];
+    node->collective_epoch = 0;
 
     *out_node = node;
     return OO_SUCCESS;
@@ -333,6 +405,17 @@ oo_status_t oo_allreduce(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
+    if (node->group->ready_signals[node->rank].ptr == nullptr ||
+        node->group->ready_signals[peer_rank].ptr == nullptr) {
+        return OO_ERROR_INTERNAL;
+    }
+
+    const int collective_epoch = ++node->collective_epoch;
+    int* local_ready_signal =
+        reinterpret_cast<int*>(node->group->ready_signals[node->rank].ptr);
+    const int* peer_ready_signal =
+        reinterpret_cast<const int*>(node->group->ready_signals[peer_rank].ptr);
+
     try {
         cudaError_t err = ooverlap::enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
             reinterpret_cast<const half*>(local->ptr),
@@ -342,7 +425,10 @@ oo_status_t oo_allreduce(
             node->rank,
             node->group->devices[0],
             node->group->devices[1],
-            stream);
+            stream,
+            local_ready_signal,
+            peer_ready_signal,
+            collective_epoch);
 
         return cuda_status_to_oo(err);
     } catch (const std::exception&) {

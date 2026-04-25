@@ -3,7 +3,6 @@
 #include <cuda_runtime.h>
 #include <stddef.h>
 
-
 #include "ooverlap/system/peer_buffer.cuh"
 
 #ifdef __cplusplus
@@ -15,6 +14,11 @@ constexpr int kOoMaxLocalDevices = 16;
 struct oo_group {
     int num_devices = 0;
     int devices[kOoMaxLocalDevices] = {};
+
+    // One peer-visible ready signal per rank/device.
+    // ready_signals[r] is physically owned by devices[r], visible to all
+    // devices in this group.
+    ooverlap::system::mapped_peer_buffer ready_signals[kOoMaxLocalDevices] = {};
 };
 
 typedef struct oo_group oo_group_t;
@@ -23,6 +27,10 @@ struct oo_node {
     oo_group_t* group = nullptr;
     int rank = -1;
     int device = -1;
+
+    // Monotonic per-node collective sequence.
+    // Rank-local calls must be issued in matching order, same as NCCL.
+    int collective_epoch = 0;
 };
 
 typedef struct oo_node oo_node_t;

@@ -70,7 +70,10 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
     int rank,
     int dev0,
     int dev1,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int* local_ready_signal = nullptr,
+    const int* peer_ready_signal = nullptr,
+    int collective_epoch = 0);
 
 cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
     TmaTwoGpuPeerAllreduceState* st,

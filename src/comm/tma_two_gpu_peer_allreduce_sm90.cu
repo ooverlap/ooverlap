@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -25,6 +26,36 @@ __device__ __forceinline__ unsigned char* stage_ptr(
     int stage) {
     return shared_raw +
            static_cast<size_t>(stage) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
+}
+
+__device__ __forceinline__ void wait_for_collective_ready_sm90(
+    int* local_ready_signal,
+    const int* peer_ready_signal,
+    int collective_epoch) {
+    if (local_ready_signal == nullptr ||
+        peer_ready_signal == nullptr ||
+        collective_epoch <= 0) {
+        return;
+    }
+
+    if (threadIdx.x == 0) {
+        // Every CTA publishes the same epoch. This avoids depending on block 0
+        // being scheduled before other CTAs. Epochs are monotonic, so atomicMax
+        // is safe across repeated collective calls.
+        atomicMax(local_ready_signal, collective_epoch);
+        __threadfence_system();
+
+        const volatile int* peer_ready =
+            reinterpret_cast<const volatile int*>(peer_ready_signal);
+
+        while (peer_ready[0] < collective_epoch) {
+#if defined(__CUDA_ARCH__)
+            __nanosleep(64);
+#endif
+        }
+    }
+
+    __syncthreads();
 }
 
 __device__ void reduce_window_to_peer_sm90(
@@ -258,13 +289,24 @@ __global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
     size_t numel,
     int num_chunks,
     int num_windows,
-    int rank) {
+    int rank,
+    int* local_ready_signal,
+    const int* peer_ready_signal,
+    int collective_epoch) {
     (void)local_progress;
     (void)peer_progress;
 
-    // Each rank only launches CTAs for windows it owns:
+    wait_for_collective_ready_sm90(
+        local_ready_signal,
+        peer_ready_signal,
+        collective_epoch);
+
+    // Each rank only owns alternating windows:
     //   rank 0 -> windows 0, 2, 4, ...
     //   rank 1 -> windows 1, 3, 5, ...
+    //
+    // Some launches may contain a signal-only CTA when this rank owns zero
+    // windows for a tiny message. That CTA only participates in the rendezvous.
     const int window_idx = 2 * static_cast<int>(blockIdx.x) + rank;
     if (window_idx >= num_windows) {
         return;
@@ -514,7 +556,10 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
     int rank,
     int dev0,
     int dev1,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int* local_ready_signal,
+    const int* peer_ready_signal,
+    int collective_epoch) {
     if (local_in == nullptr || local_buf == nullptr || peer_buf == nullptr) {
         return cudaErrorInvalidDevicePointer;
     }
@@ -531,8 +576,18 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
     const int device = (rank == 0) ? dev0 : dev1;
     const int num_chunks = tma_two_gpu_peer_allreduce_compute_num_chunks(numel);
     const int num_windows = comm::utils::window_num_chunks(num_chunks);
-    const int num_blocks =
+    const int owned_blocks =
         (rank == 0) ? ((num_windows + 1) / 2) : (num_windows / 2);
+
+    const bool needs_rendezvous =
+        local_ready_signal != nullptr &&
+        peer_ready_signal != nullptr &&
+        collective_epoch > 0;
+
+    // If rendezvous is enabled, launch at least one CTA even when this rank
+    // owns zero windows. That CTA only publishes/waits on the epoch signal.
+    const int num_blocks =
+        needs_rendezvous ? std::max(1, owned_blocks) : owned_blocks;
 
     if (num_blocks <= 0) {
         return cudaSuccess;
@@ -556,7 +611,10 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
             numel,
             num_chunks,
             num_windows,
-            rank);
+            rank,
+            local_ready_signal,
+            peer_ready_signal,
+            collective_epoch);
 
     return cudaGetLastError();
 }
@@ -587,9 +645,11 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
     }
 
     const int num_windows = comm::utils::window_num_chunks(num_chunks);
-    const int num_blocks_rank0 = (num_windows + 1) / 2;
-    const int num_blocks_rank1 = num_windows / 2;
+    const int num_blocks_rank0 = std::max(1, (num_windows + 1) / 2);
+    const int num_blocks_rank1 = std::max(1, num_windows / 2);
     const size_t smem_bytes = TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES;
+
+    constexpr int collective_epoch = 1;
 
     system::runtime::set_device(st->dev0);
     tma_two_gpu_reduce_or_copy_windows_kernel_sm90<<<
@@ -605,32 +665,36 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
             numel,
             num_chunks,
             num_windows,
-            0);
+            0,
+            reinterpret_cast<int*>(st->progress0.ptr),
+            reinterpret_cast<const int*>(st->progress1.ptr),
+            collective_epoch);
     cudaError_t err0 = cudaGetLastError();
     if (err0 != cudaSuccess) {
         return err0;
     }
 
-    if (num_blocks_rank1 > 0) {
-        system::runtime::set_device(st->dev1);
-        tma_two_gpu_reduce_or_copy_windows_kernel_sm90<<<
-            num_blocks_rank1,
-            TMA_TWO_GPU_PEER_THREADS,
-            smem_bytes,
-            stream1>>>(
-                rank1_in,
-                rank1_out_peer,
-                rank0_out_peer,
-                reinterpret_cast<int*>(st->progress1.ptr),
-                reinterpret_cast<const int*>(st->progress0.ptr),
-                numel,
-                num_chunks,
-                num_windows,
-                1);
-        cudaError_t err1 = cudaGetLastError();
-        if (err1 != cudaSuccess) {
-            return err1;
-        }
+    system::runtime::set_device(st->dev1);
+    tma_two_gpu_reduce_or_copy_windows_kernel_sm90<<<
+        num_blocks_rank1,
+        TMA_TWO_GPU_PEER_THREADS,
+        smem_bytes,
+        stream1>>>(
+            rank1_in,
+            rank1_out_peer,
+            rank0_out_peer,
+            reinterpret_cast<int*>(st->progress1.ptr),
+            reinterpret_cast<const int*>(st->progress0.ptr),
+            numel,
+            num_chunks,
+            num_windows,
+            1,
+            reinterpret_cast<int*>(st->progress1.ptr),
+            reinterpret_cast<const int*>(st->progress0.ptr),
+            collective_epoch);
+    cudaError_t err1 = cudaGetLastError();
+    if (err1 != cudaSuccess) {
+        return err1;
     }
 
     return cudaSuccess;
