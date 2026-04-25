@@ -7,12 +7,9 @@
 #include <pybind11/stl.h>
 
 #include "overlap/gemm_signal_sm90_dispatch.h"
-#include "rmsnorm/rmsnorm.h"
-#include "overlap_impl.h"
 #include "overlap/gemm_scatter_sm90_dispatch.h"
+#include "overlap_impl.h"
 
-#include "test/tma_collective_sm90.h"
-#include "test/tma_vmm_smoke_test.h"
 #include "test/persistent_allreduce_2gpu_sm90.h"
 
 namespace py = pybind11;
@@ -79,15 +76,17 @@ static void gemm_signal_sm90(
   cudaStream_t stream = at::cuda::getDefaultCUDAStream().stream();
 
   bool ok = ooverlap::gemm_signal_sm90_dispatch(
-      (int)algo,
-      (int)M, (int)N, (int)K,
-      (int)ReLDN,
-      (int32_t*)CommThr.data_ptr<int32_t>(),
-      (void*)A.data_ptr<at::Half>(),
-      (void*)B_packed.data_ptr<at::Half>(),
-      (void*)D.data_ptr<at::Half>(),
-      (int32_t*)MM.data_ptr<int32_t>(),
-      (int32_t*)RA.data_ptr<int32_t>(),
+      static_cast<int>(algo),
+      static_cast<int>(M),
+      static_cast<int>(N),
+      static_cast<int>(K),
+      static_cast<int>(ReLDN),
+      reinterpret_cast<int32_t*>(CommThr.data_ptr<int32_t>()),
+      static_cast<void*>(A.data_ptr<at::Half>()),
+      static_cast<void*>(B_packed.data_ptr<at::Half>()),
+      static_cast<void*>(D.data_ptr<at::Half>()),
+      reinterpret_cast<int32_t*>(MM.data_ptr<int32_t>()),
+      reinterpret_cast<int32_t*>(RA.data_ptr<int32_t>()),
       monitor,
       stream);
 
@@ -157,16 +156,18 @@ static void gemm_scatter_sm90(
   cudaStream_t stream = at::cuda::getDefaultCUDAStream().stream();
 
   bool ok = ooverlap::gemm_scatter_sm90_dispatch(
-      (int)algo,
-      (int)M, (int)N, (int)K,
-      (int)ReLDN,
-      (int32_t*)CommThr.data_ptr<int32_t>(),
-      (void*)A.data_ptr<at::Half>(),
-      (void*)B_packed.data_ptr<at::Half>(),
-      (void*)D.data_ptr<at::Half>(),
-      (int32_t*)MM.data_ptr<int32_t>(),
-      (int32_t*)RA.data_ptr<int32_t>(),
-      (int32_t*)RE.data_ptr<int32_t>(),
+      static_cast<int>(algo),
+      static_cast<int>(M),
+      static_cast<int>(N),
+      static_cast<int>(K),
+      static_cast<int>(ReLDN),
+      reinterpret_cast<int32_t*>(CommThr.data_ptr<int32_t>()),
+      static_cast<void*>(A.data_ptr<at::Half>()),
+      static_cast<void*>(B_packed.data_ptr<at::Half>()),
+      static_cast<void*>(D.data_ptr<at::Half>()),
+      reinterpret_cast<int32_t*>(MM.data_ptr<int32_t>()),
+      reinterpret_cast<int32_t*>(RA.data_ptr<int32_t>()),
+      reinterpret_cast<int32_t*>(RE.data_ptr<int32_t>()),
       monitor,
       stream);
 
@@ -183,27 +184,6 @@ PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("generate_nccl_id", &generate_nccl_id,
         "Generate an NCCL unique ID as a Python list[int]");
 
-  m.def("tma_vmm_smoke_test",
-        &ooverlap::tma_vmm_smoke_test,
-        py::arg("num_elements"),
-        py::arg("src_device") = 0,
-        py::arg("dst_device") = 1,
-        "2-GPU VMM + bulk-TMA smoke test");
-
-  m.def("tma_two_gpu_all_reduce_smoke_test",
-        &ooverlap::tma_two_gpu_all_reduce_smoke_test,
-        py::arg("numel"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1,
-        "2-GPU same-process all-reduce smoke test above bulk-TMA");
-
-  m.def("tma_two_gpu_all_gather_smoke_test",
-        &ooverlap::tma_two_gpu_all_gather_smoke_test,
-        py::arg("shard_numel"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1,
-        "2-GPU same-process all-gather smoke test above bulk-TMA");
-
   m.def("tma_persistent_two_gpu_allreduce_smoke_test",
         &ooverlap::tma_persistent_two_gpu_allreduce_smoke_test,
         py::arg("numel"),
@@ -218,7 +198,7 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("warmup"),
         py::arg("dev0") = 0,
         py::arg("dev1") = 1,
-        "Benchmark persistent 2-GPU all-reduce vs basic TMA vs NCCL");
+        "Benchmark persistent 2-GPU all-reduce vs NCCL");
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())

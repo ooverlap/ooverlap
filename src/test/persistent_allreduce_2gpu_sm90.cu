@@ -1,7 +1,6 @@
 #include "test/persistent_allreduce_2gpu_sm90.h"
 
 #include "comm/ooverlap_comm.h"
-#include "test/tma_collective_sm90.h"
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/test_utils.cuh"
 
@@ -10,7 +9,6 @@
 #include <nccl.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -70,6 +68,44 @@ void sync_two_streams(
     system::runtime::sync_stream_on_device(dev1, stream1, what);
 }
 
+void fill_inputs(
+    half* rank0,
+    half* rank1,
+    int64_t numel,
+    int dev0,
+    int dev1,
+    cudaStream_t stream0,
+    cudaStream_t stream1) {
+    system::runtime::set_device(dev0);
+    testing::fill_pattern(rank0, numel, 0.25f, 1.0f, stream0);
+
+    system::runtime::set_device(dev1);
+    testing::fill_pattern(rank1, numel, 0.50f, 2.0f, stream1);
+
+    sync_two_streams(dev0, stream0, dev1, stream1, "sync fill inputs");
+}
+
+void reset_working_inputs_async(
+    const half* rank0_src,
+    const half* rank1_src,
+    half* rank0_work,
+    half* rank1_work,
+    size_t bytes,
+    int dev0,
+    int dev1,
+    cudaStream_t stream0,
+    cudaStream_t stream1) {
+    system::runtime::set_device(dev0);
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(rank0_work, rank0_src, bytes, cudaMemcpyDeviceToDevice, stream0),
+        "cudaMemcpyAsync(rank0_src -> rank0_work)");
+
+    system::runtime::set_device(dev1);
+    system::runtime::check_cuda(
+        cudaMemcpyAsync(rank1_work, rank1_src, bytes, cudaMemcpyDeviceToDevice, stream1),
+        "cudaMemcpyAsync(rank1_src -> rank1_work)");
+}
+
 double elapsed_ms_two_stream_max(
     int dev0,
     cudaStream_t stream0,
@@ -77,7 +113,6 @@ double elapsed_ms_two_stream_max(
     cudaStream_t stream1,
     int iters,
     const std::function<void(int)>& launch_once) {
-
     cudaEvent_t start0 = nullptr;
     cudaEvent_t stop0 = nullptr;
     cudaEvent_t start1 = nullptr;
@@ -133,57 +168,6 @@ double elapsed_ms_two_stream_max(
     return static_cast<double>(std::max(ms0, ms1));
 }
 
-double elapsed_ms_host_avg(
-    int iters,
-    const std::function<void(int)>& launch_once) {
-    const auto start = std::chrono::steady_clock::now();
-    for (int i = 0; i < iters; ++i) {
-        launch_once(i);
-    }
-    const auto stop = std::chrono::steady_clock::now();
-    const double total_ms =
-        std::chrono::duration<double, std::milli>(stop - start).count();
-    return total_ms / static_cast<double>(iters);
-}
-
-void fill_inputs(
-    half* rank0,
-    half* rank1,
-    int64_t numel,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
-    system::runtime::set_device(dev0);
-    testing::fill_pattern(rank0, numel, 0.25f, 1.0f, stream0);
-
-    system::runtime::set_device(dev1);
-    testing::fill_pattern(rank1, numel, 0.50f, 2.0f, stream1);
-
-    sync_two_streams(dev0, stream0, dev1, stream1, "sync fill inputs");
-}
-
-void reset_working_inputs_async(
-    const half* rank0_src,
-    const half* rank1_src,
-    half* rank0_work,
-    half* rank1_work,
-    size_t bytes,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
-    system::runtime::set_device(dev0);
-    system::runtime::check_cuda(
-        cudaMemcpyAsync(rank0_work, rank0_src, bytes, cudaMemcpyDeviceToDevice, stream0),
-        "cudaMemcpyAsync(rank0_src -> rank0_work)");
-
-    system::runtime::set_device(dev1);
-    system::runtime::check_cuda(
-        cudaMemcpyAsync(rank1_work, rank1_src, bytes, cudaMemcpyDeviceToDevice, stream1),
-        "cudaMemcpyAsync(rank1_src -> rank1_work)");
-}
-
 double elapsed_ms_oo_allreduce(
     oo_node_t* node0,
     oo_node_t* node1,
@@ -197,7 +181,6 @@ double elapsed_ms_oo_allreduce(
     cudaStream_t stream0,
     cudaStream_t stream1,
     int iters) {
-
     cudaEvent_t start0 = nullptr;
     cudaEvent_t stop0 = nullptr;
     cudaEvent_t start1 = nullptr;
@@ -321,7 +304,6 @@ std::vector<float> reference_two_gpu_sum_fp16(int64_t numel) {
     return ref;
 }
 
-#if OOVERLAP_BENCH_VERIFY_RESULTS
 void verify_two_gpu_allreduce_result(
     const char* label,
     half* rank0,
@@ -336,7 +318,6 @@ void verify_two_gpu_allreduce_result(
     testing::expect_allclose(got0, ref, (std::string(label) + " rank0").c_str());
     testing::expect_allclose(got1, ref, (std::string(label) + " rank1").c_str());
 }
-#endif
 
 } // namespace
 
@@ -344,7 +325,6 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
     int64_t numel,
     int dev0,
     int dev1) {
-
     if (numel <= 0) {
         throw std::invalid_argument("tma_persistent_two_gpu_allreduce_smoke_test: numel must be > 0");
     }
@@ -363,15 +343,9 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
     try {
         int devices[2] = {dev0, dev1};
 
-        check_oo(
-            oo_group_create(devices, 2, &group),
-            "oo_group_create");
-        check_oo(
-            oo_node_create(group, 0, &node0),
-            "oo_node_create(rank0)");
-        check_oo(
-            oo_node_create(group, 1, &node1),
-            "oo_node_create(rank1)");
+        check_oo(oo_group_create(devices, 2, &group), "oo_group_create");
+        check_oo(oo_node_create(group, 0, &node0), "oo_node_create(rank0)");
+        check_oo(oo_node_create(group, 1, &node1), "oo_node_create(rank1)");
 
         const int node0_dev = oo_node_device(node0);
         const int node1_dev = oo_node_device(node1);
@@ -380,12 +354,8 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
         stream0 = system::runtime::create_stream_on_device(node0_dev);
         stream1 = system::runtime::create_stream_on_device(node1_dev);
 
-        check_oo(
-            oo_buffer_alloc(node0, bytes, &buf0),
-            "oo_buffer_alloc(rank0)");
-        check_oo(
-            oo_buffer_alloc(node1, bytes, &buf1),
-            "oo_buffer_alloc(rank1)");
+        check_oo(oo_buffer_alloc(node0, bytes, &buf0), "oo_buffer_alloc(rank0)");
+        check_oo(oo_buffer_alloc(node1, bytes, &buf1), "oo_buffer_alloc(rank1)");
 
         half* rank0_buf = reinterpret_cast<half*>(oo_buffer_ptr(buf0));
         half* rank1_buf = reinterpret_cast<half*>(oo_buffer_ptr(buf1));
@@ -428,14 +398,13 @@ bool tma_persistent_two_gpu_allreduce_smoke_test(
             stream1,
             "sync oo allreduce smoke");
 
-        auto got0 = testing::copy_half_device_to_host_float(
-            rank0_buf, numel, node0_dev);
-        auto got1 = testing::copy_half_device_to_host_float(
-            rank1_buf, numel, node1_dev);
-        auto ref = reference_two_gpu_sum_fp16(numel);
-
-        testing::expect_allclose(got0, ref, "oo allreduce rank0");
-        testing::expect_allclose(got1, ref, "oo allreduce rank1");
+        verify_two_gpu_allreduce_result(
+            "oo allreduce smoke",
+            rank0_buf,
+            rank1_buf,
+            numel,
+            node0_dev,
+            node1_dev);
 
         oo_buffer_destroy(buf0);
         oo_buffer_destroy(buf1);
@@ -481,7 +450,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     int warmup,
     int dev0,
     int dev1) {
-
     if (numel <= 0 || iters <= 0 || warmup < 0) {
         throw std::invalid_argument("benchmark_persistent_two_gpu_allreduce_sm90: invalid args");
     }
@@ -494,11 +462,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     oo_node_t* node1 = nullptr;
     oo_buffer_t* oo_rank0_buf = nullptr;
     oo_buffer_t* oo_rank1_buf = nullptr;
-    oo_buffer_t* basic_inbox0 = nullptr;
-    oo_buffer_t* basic_inbox1 = nullptr;
 
-    half* basic_rank0 = nullptr;
-    half* basic_rank1 = nullptr;
     half* nccl_rank0_out = nullptr;
     half* nccl_rank1_out = nullptr;
     half* rank0_src = nullptr;
@@ -512,15 +476,9 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
     try {
         int devices[2] = {dev0, dev1};
 
-        check_oo(
-            oo_group_create(devices, 2, &group),
-            "oo_group_create");
-        check_oo(
-            oo_node_create(group, 0, &node0),
-            "oo_node_create(rank0)");
-        check_oo(
-            oo_node_create(group, 1, &node1),
-            "oo_node_create(rank1)");
+        check_oo(oo_group_create(devices, 2, &group), "oo_group_create");
+        check_oo(oo_node_create(group, 0, &node0), "oo_node_create(rank0)");
+        check_oo(oo_node_create(group, 1, &node1), "oo_node_create(rank1)");
 
         const int node0_dev = oo_node_device(node0);
         const int node1_dev = oo_node_device(node1);
@@ -530,27 +488,15 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         stream1 = system::runtime::create_stream_on_device(node1_dev);
 
         system::runtime::set_device(node0_dev);
-        system::runtime::check_cuda(cudaMalloc(&basic_rank0, bytes), "cudaMalloc(basic_rank0)");
         system::runtime::check_cuda(cudaMalloc(&nccl_rank0_out, bytes), "cudaMalloc(nccl_rank0_out)");
         system::runtime::check_cuda(cudaMalloc(&rank0_src, bytes), "cudaMalloc(rank0_src)");
 
         system::runtime::set_device(node1_dev);
-        system::runtime::check_cuda(cudaMalloc(&basic_rank1, bytes), "cudaMalloc(basic_rank1)");
         system::runtime::check_cuda(cudaMalloc(&nccl_rank1_out, bytes), "cudaMalloc(nccl_rank1_out)");
         system::runtime::check_cuda(cudaMalloc(&rank1_src, bytes), "cudaMalloc(rank1_src)");
 
-        check_oo(
-            oo_buffer_alloc(node0, bytes, &oo_rank0_buf),
-            "oo_buffer_alloc(rank0 work)");
-        check_oo(
-            oo_buffer_alloc(node1, bytes, &oo_rank1_buf),
-            "oo_buffer_alloc(rank1 work)");
-        check_oo(
-            oo_buffer_alloc(node0, bytes, &basic_inbox0),
-            "oo_buffer_alloc(basic inbox0)");
-        check_oo(
-            oo_buffer_alloc(node1, bytes, &basic_inbox1),
-            "oo_buffer_alloc(basic inbox1)");
+        check_oo(oo_buffer_alloc(node0, bytes, &oo_rank0_buf), "oo_buffer_alloc(rank0 work)");
+        check_oo(oo_buffer_alloc(node1, bytes, &oo_rank1_buf), "oo_buffer_alloc(rank1 work)");
 
         half* rank0_work = reinterpret_cast<half*>(oo_buffer_ptr(oo_rank0_buf));
         half* rank1_work = reinterpret_cast<half*>(oo_buffer_ptr(oo_rank1_buf));
@@ -567,60 +513,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         int nccl_devices[2] = {node0_dev, node1_dev};
         OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitAll(comms, 2, nccl_devices));
 
-        // Warm up basic.
-        system::runtime::set_device(node0_dev);
-        system::runtime::check_cuda(
-            cudaMemcpyAsync(basic_rank0, rank0_src, bytes, cudaMemcpyDeviceToDevice, stream0),
-            "cudaMemcpyAsync(rank0_src -> basic_rank0)");
-        system::runtime::set_device(node1_dev);
-        system::runtime::check_cuda(
-            cudaMemcpyAsync(basic_rank1, rank1_src, bytes, cudaMemcpyDeviceToDevice, stream1),
-            "cudaMemcpyAsync(rank1_src -> basic_rank1)");
-        sync_two_streams(node0_dev, stream0, node1_dev, stream1, "sync basic reset");
-
-        for (int i = 0; i < warmup; ++i) {
-            system::runtime::check_cuda(
-                enqueue_two_gpu_all_reduce_tma_sm90(
-                    basic_rank0,
-                    basic_rank1,
-                    reinterpret_cast<half*>(oo_buffer_ptr(basic_inbox0)),
-                    reinterpret_cast<half*>(oo_buffer_ptr(basic_inbox1)),
-                    static_cast<size_t>(numel),
-                    node0_dev,
-                    node1_dev,
-                    stream0,
-                    stream1),
-                "enqueue_two_gpu_all_reduce_tma_sm90 warmup");
-        }
-
-        system::runtime::set_device(node0_dev);
-        system::runtime::check_cuda(
-            cudaMemcpyAsync(basic_rank0, rank0_src, bytes, cudaMemcpyDeviceToDevice, stream0),
-            "cudaMemcpyAsync(rank0_src -> basic_rank0 reset)");
-        system::runtime::set_device(node1_dev);
-        system::runtime::check_cuda(
-            cudaMemcpyAsync(basic_rank1, rank1_src, bytes, cudaMemcpyDeviceToDevice, stream1),
-            "cudaMemcpyAsync(rank1_src -> basic_rank1 reset)");
-        sync_two_streams(node0_dev, stream0, node1_dev, stream1, "sync basic reset timed");
-
-        const double avg_basic_ms = elapsed_ms_host_avg(
-            iters,
-            [&](int) {
-                system::runtime::check_cuda(
-                    enqueue_two_gpu_all_reduce_tma_sm90(
-                        basic_rank0,
-                        basic_rank1,
-                        reinterpret_cast<half*>(oo_buffer_ptr(basic_inbox0)),
-                        reinterpret_cast<half*>(oo_buffer_ptr(basic_inbox1)),
-                        static_cast<size_t>(numel),
-                        node0_dev,
-                        node1_dev,
-                        stream0,
-                        stream1),
-                    "enqueue_two_gpu_all_reduce_tma_sm90");
-            });
-
-        // Warm up new public API path.
         for (int i = 0; i < warmup; ++i) {
             reset_working_inputs_async(
                 rank0_src,
@@ -655,7 +547,12 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                     stream1),
                 "oo_allreduce(rank1 warmup)");
 
-            sync_two_streams(node0_dev, stream0, node1_dev, stream1, "sync oo allreduce warmup");
+            sync_two_streams(
+                node0_dev,
+                stream0,
+                node1_dev,
+                stream1,
+                "sync oo allreduce warmup");
         }
 
         const double oo_total_ms = elapsed_ms_oo_allreduce(
@@ -672,7 +569,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             stream1,
             iters);
 
-        // Warm up NCCL.
         for (int i = 0; i < warmup; ++i) {
             OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
             OOVERLAP_PERSIST_NCCL_CHECK(
@@ -694,11 +590,21 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                     comms[1],
                     stream1));
             OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
-            sync_two_streams(node0_dev, stream0, node1_dev, stream1, "sync NCCL warmup");
+
+            sync_two_streams(
+                node0_dev,
+                stream0,
+                node1_dev,
+                stream1,
+                "sync NCCL warmup");
         }
 
         const double nccl_total_ms = elapsed_ms_two_stream_max(
-            node0_dev, stream0, node1_dev, stream1, iters,
+            node0_dev,
+            stream0,
+            node1_dev,
+            stream1,
+            iters,
             [&](int) {
                 OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
                 OOVERLAP_PERSIST_NCCL_CHECK(
@@ -723,63 +629,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             });
 
 #if OOVERLAP_BENCH_VERIFY_RESULTS
-        // Verify basic TMA with a clean one-shot run after timing.
-        reset_working_inputs_async(
-            rank0_src,
-            rank1_src,
-            basic_rank0,
-            basic_rank1,
-            bytes,
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1);
-
-        system::runtime::set_device(node0_dev);
-        system::runtime::check_cuda(
-            cudaMemsetAsync(oo_buffer_ptr(basic_inbox0), 0, bytes, stream0),
-            "cudaMemsetAsync(basic_inbox0 verify)");
-        system::runtime::set_device(node1_dev);
-        system::runtime::check_cuda(
-            cudaMemsetAsync(oo_buffer_ptr(basic_inbox1), 0, bytes, stream1),
-            "cudaMemsetAsync(basic_inbox1 verify)");
-
-        sync_two_streams(
-            node0_dev,
-            stream0,
-            node1_dev,
-            stream1,
-            "sync basic verify reset");
-
-        system::runtime::check_cuda(
-            enqueue_two_gpu_all_reduce_tma_sm90(
-                basic_rank0,
-                basic_rank1,
-                reinterpret_cast<half*>(oo_buffer_ptr(basic_inbox0)),
-                reinterpret_cast<half*>(oo_buffer_ptr(basic_inbox1)),
-                static_cast<size_t>(numel),
-                node0_dev,
-                node1_dev,
-                stream0,
-                stream1),
-            "enqueue_two_gpu_all_reduce_tma_sm90 verify");
-
-        sync_two_streams(
-            node0_dev,
-            stream0,
-            node1_dev,
-            stream1,
-            "sync basic verify");
-
-        verify_two_gpu_allreduce_result(
-            "basic TMA benchmark verify",
-            basic_rank0,
-            basic_rank1,
-            numel,
-            node0_dev,
-            node1_dev);
-
-        // Verify public oo_allreduce with a clean one-shot run after timing.
         reset_working_inputs_async(
             rank0_src,
             rank1_src,
@@ -835,7 +684,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             node0_dev,
             node1_dev);
 
-        // Verify NCCL with a clean one-shot run after timing.
         OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
         OOVERLAP_PERSIST_NCCL_CHECK(
             ncclAllReduce(
@@ -879,29 +727,21 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         comms[1] = nullptr;
 
         system::runtime::set_device(node0_dev);
-        system::runtime::check_cuda(cudaFree(basic_rank0), "cudaFree(basic_rank0)");
         system::runtime::check_cuda(cudaFree(nccl_rank0_out), "cudaFree(nccl_rank0_out)");
         system::runtime::check_cuda(cudaFree(rank0_src), "cudaFree(rank0_src)");
-        basic_rank0 = nullptr;
         nccl_rank0_out = nullptr;
         rank0_src = nullptr;
 
         system::runtime::set_device(node1_dev);
-        system::runtime::check_cuda(cudaFree(basic_rank1), "cudaFree(basic_rank1)");
         system::runtime::check_cuda(cudaFree(nccl_rank1_out), "cudaFree(nccl_rank1_out)");
         system::runtime::check_cuda(cudaFree(rank1_src), "cudaFree(rank1_src)");
-        basic_rank1 = nullptr;
         nccl_rank1_out = nullptr;
         rank1_src = nullptr;
 
         oo_buffer_destroy(oo_rank0_buf);
         oo_buffer_destroy(oo_rank1_buf);
-        oo_buffer_destroy(basic_inbox0);
-        oo_buffer_destroy(basic_inbox1);
         oo_rank0_buf = nullptr;
         oo_rank1_buf = nullptr;
-        basic_inbox0 = nullptr;
-        basic_inbox1 = nullptr;
 
         oo_node_destroy(node0);
         oo_node_destroy(node1);
@@ -922,13 +762,10 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
         return {
             {"numel", static_cast<double>(numel)},
-            {"avg_ms_basic", avg_basic_ms},
             {"avg_ms_persistent", avg_oo_ms},
             {"avg_ms_oo_allreduce", avg_oo_ms},
             {"avg_ms_nccl", avg_nccl_ms},
-            {"speedup_basic_over_persistent", avg_basic_ms / avg_oo_ms},
             {"speedup_nccl_over_persistent", avg_nccl_ms / avg_oo_ms},
-            {"speedup_basic_over_oo_allreduce", avg_basic_ms / avg_oo_ms},
             {"speedup_nccl_over_oo_allreduce", avg_nccl_ms / avg_oo_ms},
             {"verify_results", static_cast<double>(OOVERLAP_BENCH_VERIFY_RESULTS)}
         };
@@ -940,10 +777,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             ncclCommDestroy(comms[1]);
         }
 
-        if (basic_rank0 != nullptr) {
-            system::runtime::set_device(dev0);
-            cudaFree(basic_rank0);
-        }
         if (nccl_rank0_out != nullptr) {
             system::runtime::set_device(dev0);
             cudaFree(nccl_rank0_out);
@@ -953,10 +786,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             cudaFree(rank0_src);
         }
 
-        if (basic_rank1 != nullptr) {
-            system::runtime::set_device(dev1);
-            cudaFree(basic_rank1);
-        }
         if (nccl_rank1_out != nullptr) {
             system::runtime::set_device(dev1);
             cudaFree(nccl_rank1_out);
@@ -971,12 +800,6 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         }
         if (oo_rank1_buf != nullptr) {
             oo_buffer_destroy(oo_rank1_buf);
-        }
-        if (basic_inbox0 != nullptr) {
-            oo_buffer_destroy(basic_inbox0);
-        }
-        if (basic_inbox1 != nullptr) {
-            oo_buffer_destroy(basic_inbox1);
         }
 
         if (node0 != nullptr) {
