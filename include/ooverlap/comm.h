@@ -21,17 +21,30 @@ typedef enum {
 } oo_status_t;
 
 typedef enum {
-    OO_DTYPE_FLOAT16 = 0
+    OO_DTYPE_FLOAT16 = 0,
+    OO_DTYPE_BFLOAT16 = 1,
+    OO_DTYPE_FLOAT32 = 2
 } oo_dtype_t;
 
 typedef enum {
-    OO_REDUCE_SUM = 0
+    OO_REDUCE_ADD = 0,
+
+    // Alias for users coming from NCCL-style naming.
+    // Sum and add are the same operation for this collective.
+    OO_REDUCE_SUM = OO_REDUCE_ADD,
+
+    OO_REDUCE_MIN = 1,
+    OO_REDUCE_MAX = 2
 } oo_reduce_op_t;
 
 typedef enum {
     OO_BUFFER_KIND_VMM = 0,
     OO_BUFFER_KIND_WRAPPED = 1
 } oo_buffer_kind_t;
+
+/* Utility */
+size_t oo_dtype_size(
+    oo_dtype_t dtype);
 
 /* Group */
 oo_status_t oo_group_create(

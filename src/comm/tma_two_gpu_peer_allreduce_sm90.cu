@@ -11,6 +11,7 @@
 #include "comm/utils.h"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -28,6 +29,10 @@ __host__ __device__ __forceinline__ size_t dtype_size_bytes(
     switch (dtype) {
         case OO_DTYPE_FLOAT16:
             return sizeof(half);
+        case OO_DTYPE_BFLOAT16:
+            return sizeof(__nv_bfloat16);
+        case OO_DTYPE_FLOAT32:
+            return sizeof(float);
         default:
             return 0;
     }
@@ -409,6 +414,48 @@ void configure_dispatch_for(int device) {
     configure_kernel_once_for<ReduceApply, ElemBytes>(device);
 }
 
+template <typename ReduceOp, int ElemBytes>
+cudaError_t launch_reduce_op_sm90(
+    const void* local_in,
+    void* local_buf,
+    void* peer_buf,
+    size_t count,
+    int rank,
+    int dev0,
+    int dev1,
+    cudaStream_t stream,
+    int* local_ready_signal,
+    const int* peer_ready_signal,
+    int collective_epoch) {
+    using ReduceApply = comm::PipelineTMAReduce<
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+        ReduceOp>;
+
+    return launch_rank_kernel_sm90<ReduceApply, ElemBytes>(
+        local_in,
+        local_buf,
+        peer_buf,
+        count,
+        rank,
+        dev0,
+        dev1,
+        stream,
+        local_ready_signal,
+        peer_ready_signal,
+        collective_epoch);
+}
+
+template <typename ReduceOp, int ElemBytes>
+void configure_reduce_op_sm90(int device) {
+    using ReduceApply = comm::PipelineTMAReduce<
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+        ReduceOp>;
+
+    configure_dispatch_for<ReduceApply, ElemBytes>(device);
+}
+
 cudaError_t dispatch_rank_kernel_sm90(
     const void* local_in,
     void* local_buf,
@@ -423,24 +470,163 @@ cudaError_t dispatch_rank_kernel_sm90(
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch) {
-    if (dtype == OO_DTYPE_FLOAT16 && op == OO_REDUCE_SUM) {
-        return launch_rank_kernel_sm90<
-            comm::PipelineTMAReduce<
-                TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-                TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-                comm::PipelineReduceAddNoFtzF16>,
-            static_cast<int>(sizeof(half))>(
-                local_in,
-                local_buf,
-                peer_buf,
-                count,
-                rank,
-                dev0,
-                dev1,
-                stream,
-                local_ready_signal,
-                peer_ready_signal,
-                collective_epoch);
+    if (dtype == OO_DTYPE_FLOAT16) {
+        if (op == OO_REDUCE_ADD) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceAddNoFtzF16,
+                static_cast<int>(sizeof(half))>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch);
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMinF16,
+                static_cast<int>(sizeof(half))>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch);
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMaxF16,
+                static_cast<int>(sizeof(half))>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch);
+        }
+    }
+
+    if (dtype == OO_DTYPE_BFLOAT16) {
+        if (op == OO_REDUCE_ADD) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceAddBF16,
+                static_cast<int>(sizeof(__nv_bfloat16))>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch);
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMinBF16,
+                static_cast<int>(sizeof(__nv_bfloat16))>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch);
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMaxBF16,
+                static_cast<int>(sizeof(__nv_bfloat16))>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch);
+        }
+    }
+
+    if (dtype == OO_DTYPE_FLOAT32) {
+        if (op == OO_REDUCE_ADD) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceAddF32,
+                static_cast<int>(sizeof(float))>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch);
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMinF32,
+                static_cast<int>(sizeof(float))>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch);
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMaxF32,
+                static_cast<int>(sizeof(float))>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch);
+        }
     }
 
     return cudaErrorInvalidValue;
@@ -450,14 +636,73 @@ void configure_dispatch_sm90(
     oo_dtype_t dtype,
     oo_reduce_op_t op,
     int device) {
-    if (dtype == OO_DTYPE_FLOAT16 && op == OO_REDUCE_SUM) {
-        configure_dispatch_for<
-            comm::PipelineTMAReduce<
-                TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-                TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-                comm::PipelineReduceAddNoFtzF16>,
-            static_cast<int>(sizeof(half))>(device);
-        return;
+    if (dtype == OO_DTYPE_FLOAT16) {
+        if (op == OO_REDUCE_ADD) {
+            configure_reduce_op_sm90<
+                comm::PipelineReduceAddNoFtzF16,
+                static_cast<int>(sizeof(half))>(device);
+            return;
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            configure_reduce_op_sm90<
+                comm::PipelineReduceMinF16,
+                static_cast<int>(sizeof(half))>(device);
+            return;
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            configure_reduce_op_sm90<
+                comm::PipelineReduceMaxF16,
+                static_cast<int>(sizeof(half))>(device);
+            return;
+        }
+    }
+
+    if (dtype == OO_DTYPE_BFLOAT16) {
+        if (op == OO_REDUCE_ADD) {
+            configure_reduce_op_sm90<
+                comm::PipelineReduceAddBF16,
+                static_cast<int>(sizeof(__nv_bfloat16))>(device);
+            return;
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            configure_reduce_op_sm90<
+                comm::PipelineReduceMinBF16,
+                static_cast<int>(sizeof(__nv_bfloat16))>(device);
+            return;
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            configure_reduce_op_sm90<
+                comm::PipelineReduceMaxBF16,
+                static_cast<int>(sizeof(__nv_bfloat16))>(device);
+            return;
+        }
+    }
+
+    if (dtype == OO_DTYPE_FLOAT32) {
+        if (op == OO_REDUCE_ADD) {
+            configure_reduce_op_sm90<
+                comm::PipelineReduceAddF32,
+                static_cast<int>(sizeof(float))>(device);
+            return;
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            configure_reduce_op_sm90<
+                comm::PipelineReduceMinF32,
+                static_cast<int>(sizeof(float))>(device);
+            return;
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            configure_reduce_op_sm90<
+                comm::PipelineReduceMaxF32,
+                static_cast<int>(sizeof(float))>(device);
+            return;
+        }
     }
 
     throw std::invalid_argument(

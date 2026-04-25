@@ -2,6 +2,7 @@
 
 #include "comm/tma_two_gpu_peer_allreduce_sm90.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -38,13 +39,10 @@ bool checked_mul_size(size_t a, size_t b, size_t* out) {
     return true;
 }
 
-size_t dtype_size(oo_dtype_t dtype) {
-    switch (dtype) {
-        case OO_DTYPE_FLOAT16:
-            return sizeof(half);
-        default:
-            return 0;
-    }
+bool reduce_op_supported(oo_reduce_op_t op) {
+    return op == OO_REDUCE_ADD ||
+           op == OO_REDUCE_MIN ||
+           op == OO_REDUCE_MAX;
 }
 
 bool same_group(const oo_group_t* a, const oo_group_t* b) {
@@ -112,6 +110,20 @@ oo_status_t init_group_ready_signals(oo_group_t* group) {
 } // namespace
 
 extern "C" {
+
+size_t oo_dtype_size(
+    oo_dtype_t dtype) {
+    switch (dtype) {
+        case OO_DTYPE_FLOAT16:
+            return sizeof(half);
+        case OO_DTYPE_BFLOAT16:
+            return sizeof(__nv_bfloat16);
+        case OO_DTYPE_FLOAT32:
+            return sizeof(float);
+        default:
+            return 0;
+    }
+}
 
 oo_status_t oo_group_create(
     const int* devices,
@@ -371,12 +383,12 @@ oo_status_t oo_allreduce(
         return OO_ERROR_UNSUPPORTED;
     }
 
-    const size_t elem_bytes = dtype_size(dtype);
+    const size_t elem_bytes = oo_dtype_size(dtype);
     if (elem_bytes == 0) {
         return OO_ERROR_UNSUPPORTED;
     }
 
-    if (op != OO_REDUCE_SUM) {
+    if (!reduce_op_supported(op)) {
         return OO_ERROR_UNSUPPORTED;
     }
 
