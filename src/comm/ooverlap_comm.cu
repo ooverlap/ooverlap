@@ -433,12 +433,15 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
         std::vector<ready_signal_block_desc> all_desc(
             static_cast<size_t>(group->num_devices));
 
+
         std::fprintf(
             stderr,
             "[ooverlap][ipc] ready signal before broker exchange_data "
-            "rank=%d broker=%p\n",
+            "rank=%d broker.get()=%p group=%p sizeof(Broker)=%zu\n",
             local_rank,
-            static_cast<void*>(group->broker.get()));
+            static_cast<void*>(group->broker.get()),
+            static_cast<void*>(group),
+            sizeof(ooverlap::system::Broker));
         std::fflush(stderr);
 
         group->broker->exchange_data(

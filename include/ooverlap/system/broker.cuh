@@ -570,11 +570,13 @@ public:
 
         std::fprintf(
             stderr,
-            "[ooverlap][broker] construct end rank=%d shm_raw=%p shm=%p sock=%d\n",
+            "[ooverlap][broker] construct end this=%p rank=%d shm_raw=%p shm=%p sock=%d sizeof(Broker)=%zu\n",
+            static_cast<void*>(this),
             local_rank_,
             shm_raw_,
             static_cast<void*>(shm_),
-            sock_);
+            sock_,
+            sizeof(Broker)); 
         std::fflush(stderr);
     }
 
@@ -620,11 +622,14 @@ public:
 
         std::fprintf(
             stderr,
-            "[ooverlap][broker] exchange_data begin rank=%d size=%zu shm=%p generation=%d\n",
+            "[ooverlap][broker] exchange_data begin this=%p rank=%d size=%zu shm_raw=%p shm=%p generation=%d sizeof(Broker)=%zu\n",
+            static_cast<void*>(this),
             local_rank_,
             size,
+            shm_raw_,
             static_cast<void*>(shm_),
-            shm_->barrier_generation);
+            shm_ ? shm_->barrier_generation : -1,
+            sizeof(Broker)); 
         std::fflush(stderr);
 
         uint8_t* dst_bytes = reinterpret_cast<uint8_t*>(dst);
@@ -911,13 +916,15 @@ private:
         if (shm_raw_ == nullptr || shm_ == nullptr) {
             std::fprintf(
                 stderr,
-                "[ooverlap][broker] null shm in %s rank=%d world=%d shm_raw=%p shm=%p key=%s\n",
+                "[ooverlap][broker] null shm in %s this=%p rank=%d world=%d shm_raw=%p shm=%p key=%s sizeof(Broker)=%zu\n",
                 where,
+                static_cast<const void*>(this),
                 local_rank_,
                 local_world_size_,
                 shm_raw_,
                 static_cast<void*>(shm_),
-                shm_key_.c_str());
+                shm_key_.c_str(),
+                sizeof(Broker)); 
             std::fflush(stderr);
             throw std::runtime_error(std::string("Broker null shm in ") + where);
         }
