@@ -346,34 +346,43 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
     const int local_rank = group->local_rank;
     const int signal_owner_rank = 0;
     const int signal_owner_device = group->devices[signal_owner_rank];
+
     const size_t signal_block_bytes =
         static_cast<size_t>(group->num_devices) * kOoReadySignalBytes;
+
+    struct ready_signal_block_desc {
+        cudaIpcMemHandle_t handle{};
+        std::uint64_t bytes = 0;
+        int owner_rank = -1;
+        int owner_device = -1;
+    };
 
     auto cleanup_ready_signals_local_only = [&]() {
         for (int r = 0; r < group->num_devices; ++r) {
             oo_ready_signal& slot = group->ready_signal_slots[r];
 
-            if (slot.kind == oo_ready_signal_kind::owned_vmm ||
-                slot.kind == oo_ready_signal_kind::owned_legacy ||
-                slot.kind == oo_ready_signal_kind::imported_legacy ||
-                slot.kind == oo_ready_signal_kind::imported_vmm) {
+            if (slot.kind == oo_ready_signal_kind::owned_legacy) {
+                if (slot.owned_legacy_ptr != nullptr) {
+                    cudaSetDevice(slot.owner_device);
+                    cudaFree(slot.owned_legacy_ptr);
+                }
+            } else if (slot.kind == oo_ready_signal_kind::imported_legacy) {
+                if (slot.ptr != nullptr) {
+                    cudaIpcCloseMemHandle(slot.ptr);
+                }
+            } else if (slot.kind == oo_ready_signal_kind::owned_vmm ||
+                       slot.kind == oo_ready_signal_kind::imported_vmm) {
                 free_ready_signal_slot(slot);
-                clear_ready_signal_compat_mirror(group, r);
-            } else {
-                clear_ready_signal_slot(slot);
-                clear_ready_signal_compat_mirror(group, r);
             }
+
+            clear_ready_signal_slot(slot);
+            clear_ready_signal_compat_mirror(group, r);
         }
     };
 
     try {
-        std::vector<int> access_devices = group_devices_vector(group);
-
-        ooverlap::system::vmm_peer_buffer_descriptor local_desc{};
-        ooverlap::system::ipc::vmm_handle local_fd{};
-
         void* signal_base = nullptr;
-        ooverlap::system::imported_peer_buffer imported_signal_block{};
+        ready_signal_block_desc local_desc{};
 
         if (local_rank == signal_owner_rank) {
             cudaError_t err = cudaSetDevice(signal_owner_device);
@@ -381,95 +390,123 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
                 return report_cuda_error(err, "cudaSetDevice(signal_owner_device)");
             }
 
-            ooverlap::system::mapped_peer_buffer block =
-                ooverlap::system::alloc_peer_visible_buffer(
-                    signal_block_bytes,
-                    signal_owner_device,
-                    access_devices);
-
-            err = cudaMemset(block.ptr, 0, block.mapped_size);
+            err = cudaMalloc(&signal_base, signal_block_bytes);
             if (err != cudaSuccess) {
-                ooverlap::system::free_peer_visible_buffer(block);
-                return report_cuda_error(err, "cudaMemset(VMM ready-signal block)");
+                return report_cuda_error(err, "cudaMalloc(legacy ready-signal block)");
             }
 
-            local_desc =
-                ooverlap::system::make_vmm_peer_buffer_descriptor(
-                    block,
-                    signal_block_bytes);
+            err = cudaMemset(signal_base, 0, signal_block_bytes);
+            if (err != cudaSuccess) {
+                cudaFree(signal_base);
+                return report_cuda_error(err, "cudaMemset(legacy ready-signal block)");
+            }
 
-            local_fd =
-                ooverlap::system::export_vmm_peer_buffer_fd(block);
+            local_desc.bytes = static_cast<std::uint64_t>(signal_block_bytes);
+            local_desc.owner_rank = signal_owner_rank;
+            local_desc.owner_device = signal_owner_device;
+
+            err = cudaIpcGetMemHandle(&local_desc.handle, signal_base);
+            if (err != cudaSuccess) {
+                cudaFree(signal_base);
+                return report_cuda_error(err, "cudaIpcGetMemHandle(ready-signal block)");
+            }
 
             /*
-             * Store ownership on slot 0. Other slots are borrowed views into
-             * the same VMM block and must not free it.
+             * Store the owner allocation on slot 0. Slot 1 will be a borrowed
+             * view into the same allocation and must not free separately.
              */
-            group->ready_signal_slots[signal_owner_rank].owned_vmm = block;
-            signal_base = block.ptr;
+            oo_ready_signal& owner_slot = group->ready_signal_slots[signal_owner_rank];
+            owner_slot.ptr = signal_base;
+            owner_slot.bytes = signal_block_bytes;
+            owner_slot.mapped_bytes = signal_block_bytes;
+            owner_slot.owner_rank = signal_owner_rank;
+            owner_slot.owner_device = signal_owner_device;
+            owner_slot.kind = oo_ready_signal_kind::owned_legacy;
+            owner_slot.owned_legacy_ptr = signal_base;
         }
 
-        /*
-         * Broadcast descriptor through the shared-memory broker.
-         * Only rank 0's descriptor is meaningful.
-         */
-        std::vector<ooverlap::system::vmm_peer_buffer_descriptor> all_desc(
+        static_assert(
+            sizeof(ready_signal_block_desc) <=
+                ooverlap::system::broker_detail::VAULT_SIZE_PER_RANK,
+            "ready_signal_block_desc does not fit in Broker exchange vault");
+
+        std::vector<ready_signal_block_desc> all_desc(
             static_cast<size_t>(group->num_devices));
+
+        std::fprintf(
+            stderr,
+            "[ooverlap][ipc] ready signal before broker exchange_data "
+            "rank=%d broker=%p\n",
+            local_rank,
+            static_cast<void*>(group->broker.get()));
+        std::fflush(stderr);
 
         group->broker->exchange_data(
             all_desc.data(),
             &local_desc,
             sizeof(local_desc));
 
-        const ooverlap::system::vmm_peer_buffer_descriptor signal_desc =
-            all_desc[signal_owner_rank];
+        const ready_signal_block_desc signal_desc = all_desc[signal_owner_rank];
 
         if (signal_desc.bytes != signal_block_bytes ||
-            signal_desc.mapped_size == 0 ||
+            signal_desc.owner_rank != signal_owner_rank ||
             signal_desc.owner_device != signal_owner_device) {
             std::fprintf(
                 stderr,
-                "[ooverlap][ipc] bad VMM ready-signal descriptor: "
-                "bytes=%llu mapped=%llu owner_device=%d expected_bytes=%llu expected_device=%d\n",
+                "[ooverlap][ipc] bad legacy ready-signal descriptor: "
+                "bytes=%llu owner_rank=%d owner_device=%d "
+                "expected_bytes=%llu expected_owner_rank=%d expected_owner_device=%d\n",
                 static_cast<unsigned long long>(signal_desc.bytes),
-                static_cast<unsigned long long>(signal_desc.mapped_size),
+                signal_desc.owner_rank,
                 signal_desc.owner_device,
                 static_cast<unsigned long long>(signal_block_bytes),
+                signal_owner_rank,
                 signal_owner_device);
             std::fflush(stderr);
+
             cleanup_ready_signals_local_only();
             return OO_ERROR_INTERNAL;
         }
 
-        /*
-         * Transfer rank 0's VMM FD using SCM_RIGHTS.
-         * Non-root passes src_fd=-1; broadcast_fd only checks src_fd on root.
-         */
-        int imported_fd = -1;
-        if (local_rank == signal_owner_rank) {
-            int ignored_fd = -1;
-            group->broker->broadcast_fd(
-                &ignored_fd,
-                local_fd.value,
-                signal_owner_rank);
+        if (local_rank != signal_owner_rank) {
+            cudaError_t err = cudaSetDevice(group->devices[local_rank]);
+            if (err != cudaSuccess) {
+                cleanup_ready_signals_local_only();
+                return report_cuda_error(err, "cudaSetDevice(before ready-signal import)");
+            }
+
+            err = cudaIpcOpenMemHandle(
+                &signal_base,
+                signal_desc.handle,
+                cudaIpcMemLazyEnablePeerAccess);
+
+            if (err != cudaSuccess) {
+                std::fprintf(
+                    stderr,
+                    "[ooverlap][ipc] cudaIpcOpenMemHandle(ready-signal block) "
+                    "failed local_rank=%d local_device=%d owner_device=%d: %s\n",
+                    local_rank,
+                    group->devices[local_rank],
+                    signal_owner_device,
+                    cudaGetErrorString(err));
+                std::fflush(stderr);
+
+                cleanup_ready_signals_local_only();
+                return OO_ERROR_CUDA;
+            }
 
             /*
-             * broadcast_fd consumes/closes the exported fd on the sender.
+             * Store the imported mapping on slot 0. Slot 1 is a borrowed view.
              */
-            local_fd.value = -1;
-        } else {
-            group->broker->broadcast_fd(
-                &imported_fd,
-                -1,
-                signal_owner_rank);
+            oo_ready_signal& imported_owner_slot =
+                group->ready_signal_slots[signal_owner_rank];
 
-            imported_signal_block =
-                ooverlap::system::import_vmm_peer_buffer(
-                    imported_fd,
-                    signal_desc,
-                    access_devices);
-
-            signal_base = imported_signal_block.ptr;
+            imported_owner_slot.ptr = signal_base;
+            imported_owner_slot.bytes = signal_block_bytes;
+            imported_owner_slot.mapped_bytes = signal_block_bytes;
+            imported_owner_slot.owner_rank = signal_owner_rank;
+            imported_owner_slot.owner_device = signal_owner_device;
+            imported_owner_slot.kind = oo_ready_signal_kind::imported_legacy;
         }
 
         if (signal_base == nullptr) {
@@ -478,46 +515,53 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
         }
 
         /*
-         * Build two int slots inside one shared signal block:
+         * Build per-rank int slots inside one shared signal block:
          *
          *   slot 0: rank 0 epoch
          *   slot 1: rank 1 epoch
          *
-         * Rank 0 owns the VMM block. Rank 1 owns one imported VMM mapping.
-         * The non-owning slots are intentionally kind=empty so cleanup frees
-         * the block exactly once per process.
+         * Only slot 0 owns/closes the backing block in each process.
+         * Other slots are borrowed views.
          */
         for (int rank = 0; rank < group->num_devices; ++rank) {
             oo_ready_signal& slot = group->ready_signal_slots[rank];
 
-            slot.ptr = reinterpret_cast<void*>(
+            void* slot_ptr = reinterpret_cast<void*>(
                 reinterpret_cast<std::uint8_t*>(signal_base) +
                 static_cast<size_t>(rank) * kOoReadySignalBytes);
 
-            slot.bytes = kOoReadySignalBytes;
-            slot.mapped_bytes = kOoReadySignalBytes;
-            slot.owner_rank = rank;
-            slot.owner_device = group->devices[rank];
-            slot.kind = oo_ready_signal_kind::empty;
+            if (rank == signal_owner_rank) {
+                /*
+                 * Preserve ownership kind already set above, but change ptr/size
+                 * to slot view. owned_legacy_ptr remains the block base.
+                 */
+                slot.ptr = slot_ptr;
+                slot.bytes = kOoReadySignalBytes;
+                slot.mapped_bytes = kOoReadySignalBytes;
+                slot.owner_rank = rank;
+                slot.owner_device = group->devices[rank];
+
+                if (local_rank == signal_owner_rank) {
+                    slot.kind = oo_ready_signal_kind::owned_legacy;
+                    slot.owned_legacy_ptr = signal_base;
+                } else {
+                    slot.kind = oo_ready_signal_kind::imported_legacy;
+                }
+            } else {
+                /*
+                 * Borrowed view into same block. It must not free anything.
+                 */
+                slot.ptr = slot_ptr;
+                slot.bytes = kOoReadySignalBytes;
+                slot.mapped_bytes = kOoReadySignalBytes;
+                slot.owner_rank = rank;
+                slot.owner_device = group->devices[rank];
+                slot.kind = oo_ready_signal_kind::empty;
+            }
 
             mirror_ready_signal_for_compat(group, rank);
         }
 
-        if (local_rank == signal_owner_rank) {
-            oo_ready_signal& owner_slot =
-                group->ready_signal_slots[signal_owner_rank];
-            owner_slot.kind = oo_ready_signal_kind::owned_vmm;
-        } else {
-            oo_ready_signal& imported_owner_slot =
-                group->ready_signal_slots[signal_owner_rank];
-            imported_owner_slot.kind = oo_ready_signal_kind::imported_vmm;
-            imported_owner_slot.imported = std::move(imported_signal_block);
-        }
-
-        /*
-         * After all slots are constructed, make sure both processes see a
-         * complete ready-signal setup before returning from group creation.
-         */
         group->broker->sync();
 
         return OO_SUCCESS;
