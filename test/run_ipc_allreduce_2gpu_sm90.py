@@ -149,6 +149,8 @@ def main():
     deadline = time.time() + args.timeout_s
     results = {}
 
+    reported_exits = set()
+
     while len(results) < 2 and time.time() < deadline:
         try:
             rank, ok, msg = result_q.get(timeout=0.25)
@@ -161,12 +163,20 @@ def main():
             pass
 
         for rank, p in enumerate(procs):
-            if p.exitcode is not None and rank not in results:
+            if (
+                p.exitcode is not None
+                and rank not in results
+                and rank not in reported_exits
+            ):
                 print(
                     f"[ipc-runner] rank={rank} pid={p.pid} exitcode={p.exitcode} "
-                    "without queue result yet",
+                    "without queue result",
                     flush=True,
                 )
+                reported_exits.add(rank)
+
+        if len(reported_exits) == 2 and len(results) == 0:
+            break 
 
     for rank, p in enumerate(procs):
         remaining = max(0.0, deadline - time.time())
