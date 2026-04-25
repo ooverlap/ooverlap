@@ -349,6 +349,27 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
     void* local_signal = nullptr;
     bool local_signal_recorded = false;
 
+    auto cleanup_ready_signals_local_only = [&]() {
+        for (int r = 0; r < group->num_devices; ++r) {
+            oo_ready_signal& slot = group->ready_signal_slots[r];
+    
+            if (slot.kind == oo_ready_signal_kind::owned_legacy) {
+                if (slot.owned_legacy_ptr != nullptr) {
+                    cudaSetDevice(slot.owner_device);
+                    cudaFree(slot.owned_legacy_ptr);
+                }
+                clear_ready_signal_slot(slot);
+                clear_ready_signal_compat_mirror(group, r);
+            } else if (slot.kind == oo_ready_signal_kind::imported_legacy) {
+                if (slot.ptr != nullptr) {
+                    cudaIpcCloseMemHandle(slot.ptr);
+                }
+                clear_ready_signal_slot(slot);
+                clear_ready_signal_compat_mirror(group, r);
+            }
+        }
+    };
+
     try {
         cudaError_t err = cudaSetDevice(local_device);
         if (err != cudaSuccess) {
@@ -478,24 +499,13 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
         return OO_SUCCESS;
 
     } catch (const std::bad_alloc&) {
-        if (!local_signal_recorded && local_signal != nullptr) {
-            cudaSetDevice(local_device);
-            cudaFree(local_signal);
-        }
+        cleanup_ready_signals_local_only();
         return OO_ERROR_INTERNAL;
-
     } catch (const std::exception& e) {
-        if (!local_signal_recorded && local_signal != nullptr) {
-            cudaSetDevice(local_device);
-            cudaFree(local_signal);
-        }
+        cleanup_ready_signals_local_only();
         return report_exception("init_group_ready_signals_ipc", e);
-
     } catch (...) {
-        if (!local_signal_recorded && local_signal != nullptr) {
-            cudaSetDevice(local_device);
-            cudaFree(local_signal);
-        }
+        cleanup_ready_signals_local_only();
         return report_unknown_exception("init_group_ready_signals_ipc");
     }
 }

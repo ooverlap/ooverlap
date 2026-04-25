@@ -135,24 +135,56 @@ inline std::string make_socket_path(const std::string& prefix, int local_rank) {
     return s;
 }
 
+inline void wait_until_initialized(volatile Vault* vault, const char* where) {
+    if (vault == nullptr) {
+        throw std::runtime_error("Broker: vault pointer is null");
+    }
+
+    /*
+     * Rank startup can race under Python multiprocessing spawn. Rank 1 can map
+     * the shm before rank 0 has published INIT_CODE. Treat that as a waitable
+     * state, not a fatal state.
+     */
+    int spins = 0;
+    while (vault->init != Vault::INIT_CODE) {
+        if ((++spins % 1000000) == 0) {
+            std::fprintf(
+                stderr,
+                "[ooverlap][broker] waiting for vault init in %s, current init=0x%x expected=0x%x\n",
+                where ? where : "unknown",
+                vault->init,
+                Vault::INIT_CODE);
+            std::fflush(stderr);
+        }
+        usleep(1);
+    }
+
+    __sync_synchronize();
+}
+
 inline void init_sync(int local_rank, volatile Vault* vault) {
+    if (vault == nullptr) {
+        throw std::runtime_error("Broker: vault pointer is null");
+    }
+
     if (local_rank == 0) {
         vault->barrier = 0;
         vault->sense = 0;
         __sync_synchronize();
         vault->init = Vault::INIT_CODE;
     } else {
-        while (vault->init != Vault::INIT_CODE) {
-            usleep(1);
-        }
-        __sync_synchronize();
+        wait_until_initialized(vault, "init_sync");
     }
+
+    __sync_synchronize();
 }
 
 inline void sync(int local_world_size, volatile Vault* vault) {
-    if (vault == nullptr || vault->init != Vault::INIT_CODE) {
-        throw std::runtime_error("Broker: vault is not initialized");
+    if (local_world_size <= 0) {
+        throw std::runtime_error("Broker: invalid local_world_size");
     }
+
+    wait_until_initialized(vault, "sync");
 
     int arrived = __sync_add_and_fetch(&vault->barrier, 1);
     if (arrived == local_world_size) {
@@ -420,15 +452,6 @@ public:
         broker_detail::init_sync(local_rank_, shm_);
         broker_detail::sync(local_world_size_, shm_);
 
-        /*
-         * After everybody mapped it, unlink the shm name. The mapping survives
-         * until every process unmaps it.
-         */
-        if (local_rank_ == 0) {
-            broker_detail::unlink_shm(shm_key_.c_str());
-        }
-        broker_detail::sync(local_world_size_, shm_);
-
         sock_ = broker_detail::create_socket(socket_prefix_, local_rank_);
         broker_detail::sync(local_world_size_, shm_);
     }
@@ -672,6 +695,24 @@ public:
     }
 
     void destroy() {
+        const int old_rank = local_rank_;
+
+        /*
+         * Best-effort final barrier. This keeps rank 0 from unlinking the shm
+         * name while a peer is still inside broker operations.
+         */
+        try {
+            if (shm_ != nullptr && local_world_size_ > 0) {
+                broker_detail::sync(local_world_size_, shm_);
+            }
+        } catch (...) {
+            // Cleanup should be best-effort.
+        }
+
+        if (old_rank == 0) {
+            broker_detail::unlink_shm(shm_key_.c_str());
+        }
+
         if (shm_raw_ != nullptr) {
             broker_detail::unmap_shm(shm_raw_, broker_detail::SHM_SIZE);
             shm_raw_ = nullptr;
@@ -679,14 +720,14 @@ public:
         }
 
         if (sock_ >= 0) {
-            broker_detail::unlink_socket(socket_prefix_, local_rank_);
+            broker_detail::unlink_socket(socket_prefix_, old_rank);
             broker_detail::close_socket(sock_);
             sock_ = -1;
         }
 
         local_rank_ = -1;
         local_world_size_ = -1;
-    }
+    } 
 
 private:
     int local_rank_;
