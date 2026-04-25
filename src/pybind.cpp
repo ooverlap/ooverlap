@@ -11,6 +11,7 @@
 #include "overlap_impl.h"
 
 #include "test/persistent_allreduce_2gpu_sm90.h"
+#include "test/ipc_allreduce_2gpu_sm90.h"
 
 namespace py = pybind11;
 
@@ -199,6 +200,16 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev0") = 0,
         py::arg("dev1") = 1,
         "Benchmark persistent 2-GPU all-reduce vs NCCL");
+
+  m.def("tma_ipc_two_gpu_allreduce_rank_smoke_test",
+        &ooverlap::tma_ipc_two_gpu_allreduce_rank_smoke_test,
+        py::arg("numel"),
+        py::arg("local_rank"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        py::arg("broker_key"),
+        py::arg("iters") = 1,
+        "2-process CUDA IPC 2-GPU all-reduce smoke test; call once per local rank");
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())

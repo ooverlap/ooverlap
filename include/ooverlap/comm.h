@@ -56,6 +56,13 @@ oo_status_t oo_group_create(
     int num_devices,
     oo_group_t** out_group);
 
+oo_status_t oo_group_create_ipc(
+    const int* devices,
+    int num_devices,
+    int local_rank,
+    const char* broker_key,
+    oo_group_t** out_group);
+
 void oo_group_destroy(
     oo_group_t* group);
 
