@@ -239,27 +239,52 @@ bool tma_ipc_two_gpu_allreduce_rank_smoke_test(
             &local_buf),
         "oo_buffer_wrap(local_work)");
 
-    ooverlap::system::legacy_peer_buffer_descriptor local_desc{};
-    check_oo(
-        oo_buffer_export_legacy_descriptor(
-            local_buf,
-            &local_desc),
-        "oo_buffer_export_legacy_descriptor(local)");
+    std::vector<int> access_devices = {dev0, dev1};
 
-    std::vector<ooverlap::system::legacy_peer_buffer_descriptor> all_desc(2);
-
+    ooverlap::system::vmm_peer_buffer_descriptor local_desc =
+        ooverlap::system::make_vmm_peer_buffer_descriptor(
+            local_buf->mapped,
+            bytes);
+     
+    ooverlap::system::ipc::vmm_handle local_fd =
+        ooverlap::system::export_vmm_peer_buffer_fd(
+            local_buf->mapped);
+     
+    std::vector<ooverlap::system::vmm_peer_buffer_descriptor> all_desc(2);
+     
     group->broker->exchange_data(
         all_desc.data(),
         &local_desc,
         sizeof(local_desc));
-
-    check_oo(
-        oo_buffer_import_legacy_descriptor(
-            node,
+     
+    std::vector<int> all_fds(2, -1);
+     
+    group->broker->exchange_fds(
+        all_fds.data(),
+        local_fd.value);
+     
+    /*
+     * exchange_fds consumes/closes local_fd.value.
+     */
+    local_fd.value = -1;
+     
+    if (all_fds[peer_rank] < 0) {
+        throw std::runtime_error("exchange_fds did not return peer fd");
+    } 
+     
+    ooverlap::system::imported_peer_buffer imported_peer =
+        ooverlap::system::import_vmm_peer_buffer(
+            all_fds[peer_rank],
             all_desc[peer_rank],
+            access_devices);
+     
+    check_oo(
+        oo_buffer_adopt_imported_peer_buffer(
+            node,
+            std::move(imported_peer),
             &peer_buf),
-        "oo_buffer_import_legacy_descriptor(peer)");
-
+        "oo_buffer_adopt_imported_peer_buffer(peer VMM)");
+ 
     /*
      * Ensure both processes have imported peer data buffers before either rank
      * launches the first collective.
@@ -327,9 +352,8 @@ bool tma_ipc_two_gpu_allreduce_rank_smoke_test(
     local_buf = nullptr;
 
     system::runtime::set_device(local_device);
-    system::runtime::check_cuda(
-        cudaFree(local_work),
-        "cudaFree(local_work)");
+    oo_buffer_destroy(local_buf);
+    local_buf = nullptr;
     local_work = nullptr;
 
     system::runtime::check_cuda(
