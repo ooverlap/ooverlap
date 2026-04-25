@@ -61,8 +61,6 @@ __device__ void reduce_window_to_peer_sm90(
         __syncthreads();
     }
 
-    // Consume one window worth of chunks. Each chunk is loaded with TMA into
-    // shared memory, then reduced into the peer-visible output buffer.
     for (int iter = 0; iter < window.chunk_count; ++iter) {
         const int chunk = window.start_chunk + iter;
         const int cur_slot = iter % TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH;
@@ -177,8 +175,6 @@ __device__ void copy_window_sm90(
         __syncthreads();
     }
 
-    // Consume one window worth of chunks. Each chunk is loaded with TMA into
-    // shared memory, then copied into the destination buffer.
     for (int iter = 0; iter < window.chunk_count; ++iter) {
         const int chunk = window.start_chunk + iter;
         const int cur_slot = iter % TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH;
@@ -296,8 +292,6 @@ __global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
     unsigned char* peer_buf_bytes =
         reinterpret_cast<unsigned char*>(peer_buf);
 
-    // Phase 1:
-    //   Owner rank reduces its local input into the peer's output buffer.
     reduce_window_to_peer_sm90(
         local_in_bytes,
         peer_buf_bytes,
@@ -306,10 +300,6 @@ __global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
         shared_raw,
         barriers);
 
-    // Phase 2:
-    //   The same owner CTA copies the finalized peer buffer back to its own
-    //   local output buffer. No peer progress flag is needed because this CTA
-    //   already waited for its own TMA reduce to complete.
     copy_window_sm90(
         peer_buf_bytes,
         local_buf_bytes,
@@ -514,6 +504,61 @@ cudaError_t prime_tma_two_gpu_peer_allreduce_outputs_sm90(
         "cudaMemsetAsync(progress1)");
 
     return cudaSuccess;
+}
+
+cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
+    const half* local_in,
+    half* local_buf,
+    half* peer_buf,
+    size_t numel,
+    int rank,
+    int dev0,
+    int dev1,
+    cudaStream_t stream) {
+    if (local_in == nullptr || local_buf == nullptr || peer_buf == nullptr) {
+        return cudaErrorInvalidDevicePointer;
+    }
+    if (numel == 0) {
+        return cudaErrorInvalidValue;
+    }
+    if (rank != 0 && rank != 1) {
+        return cudaErrorInvalidValue;
+    }
+    if (dev0 == dev1) {
+        return cudaErrorInvalidValue;
+    }
+
+    const int device = (rank == 0) ? dev0 : dev1;
+    const int num_chunks = tma_two_gpu_peer_allreduce_compute_num_chunks(numel);
+    const int num_windows = comm::utils::window_num_chunks(num_chunks);
+    const int num_blocks =
+        (rank == 0) ? ((num_windows + 1) / 2) : (num_windows / 2);
+
+    if (num_blocks <= 0) {
+        return cudaSuccess;
+    }
+
+    tma_two_gpu_peer_allreduce_configure_kernel_once(device);
+
+    const size_t smem_bytes = TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES;
+
+    system::runtime::set_device(device);
+    tma_two_gpu_reduce_or_copy_windows_kernel_sm90<<<
+        num_blocks,
+        TMA_TWO_GPU_PEER_THREADS,
+        smem_bytes,
+        stream>>>(
+            local_in,
+            local_buf,
+            peer_buf,
+            nullptr,
+            nullptr,
+            numel,
+            num_chunks,
+            num_windows,
+            rank);
+
+    return cudaGetLastError();
 }
 
 cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(

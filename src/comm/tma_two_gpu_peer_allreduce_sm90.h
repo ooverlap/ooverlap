@@ -62,6 +62,16 @@ cudaError_t prime_tma_two_gpu_peer_allreduce_outputs_sm90(
     cudaStream_t stream0,
     cudaStream_t stream1);
 
+cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
+    const half* local_in,
+    half* local_buf,
+    half* peer_buf,
+    size_t numel,
+    int rank,
+    int dev0,
+    int dev1,
+    cudaStream_t stream);
+
 cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
     TmaTwoGpuPeerAllreduceState* st,
     const half* rank0_in,
