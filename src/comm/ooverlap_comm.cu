@@ -1,7 +1,6 @@
 #include "comm/ooverlap_comm.h"
 
 #include "comm/tma_two_gpu_peer_allreduce_sm90.h"
-#include "ooverlap/system/peer_buffer.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -12,34 +11,6 @@
 #include <vector>
 
 namespace {
-
-constexpr int kOoMaxLocalDevices = 16;
-
-struct oo_group {
-    int num_devices = 0;
-    int devices[kOoMaxLocalDevices] = {};
-};
-
-struct oo_node {
-    oo_group_t* group = nullptr;
-    int rank = -1;
-    int device = -1;
-};
-
-struct oo_buffer {
-    void* ptr = nullptr;
-    size_t bytes = 0;
-    size_t mapped_bytes = 0;
-    oo_buffer_kind_t kind = OO_BUFFER_KIND_WRAPPED;
-
-    // Internal validation/debug metadata. Public semantics should still treat
-    // Buffer as pointer + size + kind.
-    oo_group_t* group = nullptr;
-    int owner_device = -1;
-
-    // Valid only for OO_BUFFER_KIND_VMM.
-    ooverlap::system::mapped_peer_buffer mapped{};
-};
 
 oo_status_t cuda_status_to_oo(cudaError_t err) {
     return (err == cudaSuccess) ? OO_SUCCESS : OO_ERROR_CUDA;

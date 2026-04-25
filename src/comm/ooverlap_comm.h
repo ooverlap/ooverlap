@@ -3,13 +3,29 @@
 #include <cuda_runtime.h>
 #include <stddef.h>
 
+
+#include "ooverlap/system/peer_buffer.cuh"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+constexpr int kOoMaxLocalDevices = 16;
+
+struct oo_group {
+    int num_devices = 0;
+    int devices[kOoMaxLocalDevices] = {};
+};
+
 typedef struct oo_group oo_group_t;
+
+struct oo_node {
+    oo_group_t* group = nullptr;
+    int rank = -1;
+    int device = -1;
+};
+
 typedef struct oo_node oo_node_t;
-typedef struct oo_buffer oo_buffer_t;
 
 typedef enum {
     OO_SUCCESS = 0,
@@ -32,6 +48,24 @@ typedef enum {
     OO_BUFFER_KIND_VMM = 0,
     OO_BUFFER_KIND_WRAPPED = 1
 } oo_buffer_kind_t;
+
+struct oo_buffer {
+    void* ptr = nullptr;
+    size_t bytes = 0;
+    size_t mapped_bytes = 0;
+    oo_buffer_kind_t kind = OO_BUFFER_KIND_WRAPPED;
+
+    // Internal validation/debug metadata. Public semantics should still treat
+    // Buffer as pointer + size + kind.
+    oo_group_t* group = nullptr;
+    int owner_device = -1;
+
+    // Valid only for OO_BUFFER_KIND_VMM.
+    ooverlap::system::mapped_peer_buffer mapped{};
+};
+
+typedef struct oo_buffer oo_buffer_t;
+
 
 /* Group */
 oo_status_t oo_group_create(
