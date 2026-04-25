@@ -152,26 +152,50 @@ void verify_local_result(
 }
 
 ncclUniqueId make_nccl_unique_id(
-    const std::vector<int64_t>& bytes) {
+    const std::vector<int64_t>& encoded) {
     ncclUniqueId id;
     std::memset(&id, 0, sizeof(id));
 
-    if (bytes.size() != sizeof(id.internal)) {
-        throw std::invalid_argument(
-            "NCCL unique ID has wrong size: got " +
-            std::to_string(bytes.size()) +
-            ", expected " +
-            std::to_string(sizeof(id.internal)));
+    const size_t expected_bytes = sizeof(id.internal);
+
+    /*
+     * Existing ooverlap generate_nccl_id() returns packed int64 words:
+     *
+     *   ret.resize(NCCL_UNIQUE_ID_BYTES / sizeof(int64_t));
+     *   memcpy(ret.data(), nccl_id.internal, NCCL_UNIQUE_ID_BYTES);
+     *
+     * So the normal path is 16 int64 values for a 128-byte NCCL ID.
+     */
+    if (encoded.size() * sizeof(int64_t) == expected_bytes) {
+        std::memcpy(
+            id.internal,
+            encoded.data(),
+            expected_bytes);
+        return id;
     }
 
-    for (size_t i = 0; i < bytes.size(); ++i) {
-        if (bytes[i] < 0 || bytes[i] > 255) {
-            throw std::invalid_argument("NCCL unique ID byte out of range");
+    /*
+     * Also allow byte-expanded form in case a future Python helper passes
+     * 128 integer byte values.
+     */
+    if (encoded.size() == expected_bytes) {
+        for (size_t i = 0; i < encoded.size(); ++i) {
+            if (encoded[i] < 0 || encoded[i] > 255) {
+                throw std::invalid_argument("NCCL unique ID byte out of range");
+            }
+            id.internal[i] = static_cast<char>(encoded[i]);
         }
-        id.internal[i] = static_cast<char>(bytes[i]);
+        return id;
     }
 
-    return id;
+    throw std::invalid_argument(
+        "NCCL unique ID has wrong encoded size: got " +
+        std::to_string(encoded.size()) +
+        " int64 values; expected either " +
+        std::to_string(expected_bytes / sizeof(int64_t)) +
+        " packed int64 values or " +
+        std::to_string(expected_bytes) +
+        " byte values");
 }
 
 double elapsed_one_rank_ms(
