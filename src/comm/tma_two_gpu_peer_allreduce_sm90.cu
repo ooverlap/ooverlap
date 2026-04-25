@@ -589,7 +589,6 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
     // owns zero windows. That CTA only publishes/waits on the epoch signal.
     const int num_blocks =
         needs_rendezvous ? std::max(1, owned_blocks) : owned_blocks;
-    std::cout << "Number of blocks is: " << num_blocks << std::endl;
 
     if (num_blocks <= 0) {
         return cudaSuccess;
