@@ -39,10 +39,21 @@ bool checked_mul_size(size_t a, size_t b, size_t* out) {
     return true;
 }
 
-bool reduce_op_supported(oo_reduce_op_t op) {
-    return op == OO_REDUCE_ADD ||
-           op == OO_REDUCE_MIN ||
-           op == OO_REDUCE_MAX;
+bool reduce_op_supported_for_dtype(
+    oo_dtype_t dtype,
+    oo_reduce_op_t op) {
+    if (op == OO_REDUCE_ADD) {
+        return dtype == OO_DTYPE_FLOAT16 ||
+               dtype == OO_DTYPE_BFLOAT16 ||
+               dtype == OO_DTYPE_FLOAT32;
+    }
+
+    if (op == OO_REDUCE_MIN || op == OO_REDUCE_MAX) {
+        return dtype == OO_DTYPE_FLOAT16 ||
+               dtype == OO_DTYPE_BFLOAT16;
+    }
+
+    return false;
 }
 
 bool same_group(const oo_group_t* a, const oo_group_t* b) {
@@ -123,6 +134,12 @@ size_t oo_dtype_size(
         default:
             return 0;
     }
+}
+
+int oo_allreduce_supported(
+    oo_dtype_t dtype,
+    oo_reduce_op_t op) {
+    return reduce_op_supported_for_dtype(dtype, op) ? 1 : 0;
 }
 
 oo_status_t oo_group_create(
@@ -388,7 +405,7 @@ oo_status_t oo_allreduce(
         return OO_ERROR_UNSUPPORTED;
     }
 
-    if (!reduce_op_supported(op)) {
+    if (!reduce_op_supported_for_dtype(dtype, op)) {
         return OO_ERROR_UNSUPPORTED;
     }
 

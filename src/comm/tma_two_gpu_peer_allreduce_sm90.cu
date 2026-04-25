@@ -593,40 +593,6 @@ cudaError_t dispatch_rank_kernel_sm90(
                     peer_ready_signal,
                     collective_epoch);
         }
-
-        if (op == OO_REDUCE_MIN) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMinF32,
-                static_cast<int>(sizeof(float))>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    dev0,
-                    dev1,
-                    stream,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch);
-        }
-
-        if (op == OO_REDUCE_MAX) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMaxF32,
-                static_cast<int>(sizeof(float))>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    dev0,
-                    dev1,
-                    stream,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch);
-        }
     }
 
     return cudaErrorInvalidValue;
@@ -686,20 +652,6 @@ void configure_dispatch_sm90(
         if (op == OO_REDUCE_ADD) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceAddF32,
-                static_cast<int>(sizeof(float))>(device);
-            return;
-        }
-
-        if (op == OO_REDUCE_MIN) {
-            configure_reduce_op_sm90<
-                comm::PipelineReduceMinF32,
-                static_cast<int>(sizeof(float))>(device);
-            return;
-        }
-
-        if (op == OO_REDUCE_MAX) {
-            configure_reduce_op_sm90<
-                comm::PipelineReduceMaxF32,
                 static_cast<int>(sizeof(float))>(device);
             return;
         }

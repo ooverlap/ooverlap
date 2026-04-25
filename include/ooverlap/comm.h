@@ -46,6 +46,10 @@ typedef enum {
 size_t oo_dtype_size(
     oo_dtype_t dtype);
 
+int oo_allreduce_supported(
+    oo_dtype_t dtype,
+    oo_reduce_op_t op);
+
 /* Group */
 oo_status_t oo_group_create(
     const int* devices,

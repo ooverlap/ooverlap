@@ -12,24 +12,6 @@
 namespace ooverlap {
 namespace comm {
 
-// -----------------------------------------------------------------------------
-// Reduce operation tags
-// -----------------------------------------------------------------------------
-//
-// These are compile-time operation selectors. No runtime enum, no switch, and
-// no functor object construction.
-//
-// Usage:
-//
-//   using Reduce = PipelineTMAReduce<
-//       4,
-//       2,
-//       PipelineReduceAddNoFtzF16>;
-//
-//   Reduce{}.issue_bulk(&stage);
-//   Reduce{}.finish_tail(&stage);
-// -----------------------------------------------------------------------------
-
 struct PipelineReduceAddF16 {
     using scalar_t = half;
 
@@ -109,7 +91,7 @@ struct PipelineReduceAddBF16 {
         void* dst,
         void* smem,
         uint32_t bytes) {
-        tma::reduce_add_bf16_async(dst, smem, bytes);
+        tma::reduce_add_noftz_bf16_async(dst, smem, bytes);
     }
 
     __device__ __forceinline__ static scalar_t apply_tail(
@@ -174,44 +156,6 @@ struct PipelineReduceAddF32 {
         return oldv + newv;
     }
 };
-
-struct PipelineReduceMinF32 {
-    using scalar_t = float;
-
-    __device__ __forceinline__ static void issue_bulk(
-        void* dst,
-        void* smem,
-        uint32_t bytes) {
-        tma::reduce_min_f32_async(dst, smem, bytes);
-    }
-
-    __device__ __forceinline__ static scalar_t apply_tail(
-        scalar_t oldv,
-        scalar_t newv) {
-        return (oldv < newv) ? oldv : newv;
-    }
-};
-
-struct PipelineReduceMaxF32 {
-    using scalar_t = float;
-
-    __device__ __forceinline__ static void issue_bulk(
-        void* dst,
-        void* smem,
-        uint32_t bytes) {
-        tma::reduce_max_f32_async(dst, smem, bytes);
-    }
-
-    __device__ __forceinline__ static scalar_t apply_tail(
-        scalar_t oldv,
-        scalar_t newv) {
-        return (oldv > newv) ? oldv : newv;
-    }
-};
-
-// -----------------------------------------------------------------------------
-// PipelineTMAReduce
-// -----------------------------------------------------------------------------
 
 template <int StageDepth, int FillDepth, typename ReduceOp>
 struct PipelineTMAReduce {

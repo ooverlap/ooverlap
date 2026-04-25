@@ -12,37 +12,26 @@ namespace tma {
 // SM90 TMA bulk reduction helpers
 // -----------------------------------------------------------------------------
 //
-// These wrappers intentionally do not provide a non-SM90 fallback.
-// If this file is compiled for an unsupported architecture or unsupported PTX
-// operation/type combination, we want the compiler/assembler to fail loudly.
-//
-// TMA bulk reduce form:
-//
-//   cp.reduce.async.bulk.global.shared::cta.bulk_group.<op>.<type>
-//
-// Source is CTA shared memory.
-// Destination is global memory.
-//
-// Exposed floating-point reductions:
+// Supported floating-point TMA bulk reductions on this path:
 //
 //   add:
 //     f16
 //     add.noftz.f16
-//     bf16
+//     add.noftz.bf16
 //     f32
 //
 //   min:
 //     f16
 //     bf16
-//     f32
 //
 //   max:
 //     f16
 //     bf16
-//     f32
 //
 // Notes:
 //   - add is the sum operation.
+//   - bf16 add requires .noftz.
+//   - f32 min/max are not supported by ptxas for cp.reduce.async.bulk.
 //   - sub is not exposed because TMA reduce has no native subtraction op.
 // -----------------------------------------------------------------------------
 
@@ -108,7 +97,7 @@ __device__ __forceinline__ void reduce_add_noftz_f16_async(
     reduce_commit_group();
 }
 
-__device__ __forceinline__ void reduce_add_bf16_async(
+__device__ __forceinline__ void reduce_add_noftz_bf16_async(
     void* dst_gmem,
     void* src_smem,
     uint32_t size_bytes) {
@@ -116,7 +105,7 @@ __device__ __forceinline__ void reduce_add_bf16_async(
 
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     asm volatile(
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.bf16 "
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16 "
         "[%0], [%1], %2;\n"
         :
         : "l"(cvta_to_global_u64(dst_gmem)),
@@ -124,6 +113,14 @@ __device__ __forceinline__ void reduce_add_bf16_async(
           "r"(size_bytes)
         : "memory");
     reduce_commit_group();
+}
+
+// Compatibility name. BF16 add must be noftz for this instruction.
+__device__ __forceinline__ void reduce_add_bf16_async(
+    void* dst_gmem,
+    void* src_smem,
+    uint32_t size_bytes) {
+    reduce_add_noftz_bf16_async(dst_gmem, src_smem, size_bytes);
 }
 
 __device__ __forceinline__ void reduce_add_f32_async(
@@ -184,24 +181,6 @@ __device__ __forceinline__ void reduce_min_bf16_async(
     reduce_commit_group();
 }
 
-__device__ __forceinline__ void reduce_min_f32_async(
-    void* dst_gmem,
-    void* src_smem,
-    uint32_t size_bytes) {
-    if (size_bytes == 0) return;
-
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    asm volatile(
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.min.f32 "
-        "[%0], [%1], %2;\n"
-        :
-        : "l"(cvta_to_global_u64(dst_gmem)),
-          "r"(cvta_to_shared_u32(src_smem)),
-          "r"(size_bytes)
-        : "memory");
-    reduce_commit_group();
-}
-
 // -----------------------------------------------------------------------------
 // max
 // -----------------------------------------------------------------------------
@@ -233,24 +212,6 @@ __device__ __forceinline__ void reduce_max_bf16_async(
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     asm volatile(
         "cp.reduce.async.bulk.global.shared::cta.bulk_group.max.bf16 "
-        "[%0], [%1], %2;\n"
-        :
-        : "l"(cvta_to_global_u64(dst_gmem)),
-          "r"(cvta_to_shared_u32(src_smem)),
-          "r"(size_bytes)
-        : "memory");
-    reduce_commit_group();
-}
-
-__device__ __forceinline__ void reduce_max_f32_async(
-    void* dst_gmem,
-    void* src_smem,
-    uint32_t size_bytes) {
-    if (size_bytes == 0) return;
-
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    asm volatile(
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.max.f32 "
         "[%0], [%1], %2;\n"
         :
         : "l"(cvta_to_global_u64(dst_gmem)),
