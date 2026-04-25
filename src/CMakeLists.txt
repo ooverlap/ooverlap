@@ -4,6 +4,8 @@ if(NOT TARGET CUDA::cudart)
   find_package(CUDAToolkit REQUIRED)
 endif()
 
+find_package(Threads REQUIRED)
+
 set(OOVERLAP_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 set(OOVERLAP_SM90A_GENCODE "--generate-code=arch=compute_90a,code=sm_90a")
@@ -51,6 +53,30 @@ function(ooverlap_link_cudadevrt target visibility)
 endfunction()
 
 # -------------------------
+# System utilities
+# -------------------------
+add_library(ooverlap_system STATIC
+  ${OOVERLAP_SRC_DIR}/system/broker.cpp
+)
+
+add_library(ooverlap::system ALIAS ooverlap_system)
+
+set_property(TARGET ooverlap_system PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+target_include_directories(ooverlap_system
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${OOVERLAP_SRC_DIR}
+)
+
+target_link_libraries(ooverlap_system
+  PUBLIC
+    Threads::Threads
+)
+
+# -------------------------
 # Core public communication library
 # -------------------------
 if(OOVERLAP_BUILD_CORE)
@@ -77,6 +103,7 @@ if(OOVERLAP_BUILD_CORE)
 
   target_link_libraries(ooverlap_comm
     PUBLIC
+      ooverlap_system
       CUDA::cudart
     PRIVATE
       CUDA::cuda_driver
@@ -440,6 +467,7 @@ if(OOVERLAP_BUILD_PYTHON)
   endif()
 
   add_library(ooverlap_ext MODULE ${OOVERLAP_EXT_SOURCES})
+  target_link_libraries(ooverlap_ext PRIVATE ooverlap_system)
 
   ooverlap_force_sm90a(ooverlap_ext)
 
