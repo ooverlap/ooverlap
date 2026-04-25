@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import faulthandler
 import multiprocessing as mp
 import os
 import queue
@@ -11,11 +12,28 @@ import uuid
 
 
 def _worker(rank, module_dir, numel, iters, dev0, dev1, broker_key, result_q):
+    faulthandler.enable(all_threads=True)
+
     try:
+        print(
+            f"[ipc-runner][rank={rank}][pid={os.getpid()}] worker start "
+            f"numel={numel} iters={iters} devs=({dev0},{dev1}) key={broker_key}",
+            flush=True,
+        )
+
         if module_dir:
             sys.path.insert(0, module_dir)
 
+        print(
+            f"[ipc-runner][rank={rank}][pid={os.getpid()}] importing ooverlap_ext",
+            flush=True,
+        )
         import ooverlap_ext
+
+        print(
+            f"[ipc-runner][rank={rank}][pid={os.getpid()}] calling extension",
+            flush=True,
+        )
 
         ok = ooverlap_ext.tma_ipc_two_gpu_allreduce_rank_smoke_test(
             numel,
@@ -26,13 +44,25 @@ def _worker(rank, module_dir, numel, iters, dev0, dev1, broker_key, result_q):
             iters,
         )
 
+        print(
+            f"[ipc-runner][rank={rank}][pid={os.getpid()}] extension returned ok={ok}",
+            flush=True,
+        )
+
         result_q.put((rank, bool(ok), ""))
 
-    except Exception:
-        result_q.put((rank, False, traceback.format_exc()))
+    except BaseException:
+        tb = traceback.format_exc()
+        print(
+            f"[ipc-runner][rank={rank}][pid={os.getpid()}] exception:\n{tb}",
+            flush=True,
+        )
+        result_q.put((rank, False, tb))
 
 
 def main():
+    faulthandler.enable(all_threads=True)
+
     parser = argparse.ArgumentParser(
         description="Run ooverlap 2-process CUDA IPC allreduce smoke test."
     )
@@ -50,7 +80,7 @@ def main():
     parser.add_argument(
         "--timeout-s",
         type=float,
-        default=120.0,
+        default=300.0,
         help="Timeout for each child process.",
     )
     parser.add_argument(
@@ -58,6 +88,11 @@ def main():
         type=str,
         default="",
         help="Unique broker key. Default: generated per run.",
+    )
+    parser.add_argument(
+        "--cuda-launch-blocking",
+        action="store_true",
+        help="Set CUDA_LAUNCH_BLOCKING=1 in child processes.",
     )
 
     args = parser.parse_args()
@@ -69,9 +104,21 @@ def main():
     if args.iters <= 0:
         raise ValueError("--iters must be > 0")
 
+    if args.cuda_launch_blocking:
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
     broker_key = args.broker_key
     if not broker_key:
         broker_key = f"ipc_ar_{os.getpid()}_{uuid.uuid4().hex[:12]}"
+
+    print(
+        "[ipc-runner] start "
+        f"numel={args.numel} iters={args.iters} "
+        f"devs=({args.dev0},{args.dev1}) key={broker_key} "
+        f"module_dir={args.module_dir or '<PYTHONPATH>'} "
+        f"CUDA_LAUNCH_BLOCKING={os.environ.get('CUDA_LAUNCH_BLOCKING', '<unset>')}",
+        flush=True,
+    )
 
     ctx = mp.get_context("spawn")
     result_q = ctx.Queue()
@@ -93,32 +140,50 @@ def main():
             daemon=False,
         )
         p.start()
+        print(
+            f"[ipc-runner] spawned rank={rank} pid={p.pid}",
+            flush=True,
+        )
         procs.append(p)
 
     deadline = time.time() + args.timeout_s
-
     results = {}
+
     while len(results) < 2 and time.time() < deadline:
         try:
             rank, ok, msg = result_q.get(timeout=0.25)
+            print(
+                f"[ipc-runner] got queue result rank={rank} ok={ok}",
+                flush=True,
+            )
             results[rank] = (ok, msg)
         except queue.Empty:
             pass
 
-        for p in procs:
-            if p.exitcode is not None and p.exitcode != 0:
-                # Keep collecting queue output if available, but remember that
-                # a nonzero exit is failure even without a Python traceback.
-                pass
+        for rank, p in enumerate(procs):
+            if p.exitcode is not None and rank not in results:
+                print(
+                    f"[ipc-runner] rank={rank} pid={p.pid} exitcode={p.exitcode} "
+                    "without queue result yet",
+                    flush=True,
+                )
 
-    for p in procs:
+    for rank, p in enumerate(procs):
         remaining = max(0.0, deadline - time.time())
+        print(
+            f"[ipc-runner] joining rank={rank} pid={p.pid} remaining={remaining:.1f}s",
+            flush=True,
+        )
         p.join(timeout=remaining)
 
     timed_out = [idx for idx, p in enumerate(procs) if p.is_alive()]
     if timed_out:
-        for p in procs:
+        for idx, p in enumerate(procs):
             if p.is_alive():
+                print(
+                    f"[ipc-runner] terminating timed-out rank={idx} pid={p.pid}",
+                    flush=True,
+                )
                 p.terminate()
         for p in procs:
             p.join(timeout=5)
@@ -147,7 +212,8 @@ def main():
     print(
         "PASS: IPC allreduce smoke test "
         f"numel={args.numel} iters={args.iters} "
-        f"devices=({args.dev0},{args.dev1}) broker_key={broker_key}"
+        f"devices=({args.dev0},{args.dev1}) broker_key={broker_key}",
+        flush=True,
     )
 
 
