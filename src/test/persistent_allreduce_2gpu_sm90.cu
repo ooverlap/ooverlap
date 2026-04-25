@@ -27,6 +27,10 @@
         }                                                                                       \
     } while (0)
 
+#ifndef OOVERLAP_BENCH_VERIFY_RESULTS
+#define OOVERLAP_BENCH_VERIFY_RESULTS 1
+#endif
+
 namespace ooverlap {
 namespace {
 
@@ -316,6 +320,23 @@ std::vector<float> reference_two_gpu_sum_fp16(int64_t numel) {
     }
     return ref;
 }
+
+#if OOVERLAP_BENCH_VERIFY_RESULTS
+void verify_two_gpu_allreduce_result(
+    const char* label,
+    half* rank0,
+    half* rank1,
+    int64_t numel,
+    int dev0,
+    int dev1) {
+    auto got0 = testing::copy_half_device_to_host_float(rank0, numel, dev0);
+    auto got1 = testing::copy_half_device_to_host_float(rank1, numel, dev1);
+    auto ref = reference_two_gpu_sum_fp16(numel);
+
+    testing::expect_allclose(got0, ref, (std::string(label) + " rank0").c_str());
+    testing::expect_allclose(got1, ref, (std::string(label) + " rank1").c_str());
+}
+#endif
 
 } // namespace
 
@@ -701,6 +722,157 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                 OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
             });
 
+#if OOVERLAP_BENCH_VERIFY_RESULTS
+        // Verify basic TMA with a clean one-shot run after timing.
+        reset_working_inputs_async(
+            rank0_src,
+            rank1_src,
+            basic_rank0,
+            basic_rank1,
+            bytes,
+            node0_dev,
+            node1_dev,
+            stream0,
+            stream1);
+
+        system::runtime::set_device(node0_dev);
+        system::runtime::check_cuda(
+            cudaMemsetAsync(oo_buffer_ptr(basic_inbox0), 0, bytes, stream0),
+            "cudaMemsetAsync(basic_inbox0 verify)");
+        system::runtime::set_device(node1_dev);
+        system::runtime::check_cuda(
+            cudaMemsetAsync(oo_buffer_ptr(basic_inbox1), 0, bytes, stream1),
+            "cudaMemsetAsync(basic_inbox1 verify)");
+
+        sync_two_streams(
+            node0_dev,
+            stream0,
+            node1_dev,
+            stream1,
+            "sync basic verify reset");
+
+        system::runtime::check_cuda(
+            enqueue_two_gpu_all_reduce_tma_sm90(
+                basic_rank0,
+                basic_rank1,
+                reinterpret_cast<half*>(oo_buffer_ptr(basic_inbox0)),
+                reinterpret_cast<half*>(oo_buffer_ptr(basic_inbox1)),
+                static_cast<size_t>(numel),
+                node0_dev,
+                node1_dev,
+                stream0,
+                stream1),
+            "enqueue_two_gpu_all_reduce_tma_sm90 verify");
+
+        sync_two_streams(
+            node0_dev,
+            stream0,
+            node1_dev,
+            stream1,
+            "sync basic verify");
+
+        verify_two_gpu_allreduce_result(
+            "basic TMA benchmark verify",
+            basic_rank0,
+            basic_rank1,
+            numel,
+            node0_dev,
+            node1_dev);
+
+        // Verify public oo_allreduce with a clean one-shot run after timing.
+        reset_working_inputs_async(
+            rank0_src,
+            rank1_src,
+            rank0_work,
+            rank1_work,
+            bytes,
+            node0_dev,
+            node1_dev,
+            stream0,
+            stream1);
+
+        sync_two_streams(
+            node0_dev,
+            stream0,
+            node1_dev,
+            stream1,
+            "sync oo verify reset");
+
+        check_oo(
+            oo_allreduce(
+                node0,
+                oo_rank0_buf,
+                oo_rank1_buf,
+                static_cast<size_t>(numel),
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                stream0),
+            "oo_allreduce(rank0 verify)");
+
+        check_oo(
+            oo_allreduce(
+                node1,
+                oo_rank1_buf,
+                oo_rank0_buf,
+                static_cast<size_t>(numel),
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                stream1),
+            "oo_allreduce(rank1 verify)");
+
+        sync_two_streams(
+            node0_dev,
+            stream0,
+            node1_dev,
+            stream1,
+            "sync oo verify");
+
+        verify_two_gpu_allreduce_result(
+            "oo_allreduce benchmark verify",
+            rank0_work,
+            rank1_work,
+            numel,
+            node0_dev,
+            node1_dev);
+
+        // Verify NCCL with a clean one-shot run after timing.
+        OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
+        OOVERLAP_PERSIST_NCCL_CHECK(
+            ncclAllReduce(
+                rank0_src,
+                nccl_rank0_out,
+                static_cast<size_t>(numel),
+                ncclFloat16,
+                ncclSum,
+                comms[0],
+                stream0));
+        OOVERLAP_PERSIST_NCCL_CHECK(
+            ncclAllReduce(
+                rank1_src,
+                nccl_rank1_out,
+                static_cast<size_t>(numel),
+                ncclFloat16,
+                ncclSum,
+                comms[1],
+                stream1));
+        OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
+
+        sync_two_streams(
+            node0_dev,
+            stream0,
+            node1_dev,
+            stream1,
+            "sync NCCL verify");
+
+        verify_two_gpu_allreduce_result(
+            "NCCL benchmark verify",
+            nccl_rank0_out,
+            nccl_rank1_out,
+            numel,
+            node0_dev,
+            node1_dev);
+#endif
+
         ncclCommDestroy(comms[0]);
         ncclCommDestroy(comms[1]);
         comms[0] = nullptr;
@@ -757,7 +929,8 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             {"speedup_basic_over_persistent", avg_basic_ms / avg_oo_ms},
             {"speedup_nccl_over_persistent", avg_nccl_ms / avg_oo_ms},
             {"speedup_basic_over_oo_allreduce", avg_basic_ms / avg_oo_ms},
-            {"speedup_nccl_over_oo_allreduce", avg_nccl_ms / avg_oo_ms}
+            {"speedup_nccl_over_oo_allreduce", avg_nccl_ms / avg_oo_ms},
+            {"verify_results", static_cast<double>(OOVERLAP_BENCH_VERIFY_RESULTS)}
         };
     } catch (...) {
         if (comms[0] != nullptr) {
