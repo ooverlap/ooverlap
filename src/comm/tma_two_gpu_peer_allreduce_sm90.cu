@@ -1,8 +1,11 @@
 #include "comm/tma_two_gpu_peer_allreduce_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
-#include "ooverlap/tma/tma.cuh"
-#include "ooverlap/tma/tma_reduce.cuh"
+
+#include "comm/exec/pipeline_stage.h"
+#include "comm/exec/pipeline_tma_load.h"
+#include "comm/exec/pipeline_tma_copy.h"
+#include "comm/exec/pipeline_tma_reduce.h"
 
 #include "comm/params.h"
 #include "comm/utils.h"
@@ -15,12 +18,20 @@
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
-#include <iostream>
 #include <unordered_map>
-#include <vector>
 
 namespace ooverlap {
 namespace {
+
+__host__ __device__ __forceinline__ size_t dtype_size_bytes(
+    oo_dtype_t dtype) {
+    switch (dtype) {
+        case OO_DTYPE_FLOAT16:
+            return sizeof(half);
+        default:
+            return 0;
+    }
+}
 
 __device__ __forceinline__ unsigned char* stage_ptr(
     unsigned char* shared_raw,
@@ -40,9 +51,6 @@ __device__ __forceinline__ void wait_for_collective_ready_sm90(
     }
 
     if (threadIdx.x == 0) {
-        // Every CTA publishes the same epoch. This avoids depending on block 0
-        // being scheduled before other CTAs. Epochs are monotonic, so atomicMax
-        // is safe across repeated collective calls.
         atomicMax(local_ready_signal, collective_epoch);
         __threadfence_system();
 
@@ -59,15 +67,18 @@ __device__ __forceinline__ void wait_for_collective_ready_sm90(
     __syncthreads();
 }
 
-__device__ void reduce_window_to_peer_sm90(
-    const unsigned char* local_in_bytes,
-    unsigned char* peer_buf_bytes,
+template <int StageDepth, int FillDepth, typename Apply>
+__device__ void run_tma_window_pipeline_sm90(
+    const unsigned char* src_bytes,
+    unsigned char* dst_bytes,
     comm::utils::Window window,
     size_t total_bytes,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    // Warm the load pipeline.
-    for (int warm = 0; warm < TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP; ++warm) {
+    comm::PipelineTMALoad load{};
+    Apply apply{};
+
+    for (int warm = 0; warm < FillDepth; ++warm) {
         if (warm >= window.chunk_count) {
             break;
         }
@@ -78,99 +89,117 @@ __device__ void reduce_window_to_peer_sm90(
         const size_t offset =
             static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
         const size_t bytes =
-            comm::utils::min_sz(TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                                total_bytes - offset);
+            comm::utils::min_sz(
+                TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                total_bytes - offset);
+
+        comm::PipelineStage stage = comm::make_pipeline_stage(
+            comm::make_pipeline_chunk(
+                src_bytes + offset,
+                dst_bytes + offset,
+                bytes),
+            stage_ptr(shared_raw, slot),
+            &barriers[slot]);
 
         if (threadIdx.x == 0) {
-            sync::init_semaphore(barriers[slot], 1);
-            tma::expect_bytes(barriers[slot], static_cast<uint32_t>(bytes));
-            tma::load_async(
-                stage_ptr(shared_raw, slot),
-                local_in_bytes + offset,
-                static_cast<uint32_t>(bytes),
-                barriers[slot]);
+            load.issue(&stage);
         }
+
         __syncthreads();
     }
 
     for (int iter = 0; iter < window.chunk_count; ++iter) {
         const int chunk = window.start_chunk + iter;
-        const int cur_slot = iter % TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH;
+        const int cur_slot = iter % StageDepth;
 
         const size_t offset =
             static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
         const size_t bytes =
-            comm::utils::min_sz(TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                                total_bytes - offset);
-        const size_t bulk_bytes = bytes & ~static_cast<size_t>(0xF);
-        const size_t tail_bytes = bytes - bulk_bytes;
+            comm::utils::min_sz(
+                TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                total_bytes - offset);
+
+        comm::PipelineStage cur_stage = comm::make_pipeline_stage(
+            comm::make_pipeline_chunk(
+                src_bytes + offset,
+                dst_bytes + offset,
+                bytes),
+            stage_ptr(shared_raw, cur_slot),
+            &barriers[cur_slot]);
 
         if (threadIdx.x == 0) {
-            sync::wait(barriers[cur_slot], 0);
+            load.wait_ready(&cur_stage);
         }
+
         __syncthreads();
 
-        const int future_iter = iter + TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP;
+        const int future_iter = iter + FillDepth;
         if (future_iter < window.chunk_count) {
             const int future_chunk = window.start_chunk + future_iter;
-            const int future_slot =
-                future_iter % TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH;
+            const int future_slot = future_iter % StageDepth;
 
             const size_t future_offset =
-                static_cast<size_t>(future_chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
+                static_cast<size_t>(future_chunk) *
+                TMA_TWO_GPU_PEER_CHUNK_BYTES;
             const size_t future_bytes =
-                comm::utils::min_sz(TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                                    total_bytes - future_offset);
+                comm::utils::min_sz(
+                    TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                    total_bytes - future_offset);
+
+            comm::PipelineStage future_stage = comm::make_pipeline_stage(
+                comm::make_pipeline_chunk(
+                    src_bytes + future_offset,
+                    dst_bytes + future_offset,
+                    future_bytes),
+                stage_ptr(shared_raw, future_slot),
+                &barriers[future_slot]);
 
             if (threadIdx.x == 0) {
-                if (iter >= TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP) {
-                    tma::reduce_async_read_wait<
-                        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP - 1>();
+                if (iter >= FillDepth) {
+                    apply.wait_before_stage_reuse();
                 }
 
-                sync::init_semaphore(barriers[future_slot], 1);
-                tma::expect_bytes(
-                    barriers[future_slot],
-                    static_cast<uint32_t>(future_bytes));
-                tma::load_async(
-                    stage_ptr(shared_raw, future_slot),
-                    local_in_bytes + future_offset,
-                    static_cast<uint32_t>(future_bytes),
-                    barriers[future_slot]);
+                load.issue(&future_stage);
             }
         }
 
         __syncthreads();
 
-        if (threadIdx.x == 0 && bulk_bytes > 0) {
-            tma::reduce_add_noftz_f16_async(
-                peer_buf_bytes + offset,
-                stage_ptr(shared_raw, cur_slot),
-                static_cast<uint32_t>(bulk_bytes));
+        if (threadIdx.x == 0) {
+            apply.issue_bulk(&cur_stage);
         }
 
-        if (tail_bytes > 0) {
-            const size_t bulk_elems = bulk_bytes / sizeof(half);
-            const size_t tail_elems = tail_bytes / sizeof(half);
-            const half* smem_half =
-                reinterpret_cast<const half*>(stage_ptr(shared_raw, cur_slot));
-            half* peer_half = reinterpret_cast<half*>(peer_buf_bytes + offset);
-
-            for (size_t i = threadIdx.x; i < tail_elems; i += blockDim.x) {
-                const float oldv = __half2float(peer_half[bulk_elems + i]);
-                const float addv = __half2float(smem_half[bulk_elems + i]);
-                peer_half[bulk_elems + i] = __float2half_rn(oldv + addv);
-            }
-        }
+        apply.finish_tail(&cur_stage);
 
         __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-        tma::reduce_async_wait<0>();
+        apply.wait_complete();
         __threadfence_system();
     }
+
     __syncthreads();
+}
+
+template <typename ReduceApply>
+__device__ void reduce_window_to_peer_sm90(
+    const unsigned char* local_in_bytes,
+    unsigned char* peer_buf_bytes,
+    comm::utils::Window window,
+    size_t total_bytes,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    run_tma_window_pipeline_sm90<
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+        ReduceApply>(
+            local_in_bytes,
+            peer_buf_bytes,
+            window,
+            total_bytes,
+            shared_raw,
+            barriers);
 }
 
 __device__ void copy_window_sm90(
@@ -180,134 +209,43 @@ __device__ void copy_window_sm90(
     size_t total_bytes,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    // Warm the load pipeline from source buffer to shared memory.
-    for (int warm = 0; warm < TMA_TWO_GPU_PEER_COPY_STAGE_GAP; ++warm) {
-        if (warm >= window.chunk_count) {
-            break;
-        }
+    using CopyApply = comm::PipelineTMACopy<
+        TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_COPY_STAGE_GAP>;
 
-        const int chunk = window.start_chunk + warm;
-        const int slot = warm;
-
-        const size_t offset =
-            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
-        const size_t bytes =
-            comm::utils::min_sz(TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                                total_bytes - offset);
-
-        if (threadIdx.x == 0) {
-            sync::init_semaphore(barriers[slot], 1);
-            tma::expect_bytes(barriers[slot], static_cast<uint32_t>(bytes));
-            tma::load_async(
-                stage_ptr(shared_raw, slot),
-                src_bytes + offset,
-                static_cast<uint32_t>(bytes),
-                barriers[slot]);
-        }
-        __syncthreads();
-    }
-
-    for (int iter = 0; iter < window.chunk_count; ++iter) {
-        const int chunk = window.start_chunk + iter;
-        const int cur_slot = iter % TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH;
-
-        const size_t offset =
-            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
-        const size_t bytes =
-            comm::utils::min_sz(TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                                total_bytes - offset);
-        const size_t bulk_bytes = bytes & ~static_cast<size_t>(0xF);
-        const size_t tail_bytes = bytes - bulk_bytes;
-
-        if (threadIdx.x == 0) {
-            sync::wait(barriers[cur_slot], 0);
-        }
-        __syncthreads();
-
-        const int future_iter = iter + TMA_TWO_GPU_PEER_COPY_STAGE_GAP;
-        if (future_iter < window.chunk_count) {
-            const int future_chunk = window.start_chunk + future_iter;
-            const int future_slot =
-                future_iter % TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH;
-
-            const size_t future_offset =
-                static_cast<size_t>(future_chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
-            const size_t future_bytes =
-                comm::utils::min_sz(TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                                    total_bytes - future_offset);
-
-            if (threadIdx.x == 0) {
-                if (iter >= TMA_TWO_GPU_PEER_COPY_STAGE_GAP) {
-                    tma::store_async_read_wait<
-                        TMA_TWO_GPU_PEER_COPY_STAGE_GAP - 1>();
-                }
-
-                sync::init_semaphore(barriers[future_slot], 1);
-                tma::expect_bytes(
-                    barriers[future_slot],
-                    static_cast<uint32_t>(future_bytes));
-                tma::load_async(
-                    stage_ptr(shared_raw, future_slot),
-                    src_bytes + future_offset,
-                    static_cast<uint32_t>(future_bytes),
-                    barriers[future_slot]);
-            }
-        }
-
-        __syncthreads();
-
-        if (threadIdx.x == 0 && bulk_bytes > 0) {
-            tma::store_async(
-                dst_bytes + offset,
-                stage_ptr(shared_raw, cur_slot),
-                static_cast<uint32_t>(bulk_bytes));
-        }
-
-        if (tail_bytes > 0) {
-            unsigned char* smem = stage_ptr(shared_raw, cur_slot);
-            for (size_t i = threadIdx.x; i < tail_bytes; i += blockDim.x) {
-                dst_bytes[offset + bulk_bytes + i] =
-                    smem[bulk_bytes + i];
-            }
-        }
-
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        tma::store_async_wait<0>();
-        __threadfence_system();
-    }
-    __syncthreads();
+    run_tma_window_pipeline_sm90<
+        TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_COPY_STAGE_GAP,
+        CopyApply>(
+            src_bytes,
+            dst_bytes,
+            window,
+            total_bytes,
+            shared_raw,
+            barriers);
 }
 
-__global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
-    const half* local_in,
-    half* local_buf,
-    half* peer_buf,
-    int* local_progress,
-    const int* peer_progress,
-    size_t numel,
-    int num_chunks,
-    int num_windows,
+template <typename ReduceApply, int ElemBytes>
+__global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
+    const void* local_in,
+    void* local_buf,
+    void* peer_buf,
+    size_t count,
     int rank,
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch) {
-    (void)local_progress;
-    (void)peer_progress;
-
     wait_for_collective_ready_sm90(
         local_ready_signal,
         peer_ready_signal,
         collective_epoch);
 
-    // Each rank only owns alternating windows:
-    //   rank 0 -> windows 0, 2, 4, ...
-    //   rank 1 -> windows 1, 3, 5, ...
-    //
-    // Some launches may contain a signal-only CTA when this rank owns zero
-    // windows for a tiny message. That CTA only participates in the rendezvous.
+    const size_t total_bytes = count * static_cast<size_t>(ElemBytes);
+    const int num_chunks = comm::utils::ceil_div_int64_to_int(
+        total_bytes,
+        TMA_TWO_GPU_PEER_CHUNK_BYTES);
+    const int num_windows = comm::utils::window_num_chunks(num_chunks);
+
     const int window_idx = 2 * static_cast<int>(blockIdx.x) + rank;
     if (window_idx >= num_windows) {
         return;
@@ -319,8 +257,6 @@ __global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
     if (window.chunk_count <= 0) {
         return;
     }
-
-    const size_t total_bytes = numel * sizeof(half);
 
     extern __shared__ uint4 shared_storage_u4[];
     unsigned char* shared_raw =
@@ -335,7 +271,7 @@ __global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
     unsigned char* peer_buf_bytes =
         reinterpret_cast<unsigned char*>(peer_buf);
 
-    reduce_window_to_peer_sm90(
+    reduce_window_to_peer_sm90<ReduceApply>(
         local_in_bytes,
         peer_buf_bytes,
         window,
@@ -352,16 +288,8 @@ __global__ void tma_two_gpu_reduce_or_copy_windows_kernel_sm90(
         barriers);
 }
 
-} // namespace
-
-int tma_two_gpu_peer_allreduce_compute_num_chunks(size_t numel) {
-    const size_t total_bytes = numel * sizeof(half);
-    return comm::utils::ceil_div_int64_to_int(
-        total_bytes,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES);
-}
-
-void tma_two_gpu_peer_allreduce_configure_kernel_once(int device) {
+template <typename ReduceApply, int ElemBytes>
+void configure_kernel_once_for(int device) {
     struct CacheEntry {
         bool configured = false;
         size_t dynamic_smem_bytes = 0;
@@ -398,14 +326,18 @@ void tma_two_gpu_peer_allreduce_configure_kernel_once(int device) {
     if (total_smem_bytes > static_cast<size_t>(prop.sharedMemPerBlock)) {
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
-                tma_two_gpu_reduce_or_copy_windows_kernel_sm90,
+                tma_two_gpu_allreduce_rank_kernel_sm90<
+                    ReduceApply,
+                    ElemBytes>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(dynamic_smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
 
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
-                tma_two_gpu_reduce_or_copy_windows_kernel_sm90,
+                tma_two_gpu_allreduce_rank_kernel_sm90<
+                    ReduceApply,
+                    ElemBytes>,
                 cudaFuncAttributePreferredSharedMemoryCarveout,
                 100),
             "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
@@ -414,146 +346,140 @@ void tma_two_gpu_peer_allreduce_configure_kernel_once(int device) {
     cache[device] = {true, dynamic_smem_bytes};
 }
 
-void tma_two_gpu_peer_allreduce_state_init(
-    TmaTwoGpuPeerAllreduceState* st,
+template <typename ReduceApply, int ElemBytes>
+cudaError_t launch_rank_kernel_sm90(
+    const void* local_in,
+    void* local_buf,
+    void* peer_buf,
+    size_t count,
+    int rank,
     int dev0,
     int dev1,
-    size_t numel) {
-    if (st == nullptr) {
-        throw std::invalid_argument("tma_two_gpu_peer_allreduce_state_init: state is null");
+    cudaStream_t stream,
+    int* local_ready_signal,
+    const int* peer_ready_signal,
+    int collective_epoch) {
+    const int device = (rank == 0) ? dev0 : dev1;
+
+    const size_t total_bytes = count * static_cast<size_t>(ElemBytes);
+    const int num_chunks = comm::utils::ceil_div_int64_to_int(
+        total_bytes,
+        TMA_TWO_GPU_PEER_CHUNK_BYTES);
+    const int num_windows = comm::utils::window_num_chunks(num_chunks);
+    const int owned_blocks =
+        (rank == 0) ? ((num_windows + 1) / 2) : (num_windows / 2);
+
+    const bool needs_rendezvous =
+        local_ready_signal != nullptr &&
+        peer_ready_signal != nullptr &&
+        collective_epoch > 0;
+
+    const int num_blocks =
+        needs_rendezvous ? std::max(1, owned_blocks) : owned_blocks;
+
+    if (num_blocks <= 0) {
+        return cudaSuccess;
     }
-    if (numel == 0) {
-        throw std::invalid_argument("tma_two_gpu_peer_allreduce_state_init: numel must be > 0");
-    }
-    if (dev0 == dev1) {
-        throw std::invalid_argument("tma_two_gpu_peer_allreduce_state_init: devices must differ");
-    }
 
-    tma_two_gpu_peer_allreduce_state_destroy(st);
+    configure_kernel_once_for<ReduceApply, ElemBytes>(device);
 
-    st->dev0 = dev0;
-    st->dev1 = dev1;
-    st->num_chunks = tma_two_gpu_peer_allreduce_compute_num_chunks(numel);
+    system::runtime::set_device(device);
 
-    tma_two_gpu_peer_allreduce_configure_kernel_once(dev0);
-    tma_two_gpu_peer_allreduce_configure_kernel_once(dev1);
+    tma_two_gpu_allreduce_rank_kernel_sm90<
+        ReduceApply,
+        ElemBytes><<<
+            num_blocks,
+            TMA_TWO_GPU_PEER_THREADS,
+            TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES,
+            stream>>>(
+                local_in,
+                local_buf,
+                peer_buf,
+                count,
+                rank,
+                local_ready_signal,
+                peer_ready_signal,
+                collective_epoch);
 
-    const std::vector<int> access_devices = {dev0, dev1};
-    st->progress0 = system::alloc_peer_visible_buffer(
-        TMA_TWO_GPU_PEER_PROGRESS_BYTES,
-        dev0,
-        access_devices);
-    st->progress1 = system::alloc_peer_visible_buffer(
-        TMA_TWO_GPU_PEER_PROGRESS_BYTES,
-        dev1,
-        access_devices);
-
-    system::runtime::set_device(dev0);
-    system::runtime::check_cuda(
-        cudaMemset(st->progress0.ptr, 0, TMA_TWO_GPU_PEER_PROGRESS_BYTES),
-        "cudaMemset(progress0)");
-
-    system::runtime::set_device(dev1);
-    system::runtime::check_cuda(
-        cudaMemset(st->progress1.ptr, 0, TMA_TWO_GPU_PEER_PROGRESS_BYTES),
-        "cudaMemset(progress1)");
+    return cudaGetLastError();
 }
 
-void tma_two_gpu_peer_allreduce_state_destroy(
-    TmaTwoGpuPeerAllreduceState* st) {
-    if (st == nullptr) {
+template <typename ReduceApply, int ElemBytes>
+void configure_dispatch_for(int device) {
+    configure_kernel_once_for<ReduceApply, ElemBytes>(device);
+}
+
+cudaError_t dispatch_rank_kernel_sm90(
+    const void* local_in,
+    void* local_buf,
+    void* peer_buf,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    int rank,
+    int dev0,
+    int dev1,
+    cudaStream_t stream,
+    int* local_ready_signal,
+    const int* peer_ready_signal,
+    int collective_epoch) {
+    if (dtype == OO_DTYPE_FLOAT16 && op == OO_REDUCE_SUM) {
+        return launch_rank_kernel_sm90<
+            comm::PipelineTMAReduce<
+                TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+                TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+                comm::PipelineReduceAddNoFtzF16>,
+            static_cast<int>(sizeof(half))>(
+                local_in,
+                local_buf,
+                peer_buf,
+                count,
+                rank,
+                dev0,
+                dev1,
+                stream,
+                local_ready_signal,
+                peer_ready_signal,
+                collective_epoch);
+    }
+
+    return cudaErrorInvalidValue;
+}
+
+void configure_dispatch_sm90(
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    int device) {
+    if (dtype == OO_DTYPE_FLOAT16 && op == OO_REDUCE_SUM) {
+        configure_dispatch_for<
+            comm::PipelineTMAReduce<
+                TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+                TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+                comm::PipelineReduceAddNoFtzF16>,
+            static_cast<int>(sizeof(half))>(device);
         return;
     }
 
-    system::free_peer_visible_buffer(st->progress0);
-    system::free_peer_visible_buffer(st->progress1);
-
-    st->dev0 = -1;
-    st->dev1 = -1;
-    st->num_chunks = 0;
+    throw std::invalid_argument(
+        "tma_two_gpu_peer_allreduce_configure_kernel_once: unsupported dtype/op");
 }
 
-void tma_two_gpu_peer_allreduce_outputs_init(
-    TmaTwoGpuPeerAllreduceOutputs* outs,
-    int dev0,
-    int dev1,
-    size_t numel) {
-    if (outs == nullptr) {
-        throw std::invalid_argument("tma_two_gpu_peer_allreduce_outputs_init: outputs is null");
-    }
-    if (numel == 0) {
-        throw std::invalid_argument("tma_two_gpu_peer_allreduce_outputs_init: numel must be > 0");
-    }
+} // namespace
 
-    tma_two_gpu_peer_allreduce_outputs_destroy(outs);
-
-    const size_t bytes = numel * sizeof(half);
-    const std::vector<int> access_devices = {dev0, dev1};
-
-    outs->dev0 = dev0;
-    outs->dev1 = dev1;
-    outs->out0 = system::alloc_peer_visible_buffer(bytes, dev0, access_devices);
-    outs->out1 = system::alloc_peer_visible_buffer(bytes, dev1, access_devices);
-}
-
-void tma_two_gpu_peer_allreduce_outputs_destroy(
-    TmaTwoGpuPeerAllreduceOutputs* outs) {
-    if (outs == nullptr) {
-        return;
-    }
-
-    system::free_peer_visible_buffer(outs->out0);
-    system::free_peer_visible_buffer(outs->out1);
-
-    outs->dev0 = -1;
-    outs->dev1 = -1;
-}
-
-cudaError_t prime_tma_two_gpu_peer_allreduce_outputs_sm90(
-    TmaTwoGpuPeerAllreduceState* st,
-    const half* rank0_in,
-    const half* rank1_in,
-    half* rank0_out_peer,
-    half* rank1_out_peer,
-    size_t numel,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
-    (void)rank0_in;
-    (void)rank1_in;
-    (void)rank0_out_peer;
-    (void)rank1_out_peer;
-    (void)numel;
-
-    if (st == nullptr) {
-        return cudaErrorInvalidValue;
-    }
-
-    system::runtime::set_device(st->dev0);
-    system::runtime::check_cuda(
-        cudaMemsetAsync(
-            st->progress0.ptr,
-            0,
-            TMA_TWO_GPU_PEER_PROGRESS_BYTES,
-            stream0),
-        "cudaMemsetAsync(progress0)");
-
-    system::runtime::set_device(st->dev1);
-    system::runtime::check_cuda(
-        cudaMemsetAsync(
-            st->progress1.ptr,
-            0,
-            TMA_TWO_GPU_PEER_PROGRESS_BYTES,
-            stream1),
-        "cudaMemsetAsync(progress1)");
-
-    return cudaSuccess;
+void tma_two_gpu_peer_allreduce_configure_kernel_once(
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    int device) {
+    configure_dispatch_sm90(dtype, op, device);
 }
 
 cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-    const half* local_in,
-    half* local_buf,
-    half* peer_buf,
-    size_t numel,
+    const void* local_in,
+    void* local_buf,
+    void* peer_buf,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
     int rank,
     int dev0,
     int dev1,
@@ -564,7 +490,7 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
     if (local_in == nullptr || local_buf == nullptr || peer_buf == nullptr) {
         return cudaErrorInvalidDevicePointer;
     }
-    if (numel == 0) {
+    if (count == 0) {
         return cudaErrorInvalidValue;
     }
     if (rank != 0 && rank != 1) {
@@ -573,165 +499,24 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
     if (dev0 == dev1) {
         return cudaErrorInvalidValue;
     }
-
-    const int device = (rank == 0) ? dev0 : dev1;
-    const int num_chunks = tma_two_gpu_peer_allreduce_compute_num_chunks(numel);
-    const int num_windows = comm::utils::window_num_chunks(num_chunks);
-    const int owned_blocks =
-        (rank == 0) ? ((num_windows + 1) / 2) : (num_windows / 2);
-
-    const bool needs_rendezvous =
-        local_ready_signal != nullptr &&
-        peer_ready_signal != nullptr &&
-        collective_epoch > 0;
-
-    // If rendezvous is enabled, launch at least one CTA even when this rank
-    // owns zero windows. That CTA only publishes/waits on the epoch signal.
-    const int num_blocks =
-        needs_rendezvous ? std::max(1, owned_blocks) : owned_blocks;
-
-    if (num_blocks <= 0) {
-        return cudaSuccess;
-    }
-
-    tma_two_gpu_peer_allreduce_configure_kernel_once(device);
-
-    const size_t smem_bytes = TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES;
-
-    system::runtime::set_device(device);
-    tma_two_gpu_reduce_or_copy_windows_kernel_sm90<<<
-        num_blocks,
-        TMA_TWO_GPU_PEER_THREADS,
-        smem_bytes,
-        stream>>>(
-            local_in,
-            local_buf,
-            peer_buf,
-            nullptr,
-            nullptr,
-            numel,
-            num_chunks,
-            num_windows,
-            rank,
-            local_ready_signal,
-            peer_ready_signal,
-            collective_epoch);
-
-    return cudaGetLastError();
-}
-
-cudaError_t enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
-    TmaTwoGpuPeerAllreduceState* st,
-    const half* rank0_in,
-    const half* rank1_in,
-    half* rank0_out_peer,
-    half* rank1_out_peer,
-    size_t numel,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
-    if (st == nullptr) {
-        return cudaErrorInvalidValue;
-    }
-    if (rank0_in == nullptr || rank1_in == nullptr ||
-        rank0_out_peer == nullptr || rank1_out_peer == nullptr) {
-        return cudaErrorInvalidDevicePointer;
-    }
-    if (numel == 0) {
+    if (dtype_size_bytes(dtype) == 0) {
         return cudaErrorInvalidValue;
     }
 
-    const int num_chunks = tma_two_gpu_peer_allreduce_compute_num_chunks(numel);
-    if (num_chunks != st->num_chunks) {
-        return cudaErrorInvalidValue;
-    }
-
-    const int num_windows = comm::utils::window_num_chunks(num_chunks);
-    const int num_blocks_rank0 = std::max(1, (num_windows + 1) / 2);
-    const int num_blocks_rank1 = std::max(1, num_windows / 2);
-    const size_t smem_bytes = TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES;
-
-    constexpr int collective_epoch = 1;
-
-    system::runtime::set_device(st->dev0);
-    tma_two_gpu_reduce_or_copy_windows_kernel_sm90<<<
-        num_blocks_rank0,
-        TMA_TWO_GPU_PEER_THREADS,
-        smem_bytes,
-        stream0>>>(
-            rank0_in,
-            rank0_out_peer,
-            rank1_out_peer,
-            reinterpret_cast<int*>(st->progress0.ptr),
-            reinterpret_cast<const int*>(st->progress1.ptr),
-            numel,
-            num_chunks,
-            num_windows,
-            0,
-            reinterpret_cast<int*>(st->progress0.ptr),
-            reinterpret_cast<const int*>(st->progress1.ptr),
-            collective_epoch);
-    cudaError_t err0 = cudaGetLastError();
-    if (err0 != cudaSuccess) {
-        return err0;
-    }
-
-    system::runtime::set_device(st->dev1);
-    tma_two_gpu_reduce_or_copy_windows_kernel_sm90<<<
-        num_blocks_rank1,
-        TMA_TWO_GPU_PEER_THREADS,
-        smem_bytes,
-        stream1>>>(
-            rank1_in,
-            rank1_out_peer,
-            rank0_out_peer,
-            reinterpret_cast<int*>(st->progress1.ptr),
-            reinterpret_cast<const int*>(st->progress0.ptr),
-            numel,
-            num_chunks,
-            num_windows,
-            1,
-            reinterpret_cast<int*>(st->progress1.ptr),
-            reinterpret_cast<const int*>(st->progress0.ptr),
-            collective_epoch);
-    cudaError_t err1 = cudaGetLastError();
-    if (err1 != cudaSuccess) {
-        return err1;
-    }
-
-    return cudaSuccess;
-}
-
-cudaError_t enqueue_tma_two_gpu_peer_allreduce_sm90(
-    TmaTwoGpuPeerAllreduceState* st,
-    const half* rank0_in,
-    const half* rank1_in,
-    half* rank0_out_peer,
-    half* rank1_out_peer,
-    size_t numel,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
-    cudaError_t err = prime_tma_two_gpu_peer_allreduce_outputs_sm90(
-        st,
-        rank0_in,
-        rank1_in,
-        rank0_out_peer,
-        rank1_out_peer,
-        numel,
-        stream0,
-        stream1);
-    if (err != cudaSuccess) {
-        return err;
-    }
-
-    return enqueue_tma_two_gpu_peer_allreduce_kernel_only_sm90(
-        st,
-        rank0_in,
-        rank1_in,
-        rank0_out_peer,
-        rank1_out_peer,
-        numel,
-        stream0,
-        stream1);
+    return dispatch_rank_kernel_sm90(
+        local_in,
+        local_buf,
+        peer_buf,
+        count,
+        dtype,
+        op,
+        rank,
+        dev0,
+        dev1,
+        stream,
+        local_ready_signal,
+        peer_ready_signal,
+        collective_epoch);
 }
 
 } // namespace ooverlap
