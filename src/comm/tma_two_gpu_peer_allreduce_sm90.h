@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/ooverlap_comm.h"
+#include "ooverlap/comm.h"
 
 #include <cuda_runtime.h>
 

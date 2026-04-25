@@ -1,6 +1,28 @@
 cmake_minimum_required(VERSION 3.20)
 project(ooverlap LANGUAGES CXX CUDA)
 
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  set(OOVERLAP_TOP_LEVEL ON)
+else()
+  set(OOVERLAP_TOP_LEVEL OFF)
+endif()
+
+option(OOVERLAP_BUILD_CORE "Build the public ooverlap communication library" ON)
+
+if(OOVERLAP_TOP_LEVEL)
+  set(OOVERLAP_BUILD_PYTHON_DEFAULT ON)
+  set(OOVERLAP_BUILD_TESTS_DEFAULT ON)
+else()
+  set(OOVERLAP_BUILD_PYTHON_DEFAULT OFF)
+  set(OOVERLAP_BUILD_TESTS_DEFAULT OFF)
+endif()
+
+option(OOVERLAP_BUILD_PYTHON "Build the Python extension module" ${OOVERLAP_BUILD_PYTHON_DEFAULT})
+option(OOVERLAP_BUILD_TESTS "Build benchmark/test helper translation units" ${OOVERLAP_BUILD_TESTS_DEFAULT})
+option(OOVERLAP_BUILD_GEMM "Build GEMM/CUTLASS helper libraries" ${OOVERLAP_BUILD_PYTHON})
+option(OOVERLAP_BUILD_LEGACY_OVERLAP "Build legacy overlap/NCCL/Torch integration" ${OOVERLAP_BUILD_PYTHON})
+option(OOVERLAP_BUILD_RMSNORM "Build RMSNorm helpers" ${OOVERLAP_BUILD_PYTHON})
+
 unset(CMAKE_CUDA_ARCHITECTURES CACHE)
 set(CMAKE_CUDA_ARCHITECTURES OFF CACHE STRING "Disable default CUDA arch flags" FORCE)
 
@@ -18,40 +40,43 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# --- CUTLASS ---
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/third-party/cutlass/include/cutlass/cutlass.h")
-  message(FATAL_ERROR
-    "CUTLASS submodule not found. Run:\n"
-    "  git submodule update --init --recursive")
-endif()
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/third_party/cutlass.cmake)
-
-# --- Torch ---
-set(ENV{TORCH_CUDA_ARCH_LIST} "9.0")
-find_package(Torch REQUIRED)
-string(REPLACE "-gencode;arch=compute_89,code=sm_89" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-string(REPLACE "-gencode arch=compute_89,code=sm_89" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-string(REPLACE "--generate-code=arch=compute_89,code=sm_89" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-
-string(REPLACE "-gencode;arch=compute_89,code=sm_89" "" TORCH_CXX_FLAGS "${TORCH_CXX_FLAGS}")
-string(REPLACE "-gencode arch=compute_89,code=sm_89" "" TORCH_CXX_FLAGS "${TORCH_CXX_FLAGS}")
-string(REPLACE "--generate-code=arch=compute_89,code=sm_89" "" TORCH_CXX_FLAGS "${TORCH_CXX_FLAGS}")
-
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-
-# --- CUDA ---
 find_package(CUDAToolkit REQUIRED)
 
-# --- NCCL (simple finder) ---
-find_path(NCCL_INCLUDE_DIR nccl.h
-  HINTS ENV NCCL_ROOT
-  PATH_SUFFIXES include)
-find_library(NCCL_LIBRARY nccl
-  HINTS ENV NCCL_ROOT
-  PATH_SUFFIXES lib lib64)
+if(OOVERLAP_BUILD_GEMM OR OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_LEGACY_OVERLAP)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/third-party/cutlass/include/cutlass/cutlass.h")
+    message(FATAL_ERROR
+      "CUTLASS submodule not found. Run:\n"
+      "  git submodule update --init --recursive")
+  endif()
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/third_party/cutlass.cmake)
+endif()
 
-if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
-  message(FATAL_ERROR "NCCL not found. Set NCCL_ROOT to your NCCL install.")
+if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_LEGACY_OVERLAP)
+  set(ENV{TORCH_CUDA_ARCH_LIST} "9.0")
+  find_package(Torch REQUIRED)
+
+  string(REPLACE "-gencode;arch=compute_89,code=sm_89" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+  string(REPLACE "-gencode arch=compute_89,code=sm_89" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+  string(REPLACE "--generate-code=arch=compute_89,code=sm_89" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+
+  string(REPLACE "-gencode;arch=compute_89,code=sm_89" "" TORCH_CXX_FLAGS "${TORCH_CXX_FLAGS}")
+  string(REPLACE "-gencode arch=compute_89,code=sm_89" "" TORCH_CXX_FLAGS "${TORCH_CXX_FLAGS}")
+  string(REPLACE "--generate-code=arch=compute_89,code=sm_89" "" TORCH_CXX_FLAGS "${TORCH_CXX_FLAGS}")
+
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+endif()
+
+if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_TESTS OR OOVERLAP_BUILD_LEGACY_OVERLAP)
+  find_path(NCCL_INCLUDE_DIR nccl.h
+    HINTS ENV NCCL_ROOT
+    PATH_SUFFIXES include)
+  find_library(NCCL_LIBRARY nccl
+    HINTS ENV NCCL_ROOT
+    PATH_SUFFIXES lib lib64)
+
+  if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+    message(FATAL_ERROR "NCCL not found. Set NCCL_ROOT to your NCCL install.")
+  endif()
 endif()
 
 add_subdirectory(src)
