@@ -1,6 +1,7 @@
 #include "comm/ooverlap_comm_internal.h"
 
 #include "comm/tma_two_gpu_peer_allreduce_sm90.h"
+#include "ooverlap/system/logging.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -8,8 +9,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -19,42 +18,24 @@ namespace {
 
 constexpr size_t kOoReadySignalBytes = sizeof(int);
 
-struct oo_ready_signal_ipc_desc {
-    cudaIpcMemHandle_t handle{};
-    std::uint64_t bytes = 0;
-    int owner_rank = -1;
-    int owner_device = -1;
-};
-
 oo_status_t report_cuda_error(cudaError_t err, const char* what) {
     if (err != cudaSuccess) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][ipc] %s failed: %s\n",
+        OOVERLAP_LOG_ERROR(
+            "%s failed: %s\n",
             what,
             cudaGetErrorString(err));
-        std::fflush(stderr);
         return OO_ERROR_CUDA;
     }
     return OO_SUCCESS;
 }
 
 oo_status_t report_exception(const char* where, const std::exception& e) {
-    std::fprintf(
-        stderr,
-        "[ooverlap][ipc] %s threw: %s\n",
-        where,
-        e.what());
-    std::fflush(stderr);
+    OOVERLAP_LOG_ERROR("%s threw: %s\n", where, e.what());
     return OO_ERROR_INTERNAL;
 }
 
 oo_status_t report_unknown_exception(const char* where) {
-    std::fprintf(
-        stderr,
-        "[ooverlap][ipc] %s threw unknown exception\n",
-        where);
-    std::fflush(stderr);
+    OOVERLAP_LOG_ERROR("%s threw unknown exception\n", where);
     return OO_ERROR_INTERNAL;
 }
 
@@ -156,7 +137,7 @@ void free_ready_signal_slot(oo_ready_signal& slot) {
                 slot.owned_legacy_ptr = nullptr;
             }
             break;
-            
+
         case oo_ready_signal_kind::imported_legacy:
             if (slot.ptr != nullptr) {
                 cudaIpcCloseMemHandle(slot.ptr);
@@ -214,23 +195,11 @@ void free_group_ready_signals_ipc(oo_group_t* group) {
         return;
     }
 
-    /*
-     * Two-phase cleanup:
-     *
-     * 1. All ranks arrive.
-     * 2. Everyone closes imported mappings.
-     * 3. All ranks arrive again.
-     * 4. Each rank frees only its own exported allocation.
-     *
-     * This avoids freeing a local cudaMalloc allocation while a peer process
-     * still has an open cudaIpc mapping to it.
-     */
     try {
         if (group->broker) {
             group->broker->sync();
         }
     } catch (...) {
-        // Destructors/cleanup should be best-effort.
     }
 
     for (int r = 0; r < group->num_devices; ++r) {
@@ -411,10 +380,6 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
                 return report_cuda_error(err, "cudaIpcGetMemHandle(ready-signal block)");
             }
 
-            /*
-             * Store the owner allocation on slot 0. Slot 1 will be a borrowed
-             * view into the same allocation and must not free separately.
-             */
             oo_ready_signal& owner_slot = group->ready_signal_slots[signal_owner_rank];
             owner_slot.ptr = signal_base;
             owner_slot.bytes = signal_block_bytes;
@@ -433,16 +398,12 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
         std::vector<ready_signal_block_desc> all_desc(
             static_cast<size_t>(group->num_devices));
 
-
-        std::fprintf(
-            stderr,
-            "[ooverlap][ipc] ready signal before broker exchange_data "
-            "rank=%d broker.get()=%p group=%p sizeof(Broker)=%zu\n",
+        OOVERLAP_LOG_DEBUG(
+            "ready signal before broker exchange_data rank=%d broker.get()=%p group=%p sizeof(Broker)=%zu\n",
             local_rank,
             static_cast<void*>(group->broker.get()),
             static_cast<void*>(group),
             sizeof(ooverlap::system::Broker));
-        std::fflush(stderr);
 
         group->broker->exchange_data(
             all_desc.data(),
@@ -454,18 +415,14 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
         if (signal_desc.bytes != signal_block_bytes ||
             signal_desc.owner_rank != signal_owner_rank ||
             signal_desc.owner_device != signal_owner_device) {
-            std::fprintf(
-                stderr,
-                "[ooverlap][ipc] bad legacy ready-signal descriptor: "
-                "bytes=%llu owner_rank=%d owner_device=%d "
-                "expected_bytes=%llu expected_owner_rank=%d expected_owner_device=%d\n",
+            OOVERLAP_LOG_ERROR(
+                "bad legacy ready-signal descriptor: bytes=%llu owner_rank=%d owner_device=%d expected_bytes=%llu expected_owner_rank=%d expected_owner_device=%d\n",
                 static_cast<unsigned long long>(signal_desc.bytes),
                 signal_desc.owner_rank,
                 signal_desc.owner_device,
                 static_cast<unsigned long long>(signal_block_bytes),
                 signal_owner_rank,
                 signal_owner_device);
-            std::fflush(stderr);
 
             cleanup_ready_signals_local_only();
             return OO_ERROR_INTERNAL;
@@ -484,23 +441,17 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
                 cudaIpcMemLazyEnablePeerAccess);
 
             if (err != cudaSuccess) {
-                std::fprintf(
-                    stderr,
-                    "[ooverlap][ipc] cudaIpcOpenMemHandle(ready-signal block) "
-                    "failed local_rank=%d local_device=%d owner_device=%d: %s\n",
+                OOVERLAP_LOG_ERROR(
+                    "cudaIpcOpenMemHandle(ready-signal block) failed local_rank=%d local_device=%d owner_device=%d: %s\n",
                     local_rank,
                     group->devices[local_rank],
                     signal_owner_device,
                     cudaGetErrorString(err));
-                std::fflush(stderr);
 
                 cleanup_ready_signals_local_only();
                 return OO_ERROR_CUDA;
             }
 
-            /*
-             * Store the imported mapping on slot 0. Slot 1 is a borrowed view.
-             */
             oo_ready_signal& imported_owner_slot =
                 group->ready_signal_slots[signal_owner_rank];
 
@@ -517,15 +468,6 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
             return OO_ERROR_INTERNAL;
         }
 
-        /*
-         * Build per-rank int slots inside one shared signal block:
-         *
-         *   slot 0: rank 0 epoch
-         *   slot 1: rank 1 epoch
-         *
-         * Only slot 0 owns/closes the backing block in each process.
-         * Other slots are borrowed views.
-         */
         for (int rank = 0; rank < group->num_devices; ++rank) {
             oo_ready_signal& slot = group->ready_signal_slots[rank];
 
@@ -534,10 +476,6 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
                 static_cast<size_t>(rank) * kOoReadySignalBytes);
 
             if (rank == signal_owner_rank) {
-                /*
-                 * Preserve ownership kind already set above, but change ptr/size
-                 * to slot view. owned_legacy_ptr remains the block base.
-                 */
                 slot.ptr = slot_ptr;
                 slot.bytes = kOoReadySignalBytes;
                 slot.mapped_bytes = kOoReadySignalBytes;
@@ -551,9 +489,6 @@ oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
                     slot.kind = oo_ready_signal_kind::imported_legacy;
                 }
             } else {
-                /*
-                 * Borrowed view into same block. It must not free anything.
-                 */
                 slot.ptr = slot_ptr;
                 slot.bytes = kOoReadySignalBytes;
                 slot.mapped_bytes = kOoReadySignalBytes;
@@ -654,10 +589,6 @@ oo_status_t oo_buffer_export_legacy_descriptor(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    /*
-     * Legacy cudaIpcGetMemHandle is meant for cudaMalloc/PyTorch-style device
-     * allocations. VMM allocations should use the VMM FD path instead.
-     */
     if (buffer->system_kind == ooverlap::system::peer_buffer_kind::owned_vmm ||
         buffer->kind == OO_BUFFER_KIND_VMM) {
         return OO_ERROR_UNSUPPORTED;
@@ -914,7 +845,8 @@ oo_status_t oo_group_create_ipc(
     } catch (const std::bad_alloc&) {
         delete group;
         return OO_ERROR_INTERNAL;
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+        OOVERLAP_LOG_ERROR("oo_group_create_ipc broker init threw: %s\n", e.what());
         delete group;
         return OO_ERROR_INTERNAL;
     } catch (...) {
@@ -972,10 +904,6 @@ oo_status_t oo_node_create(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    /*
-     * In multiprocess IPC mode, this process should only create/use its local
-     * rank. The peer rank lives in the peer process.
-     */
     if (group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc &&
         rank != group->local_rank) {
         return OO_ERROR_INVALID_ARGUMENT;
@@ -1051,7 +979,8 @@ oo_status_t oo_buffer_alloc(
     } catch (const std::bad_alloc&) {
         delete buffer;
         return OO_ERROR_INTERNAL;
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+        OOVERLAP_LOG_ERROR("oo_buffer_alloc threw: %s\n", e.what());
         delete buffer;
         return OO_ERROR_CUDA;
     } catch (...) {
@@ -1183,11 +1112,6 @@ oo_status_t oo_allreduce(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    /*
-     * In multiprocess mode, a peer buffer must be a real imported IPC mapping.
-     * This is the guard that prevents accidentally passing a fake wrapped peer
-     * pointer and then hanging/faulting inside the TMA kernel.
-     */
     if (node->group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc &&
         !buffer_is_imported(peer)) {
         return OO_ERROR_INVALID_ARGUMENT;
@@ -1213,11 +1137,6 @@ oo_status_t oo_allreduce(
         return OO_ERROR_INTERNAL;
     }
 
-    if (local_signal_slot.owner_rank != node->rank ||
-        peer_signal_slot.owner_rank != peer_rank) {
-        return OO_ERROR_INTERNAL;
-    }
-
     const int collective_epoch = ++node->collective_epoch;
 
     int* local_ready_signal =
@@ -1230,6 +1149,18 @@ oo_status_t oo_allreduce(
         if (set_err != cudaSuccess) {
             return OO_ERROR_CUDA;
         }
+
+        OOVERLAP_LOG_TRACE(
+            "oo_allreduce rank=%d count=%zu dtype=%d op=%d local=%p peer=%p epoch=%d local_signal=%p peer_signal=%p\n",
+            node->rank,
+            count,
+            static_cast<int>(dtype),
+            static_cast<int>(op),
+            local->ptr,
+            peer->ptr,
+            collective_epoch,
+            static_cast<void*>(local_ready_signal),
+            static_cast<const void*>(peer_ready_signal));
 
         cudaError_t err = ooverlap::enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
             local->ptr,
@@ -1247,7 +1178,8 @@ oo_status_t oo_allreduce(
             collective_epoch);
 
         return cuda_status_to_oo(err);
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+        OOVERLAP_LOG_ERROR("oo_allreduce threw: %s\n", e.what());
         return OO_ERROR_CUDA;
     } catch (...) {
         return OO_ERROR_INTERNAL;

@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 project(ooverlap LANGUAGES CXX CUDA)
 
+set(OOVERLAP_LOG_LEVEL "2" CACHE STRING
+    "ooverlap compile-time log level: 0 none, 1 fatal, 2 error, 3 warn, 4 info, 5 debug, 6 trace")
+
+add_compile_definitions(OOVERLAP_LOG_LEVEL=${OOVERLAP_LOG_LEVEL})
+
 if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
   set(OOVERLAP_TOP_LEVEL ON)
 else()

@@ -11,29 +11,33 @@ import traceback
 import uuid
 
 
-def _worker(rank, module_dir, numel, iters, dev0, dev1, broker_key, result_q):
+def _worker(rank, module_dir, numel, iters, dev0, dev1, broker_key, verbose, result_q):
     faulthandler.enable(all_threads=True)
 
     try:
-        print(
-            f"[ipc-runner][rank={rank}][pid={os.getpid()}] worker start "
-            f"numel={numel} iters={iters} devs=({dev0},{dev1}) key={broker_key}",
-            flush=True,
-        )
+        if verbose:
+            print(
+                f"[ipc-runner][rank={rank}][pid={os.getpid()}] worker start "
+                f"numel={numel} iters={iters} devs=({dev0},{dev1}) key={broker_key}",
+                flush=True,
+            )
 
         if module_dir:
             sys.path.insert(0, module_dir)
 
-        print(
-            f"[ipc-runner][rank={rank}][pid={os.getpid()}] importing ooverlap_ext",
-            flush=True,
-        )
+        if verbose:
+            print(
+                f"[ipc-runner][rank={rank}][pid={os.getpid()}] importing ooverlap_ext",
+                flush=True,
+            )
+
         import ooverlap_ext
 
-        print(
-            f"[ipc-runner][rank={rank}][pid={os.getpid()}] calling extension",
-            flush=True,
-        )
+        if verbose:
+            print(
+                f"[ipc-runner][rank={rank}][pid={os.getpid()}] calling extension",
+                flush=True,
+            )
 
         ok = ooverlap_ext.tma_ipc_two_gpu_allreduce_rank_smoke_test(
             numel,
@@ -44,10 +48,11 @@ def _worker(rank, module_dir, numel, iters, dev0, dev1, broker_key, result_q):
             iters,
         )
 
-        print(
-            f"[ipc-runner][rank={rank}][pid={os.getpid()}] extension returned ok={ok}",
-            flush=True,
-        )
+        if verbose:
+            print(
+                f"[ipc-runner][rank={rank}][pid={os.getpid()}] extension returned ok={ok}",
+                flush=True,
+            )
 
         result_q.put((rank, bool(ok), ""))
 
@@ -74,8 +79,7 @@ def main():
         "--module-dir",
         type=str,
         default=os.environ.get("OOVERLAP_EXT_DIR", ""),
-        help="Directory containing ooverlap_ext.so. "
-             "Optional if PYTHONPATH already points to it.",
+        help="Directory containing ooverlap_ext.so. Optional if PYTHONPATH already points to it.",
     )
     parser.add_argument(
         "--timeout-s",
@@ -94,6 +98,11 @@ def main():
         action="store_true",
         help="Set CUDA_LAUNCH_BLOCKING=1 in child processes.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print Python runner progress logs.",
+    )
 
     args = parser.parse_args()
 
@@ -111,14 +120,15 @@ def main():
     if not broker_key:
         broker_key = f"ipc_ar_{os.getpid()}_{uuid.uuid4().hex[:12]}"
 
-    print(
-        "[ipc-runner] start "
-        f"numel={args.numel} iters={args.iters} "
-        f"devs=({args.dev0},{args.dev1}) key={broker_key} "
-        f"module_dir={args.module_dir or '<PYTHONPATH>'} "
-        f"CUDA_LAUNCH_BLOCKING={os.environ.get('CUDA_LAUNCH_BLOCKING', '<unset>')}",
-        flush=True,
-    )
+    if args.verbose:
+        print(
+            "[ipc-runner] start "
+            f"numel={args.numel} iters={args.iters} "
+            f"devs=({args.dev0},{args.dev1}) key={broker_key} "
+            f"module_dir={args.module_dir or '<PYTHONPATH>'} "
+            f"CUDA_LAUNCH_BLOCKING={os.environ.get('CUDA_LAUNCH_BLOCKING', '<unset>')}",
+            flush=True,
+        )
 
     ctx = mp.get_context("spawn")
     result_q = ctx.Queue()
@@ -135,29 +145,31 @@ def main():
                 args.dev0,
                 args.dev1,
                 broker_key,
+                args.verbose,
                 result_q,
             ),
             daemon=False,
         )
         p.start()
-        print(
-            f"[ipc-runner] spawned rank={rank} pid={p.pid}",
-            flush=True,
-        )
+        if args.verbose:
+            print(
+                f"[ipc-runner] spawned rank={rank} pid={p.pid}",
+                flush=True,
+            )
         procs.append(p)
 
     deadline = time.time() + args.timeout_s
     results = {}
-
     reported_exits = set()
 
     while len(results) < 2 and time.time() < deadline:
         try:
             rank, ok, msg = result_q.get(timeout=0.25)
-            print(
-                f"[ipc-runner] got queue result rank={rank} ok={ok}",
-                flush=True,
-            )
+            if args.verbose:
+                print(
+                    f"[ipc-runner] got queue result rank={rank} ok={ok}",
+                    flush=True,
+                )
             results[rank] = (ok, msg)
         except queue.Empty:
             pass
@@ -176,14 +188,15 @@ def main():
                 reported_exits.add(rank)
 
         if len(reported_exits) == 2 and len(results) == 0:
-            break 
+            break
 
     for rank, p in enumerate(procs):
         remaining = max(0.0, deadline - time.time())
-        print(
-            f"[ipc-runner] joining rank={rank} pid={p.pid} remaining={remaining:.1f}s",
-            flush=True,
-        )
+        if args.verbose:
+            print(
+                f"[ipc-runner] joining rank={rank} pid={p.pid} remaining={remaining:.1f}s",
+                flush=True,
+            )
         p.join(timeout=remaining)
 
     timed_out = [idx for idx, p in enumerate(procs) if p.is_alive()]

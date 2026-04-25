@@ -1,10 +1,10 @@
 #include "test/ipc_allreduce_2gpu_sm90.h"
 
 #include "comm/ooverlap_comm_internal.h"
+#include "ooverlap/system/logging.h"
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/test_utils.cuh"
 
-#include <cstdarg>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -33,17 +34,20 @@ void debug_log_impl(
     int rank,
     const char* file,
     int line,
+    const char* func,
     const char* fmt,
     ...) {
+#if OOVERLAP_LOG_LEVEL >= OOVERLAP_LOG_LEVEL_DEBUG
     std::fprintf(
         stderr,
-        "[ipc-test][pid=%ld][rank=%d][stage=%d:%s][%s:%d] ",
+        "[ipc-test][pid=%ld][rank=%d][stage=%d:%s][%s:%d:%s] ",
         static_cast<long>(getpid()),
         rank,
         static_cast<int>(g_stage_id),
         g_stage_name ? g_stage_name : "null",
         file,
-        line);
+        line,
+        func);
 
     va_list args;
     va_start(args, fmt);
@@ -52,10 +56,17 @@ void debug_log_impl(
 
     std::fprintf(stderr, "\n");
     std::fflush(stderr);
+#else
+    (void)rank;
+    (void)file;
+    (void)line;
+    (void)func;
+    (void)fmt;
+#endif
 }
 
 #define IPC_LOG(rank, fmt, ...) \
-    debug_log_impl((rank), __FILE__, __LINE__, (fmt), ##__VA_ARGS__)
+    debug_log_impl((rank), __FILE__, __LINE__, __func__, (fmt), ##__VA_ARGS__)
 
 #define IPC_STAGE(rank, id, name)                                      \
     do {                                                               \
@@ -130,15 +141,6 @@ void check_cuda(cudaError_t err, const char* what, int rank) {
         throw std::runtime_error(
             std::string(what) + " failed: " + cudaGetErrorString(err));
     }
-}
-
-void sync_cuda_device(int device, const char* what, int rank) {
-    IPC_LOG(rank, "cudaDeviceSynchronize before/at %s device=%d", what, device);
-    cudaError_t err = cudaSetDevice(device);
-    check_cuda(err, "cudaSetDevice(sync_cuda_device)", rank);
-
-    err = cudaDeviceSynchronize();
-    check_cuda(err, what, rank);
 }
 
 float rank_scale(int rank) {
@@ -396,11 +398,6 @@ bool tma_ipc_two_gpu_allreduce_rank_smoke_test(
         check_cuda(cudaMalloc(&local_src, bytes), "cudaMalloc(local_src)", local_rank);
         IPC_LOG(local_rank, "local_src=%p bytes=%zu", static_cast<void*>(local_src), bytes);
 
-        /*
-         * IMPORTANT:
-         * local work buffer must be VMM-backed for this IPC/TMA test.
-         * Do not cudaMalloc + oo_buffer_wrap here.
-         */
         IPC_STAGE(local_rank, 50, "oo_buffer_alloc local VMM buffer");
         st = oo_buffer_alloc(
             node,
@@ -475,9 +472,6 @@ bool tma_ipc_two_gpu_allreduce_rank_smoke_test(
                 all_fds[0],
                 all_fds[1]);
 
-        /*
-         * exchange_fds consumes/closes local_fd.value.
-         */
         local_fd.value = -1;
 
         if (all_fds[peer_rank] < 0) {

@@ -1,4 +1,5 @@
 #include "ooverlap/system/broker.cuh"
+#include "ooverlap/system/logging.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -103,13 +104,7 @@ std::string make_socket_path(const std::string& prefix, int local_rank) {
 
 void die_pthread(int err, const char* what) {
     if (err != 0) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] %s failed: %s\n",
-            what,
-            std::strerror(err));
-        std::fflush(stderr);
-
+        OOVERLAP_LOG_ERROR("%s failed: %s\n", what, std::strerror(err));
         throw std::runtime_error(std::string("Broker: ") + what + " failed");
     }
 }
@@ -122,13 +117,11 @@ void wait_until_initialized(volatile Vault* vault, const char* where) {
     int spins = 0;
     while (vault->init != INIT_CODE) {
         if ((++spins % 1000000) == 0) {
-            std::fprintf(
-                stderr,
-                "[ooverlap][broker] waiting for init in %s, init=0x%x expected=0x%x\n",
+            OOVERLAP_LOG_TRACE(
+                "waiting for init in %s, init=0x%x expected=0x%x\n",
                 where ? where : "unknown",
                 static_cast<unsigned>(vault->init),
                 static_cast<unsigned>(INIT_CODE));
-            std::fflush(stderr);
         }
 
         usleep(1);
@@ -147,29 +140,18 @@ void init_vault_rank0(Vault* vault, int local_world_size) {
     pthread_mutexattr_t mutex_attr;
     pthread_condattr_t cond_attr;
 
-    die_pthread(
-        pthread_mutexattr_init(&mutex_attr),
-        "pthread_mutexattr_init");
+    die_pthread(pthread_mutexattr_init(&mutex_attr), "pthread_mutexattr_init");
+    die_pthread(pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED),
+                "pthread_mutexattr_setpshared");
 
-    die_pthread(
-        pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED),
-        "pthread_mutexattr_setpshared");
+    die_pthread(pthread_condattr_init(&cond_attr), "pthread_condattr_init");
+    die_pthread(pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED),
+                "pthread_condattr_setpshared");
 
-    die_pthread(
-        pthread_condattr_init(&cond_attr),
-        "pthread_condattr_init");
-
-    die_pthread(
-        pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED),
-        "pthread_condattr_setpshared");
-
-    die_pthread(
-        pthread_mutex_init(&vault->mutex, &mutex_attr),
-        "pthread_mutex_init");
-
-    die_pthread(
-        pthread_cond_init(&vault->cond, &cond_attr),
-        "pthread_cond_init");
+    die_pthread(pthread_mutex_init(&vault->mutex, &mutex_attr),
+                "pthread_mutex_init");
+    die_pthread(pthread_cond_init(&vault->cond, &cond_attr),
+                "pthread_cond_init");
 
     pthread_mutexattr_destroy(&mutex_attr);
     pthread_condattr_destroy(&cond_attr);
@@ -230,24 +212,18 @@ void* create_shm(const char* key, size_t size) {
 
     int shm_fd = shm_open(key, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (shm_fd < 0) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] shm_open create failed for %s: %s\n",
+        OOVERLAP_LOG_ERROR(
+            "shm_open create failed for %s: %s\n",
             key,
             std::strerror(errno));
-        std::fflush(stderr);
-
         throw std::runtime_error("Broker: failed to create shared memory");
     }
 
     if (ftruncate(shm_fd, static_cast<off_t>(size)) != 0) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] ftruncate failed for %s: %s\n",
+        OOVERLAP_LOG_ERROR(
+            "ftruncate failed for %s: %s\n",
             key,
             std::strerror(errno));
-        std::fflush(stderr);
-
         shm_unlink(key);
         close(shm_fd);
         throw std::runtime_error("Broker: failed to resize shared memory");
@@ -257,13 +233,10 @@ void* create_shm(const char* key, size_t size) {
     close(shm_fd);
 
     if (addr == MAP_FAILED) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] mmap create failed for %s: %s\n",
+        OOVERLAP_LOG_ERROR(
+            "mmap create failed for %s: %s\n",
             key,
             std::strerror(errno));
-        std::fflush(stderr);
-
         shm_unlink(key);
         throw std::runtime_error("Broker: failed to map shared memory");
     }
@@ -281,13 +254,10 @@ void* open_shm(const char* key, size_t size) {
         }
 
         if (errno != ENOENT) {
-            std::fprintf(
-                stderr,
-                "[ooverlap][broker] shm_open open failed for %s: %s\n",
+            OOVERLAP_LOG_ERROR(
+                "shm_open open failed for %s: %s\n",
                 key,
                 std::strerror(errno));
-            std::fflush(stderr);
-
             throw std::runtime_error("Broker: failed to open shared memory");
         }
 
@@ -297,13 +267,10 @@ void* open_shm(const char* key, size_t size) {
     struct stat shm_st {};
     do {
         if (fstat(shm_fd, &shm_st) != 0) {
-            std::fprintf(
-                stderr,
-                "[ooverlap][broker] fstat failed for %s: %s\n",
+            OOVERLAP_LOG_ERROR(
+                "fstat failed for %s: %s\n",
                 key,
                 std::strerror(errno));
-            std::fflush(stderr);
-
             close(shm_fd);
             throw std::runtime_error("Broker: failed to stat shared memory");
         }
@@ -315,13 +282,10 @@ void* open_shm(const char* key, size_t size) {
     close(shm_fd);
 
     if (addr == MAP_FAILED) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] mmap open failed for %s: %s\n",
+        OOVERLAP_LOG_ERROR(
+            "mmap open failed for %s: %s\n",
             key,
             std::strerror(errno));
-        std::fflush(stderr);
-
         throw std::runtime_error("Broker: failed to map shared memory");
     }
 
@@ -343,12 +307,7 @@ void unmap_shm(void* addr, size_t size) {
 int create_socket(const std::string& socket_prefix, int local_rank) {
     int sock_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (sock_fd < 0) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] socket failed: %s\n",
-            std::strerror(errno));
-        std::fflush(stderr);
-
+        OOVERLAP_LOG_ERROR("socket failed: %s\n", std::strerror(errno));
         throw std::runtime_error("Broker: socket creation failed");
     }
 
@@ -360,13 +319,10 @@ int create_socket(const std::string& socket_prefix, int local_rank) {
     std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (bind(sock_fd, reinterpret_cast<sockaddr*>(&addr), SUN_LEN(&addr)) < 0) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] bind failed for %s: %s\n",
+        OOVERLAP_LOG_ERROR(
+            "bind failed for %s: %s\n",
             socket_path.c_str(),
             std::strerror(errno));
-        std::fflush(stderr);
-
         close(sock_fd);
         throw std::runtime_error("Broker: failed to bind socket");
     }
@@ -443,13 +399,11 @@ void send_fd(
             continue;
         }
 
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] sendmsg fd src_rank=%d dst_rank=%d failed: %s\n",
+        OOVERLAP_LOG_ERROR(
+            "sendmsg fd src_rank=%d dst_rank=%d failed: %s\n",
             src_local_rank,
             dst_local_rank,
             std::strerror(errno));
-        std::fflush(stderr);
 
         throw std::runtime_error("Broker: failed to send fd");
     }
@@ -490,12 +444,7 @@ void recv_fd(int sock_fd, int* out_fd, int* out_src_local_rank) {
             continue;
         }
 
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] recvmsg fd failed: %s\n",
-            std::strerror(errno));
-        std::fflush(stderr);
-
+        OOVERLAP_LOG_ERROR("recvmsg fd failed: %s\n", std::strerror(errno));
         throw std::runtime_error("Broker: failed to receive fd");
     }
 
@@ -538,16 +487,14 @@ Broker::Broker(int local_rank, int local_world_size, const char* key)
         throw std::runtime_error("Broker: local_world_size exceeds MAX_LOCAL_WORLD_SIZE");
     }
 
-    std::fprintf(
-        stderr,
-        "[ooverlap][broker] construct begin this=%p rank=%d world=%d shm=%s socket_prefix=%s sizeof(Broker)=%zu\n",
+    OOVERLAP_LOG_DEBUG(
+        "broker construct begin this=%p rank=%d world=%d shm=%s socket_prefix=%s sizeof(Broker)=%zu\n",
         static_cast<void*>(this),
         local_rank_,
         local_world_size_,
         shm_key_.c_str(),
         socket_prefix_.c_str(),
         sizeof(Broker));
-    std::fflush(stderr);
 
     if (local_rank_ == 0) {
         shm_raw_ = broker_detail::create_shm(
@@ -575,16 +522,14 @@ Broker::Broker(int local_rank, int local_world_size, const char* key)
 
     broker_detail::sync(local_world_size_, shm_);
 
-    std::fprintf(
-        stderr,
-        "[ooverlap][broker] construct end this=%p rank=%d shm_raw=%p shm=%p sock=%d sizeof(Broker)=%zu\n",
+    OOVERLAP_LOG_DEBUG(
+        "broker construct end this=%p rank=%d shm_raw=%p shm=%p sock=%d sizeof(Broker)=%zu\n",
         static_cast<void*>(this),
         local_rank_,
         shm_raw_,
         static_cast<void*>(shm_),
         sock_,
         sizeof(Broker));
-    std::fflush(stderr);
 }
 
 Broker::~Broker() {
@@ -605,9 +550,8 @@ void Broker::check_alive(const char* where) const {
     }
 
     if (shm_raw_ == nullptr || shm_ == nullptr) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] null shm in %s this=%p rank=%d world=%d shm_raw=%p shm=%p key=%s sizeof(Broker)=%zu\n",
+        OOVERLAP_LOG_ERROR(
+            "broker null shm in %s this=%p rank=%d world=%d shm_raw=%p shm=%p key=%s sizeof(Broker)=%zu\n",
             where,
             static_cast<const void*>(this),
             local_rank_,
@@ -616,15 +560,13 @@ void Broker::check_alive(const char* where) const {
             static_cast<void*>(shm_),
             shm_key_.c_str(),
             sizeof(Broker));
-        std::fflush(stderr);
 
         throw std::runtime_error(std::string("Broker null shm in ") + where);
     }
 
     if (shm_->init != broker_detail::INIT_CODE) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] bad magic in %s this=%p rank=%d init=0x%x expected=0x%x shm=%p sizeof(Broker)=%zu\n",
+        OOVERLAP_LOG_ERROR(
+            "broker bad magic in %s this=%p rank=%d init=0x%x expected=0x%x shm=%p sizeof(Broker)=%zu\n",
             where,
             static_cast<const void*>(this),
             local_rank_,
@@ -632,7 +574,6 @@ void Broker::check_alive(const char* where) const {
             static_cast<unsigned>(broker_detail::INIT_CODE),
             static_cast<void*>(shm_),
             sizeof(Broker));
-        std::fflush(stderr);
 
         throw std::runtime_error(std::string("Broker bad magic in ") + where);
     }
@@ -663,9 +604,8 @@ void Broker::exchange_data(void* dst, const void* src, size_t size) {
         throw std::runtime_error("Broker: invalid exchange_data size");
     }
 
-    std::fprintf(
-        stderr,
-        "[ooverlap][broker] exchange_data begin this=%p rank=%d size=%zu shm_raw=%p shm=%p generation=%d sizeof(Broker)=%zu\n",
+    OOVERLAP_LOG_TRACE(
+        "broker exchange_data begin this=%p rank=%d size=%zu shm_raw=%p shm=%p generation=%d sizeof(Broker)=%zu\n",
         static_cast<void*>(this),
         local_rank_,
         size,
@@ -673,7 +613,6 @@ void Broker::exchange_data(void* dst, const void* src, size_t size) {
         static_cast<void*>(shm_),
         shm_ ? shm_->barrier_generation : -1,
         sizeof(Broker));
-    std::fflush(stderr);
 
     uint8_t* dst_bytes = reinterpret_cast<uint8_t*>(dst);
     const uint8_t* src_bytes = reinterpret_cast<const uint8_t*>(src);
@@ -696,15 +635,13 @@ void Broker::exchange_data(void* dst, const void* src, size_t size) {
 
     sync();
 
-    std::fprintf(
-        stderr,
-        "[ooverlap][broker] exchange_data end this=%p rank=%d size=%zu generation=%d sizeof(Broker)=%zu\n",
+    OOVERLAP_LOG_TRACE(
+        "broker exchange_data end this=%p rank=%d size=%zu generation=%d sizeof(Broker)=%zu\n",
         static_cast<void*>(this),
         local_rank_,
         size,
         shm_->barrier_generation,
         sizeof(Broker));
-    std::fflush(stderr);
 }
 
 void Broker::exchange_fds(int* dst_fds, int src_fd) {
@@ -718,14 +655,12 @@ void Broker::exchange_fds(int* dst_fds, int src_fd) {
         throw std::runtime_error("Broker: exchange_fds source fd is invalid");
     }
 
-    std::fprintf(
-        stderr,
-        "[ooverlap][broker] exchange_fds begin this=%p rank=%d src_fd=%d sizeof(Broker)=%zu\n",
+    OOVERLAP_LOG_TRACE(
+        "broker exchange_fds begin this=%p rank=%d src_fd=%d sizeof(Broker)=%zu\n",
         static_cast<void*>(this),
         local_rank_,
         src_fd,
         sizeof(Broker));
-    std::fflush(stderr);
 
     for (int r = 0; r < local_world_size_; ++r) {
         dst_fds[r] = -1;
@@ -741,17 +676,14 @@ void Broker::exchange_fds(int* dst_fds, int src_fd) {
             int received_fd = -1;
             int src_rank = -1;
 
-            std::fprintf(stderr, "[ooverlap][broker] rank0 recv_fd wait\n");
-            std::fflush(stderr);
+            OOVERLAP_LOG_TRACE("broker rank0 recv_fd wait\n");
 
             broker_detail::recv_fd(sock_, &received_fd, &src_rank);
 
-            std::fprintf(
-                stderr,
-                "[ooverlap][broker] rank0 recv_fd got src_rank=%d fd=%d\n",
+            OOVERLAP_LOG_TRACE(
+                "broker rank0 recv_fd got src_rank=%d fd=%d\n",
                 src_rank,
                 received_fd);
-            std::fflush(stderr);
 
             if (src_rank <= 0 || src_rank >= local_world_size_) {
                 if (received_fd >= 0) {
@@ -770,13 +702,11 @@ void Broker::exchange_fds(int* dst_fds, int src_fd) {
                     continue;
                 }
 
-                std::fprintf(
-                    stderr,
-                    "[ooverlap][broker] rank0 send fd from src_rank=%d to dst_rank=%d fd=%d\n",
+                OOVERLAP_LOG_TRACE(
+                    "broker rank0 send fd from src_rank=%d to dst_rank=%d fd=%d\n",
                     src_rank,
                     dst_rank,
                     gathered[src_rank]);
-                std::fflush(stderr);
 
                 broker_detail::send_fd(
                     sock_,
@@ -794,12 +724,10 @@ void Broker::exchange_fds(int* dst_fds, int src_fd) {
         close(gathered[0]);
         gathered[0] = -1;
     } else {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] rank%d send fd to rank0 fd=%d\n",
+        OOVERLAP_LOG_TRACE(
+            "broker rank%d send fd to rank0 fd=%d\n",
             local_rank_,
             src_fd);
-        std::fflush(stderr);
 
         broker_detail::send_fd(
             sock_,
@@ -814,21 +742,17 @@ void Broker::exchange_fds(int* dst_fds, int src_fd) {
             int received_fd = -1;
             int src_rank = -1;
 
-            std::fprintf(
-                stderr,
-                "[ooverlap][broker] rank%d recv_fd wait\n",
+            OOVERLAP_LOG_TRACE(
+                "broker rank%d recv_fd wait\n",
                 local_rank_);
-            std::fflush(stderr);
 
             broker_detail::recv_fd(sock_, &received_fd, &src_rank);
 
-            std::fprintf(
-                stderr,
-                "[ooverlap][broker] rank%d recv_fd got src_rank=%d fd=%d\n",
+            OOVERLAP_LOG_TRACE(
+                "broker rank%d recv_fd got src_rank=%d fd=%d\n",
                 local_rank_,
                 src_rank,
                 received_fd);
-            std::fflush(stderr);
 
             if (src_rank < 0 ||
                 src_rank >= local_world_size_ ||
@@ -848,13 +772,11 @@ void Broker::exchange_fds(int* dst_fds, int src_fd) {
 
     sync();
 
-    std::fprintf(
-        stderr,
-        "[ooverlap][broker] exchange_fds end this=%p rank=%d sizeof(Broker)=%zu\n",
+    OOVERLAP_LOG_TRACE(
+        "broker exchange_fds end this=%p rank=%d sizeof(Broker)=%zu\n",
         static_cast<void*>(this),
         local_rank_,
         sizeof(Broker));
-    std::fflush(stderr);
 }
 
 void Broker::broadcast_fd(int* dst_fd, int src_fd, int src_rank) {
@@ -864,15 +786,13 @@ void Broker::broadcast_fd(int* dst_fd, int src_fd, int src_rank) {
         throw std::runtime_error("Broker: invalid broadcast source rank");
     }
 
-    std::fprintf(
-        stderr,
-        "[ooverlap][broker] broadcast_fd begin this=%p rank=%d src_rank=%d src_fd=%d sizeof(Broker)=%zu\n",
+    OOVERLAP_LOG_TRACE(
+        "broker broadcast_fd begin this=%p rank=%d src_rank=%d src_fd=%d sizeof(Broker)=%zu\n",
         static_cast<void*>(this),
         local_rank_,
         src_rank,
         src_fd,
         sizeof(Broker));
-    std::fflush(stderr);
 
     sync();
 
@@ -915,28 +835,24 @@ void Broker::broadcast_fd(int* dst_fd, int src_fd, int src_rank) {
 
     sync();
 
-    std::fprintf(
-        stderr,
-        "[ooverlap][broker] broadcast_fd end this=%p rank=%d sizeof(Broker)=%zu\n",
+    OOVERLAP_LOG_TRACE(
+        "broker broadcast_fd end this=%p rank=%d sizeof(Broker)=%zu\n",
         static_cast<void*>(this),
         local_rank_,
         sizeof(Broker));
-    std::fflush(stderr);
 }
 
 void Broker::destroy() {
     const int old_rank = local_rank_;
 
     if (old_rank >= 0) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] destroy begin this=%p rank=%d shm=%p sock=%d sizeof(Broker)=%zu\n",
+        OOVERLAP_LOG_DEBUG(
+            "broker destroy begin this=%p rank=%d shm=%p sock=%d sizeof(Broker)=%zu\n",
             static_cast<void*>(this),
             old_rank,
             static_cast<void*>(shm_),
             sock_,
             sizeof(Broker));
-        std::fflush(stderr);
     }
 
     if (old_rank == 0 && !shm_key_.empty()) {
@@ -962,13 +878,11 @@ void Broker::destroy() {
     local_world_size_ = -1;
 
     if (old_rank >= 0) {
-        std::fprintf(
-            stderr,
-            "[ooverlap][broker] destroy end this=%p rank=%d sizeof(Broker)=%zu\n",
+        OOVERLAP_LOG_DEBUG(
+            "broker destroy end this=%p rank=%d sizeof(Broker)=%zu\n",
             static_cast<void*>(this),
             old_rank,
             sizeof(Broker));
-        std::fflush(stderr);
     }
 }
 
