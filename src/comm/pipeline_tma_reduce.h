@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/exec/pipeline_stage.h"
+#include "comm/pipeline_stage.h"
 #include "ooverlap/tma/tma_reduce.cuh"
 
 #include <cuda_bf16.h>

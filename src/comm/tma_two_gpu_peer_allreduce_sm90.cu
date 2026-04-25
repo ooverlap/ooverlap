@@ -2,10 +2,10 @@
 
 #include "ooverlap/system/runtime_utils.cuh"
 
-#include "comm/exec/pipeline_stage.h"
-#include "comm/exec/pipeline_tma_load.h"
-#include "comm/exec/pipeline_tma_copy.h"
-#include "comm/exec/pipeline_tma_reduce.h"
+#include "comm/pipeline_stage.h"
+#include "comm/pipeline_tma_load.h"
+#include "comm/pipeline_tma_copy.h"
+#include "comm/pipeline_tma_reduce.h"
 
 #include "comm/params.h"
 #include "comm/utils.h"

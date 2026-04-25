@@ -300,7 +300,8 @@ oo_status_t oo_buffer_wrap(
     }
     *out_buffer = nullptr;
 
-    if (node == nullptr || node->group == nullptr || ptr == nullptr || bytes == 0) {
+    if (node == nullptr || node->group == nullptr ||
+        ptr == nullptr || bytes == 0) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
@@ -370,7 +371,12 @@ oo_status_t oo_allreduce(
         return OO_ERROR_UNSUPPORTED;
     }
 
-    if (dtype != OO_DTYPE_FLOAT16 || op != OO_REDUCE_SUM) {
+    const size_t elem_bytes = dtype_size(dtype);
+    if (elem_bytes == 0) {
+        return OO_ERROR_UNSUPPORTED;
+    }
+
+    if (op != OO_REDUCE_SUM) {
         return OO_ERROR_UNSUPPORTED;
     }
 
@@ -397,7 +403,7 @@ oo_status_t oo_allreduce(
     }
 
     size_t required_bytes = 0;
-    if (!checked_mul_size(count, dtype_size(dtype), &required_bytes)) {
+    if (!checked_mul_size(count, elem_bytes, &required_bytes)) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
@@ -411,6 +417,7 @@ oo_status_t oo_allreduce(
     }
 
     const int collective_epoch = ++node->collective_epoch;
+
     int* local_ready_signal =
         reinterpret_cast<int*>(node->group->ready_signals[node->rank].ptr);
     const int* peer_ready_signal =
@@ -418,10 +425,12 @@ oo_status_t oo_allreduce(
 
     try {
         cudaError_t err = ooverlap::enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            reinterpret_cast<const half*>(local->ptr),
-            reinterpret_cast<half*>(local->ptr),
-            reinterpret_cast<half*>(peer->ptr),
+            local->ptr,
+            local->ptr,
+            peer->ptr,
             count,
+            dtype,
+            op,
             node->rank,
             node->group->devices[0],
             node->group->devices[1],
