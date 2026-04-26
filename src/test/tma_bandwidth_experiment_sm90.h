@@ -16,6 +16,7 @@ benchmark_tma_bandwidth_experiment_sm90(
     int num_blocks,
     int dev0,
     int dev1,
-    bool include_mem_async);
+    bool include_mem_async,
+    bool include_nccl);
 
 } // namespace ooverlap

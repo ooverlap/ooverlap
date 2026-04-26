@@ -18,6 +18,8 @@ METHOD_NAME = {
     0: "tma_copy",
     1: "tma_reduce_add_f16",
     2: "mem_async_copy",
+    3: "gmem_copy_u128",
+    4: "nccl_sendrecv",
 }
 
 
@@ -70,7 +72,13 @@ def print_table(rows):
 
 def ordered_methods(rows):
     present = {r["method_name"] for r in rows}
-    preferred = ["tma_copy", "tma_reduce_add_f16"]
+    preferred = [
+        "tma_copy",
+        "gmem_copy_u128",
+        "nccl_sendrecv",
+        "tma_reduce_add_f16",
+        "mem_async_copy",
+    ]
     return [m for m in preferred if m in present]
 
 
@@ -102,11 +110,11 @@ def plot_rows(rows, output_prefix):
         plt.ylabel("Effective bandwidth (GB/s)")
 
         if scenario == "local_to_peer":
-            title = "TMA bandwidth: local -> peer"
+            title = "Bandwidth: local -> peer"
         elif scenario == "peer_to_local":
-            title = "TMA bandwidth: peer -> local"
+            title = "Bandwidth: peer -> local"
         else:
-            title = "TMA bandwidth: same device"
+            title = "Bandwidth: same device"
 
         plt.title(title)
         plt.grid(True, which="both")
@@ -129,7 +137,12 @@ def main():
     parser.add_argument(
         "--include-mem-async",
         action="store_true",
-        help="Still benchmarks mem_async_copy, but plots only TMA copy/reduce.",
+        help="Include slow cuda::memcpy_async baseline.",
+    )
+    parser.add_argument(
+        "--include-nccl",
+        action="store_true",
+        help="Include NCCL ncclSend/ncclRecv one-way copy baseline.",
     )
     args = parser.parse_args()
 
@@ -140,7 +153,8 @@ def main():
         f"[info] min_bytes={args.min_bytes} max_bytes={args.max_bytes} "
         f"iters={args.iters} warmup={args.warmup} blocks={args.num_blocks} "
         f"dev0={args.dev0} dev1={args.dev1} "
-        f"include_mem_async={args.include_mem_async}"
+        f"include_mem_async={args.include_mem_async} "
+        f"include_nccl={args.include_nccl}"
     )
 
     ext = load_ooverlap_ext()
@@ -154,6 +168,7 @@ def main():
         args.dev0,
         args.dev1,
         args.include_mem_async,
+        args.include_nccl,
     )
 
     rows = normalize_rows(rows)

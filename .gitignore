@@ -2,3 +2,4 @@ build/
 exper/
 .cache
 .clangd
+*png

@@ -13,6 +13,7 @@
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <nccl.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -22,10 +23,21 @@
 #include <string>
 #include <vector>
 
+#define OOVERLAP_EXPERIMENT_NCCL_CHECK(cmd)                                      \
+    do {                                                                         \
+        ncclResult_t result__ = (cmd);                                           \
+        if (result__ != ncclSuccess) {                                           \
+            throw std::runtime_error(                                            \
+                std::string("NCCL error: ") + ncclGetErrorString(result__));     \
+        }                                                                        \
+    } while (0)
+
 namespace ooverlap {
 namespace {
 
 constexpr int kExperimentThreads = TMA_TWO_GPU_PEER_THREADS;
+constexpr int kExperimentGmemThreads = 256;
+
 constexpr int kExperimentChunkBytes = TMA_TWO_GPU_PEER_CHUNK_BYTES;
 constexpr int kExperimentStageDepth = TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH;
 constexpr int kExperimentFillDepth = TMA_TWO_GPU_PEER_COPY_STAGE_GAP;
@@ -50,6 +62,8 @@ enum class ExperimentMethod {
     kTmaCopy = 0,
     kTmaReduce = 1,
     kMemAsyncCopy = 2,
+    kGmemCopy = 3,
+    kNcclSendRecv = 4,
 };
 
 enum ExperimentScenarioId {
@@ -57,6 +71,7 @@ enum ExperimentScenarioId {
     kScenarioPeerToLocal = 1,
     kScenarioSameDev = 2,
 };
+
 __host__ __device__ __forceinline__ int ceil_div_int64_to_int(
     size_t x,
     size_t y) {
@@ -343,6 +358,37 @@ __global__ void mem_async_copy_kernel(
     __threadfence_system();
 }
 
+__global__ void gmem_copy_u128_kernel(
+    const void* src,
+    void* dst,
+    size_t total_bytes) {
+    const uint4* src_u128 = reinterpret_cast<const uint4*>(src);
+    uint4* dst_u128 = reinterpret_cast<uint4*>(dst);
+
+    const size_t num_u128 = total_bytes / sizeof(uint4);
+    const size_t tid =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride =
+        static_cast<size_t>(gridDim.x) * blockDim.x;
+
+    for (size_t i = tid; i < num_u128; i += stride) {
+        dst_u128[i] = src_u128[i];
+    }
+
+    const size_t tail_start = num_u128 * sizeof(uint4);
+
+    const unsigned char* src_u8 =
+        reinterpret_cast<const unsigned char*>(src);
+    unsigned char* dst_u8 =
+        reinterpret_cast<unsigned char*>(dst);
+
+    for (size_t i = tail_start + tid; i < total_bytes; i += stride) {
+        dst_u8[i] = src_u8[i];
+    }
+
+    __threadfence_system();
+}
+
 void configure_one_kernel(
     const void* kernel,
     size_t dynamic_smem_bytes,
@@ -410,6 +456,12 @@ void configure_experiment_kernels_once(int device) {
         device,
         "mem_async_copy_kernel");
 
+    configure_one_kernel(
+        reinterpret_cast<const void*>(gmem_copy_u128_kernel),
+        0,
+        device,
+        "gmem_copy_u128_kernel");
+
     if (device >= 0 && device < 16) {
         configured[device] = true;
     }
@@ -460,6 +512,17 @@ cudaError_t launch_method(
                     dst,
                     bytes,
                     num_chunks);
+            return cudaGetLastError();
+
+        case ExperimentMethod::kGmemCopy:
+            gmem_copy_u128_kernel<<<
+                num_blocks,
+                kExperimentGmemThreads,
+                0,
+                stream>>>(
+                    src,
+                    dst,
+                    bytes);
             return cudaGetLastError();
 
         default:
@@ -528,6 +591,165 @@ double benchmark_one_method_ms(
     return static_cast<double>(total_ms) / static_cast<double>(iters);
 }
 
+double benchmark_nccl_sendrecv_ms(
+    const void* src,
+    void* dst,
+    size_t bytes,
+    int src_device,
+    int dst_device,
+    int src_rank,
+    int dst_rank,
+    ncclComm_t src_comm,
+    ncclComm_t dst_comm,
+    int iters,
+    int warmup) {
+    cudaStream_t src_stream =
+        system::runtime::create_stream_on_device(src_device);
+    cudaStream_t dst_stream =
+        system::runtime::create_stream_on_device(dst_device);
+
+    cudaEvent_t src_start = nullptr;
+    cudaEvent_t src_stop = nullptr;
+    cudaEvent_t dst_start = nullptr;
+    cudaEvent_t dst_stop = nullptr;
+
+    try {
+        auto launch_once = [&]() {
+            OOVERLAP_EXPERIMENT_NCCL_CHECK(ncclGroupStart());
+
+            system::runtime::set_device(src_device);
+            OOVERLAP_EXPERIMENT_NCCL_CHECK(
+                ncclSend(
+                    src,
+                    bytes,
+                    ncclUint8,
+                    dst_rank,
+                    src_comm,
+                    src_stream));
+
+            system::runtime::set_device(dst_device);
+            OOVERLAP_EXPERIMENT_NCCL_CHECK(
+                ncclRecv(
+                    dst,
+                    bytes,
+                    ncclUint8,
+                    src_rank,
+                    dst_comm,
+                    dst_stream));
+
+            OOVERLAP_EXPERIMENT_NCCL_CHECK(ncclGroupEnd());
+        };
+
+        for (int i = 0; i < warmup; ++i) {
+            launch_once();
+        }
+
+        system::runtime::sync_stream_on_device(
+            src_device,
+            src_stream,
+            "sync NCCL send warmup");
+        system::runtime::sync_stream_on_device(
+            dst_device,
+            dst_stream,
+            "sync NCCL recv warmup");
+
+        system::runtime::set_device(src_device);
+        system::runtime::check_cuda(
+            cudaEventCreate(&src_start),
+            "cudaEventCreate(src_start)");
+        system::runtime::check_cuda(
+            cudaEventCreate(&src_stop),
+            "cudaEventCreate(src_stop)");
+        system::runtime::check_cuda(
+            cudaEventRecord(src_start, src_stream),
+            "cudaEventRecord(src_start)");
+
+        system::runtime::set_device(dst_device);
+        system::runtime::check_cuda(
+            cudaEventCreate(&dst_start),
+            "cudaEventCreate(dst_start)");
+        system::runtime::check_cuda(
+            cudaEventCreate(&dst_stop),
+            "cudaEventCreate(dst_stop)");
+        system::runtime::check_cuda(
+            cudaEventRecord(dst_start, dst_stream),
+            "cudaEventRecord(dst_start)");
+
+        for (int i = 0; i < iters; ++i) {
+            launch_once();
+        }
+
+        system::runtime::set_device(src_device);
+        system::runtime::check_cuda(
+            cudaEventRecord(src_stop, src_stream),
+            "cudaEventRecord(src_stop)");
+
+        system::runtime::set_device(dst_device);
+        system::runtime::check_cuda(
+            cudaEventRecord(dst_stop, dst_stream),
+            "cudaEventRecord(dst_stop)");
+
+        system::runtime::set_device(src_device);
+        system::runtime::check_cuda(
+            cudaEventSynchronize(src_stop),
+            "cudaEventSynchronize(src_stop)");
+
+        system::runtime::set_device(dst_device);
+        system::runtime::check_cuda(
+            cudaEventSynchronize(dst_stop),
+            "cudaEventSynchronize(dst_stop)");
+
+        float src_ms = 0.0f;
+        float dst_ms = 0.0f;
+
+        system::runtime::set_device(src_device);
+        system::runtime::check_cuda(
+            cudaEventElapsedTime(&src_ms, src_start, src_stop),
+            "cudaEventElapsedTime(src)");
+
+        system::runtime::set_device(dst_device);
+        system::runtime::check_cuda(
+            cudaEventElapsedTime(&dst_ms, dst_start, dst_stop),
+            "cudaEventElapsedTime(dst)");
+
+        system::runtime::set_device(src_device);
+        cudaEventDestroy(src_start);
+        cudaEventDestroy(src_stop);
+
+        system::runtime::set_device(dst_device);
+        cudaEventDestroy(dst_start);
+        cudaEventDestroy(dst_stop);
+
+        system::runtime::destroy_stream_on_device(src_device, src_stream);
+        system::runtime::destroy_stream_on_device(dst_device, dst_stream);
+
+        return static_cast<double>(std::max(src_ms, dst_ms)) /
+               static_cast<double>(iters);
+    } catch (...) {
+        if (src_start != nullptr) {
+            system::runtime::set_device(src_device);
+            cudaEventDestroy(src_start);
+        }
+        if (src_stop != nullptr) {
+            system::runtime::set_device(src_device);
+            cudaEventDestroy(src_stop);
+        }
+        if (dst_start != nullptr) {
+            system::runtime::set_device(dst_device);
+            cudaEventDestroy(dst_start);
+        }
+        if (dst_stop != nullptr) {
+            system::runtime::set_device(dst_device);
+            cudaEventDestroy(dst_stop);
+        }
+
+        system::runtime::destroy_stream_on_device(src_device, src_stream);
+        system::runtime::destroy_stream_on_device(dst_device, dst_stream);
+
+        throw;
+    }
+}
+
 void memset_buffer(
     int device,
     void* ptr,
@@ -570,26 +792,6 @@ void add_result(
     results.push_back(row);
 }
 
-void initialize_buffer(
-    int device,
-    void* ptr,
-    int value,
-    size_t bytes) {
-    cudaStream_t stream = system::runtime::create_stream_on_device(device);
-
-    try {
-        memset_buffer(device, ptr, value, bytes, stream);
-        system::runtime::sync_stream_on_device(
-            device,
-            stream,
-            "sync initialize buffer");
-        system::runtime::destroy_stream_on_device(device, stream);
-    } catch (...) {
-        system::runtime::destroy_stream_on_device(device, stream);
-        throw;
-    }
-}
-
 void run_case_for_size(
     std::vector<std::map<std::string, double>>& results,
     int scenario_id,
@@ -600,7 +802,9 @@ void run_case_for_size(
     int num_blocks,
     int iters,
     int warmup,
-    bool include_mem_async) {
+    bool include_mem_async,
+    bool include_nccl,
+    ncclComm_t* comms) {
     std::vector<int> access_devices;
     auto add_access_device = [&](int device) {
         for (int d : access_devices) {
@@ -646,6 +850,7 @@ void run_case_for_size(
         std::vector<ExperimentMethod> methods = {
             ExperimentMethod::kTmaCopy,
             ExperimentMethod::kTmaReduce,
+            ExperimentMethod::kGmemCopy,
         };
 
         if (include_mem_async) {
@@ -677,6 +882,33 @@ void run_case_for_size(
                 latency_ms);
         }
 
+        if (include_nccl && comms != nullptr && src_device != dst_device) {
+            const double latency_ms =
+                benchmark_nccl_sendrecv_ms(
+                    src_buf.ptr,
+                    dst_buf.ptr,
+                    bytes,
+                    src_device,
+                    dst_device,
+                    0,
+                    1,
+                    comms[0],
+                    comms[1],
+                    iters,
+                    warmup);
+
+            add_result(
+                results,
+                scenario_id,
+                ExperimentMethod::kNcclSendRecv,
+                src_device,
+                dst_device,
+                -1,
+                bytes,
+                num_blocks,
+                latency_ms);
+        }
+
         system::runtime::destroy_stream_on_device(kernel_device, stream);
         system::free_peer_visible_buffer(src_buf);
         system::free_peer_visible_buffer(dst_buf);
@@ -699,12 +931,10 @@ void run_all_cases_for_size(
     int warmup,
     int dev0,
     int dev1,
-    bool include_mem_async) {
+    bool include_mem_async,
+    bool include_nccl,
+    ncclComm_t* comms) {
     if (dev0 != dev1) {
-        // local -> peer:
-        // kernel runs on dev0.
-        // src is local to the kernel.
-        // dst is peer memory on dev1.
         run_case_for_size(
             results,
             kScenarioLocalToPeer,
@@ -715,12 +945,10 @@ void run_all_cases_for_size(
             num_blocks,
             iters,
             warmup,
-            include_mem_async);
+            include_mem_async,
+            include_nccl,
+            comms);
 
-        // peer -> local:
-        // kernel runs on dev1.
-        // src is peer memory from dev0.
-        // dst is local memory on dev1.
         run_case_for_size(
             results,
             kScenarioPeerToLocal,
@@ -731,12 +959,11 @@ void run_all_cases_for_size(
             num_blocks,
             iters,
             warmup,
-            include_mem_async);
+            include_mem_async,
+            include_nccl,
+            comms);
     }
 
-    // same device:
-    // kernel runs on dev0.
-    // src and dst are both local dev0 memory.
     run_case_for_size(
         results,
         kScenarioSameDev,
@@ -747,7 +974,9 @@ void run_all_cases_for_size(
         num_blocks,
         iters,
         warmup,
-        include_mem_async);
+        include_mem_async,
+        false,
+        nullptr);
 }
 
 } // namespace
@@ -761,7 +990,8 @@ benchmark_tma_bandwidth_experiment_sm90(
     int num_blocks,
     int dev0,
     int dev1,
-    bool include_mem_async) {
+    bool include_mem_async,
+    bool include_nccl) {
     if (min_bytes <= 0 || max_bytes <= 0 || min_bytes > max_bytes) {
         throw std::invalid_argument(
             "benchmark_tma_bandwidth_experiment_sm90: invalid byte range");
@@ -784,23 +1014,48 @@ benchmark_tma_bandwidth_experiment_sm90(
 
     std::vector<std::map<std::string, double>> results;
 
-    for (int64_t bytes_i = min_bytes;
-         bytes_i <= max_bytes;
-         bytes_i *= 2) {
-        const size_t bytes = static_cast<size_t>(bytes_i);
+    ncclComm_t comms[2] = {nullptr, nullptr};
+    bool nccl_initialized = false;
 
-        run_all_cases_for_size(
-            results,
-            bytes,
-            num_blocks,
-            iters,
-            warmup,
-            dev0,
-            dev1,
-            include_mem_async);
+    try {
+        if (include_nccl && dev0 != dev1) {
+            int devices[2] = {dev0, dev1};
+            OOVERLAP_EXPERIMENT_NCCL_CHECK(
+                ncclCommInitAll(comms, 2, devices));
+            nccl_initialized = true;
+        }
+
+        for (int64_t bytes_i = min_bytes;
+             bytes_i <= max_bytes;
+             bytes_i *= 2) {
+            const size_t bytes = static_cast<size_t>(bytes_i);
+
+            run_all_cases_for_size(
+                results,
+                bytes,
+                num_blocks,
+                iters,
+                warmup,
+                dev0,
+                dev1,
+                include_mem_async,
+                include_nccl,
+                nccl_initialized ? comms : nullptr);
+        }
+
+        if (nccl_initialized) {
+            ncclCommDestroy(comms[0]);
+            ncclCommDestroy(comms[1]);
+        }
+
+        return results;
+    } catch (...) {
+        if (nccl_initialized) {
+            ncclCommDestroy(comms[0]);
+            ncclCommDestroy(comms[1]);
+        }
+        throw;
     }
-
-    return results;
 }
 
 } // namespace ooverlap
