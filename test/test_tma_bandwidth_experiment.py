@@ -18,10 +18,11 @@ METHOD_NAME = {
     0: "tma_copy",
     1: "tma_reduce_add_f16",
     2: "mem_async_copy",
-    3: "gmem_copy_u128",
+    3: "gmem_copy_u32",
     4: "nccl_sendrecv",
+    5: "gmem_copy_u64",
+    6: "gmem_copy_u128",
 }
-
 
 def load_ooverlap_ext():
     root = Path(__file__).resolve().parents[1]
@@ -49,7 +50,7 @@ def normalize_rows(rows):
 def print_table(rows):
     print(
         f"{'scenario':>15} "
-        f"{'method':>20} "
+        f"{'method':>27} "
         f"{'MiB':>10} "
         f"{'GB/s':>12} "
         f"{'src':>4} "
@@ -60,7 +61,7 @@ def print_table(rows):
     for r in rows:
         print(
             f"{r['scenario_name']:>15} "
-            f"{r['method_name']:>20} "
+            f"{r['method_name']:>27} "
             f"{r['mib']:10.1f} "
             f"{r['gbps']:12.2f} "
             f"{int(r['src_device']):4d} "
@@ -74,11 +75,14 @@ def ordered_methods(rows):
     present = {r["method_name"] for r in rows}
     preferred = [
         "tma_copy",
+        "gmem_copy_u32",
+        "gmem_copy_u64",
         "gmem_copy_u128",
         "nccl_sendrecv",
         "tma_reduce_add_f16",
         "mem_async_copy",
     ]
+    
     return [m for m in preferred if m in present]
 
 

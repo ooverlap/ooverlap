@@ -62,8 +62,10 @@ enum class ExperimentMethod {
     kTmaCopy = 0,
     kTmaReduce = 1,
     kMemAsyncCopy = 2,
-    kGmemCopy = 3,
+    kGmemCopyU32 = 3,
     kNcclSendRecv = 4,
+    kGmemCopyU64 = 5,
+    kGmemCopyU128 = 6,
 };
 
 enum ExperimentScenarioId {
@@ -358,35 +360,193 @@ __global__ void mem_async_copy_kernel(
     __threadfence_system();
 }
 
-__global__ void gmem_copy_u128_kernel(
-    const void* src,
-    void* dst,
+template <typename VecT>
+__device__ __forceinline__ VecT load_copy_vec(
+    const VecT* __restrict__ ptr) {
+    return ptr[0];
+}
+
+template <typename VecT>
+__device__ __forceinline__ void store_copy_vec(
+    VecT* __restrict__ ptr,
+    VecT value) {
+    ptr[0] = value;
+}
+
+template <>
+__device__ __forceinline__ uint4 load_copy_vec<uint4>(
+    const uint4* __restrict__ ptr) {
+    uint4 value;
+
+    asm volatile(
+        "{\n"
+        "  .reg .u64 addr;\n"
+        "  cvta.to.global.u64 addr, %4;\n"
+        "  ld.global.nc.v4.u32 {%0, %1, %2, %3}, [addr];\n"
+        "}\n"
+        : "=r"(value.x),
+          "=r"(value.y),
+          "=r"(value.z),
+          "=r"(value.w)
+        : "l"(ptr));
+
+    return value;
+}
+
+template <>
+__device__ __forceinline__ void store_copy_vec<uint4>(
+    uint4* __restrict__ ptr,
+    uint4 value) {
+    asm volatile(
+        "{\n"
+        "  .reg .u64 addr;\n"
+        "  cvta.to.global.u64 addr, %0;\n"
+        "  st.global.v4.u32 [addr], {%1, %2, %3, %4};\n"
+        "}\n"
+        :
+        : "l"(ptr),
+          "r"(value.x),
+          "r"(value.y),
+          "r"(value.z),
+          "r"(value.w)
+        : "memory");
+}
+
+template <typename VecT>
+__global__ void gmem_copy_coalesced_kernel(
+    const void* __restrict__ src,
+    void* __restrict__ dst,
     size_t total_bytes) {
-    const uint4* src_u128 = reinterpret_cast<const uint4*>(src);
-    uint4* dst_u128 = reinterpret_cast<uint4*>(dst);
-
-    const size_t num_u128 = total_bytes / sizeof(uint4);
-    const size_t tid =
-        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t stride =
-        static_cast<size_t>(gridDim.x) * blockDim.x;
-
-    for (size_t i = tid; i < num_u128; i += stride) {
-        dst_u128[i] = src_u128[i];
-    }
-
-    const size_t tail_start = num_u128 * sizeof(uint4);
-
-    const unsigned char* src_u8 =
+    const unsigned char* __restrict__ src_u8 =
         reinterpret_cast<const unsigned char*>(src);
-    unsigned char* dst_u8 =
+    unsigned char* __restrict__ dst_u8 =
         reinterpret_cast<unsigned char*>(dst);
 
-    for (size_t i = tail_start + tid; i < total_bytes; i += stride) {
-        dst_u8[i] = src_u8[i];
+    const size_t total_vec = total_bytes / sizeof(VecT);
+
+    const size_t block = static_cast<size_t>(blockIdx.x);
+    const size_t nblocks = static_cast<size_t>(gridDim.x);
+    const size_t lane = static_cast<size_t>(threadIdx.x);
+    const size_t block_threads = static_cast<size_t>(blockDim.x);
+
+    // Each CTA owns one contiguous slice instead of doing:
+    //     i = global_tid; i += gridDim.x * blockDim.x
+    //
+    // This keeps each CTA local to one region of memory. Within the CTA,
+    // consecutive threadIdx.x lanes still access consecutive VecT elements,
+    // which is the important coalescing rule.
+    constexpr size_t kWarpElems = 32;
+    constexpr int kUnroll = 4;
+
+    const size_t raw_vecs_per_block =
+        (total_vec + nblocks - 1) / nblocks;
+
+    // Round the slice size up to a warp-sized VecT multiple so each CTA starts
+    // closer to a naturally coalesced boundary.
+    const size_t vecs_per_block =
+        ((raw_vecs_per_block + kWarpElems - 1) / kWarpElems) * kWarpElems;
+
+    const size_t block_begin = block * vecs_per_block;
+    const size_t block_end =
+        min_sz(total_vec, block_begin + vecs_per_block);
+
+    const VecT* __restrict__ src_vec =
+        reinterpret_cast<const VecT*>(src);
+    VecT* __restrict__ dst_vec =
+        reinterpret_cast<VecT*>(dst);
+
+    const size_t step = block_threads * static_cast<size_t>(kUnroll);
+
+    for (size_t base = block_begin + lane;
+         base < block_end;
+         base += step) {
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const size_t i =
+                base + static_cast<size_t>(u) * block_threads;
+
+            if (i < block_end) {
+                const VecT value = load_copy_vec<VecT>(src_vec + i);
+                store_copy_vec<VecT>(dst_vec + i, value);
+            }
+        }
     }
 
-    __threadfence_system();
+    // Byte tail after the vectorized region. Only CTA 0 handles this to avoid
+    // duplicated tail stores.
+    const size_t tail_begin = total_vec * sizeof(VecT);
+
+    if (blockIdx.x == 0) {
+        for (size_t i = tail_begin + lane;
+             i < total_bytes;
+             i += block_threads) {
+            dst_u8[i] = src_u8[i];
+        }
+    }
+}
+
+
+template <typename VecT, int Unroll>
+__global__ void gmem_copy_contiguous_slice_kernel(
+    const void* __restrict__ src,
+    void* __restrict__ dst,
+    size_t total_bytes) {
+    const unsigned char* __restrict__ src_u8 =
+        reinterpret_cast<const unsigned char*>(src);
+    unsigned char* __restrict__ dst_u8 =
+        reinterpret_cast<unsigned char*>(dst);
+
+    const size_t total_vec = total_bytes / sizeof(VecT);
+
+    const size_t block = static_cast<size_t>(blockIdx.x);
+    const size_t nblocks = static_cast<size_t>(gridDim.x);
+    const size_t block_threads = static_cast<size_t>(blockDim.x);
+    const size_t lane = static_cast<size_t>(threadIdx.x);
+
+    // Each CTA owns one contiguous slice of the vectorized range.
+    // This removes the grid-stride interleaving pattern:
+    //     i = tid; i += gridDim.x * blockDim.x
+    // and replaces it with:
+    //     i in [block_start, block_end)
+    const size_t vecs_per_block =
+        (total_vec + nblocks - 1) / nblocks;
+
+    const size_t block_begin = block * vecs_per_block;
+    const size_t block_end =
+        min_sz(total_vec, block_begin + vecs_per_block);
+
+    const VecT* __restrict__ src_vec =
+        reinterpret_cast<const VecT*>(src);
+    VecT* __restrict__ dst_vec =
+        reinterpret_cast<VecT*>(dst);
+
+    // Inside each CTA, lanes are still consecutive, so every warp iteration
+    // is coalesced. Only the per-CTA slice advances.
+    const size_t step = block_threads * static_cast<size_t>(Unroll);
+
+    for (size_t base = block_begin + lane;
+         base < block_end;
+         base += step) {
+#pragma unroll
+        for (int u = 0; u < Unroll; ++u) {
+            const size_t i =
+                base + static_cast<size_t>(u) * block_threads;
+
+            if (i < block_end) {
+                dst_vec[i] = src_vec[i];
+            }
+        }
+    }
+
+    // Only one CTA handles the byte tail after the vectorized region.
+    const size_t tail_begin = total_vec * sizeof(VecT);
+    if (blockIdx.x == 0) {
+        for (size_t i = tail_begin + lane;
+             i < total_bytes;
+             i += block_threads) {
+            dst_u8[i] = src_u8[i];
+        }
+    }
 }
 
 void configure_one_kernel(
@@ -457,10 +617,22 @@ void configure_experiment_kernels_once(int device) {
         "mem_async_copy_kernel");
 
     configure_one_kernel(
-        reinterpret_cast<const void*>(gmem_copy_u128_kernel),
+        reinterpret_cast<const void*>(gmem_copy_coalesced_kernel<uint32_t>),
         0,
         device,
-        "gmem_copy_u128_kernel");
+        "gmem_copy_coalesced_kernel<uint32_t>");
+
+    configure_one_kernel(
+        reinterpret_cast<const void*>(gmem_copy_coalesced_kernel<uint2>),
+        0,
+        device,
+        "gmem_copy_coalesced_kernel<uint2>");
+
+    configure_one_kernel(
+        reinterpret_cast<const void*>(gmem_copy_coalesced_kernel<uint4>),
+        0,
+        device,
+        "gmem_copy_coalesced_kernel<uint4>");
 
     if (device >= 0 && device < 16) {
         configured[device] = true;
@@ -514,8 +686,30 @@ cudaError_t launch_method(
                     num_chunks);
             return cudaGetLastError();
 
-        case ExperimentMethod::kGmemCopy:
-            gmem_copy_u128_kernel<<<
+        case ExperimentMethod::kGmemCopyU32:
+            gmem_copy_coalesced_kernel<uint32_t><<<
+                num_blocks,
+                kExperimentGmemThreads,
+                0,
+                stream>>>(
+                    src,
+                    dst,
+                    bytes);
+            return cudaGetLastError();
+
+        case ExperimentMethod::kGmemCopyU64:
+            gmem_copy_coalesced_kernel<uint2><<<
+                num_blocks,
+                kExperimentGmemThreads,
+                0,
+                stream>>>(
+                    src,
+                    dst,
+                    bytes);
+            return cudaGetLastError();
+
+        case ExperimentMethod::kGmemCopyU128:
+            gmem_copy_coalesced_kernel<uint4><<<
                 num_blocks,
                 kExperimentGmemThreads,
                 0,
@@ -850,7 +1044,9 @@ void run_case_for_size(
         std::vector<ExperimentMethod> methods = {
             ExperimentMethod::kTmaCopy,
             ExperimentMethod::kTmaReduce,
-            ExperimentMethod::kGmemCopy,
+            ExperimentMethod::kGmemCopyU32,
+            ExperimentMethod::kGmemCopyU64,
+            ExperimentMethod::kGmemCopyU128,
         };
 
         if (include_mem_async) {
