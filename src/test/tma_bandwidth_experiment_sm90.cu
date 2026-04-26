@@ -30,8 +30,10 @@ constexpr int kExperimentChunkBytes = TMA_TWO_GPU_PEER_CHUNK_BYTES;
 constexpr int kExperimentStageDepth = TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH;
 constexpr int kExperimentFillDepth = TMA_TWO_GPU_PEER_COPY_STAGE_GAP;
 constexpr int kExperimentBarrierCount = TMA_TWO_GPU_PEER_BARRIER_COUNT;
+
 constexpr size_t kExperimentTmaSmemBytes =
     static_cast<size_t>(kExperimentStageDepth) * kExperimentChunkBytes;
+
 constexpr size_t kExperimentMemAsyncSmemBytes = kExperimentChunkBytes;
 
 static_assert(kExperimentStageDepth > 0, "stage depth must be positive");
@@ -44,6 +46,17 @@ struct ChunkRange {
     int chunk_count = 0;
 };
 
+enum class ExperimentMethod {
+    kTmaCopy = 0,
+    kTmaReduce = 1,
+    kMemAsyncCopy = 2,
+};
+
+enum ExperimentScenarioId {
+    kScenarioLocalToPeer = 0,
+    kScenarioPeerToLocal = 1,
+    kScenarioSameDev = 2,
+};
 __host__ __device__ __forceinline__ int ceil_div_int64_to_int(
     size_t x,
     size_t y) {
@@ -342,14 +355,17 @@ void configure_one_kernel(
         cudaGetDeviceProperties(&prop, device),
         "cudaGetDeviceProperties");
 
-    const size_t total_smem_bytes =
-        dynamic_smem_bytes +
+    const size_t static_smem_bytes =
         static_cast<size_t>(kExperimentBarrierCount) *
-            sizeof(sync::semaphore);
+        sizeof(sync::semaphore);
+
+    const size_t total_smem_bytes =
+        dynamic_smem_bytes + static_smem_bytes;
 
     if (total_smem_bytes > static_cast<size_t>(prop.sharedMemPerBlockOptin)) {
         throw std::runtime_error(
-            std::string(name) + ": requested shared memory exceeds opt-in limit");
+            std::string(name) +
+            ": requested shared memory exceeds opt-in limit");
     }
 
     if (dynamic_smem_bytes > static_cast<size_t>(prop.sharedMemPerBlock)) {
@@ -371,6 +387,7 @@ void configure_one_kernel(
 
 void configure_experiment_kernels_once(int device) {
     static bool configured[16] = {};
+
     if (device >= 0 && device < 16 && configured[device]) {
         return;
     }
@@ -395,25 +412,6 @@ void configure_experiment_kernels_once(int device) {
 
     if (device >= 0 && device < 16) {
         configured[device] = true;
-    }
-}
-
-enum class ExperimentMethod {
-    kTmaCopy = 0,
-    kTmaReduce = 1,
-    kMemAsyncCopy = 2,
-};
-
-const char* method_name(ExperimentMethod method) {
-    switch (method) {
-        case ExperimentMethod::kTmaCopy:
-            return "tma_copy";
-        case ExperimentMethod::kTmaReduce:
-            return "tma_reduce_add_f16";
-        case ExperimentMethod::kMemAsyncCopy:
-            return "mem_async_copy";
-        default:
-            return "unknown";
     }
 }
 
@@ -475,11 +473,11 @@ double benchmark_one_method_ms(
     void* dst,
     size_t bytes,
     int num_blocks,
-    int device,
+    int kernel_device,
     cudaStream_t stream,
     int iters,
     int warmup) {
-    system::runtime::set_device(device);
+    system::runtime::set_device(kernel_device);
 
     for (int i = 0; i < warmup; ++i) {
         system::runtime::check_cuda(
@@ -494,8 +492,12 @@ double benchmark_one_method_ms(
     cudaEvent_t start = nullptr;
     cudaEvent_t stop = nullptr;
 
-    system::runtime::check_cuda(cudaEventCreate(&start), "cudaEventCreate(start)");
-    system::runtime::check_cuda(cudaEventCreate(&stop), "cudaEventCreate(stop)");
+    system::runtime::check_cuda(
+        cudaEventCreate(&start),
+        "cudaEventCreate(start)");
+    system::runtime::check_cuda(
+        cudaEventCreate(&stop),
+        "cudaEventCreate(stop)");
 
     system::runtime::check_cuda(
         cudaEventRecord(start, stream),
@@ -540,8 +542,11 @@ void memset_buffer(
 
 void add_result(
     std::vector<std::map<std::string, double>>& results,
-    const char* scenario,
+    int scenario_id,
     ExperimentMethod method,
+    int src_device,
+    int dst_device,
+    int kernel_device,
     size_t bytes,
     int num_blocks,
     double latency_ms) {
@@ -552,10 +557,11 @@ void add_result(
             : 0.0;
 
     std::map<std::string, double> row;
-    row["scenario"] =
-        (std::string(scenario) == "peer") ? 0.0 : 1.0;
-    row["method"] =
-        static_cast<double>(static_cast<int>(method));
+    row["scenario"] = static_cast<double>(scenario_id);
+    row["method"] = static_cast<double>(static_cast<int>(method));
+    row["src_device"] = static_cast<double>(src_device);
+    row["dst_device"] = static_cast<double>(dst_device);
+    row["kernel_device"] = static_cast<double>(kernel_device);
     row["bytes"] = static_cast<double>(bytes);
     row["num_blocks"] = static_cast<double>(num_blocks);
     row["latency_ms"] = latency_ms;
@@ -564,20 +570,50 @@ void add_result(
     results.push_back(row);
 }
 
-void run_scenario_for_size(
+void initialize_buffer(
+    int device,
+    void* ptr,
+    int value,
+    size_t bytes) {
+    cudaStream_t stream = system::runtime::create_stream_on_device(device);
+
+    try {
+        memset_buffer(device, ptr, value, bytes, stream);
+        system::runtime::sync_stream_on_device(
+            device,
+            stream,
+            "sync initialize buffer");
+        system::runtime::destroy_stream_on_device(device, stream);
+    } catch (...) {
+        system::runtime::destroy_stream_on_device(device, stream);
+        throw;
+    }
+}
+
+void run_case_for_size(
     std::vector<std::map<std::string, double>>& results,
-    const char* scenario,
+    int scenario_id,
     int src_device,
     int dst_device,
+    int kernel_device,
     size_t bytes,
     int num_blocks,
     int iters,
     int warmup,
     bool include_mem_async) {
-    const std::vector<int> access_devices =
-        (src_device == dst_device)
-            ? std::vector<int>{src_device}
-            : std::vector<int>{src_device, dst_device};
+    std::vector<int> access_devices;
+    auto add_access_device = [&](int device) {
+        for (int d : access_devices) {
+            if (d == device) {
+                return;
+            }
+        }
+        access_devices.push_back(device);
+    };
+
+    add_access_device(src_device);
+    add_access_device(dst_device);
+    add_access_device(kernel_device);
 
     system::mapped_peer_buffer src_buf =
         system::alloc_peer_visible_buffer(bytes, src_device, access_devices);
@@ -587,14 +623,14 @@ void run_scenario_for_size(
     cudaStream_t stream = nullptr;
 
     try {
-        configure_experiment_kernels_once(dst_device);
+        configure_experiment_kernels_once(kernel_device);
 
-        stream = system::runtime::create_stream_on_device(dst_device);
+        stream = system::runtime::create_stream_on_device(kernel_device);
 
         memset_buffer(dst_device, dst_buf.ptr, 0, bytes, stream);
 
-        // The source buffer is owned by src_device. Initialize it on src_device.
-        cudaStream_t src_stream = system::runtime::create_stream_on_device(src_device);
+        cudaStream_t src_stream =
+            system::runtime::create_stream_on_device(src_device);
         memset_buffer(src_device, src_buf.ptr, 1, bytes, src_stream);
         system::runtime::sync_stream_on_device(
             src_device,
@@ -611,14 +647,12 @@ void run_scenario_for_size(
             ExperimentMethod::kTmaCopy,
             ExperimentMethod::kTmaReduce,
         };
-        
+
         if (include_mem_async) {
             methods.push_back(ExperimentMethod::kMemAsyncCopy);
         }
-        
+
         for (ExperimentMethod method : methods) {
-            // Do not reset dst inside the timed loop; this experiment measures
-            // kernel transfer/reduce throughput only, not cudaMemset.
             const double latency_ms =
                 benchmark_one_method_ms(
                     method,
@@ -626,32 +660,94 @@ void run_scenario_for_size(
                     dst_buf.ptr,
                     bytes,
                     num_blocks,
-                    dst_device,
+                    kernel_device,
                     stream,
                     iters,
                     warmup);
 
             add_result(
                 results,
-                scenario,
+                scenario_id,
                 method,
+                src_device,
+                dst_device,
+                kernel_device,
                 bytes,
                 num_blocks,
                 latency_ms);
         }
 
-        system::runtime::destroy_stream_on_device(dst_device, stream);
+        system::runtime::destroy_stream_on_device(kernel_device, stream);
         system::free_peer_visible_buffer(src_buf);
         system::free_peer_visible_buffer(dst_buf);
     } catch (...) {
         if (stream != nullptr) {
-            system::runtime::destroy_stream_on_device(dst_device, stream);
+            system::runtime::destroy_stream_on_device(kernel_device, stream);
         }
 
         system::free_peer_visible_buffer(src_buf);
         system::free_peer_visible_buffer(dst_buf);
         throw;
     }
+}
+
+void run_all_cases_for_size(
+    std::vector<std::map<std::string, double>>& results,
+    size_t bytes,
+    int num_blocks,
+    int iters,
+    int warmup,
+    int dev0,
+    int dev1,
+    bool include_mem_async) {
+    if (dev0 != dev1) {
+        // local -> peer:
+        // kernel runs on dev0.
+        // src is local to the kernel.
+        // dst is peer memory on dev1.
+        run_case_for_size(
+            results,
+            kScenarioLocalToPeer,
+            dev0,
+            dev1,
+            dev0,
+            bytes,
+            num_blocks,
+            iters,
+            warmup,
+            include_mem_async);
+
+        // peer -> local:
+        // kernel runs on dev1.
+        // src is peer memory from dev0.
+        // dst is local memory on dev1.
+        run_case_for_size(
+            results,
+            kScenarioPeerToLocal,
+            dev0,
+            dev1,
+            dev1,
+            bytes,
+            num_blocks,
+            iters,
+            warmup,
+            include_mem_async);
+    }
+
+    // same device:
+    // kernel runs on dev0.
+    // src and dst are both local dev0 memory.
+    run_case_for_size(
+        results,
+        kScenarioSameDev,
+        dev0,
+        dev0,
+        dev0,
+        bytes,
+        num_blocks,
+        iters,
+        warmup,
+        include_mem_async);
 }
 
 } // namespace
@@ -693,30 +789,14 @@ benchmark_tma_bandwidth_experiment_sm90(
          bytes_i *= 2) {
         const size_t bytes = static_cast<size_t>(bytes_i);
 
-        // Scenario 1: source on dev0, destination on dev1, kernel runs on dev1.
-        if (dev0 != dev1) {
-            run_scenario_for_size(
+        run_all_cases_for_size(
             results,
-            "peer",
+            bytes,
+            num_blocks,
+            iters,
+            warmup,
             dev0,
             dev1,
-            bytes,
-            num_blocks,
-            iters,
-            warmup,
-            include_mem_async);
-        }
-
-        // Scenario 2: source and destination both on dev0, kernel runs on dev0.
-        run_scenario_for_size(
-            results,
-            "same",
-            dev0,
-            dev0,
-            bytes,
-            num_blocks,
-            iters,
-            warmup,
             include_mem_async);
     }
 

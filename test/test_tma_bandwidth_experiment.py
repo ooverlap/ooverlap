@@ -2,7 +2,6 @@
 
 import argparse
 import importlib.util
-import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -10,8 +9,9 @@ import torch
 
 
 SCENARIO_NAME = {
-    0: "peer",
-    1: "same",
+    0: "local_to_peer",
+    1: "peer_to_local",
+    2: "same_dev",
 }
 
 METHOD_NAME = {
@@ -46,29 +46,37 @@ def normalize_rows(rows):
 
 def print_table(rows):
     print(
-        f"{'scenario':>8} "
+        f"{'scenario':>15} "
         f"{'method':>20} "
         f"{'MiB':>10} "
-        f"{'lat ms':>12} "
         f"{'GB/s':>12} "
+        f"{'src':>4} "
+        f"{'dst':>4} "
+        f"{'ker':>4} "
         f"{'blocks':>8}"
     )
     for r in rows:
         print(
-            f"{r['scenario_name']:>8} "
+            f"{r['scenario_name']:>15} "
             f"{r['method_name']:>20} "
             f"{r['mib']:10.1f} "
-            f"{r['latency_ms']:12.4f} "
             f"{r['gbps']:12.2f} "
+            f"{int(r['src_device']):4d} "
+            f"{int(r['dst_device']):4d} "
+            f"{int(r['kernel_device']):4d} "
             f"{int(r['num_blocks']):8d}"
         )
 
 
+def ordered_methods(rows):
+    present = {r["method_name"] for r in rows}
+    preferred = ["tma_copy", "tma_reduce_add_f16"]
+    return [m for m in preferred if m in present]
+
+
 def plot_rows(rows, output_prefix):
-    scenarios = ["peer", "same"]
-    methods = sorted({r["method_name"] for r in rows})
-    preferred = ["tma_copy", "tma_reduce_add_f16", "mem_async_copy"]
-    methods = [m for m in preferred if m in methods]
+    scenarios = ["local_to_peer", "peer_to_local", "same_dev"]
+    methods = ordered_methods(rows)
 
     for scenario in scenarios:
         subset = [r for r in rows if r["scenario_name"] == scenario]
@@ -76,6 +84,7 @@ def plot_rows(rows, output_prefix):
             continue
 
         plt.figure()
+
         for method in methods:
             data = sorted(
                 [r for r in subset if r["method_name"] == method],
@@ -83,6 +92,7 @@ def plot_rows(rows, output_prefix):
             )
             if not data:
                 continue
+
             xs = [r["mib"] for r in data]
             ys = [r["gbps"] for r in data]
             plt.plot(xs, ys, marker="o", label=method)
@@ -90,33 +100,20 @@ def plot_rows(rows, output_prefix):
         plt.xscale("log", base=2)
         plt.xlabel("Transfer size (MiB)")
         plt.ylabel("Effective bandwidth (GB/s)")
-        plt.title(f"TMA experiment bandwidth: {scenario}")
+
+        if scenario == "local_to_peer":
+            title = "TMA bandwidth: local -> peer"
+        elif scenario == "peer_to_local":
+            title = "TMA bandwidth: peer -> local"
+        else:
+            title = "TMA bandwidth: same device"
+
+        plt.title(title)
         plt.grid(True, which="both")
         plt.legend()
         plt.tight_layout()
         plt.savefig(f"{output_prefix}_{scenario}_bandwidth.png", dpi=200)
-
-        plt.figure()
-        for method in methods:
-            data = sorted(
-                [r for r in subset if r["method_name"] == method],
-                key=lambda x: x["bytes"],
-            )
-            if not data:
-                continue
-            xs = [r["mib"] for r in data]
-            ys = [r["latency_ms"] for r in data]
-            plt.plot(xs, ys, marker="o", label=method)
-
-        plt.xscale("log", base=2)
-        plt.yscale("log")
-        plt.xlabel("Transfer size (MiB)")
-        plt.ylabel("Latency per launch (ms)")
-        plt.title(f"TMA experiment latency: {scenario}")
-        plt.grid(True, which="both")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(f"{output_prefix}_{scenario}_latency.png", dpi=200)
+        plt.close()
 
 
 def main():
@@ -132,7 +129,7 @@ def main():
     parser.add_argument(
         "--include-mem-async",
         action="store_true",
-        help="Include slow cuda::memcpy_async baseline in the sweep.",
+        help="Still benchmarks mem_async_copy, but plots only TMA copy/reduce.",
     )
     args = parser.parse_args()
 
@@ -142,7 +139,8 @@ def main():
     print(
         f"[info] min_bytes={args.min_bytes} max_bytes={args.max_bytes} "
         f"iters={args.iters} warmup={args.warmup} blocks={args.num_blocks} "
-        f"dev0={args.dev0} dev1={args.dev1}"
+        f"dev0={args.dev0} dev1={args.dev1} "
+        f"include_mem_async={args.include_mem_async}"
     )
 
     ext = load_ooverlap_ext()
@@ -162,10 +160,9 @@ def main():
     print_table(rows)
     plot_rows(rows, args.output_prefix)
 
-    print(f"[done] wrote:")
-    for scenario in ["peer", "same"]:
+    print("[done] wrote:")
+    for scenario in ["local_to_peer", "peer_to_local", "same_dev"]:
         print(f"  {args.output_prefix}_{scenario}_bandwidth.png")
-        print(f"  {args.output_prefix}_{scenario}_latency.png")
 
 
 if __name__ == "__main__":
