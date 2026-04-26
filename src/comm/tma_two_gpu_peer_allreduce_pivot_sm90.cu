@@ -22,14 +22,17 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#ifndef OOVERLAP_PIVOT_DISABLE_FAST_COPY_ONLY
-#define OOVERLAP_PIVOT_DISABLE_FAST_COPY_ONLY 1
+#ifndef OOVERLAP_PIVOT_FAST_COPY_BATCH_CHUNKS
+#define OOVERLAP_PIVOT_FAST_COPY_BATCH_CHUNKS 16
 #endif
 
 namespace ooverlap {
 namespace {
 
-constexpr int kPivotProducerWarpThreads = 32;
+struct PivotSignalCacheEntry {
+    int* ptr = nullptr;
+    size_t capacity = 0;
+};
 
 __host__ __device__ __forceinline__ size_t dtype_size_bytes(
     oo_dtype_t dtype) {
@@ -118,78 +121,169 @@ __device__ __forceinline__ comm::utils::Window make_sub_window_sm90(
     return out;
 }
 
-template <typename ReduceOp>
-__device__ __forceinline__ void finish_reduce_tail_warp_sm90(
-    const comm::PipelineStage* stage,
-    int lane) {
-    using scalar_t = typename ReduceOp::scalar_t;
-
-    const size_t bulk_bytes = comm::pipeline_stage_bulk_bytes(stage);
-    const size_t tail_bytes = comm::pipeline_stage_tail_bytes(stage);
-
-    if (tail_bytes == 0) {
+__device__ __forceinline__ void publish_pivot_ready_count_sm90(
+    int* ready_count,
+    int count) {
+    if (ready_count == nullptr || count <= 0) {
         return;
     }
 
-    const size_t bulk_elems = bulk_bytes / sizeof(scalar_t);
-    const size_t tail_elems = tail_bytes / sizeof(scalar_t);
-
-    scalar_t* dst =
-        reinterpret_cast<scalar_t*>(stage->chunk.dst);
-    const scalar_t* src =
-        reinterpret_cast<const scalar_t*>(stage->smem);
-
-    for (size_t i = static_cast<size_t>(lane);
-         i < tail_elems;
-         i += static_cast<size_t>(kPivotProducerWarpThreads)) {
-        const size_t idx = bulk_elems + i;
-        dst[idx] = ReduceOp::apply_tail(dst[idx], src[idx]);
-    }
-}
-
-__device__ __forceinline__ void finish_copy_tail_warp_sm90(
-    const comm::PipelineStage* stage,
-    int lane) {
-    const size_t bulk_bytes = comm::pipeline_stage_bulk_bytes(stage);
-    const size_t tail_bytes = comm::pipeline_stage_tail_bytes(stage);
-
-    if (tail_bytes == 0) {
-        return;
-    }
-
-    unsigned char* dst = stage->chunk.dst + bulk_bytes;
-    const unsigned char* src = stage->smem + bulk_bytes;
-
-    for (size_t i = static_cast<size_t>(lane);
-         i < tail_bytes;
-         i += static_cast<size_t>(kPivotProducerWarpThreads)) {
-        dst[i] = src[i];
-    }
+    __threadfence();
+    atomicMax(ready_count, count);
 }
 
 __device__ __forceinline__ void fast_copy_chunk_u128_no_allocate_sm90(
     const unsigned char* __restrict__ src_bytes,
     unsigned char* __restrict__ dst_bytes,
-    size_t bytes,
-    int copy_thread,
-    int copy_threads) {
+    size_t bytes) {
     comm::fast_copy::copy_byte_range<uint4, 8>(
         src_bytes,
         dst_bytes,
         0,
         bytes,
-        static_cast<size_t>(copy_thread),
-        static_cast<size_t>(copy_threads));
+        static_cast<size_t>(threadIdx.x),
+        static_cast<size_t>(blockDim.x));
 }
 
-template <typename ReduceOp>
-__device__ void reduce_window_and_signal_pivot_sm90(
+/*
+ * Original full-CTA TMA pipeline, kept in the same shape as the normal kernel.
+ */
+template <int StageDepth, int FillDepth, typename Apply>
+__device__ void run_tma_window_pipeline_sm90(
+    const unsigned char* src_bytes,
+    unsigned char* dst_bytes,
+    comm::utils::Window window,
+    size_t total_bytes,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    comm::PipelineTMALoad load{};
+    Apply apply{};
+
+    for (int warm = 0; warm < FillDepth; ++warm) {
+        if (warm >= window.chunk_count) {
+            break;
+        }
+
+        const int chunk = window.start_chunk + warm;
+        const int slot = warm;
+
+        const size_t offset =
+            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+        const size_t bytes =
+            comm::utils::min_sz(
+                TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                total_bytes - offset);
+
+        comm::PipelineStage stage = comm::make_pipeline_stage(
+            comm::make_pipeline_chunk(
+                src_bytes + offset,
+                dst_bytes + offset,
+                bytes),
+            stage_ptr(shared_raw, slot),
+            &barriers[slot]);
+
+        if (threadIdx.x == 0) {
+            load.issue(&stage);
+        }
+
+        __syncthreads();
+    }
+
+    for (int iter = 0; iter < window.chunk_count; ++iter) {
+        const int chunk = window.start_chunk + iter;
+        const int cur_slot = iter % StageDepth;
+
+        const size_t offset =
+            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+        const size_t bytes =
+            comm::utils::min_sz(
+                TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                total_bytes - offset);
+
+        comm::PipelineStage cur_stage = comm::make_pipeline_stage(
+            comm::make_pipeline_chunk(
+                src_bytes + offset,
+                dst_bytes + offset,
+                bytes),
+            stage_ptr(shared_raw, cur_slot),
+            &barriers[cur_slot]);
+
+        if (threadIdx.x == 0) {
+            load.wait_ready(&cur_stage);
+        }
+
+        __syncthreads();
+
+        const int future_iter = iter + FillDepth;
+
+        if (future_iter < window.chunk_count) {
+            const int future_chunk = window.start_chunk + future_iter;
+            const int future_slot = future_iter % StageDepth;
+
+            const size_t future_offset =
+                static_cast<size_t>(future_chunk) *
+                TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+            const size_t future_bytes =
+                comm::utils::min_sz(
+                    TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                    total_bytes - future_offset);
+
+            comm::PipelineStage future_stage = comm::make_pipeline_stage(
+                comm::make_pipeline_chunk(
+                    src_bytes + future_offset,
+                    dst_bytes + future_offset,
+                    future_bytes),
+                stage_ptr(shared_raw, future_slot),
+                &barriers[future_slot]);
+
+            if (threadIdx.x == 0) {
+                if (iter >= FillDepth) {
+                    apply.wait_before_stage_reuse();
+                }
+
+                load.issue(&future_stage);
+            }
+        }
+
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            apply.issue_bulk(&cur_stage);
+        }
+
+        apply.finish_tail(&cur_stage);
+
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        apply.wait_complete();
+        __threadfence_system();
+    }
+
+    __syncthreads();
+}
+
+/*
+ * Full-CTA reduce pipeline plus per-window producer signal.
+ *
+ * Important:
+ * For chunks copied by the fast-copy CTA, we need the reduced destination
+ * chunk to be truly complete before publishing the counter. Therefore for
+ * those pivot chunks we use reduce_async_wait<FillDepth - 1>(), not only
+ * reduce_async_read_wait<FillDepth - 1>().
+ */
+template <typename ReduceApply>
+__device__ void reduce_window_and_signal_pivot_cta_sm90(
     const unsigned char* src_bytes,
     unsigned char* dst_bytes,
     comm::utils::Window window,
     size_t total_bytes,
     int pivot_count,
-    volatile int* reduced_pivot_count,
+    int* ready_count,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
     constexpr int StageDepth = TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH;
@@ -203,25 +297,36 @@ __device__ void reduce_window_and_signal_pivot_sm90(
         return;
     }
 
-    const unsigned int mask = 0xffffffffu;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-
     comm::PipelineTMALoad load{};
+    ReduceApply apply{};
 
-    auto publish_pivot_count = [&](int completed_count) {
-        if (pivot_count <= 0 || completed_count <= 0) {
+   
+    auto publish_completed = [&](int completed_count) {
+        if (threadIdx.x != 0 ||
+            ready_count == nullptr ||
+            pivot_count <= 0 ||
+            completed_count <= 0) {
             return;
         }
-
+    
         int publish_count = completed_count;
+    
         if (publish_count > pivot_count) {
             publish_count = pivot_count;
         }
-
-        if (lane == 0 && reduced_pivot_count[0] < publish_count) {
-            __threadfence();
-            reduced_pivot_count[0] = publish_count;
+    
+        constexpr int kBatchChunks = OOVERLAP_PIVOT_FAST_COPY_BATCH_CHUNKS;
+    
+        /*
+         * Publish only on batch boundaries, or for the final pivot chunk.
+         * This avoids one global fence/atomic per chunk.
+         */
+        if (publish_count < pivot_count &&
+            (publish_count % kBatchChunks) != 0) {
+            return;
         }
+    
+        publish_pivot_ready_count_sm90(ready_count, publish_count);
     };
 
     for (int warm = 0; warm < FillDepth; ++warm) {
@@ -248,11 +353,11 @@ __device__ void reduce_window_and_signal_pivot_sm90(
             stage_ptr(shared_raw, slot),
             &barriers[slot]);
 
-        if (lane == 0) {
+        if (threadIdx.x == 0) {
             load.issue(&stage);
         }
 
-        __syncwarp(mask);
+        __syncthreads();
     }
 
     for (int iter = 0; iter < window.chunk_count; ++iter) {
@@ -275,11 +380,11 @@ __device__ void reduce_window_and_signal_pivot_sm90(
             stage_ptr(shared_raw, cur_slot),
             &barriers[cur_slot]);
 
-        if (lane == 0) {
+        if (threadIdx.x == 0) {
             load.wait_ready(&cur_stage);
         }
 
-        __syncwarp(mask);
+        __syncthreads();
 
         const int future_iter = iter + FillDepth;
 
@@ -304,190 +409,179 @@ __device__ void reduce_window_and_signal_pivot_sm90(
                 stage_ptr(shared_raw, future_slot),
                 &barriers[future_slot]);
 
-            if (lane == 0) {
+            if (threadIdx.x == 0) {
                 if (iter >= FillDepth) {
                     const int completed_count = iter - FillDepth + 1;
-
+                 
                     if (completed_count <= pivot_count) {
-                        tma::reduce_async_wait<FillDepth - 1>();
-                        publish_pivot_count(completed_count);
+                        constexpr int kBatchChunks =
+                            OOVERLAP_PIVOT_FAST_COPY_BATCH_CHUNKS;
+                 
+                        const bool publish_now =
+                            completed_count == pivot_count ||
+                            ((completed_count % kBatchChunks) == 0);
+                 
+                        if (publish_now) {
+                            /*
+                             * Consumer CTA may read these chunks now, so wait for
+                             * the reduce result to be globally complete.
+                             */
+                            tma::reduce_async_read_wait<FillDepth - 1>();
+                            publish_completed(completed_count);
+                        } else {
+                            /*
+                             * No consumer reads this chunk yet. We only need the normal
+                             * stage-reuse wait.
+                             */
+                            apply.wait_before_stage_reuse();
+                        }
                     } else {
-                        tma::reduce_async_read_wait<FillDepth - 1>();
+                        apply.wait_before_stage_reuse();
                     }
-                }
+                } 
 
                 load.issue(&future_stage);
             }
         }
 
-        __syncwarp(mask);
+        __syncthreads();
 
-        if (lane == 0) {
-            const size_t bulk_bytes =
-                comm::pipeline_stage_bulk_bytes(&cur_stage);
-
-            if (bulk_bytes != 0) {
-                ReduceOp::issue_bulk(
-                    cur_stage.chunk.dst,
-                    cur_stage.smem,
-                    static_cast<uint32_t>(bulk_bytes));
-            }
+        if (threadIdx.x == 0) {
+            apply.issue_bulk(&cur_stage);
         }
 
-        __syncwarp(mask);
+        apply.finish_tail(&cur_stage);
 
-        finish_reduce_tail_warp_sm90<ReduceOp>(&cur_stage, lane);
-
-        __syncwarp(mask);
+        __syncthreads();
     }
 
-    if (lane == 0) {
-        tma::reduce_async_wait<0>();
+    if (threadIdx.x == 0) {
+        apply.wait_complete();
         __threadfence();
 
-        if (reduced_pivot_count[0] < pivot_count) {
-            reduced_pivot_count[0] = pivot_count;
+        if (pivot_count > 0) {
+            publish_pivot_ready_count_sm90(ready_count, pivot_count);
         }
+
+        __threadfence_system();
     }
 
-    __syncwarp(mask);
+    __syncthreads();
 }
 
-template <int StageDepth, int FillDepth>
-__device__ void copy_window_tma_warp_sm90(
+template <typename ReduceApply>
+__device__ void reduce_window_to_local_sm90(
+    const unsigned char* peer_buf_bytes,
+    unsigned char* local_buf_bytes,
+    comm::utils::Window window,
+    size_t total_bytes,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    run_tma_window_pipeline_sm90<
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+        ReduceApply>(
+            peer_buf_bytes,
+            local_buf_bytes,
+            window,
+            total_bytes,
+            shared_raw,
+            barriers);
+}
+
+__device__ void copy_window_tma_sm90(
     const unsigned char* src_bytes,
     unsigned char* dst_bytes,
     comm::utils::Window window,
     size_t total_bytes,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    static_assert(StageDepth > 0, "StageDepth must be > 0");
-    static_assert(FillDepth > 0, "FillDepth must be > 0");
-    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+    using CopyApply = comm::PipelineTMACopy<
+        TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_COPY_STAGE_GAP>;
 
-    if (window.chunk_count <= 0) {
+    run_tma_window_pipeline_sm90<
+        TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_COPY_STAGE_GAP,
+        CopyApply>(
+            src_bytes,
+            dst_bytes,
+            window,
+            total_bytes,
+            shared_raw,
+            barriers);
+}
+
+__device__ void fast_copy_pivot_prefix_cta_sm90(
+    const unsigned char* local_buf_bytes,
+    unsigned char* peer_buf_bytes,
+    comm::utils::Window window,
+    size_t total_bytes,
+    int pivot_count,
+    const int* ready_count) {
+    if (pivot_count <= 0 || ready_count == nullptr) {
         return;
     }
 
-    const unsigned int mask = 0xffffffffu;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
+    constexpr int kBatchChunks = OOVERLAP_PIVOT_FAST_COPY_BATCH_CHUNKS;
 
-    comm::PipelineTMALoad load{};
+    const volatile int* ready =
+        reinterpret_cast<const volatile int*>(ready_count);
 
-    using CopyApply =
-        comm::PipelineTMACopy<StageDepth, FillDepth>;
+    for (int begin = 0; begin < pivot_count; begin += kBatchChunks) {
+        int end = begin + kBatchChunks;
 
-    CopyApply apply{};
-
-    for (int warm = 0; warm < FillDepth; ++warm) {
-        if (warm >= window.chunk_count) {
-            break;
+        if (end > pivot_count) {
+            end = pivot_count;
         }
 
-        const int chunk = window.start_chunk + warm;
-        const int slot = warm;
-
-        const size_t offset =
-            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
-
-        const size_t bytes =
-            comm::utils::min_sz(
-                TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                total_bytes - offset);
-
-        comm::PipelineStage stage = comm::make_pipeline_stage(
-            comm::make_pipeline_chunk(
-                src_bytes + offset,
-                dst_bytes + offset,
-                bytes),
-            stage_ptr(shared_raw, slot),
-            &barriers[slot]);
-
-        if (lane == 0) {
-            load.issue(&stage);
+        /*
+         * Wait until the producer has completed the whole batch.
+         */
+        while (ready[0] < end) {
+#if defined(__CUDA_ARCH__)
+            __nanosleep(64);
+#endif
         }
 
-        __syncwarp(mask);
+        const int begin_chunk = window.start_chunk + begin;
+        const int end_chunk = window.start_chunk + end;
+
+        const size_t begin_offset =
+            static_cast<size_t>(begin_chunk) *
+            TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+        size_t end_offset =
+            static_cast<size_t>(end_chunk) *
+            TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+        if (end_offset > total_bytes) {
+            end_offset = total_bytes;
+        }
+
+        if (begin_offset >= end_offset) {
+            continue;
+        }
+
+        const size_t bytes = end_offset - begin_offset;
+
+        /*
+         * Copy the whole batch as one contiguous byte range.
+         * This should reduce loop overhead and make the fast path closer to
+         * the standalone fast copy benchmark.
+         */
+        fast_copy_chunk_u128_no_allocate_sm90(
+            local_buf_bytes + begin_offset,
+            peer_buf_bytes + begin_offset,
+            bytes);
     }
 
-    for (int iter = 0; iter < window.chunk_count; ++iter) {
-        const int chunk = window.start_chunk + iter;
-        const int cur_slot = iter % StageDepth;
-
-        const size_t offset =
-            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
-
-        const size_t bytes =
-            comm::utils::min_sz(
-                TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                total_bytes - offset);
-
-        comm::PipelineStage cur_stage = comm::make_pipeline_stage(
-            comm::make_pipeline_chunk(
-                src_bytes + offset,
-                dst_bytes + offset,
-                bytes),
-            stage_ptr(shared_raw, cur_slot),
-            &barriers[cur_slot]);
-
-        if (lane == 0) {
-            load.wait_ready(&cur_stage);
-        }
-
-        __syncwarp(mask);
-
-        const int future_iter = iter + FillDepth;
-
-        if (future_iter < window.chunk_count) {
-            const int future_chunk = window.start_chunk + future_iter;
-            const int future_slot = future_iter % StageDepth;
-
-            const size_t future_offset =
-                static_cast<size_t>(future_chunk) *
-                TMA_TWO_GPU_PEER_CHUNK_BYTES;
-
-            const size_t future_bytes =
-                comm::utils::min_sz(
-                    TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                    total_bytes - future_offset);
-
-            comm::PipelineStage future_stage = comm::make_pipeline_stage(
-                comm::make_pipeline_chunk(
-                    src_bytes + future_offset,
-                    dst_bytes + future_offset,
-                    future_bytes),
-                stage_ptr(shared_raw, future_slot),
-                &barriers[future_slot]);
-
-            if (lane == 0) {
-                if (iter >= FillDepth) {
-                    apply.wait_before_stage_reuse();
-                }
-
-                load.issue(&future_stage);
-            }
-        }
-
-        __syncwarp(mask);
-
-        if (lane == 0) {
-            apply.issue_bulk(&cur_stage);
-        }
-
-        finish_copy_tail_warp_sm90(&cur_stage, lane);
-
-        __syncwarp(mask);
-    }
-
-    if (lane == 0) {
-        apply.wait_complete();
+    if (threadIdx.x == 0) {
         __threadfence_system();
     }
-
-    __syncwarp(mask);
 }
-
-template <typename ReduceOp, int ElemBytes>
+    
+template <typename ReduceApply, int ElemBytes>
 __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
     const void* local_in,
     void* local_buf,
@@ -498,11 +592,30 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
     const int* peer_ready_signal,
     int collective_epoch,
     int pivot_numerator,
-    int pivot_denominator) {
+    int pivot_denominator,
+    int* pivot_ready_counts,
+    int owned_windows,
+    int blocks_per_window) {
     wait_for_collective_ready_sm90(
         local_ready_signal,
         peer_ready_signal,
         collective_epoch);
+
+    const bool cta_split = blocks_per_window == 2;
+
+    const int owned_window_idx =
+        cta_split
+            ? static_cast<int>(blockIdx.x) / 2
+            : static_cast<int>(blockIdx.x);
+
+    const int role =
+        cta_split
+            ? static_cast<int>(blockIdx.x) & 1
+            : 0;
+
+    if (owned_window_idx >= owned_windows) {
+        return;
+    }
 
     const size_t total_bytes = count * static_cast<size_t>(ElemBytes);
 
@@ -513,7 +626,7 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
 
     const int num_windows = comm::utils::window_num_chunks(num_chunks);
 
-    const int window_idx = 2 * static_cast<int>(blockIdx.x) + rank;
+    const int window_idx = 2 * owned_window_idx + rank;
 
     if (window_idx >= num_windows) {
         return;
@@ -526,20 +639,6 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
         return;
     }
 
-    extern __shared__ uint4 shared_storage_u4[];
-
-    unsigned char* shared_raw =
-        reinterpret_cast<unsigned char*>(shared_storage_u4);
-
-    __shared__ sync::semaphore barriers[TMA_TWO_GPU_PEER_BARRIER_COUNT];
-    __shared__ volatile int reduced_pivot_count;
-
-    if (threadIdx.x == 0) {
-        reduced_pivot_count = 0;
-    }
-
-    __syncthreads();
-
     const unsigned char* local_in_bytes =
         reinterpret_cast<const unsigned char*>(local_in);
 
@@ -551,132 +650,77 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
 
     (void)local_in_bytes;
 
-#if OOVERLAP_PIVOT_DISABLE_FAST_COPY_ONLY
+    const int pivot_count =
+        cta_split
+            ? compute_pivot_chunk_count(
+                  window.chunk_count,
+                  pivot_numerator,
+                  pivot_denominator)
+            : 0;
+
+    int* window_ready_count =
+        (pivot_ready_counts != nullptr)
+            ? pivot_ready_counts + owned_window_idx
+            : nullptr;
+
     /*
-     * Narrow debug mode:
+     * role 1: consumer CTA.
      *
-     * Compile out only the fast-copy consumer path.
-     *
-     * This keeps the pivot implementation's producer-warp reduce and
-     * producer-warp TMA copy in place. That lets us test whether the slow path
-     * is caused by:
-     *
-     *   A) my pivot reduce/copy implementation itself, or
-     *   B) the extra fast-copy consumer code/register pressure.
-     *
-     * Only the producer warp does useful work here. Other threads exit after
-     * the shared initialization barrier above.
+     * It only copies the prefix [0, pivot_count). It has no shared-memory TMA
+     * state, but the launch still reserves dynamic smem because this is one
+     * combined kernel. That is fine for this test.
      */
-    if (threadIdx.x >= kPivotProducerWarpThreads) {
-        return;
-    }
-
-    (void)pivot_numerator;
-    (void)pivot_denominator;
-
-    reduce_window_and_signal_pivot_sm90<ReduceOp>(
-        peer_buf_bytes,
-        local_buf_bytes,
-        window,
-        total_bytes,
-        0,
-        &reduced_pivot_count,
-        shared_raw,
-        barriers);
-
-    copy_window_tma_warp_sm90<
-        TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_COPY_STAGE_GAP>(
+    if (role == 1) {
+        fast_copy_pivot_prefix_cta_sm90(
             local_buf_bytes,
             peer_buf_bytes,
             window,
             total_bytes,
-            shared_raw,
-            barriers);
+            pivot_count,
+            window_ready_count);
+        return;
+    }
 
-    return;
-#else
-    const int pivot_count =
-        compute_pivot_chunk_count(
-            window.chunk_count,
-            pivot_numerator,
-            pivot_denominator);
+    /*
+     * role 0: producer CTA.
+     *
+     * This is intentionally full CTA, not one warp. That is the key difference
+     * from the previous slow pivot implementation.
+     */
+    extern __shared__ uint4 shared_storage_u4[];
+
+    unsigned char* shared_raw =
+        reinterpret_cast<unsigned char*>(shared_storage_u4);
+
+    __shared__ sync::semaphore barriers[TMA_TWO_GPU_PEER_BARRIER_COUNT];
 
     if (pivot_count <= 0) {
-        if (threadIdx.x >= kPivotProducerWarpThreads) {
-            return;
-        }
-
-        reduce_window_and_signal_pivot_sm90<ReduceOp>(
+        reduce_window_to_local_sm90<ReduceApply>(
             peer_buf_bytes,
             local_buf_bytes,
             window,
             total_bytes,
-            0,
-            &reduced_pivot_count,
             shared_raw,
             barriers);
 
-        copy_window_tma_warp_sm90<
-            TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
-            TMA_TWO_GPU_PEER_COPY_STAGE_GAP>(
-                local_buf_bytes,
-                peer_buf_bytes,
-                window,
-                total_bytes,
-                shared_raw,
-                barriers);
+        copy_window_tma_sm90(
+            local_buf_bytes,
+            peer_buf_bytes,
+            window,
+            total_bytes,
+            shared_raw,
+            barriers);
 
         return;
     }
 
-    if (threadIdx.x >= kPivotProducerWarpThreads) {
-        const int copy_thread =
-            static_cast<int>(threadIdx.x) - kPivotProducerWarpThreads;
-
-        const int copy_threads =
-            static_cast<int>(blockDim.x) - kPivotProducerWarpThreads;
-
-        if (copy_threads <= 0) {
-            return;
-        }
-
-        for (int iter = 0; iter < pivot_count; ++iter) {
-            while (reduced_pivot_count <= iter) {
-#if defined(__CUDA_ARCH__)
-                __nanosleep(64);
-#endif
-            }
-
-            const int chunk = window.start_chunk + iter;
-
-            const size_t offset =
-                static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
-
-            const size_t bytes =
-                comm::utils::min_sz(
-                    TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                    total_bytes - offset);
-
-            fast_copy_chunk_u128_no_allocate_sm90(
-                local_buf_bytes + offset,
-                peer_buf_bytes + offset,
-                bytes,
-                copy_thread,
-                copy_threads);
-        }
-
-        __threadfence_system();
-        return;
-    }
-
-    reduce_window_and_signal_pivot_sm90<ReduceOp>(
+    reduce_window_and_signal_pivot_cta_sm90<ReduceApply>(
         peer_buf_bytes,
         local_buf_bytes,
         window,
         total_bytes,
         pivot_count,
-        &reduced_pivot_count,
+        window_ready_count,
         shared_raw,
         barriers);
 
@@ -689,20 +733,52 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
                 pivot_count,
                 rest_count);
 
-        copy_window_tma_warp_sm90<
-            TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
-            TMA_TWO_GPU_PEER_COPY_STAGE_GAP>(
-                local_buf_bytes,
-                peer_buf_bytes,
-                rest_window,
-                total_bytes,
-                shared_raw,
-                barriers);
+        copy_window_tma_sm90(
+            local_buf_bytes,
+            peer_buf_bytes,
+            rest_window,
+            total_bytes,
+            shared_raw,
+            barriers);
     }
-#endif
 }
 
-template <typename ReduceOp, int ElemBytes>
+PivotSignalCacheEntry& pivot_signal_cache_for_device(int device) {
+    static std::mutex mutex;
+    static std::unordered_map<int, PivotSignalCacheEntry> cache;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    return cache[device];
+}
+
+int* ensure_pivot_signal_capacity(int device, size_t required_count) {
+    if (required_count == 0) {
+        return nullptr;
+    }
+
+    PivotSignalCacheEntry& entry = pivot_signal_cache_for_device(device);
+
+    if (entry.ptr != nullptr && entry.capacity >= required_count) {
+        return entry.ptr;
+    }
+
+    system::runtime::set_device(device);
+
+    if (entry.ptr != nullptr) {
+        cudaFree(entry.ptr);
+        entry.ptr = nullptr;
+        entry.capacity = 0;
+    }
+
+    system::runtime::check_cuda(
+        cudaMalloc(&entry.ptr, required_count * sizeof(int)),
+        "cudaMalloc(pivot ready counts)");
+
+    entry.capacity = required_count;
+    return entry.ptr;
+}
+
+template <typename ReduceApply, int ElemBytes>
 void configure_pivot_kernel_once_for(int device) {
     struct CacheEntry {
         bool configured = false;
@@ -747,7 +823,7 @@ void configure_pivot_kernel_once_for(int device) {
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
                 tma_two_gpu_allreduce_rank_pivot_kernel_sm90<
-                    ReduceOp,
+                    ReduceApply,
                     ElemBytes>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(dynamic_smem_bytes)),
@@ -757,7 +833,7 @@ void configure_pivot_kernel_once_for(int device) {
     system::runtime::check_cuda(
         cudaFuncSetAttribute(
             tma_two_gpu_allreduce_rank_pivot_kernel_sm90<
-                ReduceOp,
+                ReduceApply,
                 ElemBytes>,
             cudaFuncAttributePreferredSharedMemoryCarveout,
             100),
@@ -766,7 +842,7 @@ void configure_pivot_kernel_once_for(int device) {
     cache[device] = {true, dynamic_smem_bytes};
 }
 
-template <typename ReduceOp, int ElemBytes>
+template <typename ReduceApply, int ElemBytes>
 cudaError_t launch_rank_pivot_kernel_sm90(
     const void* local_in,
     void* local_buf,
@@ -792,27 +868,54 @@ cudaError_t launch_rank_pivot_kernel_sm90(
 
     const int num_windows = comm::utils::window_num_chunks(num_chunks);
 
-    const int owned_blocks =
+    const int owned_windows =
         (rank == 0) ? ((num_windows + 1) / 2) : (num_windows / 2);
+
+    const bool use_cta_split =
+        pivot_numerator > 0 &&
+        pivot_denominator > 0 &&
+        owned_windows > 0;
+
+    const int blocks_per_window = use_cta_split ? 2 : 1;
 
     const bool needs_rendezvous =
         local_ready_signal != nullptr &&
         peer_ready_signal != nullptr &&
         collective_epoch > 0;
 
-    const int num_blocks =
-        needs_rendezvous ? std::max(1, owned_blocks) : owned_blocks;
+    int num_blocks = owned_windows * blocks_per_window;
+
+    if (needs_rendezvous) {
+        num_blocks = std::max(1, num_blocks);
+    }
 
     if (num_blocks <= 0) {
         return cudaSuccess;
     }
 
-    configure_pivot_kernel_once_for<ReduceOp, ElemBytes>(device);
+    configure_pivot_kernel_once_for<ReduceApply, ElemBytes>(device);
 
     system::runtime::set_device(device);
 
+    int* pivot_ready_counts = nullptr;
+
+    if (use_cta_split) {
+        pivot_ready_counts =
+            ensure_pivot_signal_capacity(
+                device,
+                static_cast<size_t>(owned_windows));
+
+        system::runtime::check_cuda(
+            cudaMemsetAsync(
+                pivot_ready_counts,
+                0,
+                static_cast<size_t>(owned_windows) * sizeof(int),
+                stream),
+            "cudaMemsetAsync(pivot ready counts)");
+    }
+
     tma_two_gpu_allreduce_rank_pivot_kernel_sm90<
-        ReduceOp,
+        ReduceApply,
         ElemBytes><<<
             num_blocks,
             TMA_TWO_GPU_PEER_THREADS,
@@ -827,7 +930,10 @@ cudaError_t launch_rank_pivot_kernel_sm90(
                 peer_ready_signal,
                 collective_epoch,
                 pivot_numerator,
-                pivot_denominator);
+                pivot_denominator,
+                pivot_ready_counts,
+                owned_windows,
+                blocks_per_window);
 
     return cudaGetLastError();
 }
@@ -847,7 +953,12 @@ cudaError_t launch_reduce_op_pivot_sm90(
     int collective_epoch,
     int pivot_numerator,
     int pivot_denominator) {
-    return launch_rank_pivot_kernel_sm90<ReduceOp, ElemBytes>(
+    using ReduceApply = comm::PipelineTMAReduce<
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+        ReduceOp>;
+
+    return launch_rank_pivot_kernel_sm90<ReduceApply, ElemBytes>(
         local_in,
         local_buf,
         peer_buf,

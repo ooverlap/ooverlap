@@ -12,9 +12,9 @@
 // device code, template arguments, shared-memory array sizes, and launch config.
 // -----------------------------------------------------------------------------
 
-#define TMA_TWO_GPU_PEER_THREADS 32
+#define TMA_TWO_GPU_PEER_THREADS 256
 #define TMA_TWO_GPU_PEER_MAX_WINDOWS 16
-#define TMA_TWO_GPU_PEER_CHUNK_BYTES (16 * 1024)
+#define TMA_TWO_GPU_PEER_CHUNK_BYTES (32 * 1024)
 
 // Phase 1: owner rank reduces its local window into peer buffer.
 #define TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH 4
