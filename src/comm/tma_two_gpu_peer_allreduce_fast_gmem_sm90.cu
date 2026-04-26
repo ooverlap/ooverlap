@@ -5,7 +5,6 @@
 #include "comm/fast_gmem_copy.cuh"
 #include "comm/params.h"
 #include "comm/pipeline_stage.h"
-#include "comm/pipeline_tma_copy.h"
 #include "comm/pipeline_tma_load.h"
 #include "comm/pipeline_tma_reduce.h"
 #include "comm/utils.h"
@@ -423,8 +422,9 @@ __device__ void reduce_window_tma_and_signal_sm90(
 
                     if (should_publish && ready_count != nullptr) {
                         /*
-                         * Wait until the oldest reduce group is complete before
-                         * allowing the consumer CTA to read that region.
+                         * The consumer CTA reads from peer_buf after seeing
+                         * progress, so wait for the relevant reduce group to be
+                         * globally complete before publishing.
                          */
                         tma::reduce_async_wait<FillDepth - 1>();
                         maybe_publish(completed_count);
@@ -1150,7 +1150,15 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
     const int* peer_ready_signal,
     int collective_epoch) {
     const cudaError_t validation =
-        validate_args(local_in, local_buf, peer_buf, count, dtype, rank, dev0, dev1);
+        validate_args(
+            local_in,
+            local_buf,
+            peer_buf,
+            count,
+            dtype,
+            rank,
+            dev0,
+            dev1);
 
     if (validation != cudaSuccess) {
         return validation;
@@ -1187,64 +1195,21 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
     const int* peer_ready_signal,
     int collective_epoch) {
     const cudaError_t validation =
-        validate_args(local_in, local_buf, peer_buf, count, dtype, rank, dev0, dev1);
+        validate_args(
+            local_in,
+            local_buf,
+            peer_buf,
+            count,
+            dtype,
+            rank,
+            dev0,
+            dev1);
 
     if (validation != cudaSuccess) {
         return validation;
     }
 
     return dispatch_rank_kernel_sm90<true>(
-        local_in,
-        local_buf,
-        peer_buf,
-        count,
-        dtype,
-        op,
-        rank,
-        dev0,
-        dev1,
-        stream,
-        local_ready_signal,
-        peer_ready_signal,
-        collective_epoch);
-}
-
-cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_pivot_sm90(
-    const void* local_in,
-    void* local_buf,
-    void* peer_buf,
-    size_t count,
-    oo_dtype_t dtype,
-    oo_reduce_op_t op,
-    int rank,
-    int dev0,
-    int dev1,
-    cudaStream_t stream,
-    int* local_ready_signal,
-    const int* peer_ready_signal,
-    int collective_epoch,
-    int pivot_numerator,
-    int pivot_denominator) {
-    (void)pivot_denominator;
-
-    if (pivot_numerator <= 0) {
-        return enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
-            local_in,
-            local_buf,
-            peer_buf,
-            count,
-            dtype,
-            op,
-            rank,
-            dev0,
-            dev1,
-            stream,
-            local_ready_signal,
-            peer_ready_signal,
-            collective_epoch);
-    }
-
-    return enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
         local_in,
         local_buf,
         peer_buf,

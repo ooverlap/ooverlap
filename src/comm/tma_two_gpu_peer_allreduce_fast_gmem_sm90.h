@@ -8,6 +8,12 @@
 
 namespace ooverlap {
 
+/*
+ * Sequential fast-gmem variant:
+ *
+ *   1. TMA reduce local_in into peer_buf.
+ *   2. Fast global-memory copy peer_buf back into local_buf.
+ */
 cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
     const void* local_in,
     void* local_buf,
@@ -23,6 +29,12 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
     const int* peer_ready_signal,
     int collective_epoch);
 
+/*
+ * Overlapped fast-gmem variant:
+ *
+ *   CTA role 0: TMA reduce local_in into peer_buf and publish progress.
+ *   CTA role 1: Fast global-memory copy completed peer_buf chunks into local_buf.
+ */
 cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
     const void* local_in,
     void* local_buf,
@@ -37,31 +49,5 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch);
-
-/*
- * Compatibility wrapper for existing benchmark code.
- *
- * This no longer implements pivot behavior:
- *   pivot_numerator <= 0 -> sequential TMA reduce then fast copy
- *   pivot_numerator >  0 -> overlapped TMA reduce + fast copy with signals
- *
- * pivot_denominator is ignored and kept only to avoid changing callers yet.
- */
-cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_pivot_sm90(
-    const void* local_in,
-    void* local_buf,
-    void* peer_buf,
-    size_t count,
-    oo_dtype_t dtype,
-    oo_reduce_op_t op,
-    int rank,
-    int dev0,
-    int dev1,
-    cudaStream_t stream,
-    int* local_ready_signal,
-    const int* peer_ready_signal,
-    int collective_epoch,
-    int pivot_numerator,
-    int pivot_denominator);
 
 } // namespace ooverlap
