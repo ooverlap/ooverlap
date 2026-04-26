@@ -186,13 +186,54 @@ __device__ void reduce_window_and_signal_pivot_sm90(
     volatile int* reduced_pivot_count,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
+    constexpr int StageDepth = TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH;
+    constexpr int FillDepth = TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP;
+
+    static_assert(StageDepth > 0, "StageDepth must be > 0");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+
+    if (window.chunk_count <= 0) {
+        return;
+    }
+
     const unsigned int mask = 0xffffffffu;
     const int lane = static_cast<int>(threadIdx.x) & 31;
 
     comm::PipelineTMALoad load{};
 
-    for (int iter = 0; iter < window.chunk_count; ++iter) {
-        const int chunk = window.start_chunk + iter;
+    auto publish_pivot_count = [&](int completed_count) {
+        if (pivot_count <= 0 || completed_count <= 0) {
+            return;
+        }
+
+        int publish_count = completed_count;
+        if (publish_count > pivot_count) {
+            publish_count = pivot_count;
+        }
+
+        if (lane == 0 && reduced_pivot_count[0] < publish_count) {
+            /*
+             * The full reduce wait happens before this function is called.
+             * This fence makes the global-memory reduce result visible before
+             * the consumer warp observes the shared-memory signal.
+             */
+            __threadfence();
+            reduced_pivot_count[0] = publish_count;
+        }
+    };
+
+    /*
+     * Warm up the TMA load pipeline exactly like the original implementation:
+     * issue FillDepth loads before consuming the first chunk.
+     */
+    for (int warm = 0; warm < FillDepth; ++warm) {
+        if (warm >= window.chunk_count) {
+            break;
+        }
+
+        const int chunk = window.start_chunk + warm;
+        const int slot = warm;
 
         const size_t offset =
             static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
@@ -207,49 +248,135 @@ __device__ void reduce_window_and_signal_pivot_sm90(
                 src_bytes + offset,
                 dst_bytes + offset,
                 bytes),
-            stage_ptr(shared_raw, 0),
-            &barriers[0]);
+            stage_ptr(shared_raw, slot),
+            &barriers[slot]);
 
         if (lane == 0) {
             load.issue(&stage);
-            load.wait_ready(&stage);
+        }
 
+        __syncwarp(mask);
+    }
+
+    /*
+     * Main pipelined reduce loop.
+     *
+     * This mirrors the original pipeline:
+     *   wait current load
+     *   wait before stage reuse
+     *   issue future load
+     *   issue current reduce
+     *   finish scalar tail
+     *
+     * Difference from original:
+     *   the stage-reuse wait is a full reduce wait, not read-only wait,
+     *   so we can safely publish pivot progress to the fast-copy consumer.
+     */
+    for (int iter = 0; iter < window.chunk_count; ++iter) {
+        const int chunk = window.start_chunk + iter;
+        const int cur_slot = iter % StageDepth;
+
+        const size_t offset =
+            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+        const size_t bytes =
+            comm::utils::min_sz(
+                TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                total_bytes - offset);
+
+        comm::PipelineStage cur_stage = comm::make_pipeline_stage(
+            comm::make_pipeline_chunk(
+                src_bytes + offset,
+                dst_bytes + offset,
+                bytes),
+            stage_ptr(shared_raw, cur_slot),
+            &barriers[cur_slot]);
+
+        if (lane == 0) {
+            load.wait_ready(&cur_stage);
+        }
+
+        __syncwarp(mask);
+
+        const int future_iter = iter + FillDepth;
+
+        if (future_iter < window.chunk_count) {
+            const int future_chunk = window.start_chunk + future_iter;
+            const int future_slot = future_iter % StageDepth;
+
+            const size_t future_offset =
+                static_cast<size_t>(future_chunk) *
+                TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+            const size_t future_bytes =
+                comm::utils::min_sz(
+                    TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                    total_bytes - future_offset);
+
+            comm::PipelineStage future_stage = comm::make_pipeline_stage(
+                comm::make_pipeline_chunk(
+                    src_bytes + future_offset,
+                    dst_bytes + future_offset,
+                    future_bytes),
+                stage_ptr(shared_raw, future_slot),
+                &barriers[future_slot]);
+
+            if (lane == 0) {
+                if (iter >= FillDepth) {
+                    /*
+                     * Original pipeline used:
+                     *   reduce_async_read_wait<FillDepth - 1>()
+                     *
+                     * For pivot, the consumer is going to read dst_bytes after
+                     * seeing the signal. So we need global reduce completion,
+                     * not just shared-memory read completion.
+                     *
+                     * This still preserves the old pipeline shape: the wait
+                     * only happens when a stage is about to be reused.
+                     */
+                    tma::reduce_async_wait<FillDepth - 1>();
+
+                    /*
+                     * At this point, the oldest outstanding full reduce is
+                     * complete. The completed local chunks are:
+                     *   [0, iter - FillDepth]
+                     */
+                    const int completed_count = iter - FillDepth + 1;
+                    publish_pivot_count(completed_count);
+                }
+
+                load.issue(&future_stage);
+            }
+        }
+
+        __syncwarp(mask);
+
+        if (lane == 0) {
             const size_t bulk_bytes =
-                comm::pipeline_stage_bulk_bytes(&stage);
+                comm::pipeline_stage_bulk_bytes(&cur_stage);
 
             if (bulk_bytes != 0) {
                 ReduceOp::issue_bulk(
-                    stage.chunk.dst,
-                    stage.smem,
+                    cur_stage.chunk.dst,
+                    cur_stage.smem,
                     static_cast<uint32_t>(bulk_bytes));
             }
         }
 
         __syncwarp(mask);
 
-        finish_reduce_tail_warp_sm90<ReduceOp>(&stage, lane);
-
-        __syncwarp(mask);
-
-        if (lane == 0) {
-            const size_t bulk_bytes =
-                comm::pipeline_stage_bulk_bytes(&stage);
-
-            if (bulk_bytes != 0) {
-                tma::reduce_async_wait<0>();
-            }
-
-            __threadfence();
-
-            if (iter < pivot_count) {
-                reduced_pivot_count[0] = iter + 1;
-            }
-        }
+        finish_reduce_tail_warp_sm90<ReduceOp>(&cur_stage, lane);
 
         __syncwarp(mask);
     }
 
     if (lane == 0) {
+        /*
+         * Complete the tail of the reduce pipeline and publish any remaining
+         * pivot chunks. This covers the last FillDepth chunks, and also small
+         * windows where the stage-reuse wait never fired.
+         */
+        tma::reduce_async_wait<0>();
         __threadfence();
 
         if (reduced_pivot_count[0] < pivot_count) {
