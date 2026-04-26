@@ -37,7 +37,7 @@ namespace ooverlap {
 namespace {
 
 constexpr int kExperimentThreads = TMA_TWO_GPU_PEER_THREADS;
-constexpr int kExperimentGmemThreads = 512;
+constexpr int kExperimentGmemThreads = 1024;
 
 constexpr int kExperimentChunkBytes = TMA_TWO_GPU_PEER_CHUNK_BYTES;
 constexpr int kExperimentStageDepth = TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH;
@@ -67,6 +67,7 @@ enum class ExperimentMethod {
     kNcclSendRecv = 4,
     kGmemCopyU64 = 5,
     kGmemCopyU128 = 6,
+    kGmemAddF16U128 = 7,
 };
 
 enum ExperimentScenarioId {
@@ -449,6 +450,13 @@ void configure_experiment_kernels_once(int device) {
         device,
         "gmem_copy_coalesced_kernel<uint4>");
 
+    configure_one_kernel(
+        reinterpret_cast<const void*>(
+            comm::fast_copy::gmem_add_f16_u128_kernel<4>),
+        0,
+        device,
+        "gmem_add_f16_u128_kernel<4>");
+
     if (device >= 0 && device < 16) {
         configured[device] = true;
     }
@@ -525,6 +533,17 @@ cudaError_t launch_method(
 
         case ExperimentMethod::kGmemCopyU128:
             comm::fast_copy::gmem_copy_coalesced_kernel<uint4><<<
+                num_blocks,
+                kExperimentGmemThreads,
+                0,
+                stream>>>(
+                    src,
+                    dst,
+                    bytes);
+            return cudaGetLastError();
+
+        case ExperimentMethod::kGmemAddF16U128:
+            comm::fast_copy::gmem_add_f16_u128_kernel<4><<<
                 num_blocks,
                 kExperimentGmemThreads,
                 0,
@@ -859,6 +878,7 @@ void run_case_for_size(
         std::vector<ExperimentMethod> methods = {
             ExperimentMethod::kTmaCopy,
             ExperimentMethod::kTmaReduce,
+            ExperimentMethod::kGmemAddF16U128,
             ExperimentMethod::kGmemCopyU32,
             ExperimentMethod::kGmemCopyU64,
             ExperimentMethod::kGmemCopyU128,

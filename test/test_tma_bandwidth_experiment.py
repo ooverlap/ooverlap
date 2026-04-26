@@ -22,7 +22,9 @@ METHOD_NAME = {
     4: "nccl_sendrecv",
     5: "gmem_copy_u64",
     6: "gmem_copy_u128",
+    7: "fast_add_f16_u128",
 }
+
 
 def load_ooverlap_ext():
     root = Path(__file__).resolve().parents[1]
@@ -71,60 +73,103 @@ def print_table(rows):
         )
 
 
-def ordered_methods(rows):
+def present_methods(rows, preferred):
     present = {r["method_name"] for r in rows}
-    preferred = [
-        "tma_copy",
-        "gmem_copy_u32",
-        "gmem_copy_u64",
-        "gmem_copy_u128",
-        "nccl_sendrecv",
-        "tma_reduce_add_f16",
-        "mem_async_copy",
-    ]
     return [m for m in preferred if m in present]
+
+
+def plot_one_group(rows, scenario, methods, title, output_path):
+    subset = [r for r in rows if r["scenario_name"] == scenario]
+    if not subset:
+        return False
+
+    plotted = False
+    plt.figure()
+
+    for method in methods:
+        data = sorted(
+            [r for r in subset if r["method_name"] == method],
+            key=lambda x: x["bytes"],
+        )
+        if not data:
+            continue
+
+        xs = [r["mib"] for r in data]
+        ys = [r["gbps"] for r in data]
+        plt.plot(xs, ys, marker="o", label=method)
+        plotted = True
+
+    if not plotted:
+        plt.close()
+        return False
+
+    plt.xscale("log", base=2)
+    plt.xlabel("Transfer size (MiB)")
+    plt.ylabel("Effective bandwidth (GB/s)")
+    plt.title(title)
+    plt.grid(True, which="both")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+    return True
 
 
 def plot_rows(rows, output_prefix):
     scenarios = ["local_to_peer", "peer_to_local", "same_dev"]
-    methods = ordered_methods(rows)
+
+    copy_methods = present_methods(
+        rows,
+        [
+            "tma_copy",
+            "gmem_copy_u32",
+            "gmem_copy_u64",
+            "gmem_copy_u128",
+            "nccl_sendrecv",
+            "mem_async_copy",
+        ],
+    )
+
+    reduce_methods = present_methods(
+        rows,
+        [
+            "tma_reduce_add_f16",
+            "fast_add_f16_u128",
+        ],
+    )
+
+    written = []
 
     for scenario in scenarios:
-        subset = [r for r in rows if r["scenario_name"] == scenario]
-        if not subset:
-            continue
-
-        plt.figure()
-
-        for method in methods:
-            data = sorted(
-                [r for r in subset if r["method_name"] == method],
-                key=lambda x: x["bytes"],
-            )
-            if not data:
-                continue
-
-            xs = [r["mib"] for r in data]
-            ys = [r["gbps"] for r in data]
-            plt.plot(xs, ys, marker="o", label=method)
-
-        plt.xscale("log", base=2)
-        plt.xlabel("Transfer size (MiB)")
-        plt.ylabel("Effective bandwidth (GB/s)")
-
         if scenario == "local_to_peer":
-            title = "Bandwidth: local -> peer"
+            scenario_title = "local -> peer"
         elif scenario == "peer_to_local":
-            title = "Bandwidth: peer -> local"
+            scenario_title = "peer -> local"
         else:
-            title = "Bandwidth: same device"
+            scenario_title = "same device"
 
-        plt.title(title)
-        plt.grid(True, which="both")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(f"{output_prefix}_{scenario}_bandwidth.png", dpi=200)
-        plt.close()
+        copy_path = f"{output_prefix}_{scenario}_copy_bandwidth.png"
+        if plot_one_group(
+            rows,
+            scenario,
+            copy_methods,
+            f"Copy bandwidth: {scenario_title}",
+            copy_path,
+        ):
+            written.append(copy_path)
+
+        reduce_path = f"{output_prefix}_{scenario}_reduce_vs_fast_add_bandwidth.png"
+        if plot_one_group(
+            rows,
+            scenario,
+            reduce_methods,
+            f"Reduce/add bandwidth: {scenario_title}",
+            reduce_path,
+        ):
+            written.append(reduce_path)
+
+    return written
 
 
 def main():
@@ -176,11 +221,11 @@ def main():
 
     rows = normalize_rows(rows)
     print_table(rows)
-    plot_rows(rows, args.output_prefix)
+    written = plot_rows(rows, args.output_prefix)
 
     print("[done] wrote:")
-    for scenario in ["local_to_peer", "peer_to_local", "same_dev"]:
-        print(f"  {args.output_prefix}_{scenario}_bandwidth.png")
+    for path in written:
+        print(f"  {path}")
 
 
 if __name__ == "__main__":
