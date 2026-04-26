@@ -112,6 +112,140 @@ __device__ __forceinline__ comm::utils::Window make_sub_window_sm90(
     return out;
 }
 
+/*
+ * Exact old-style TMA window pipeline.
+ *
+ * This is intentionally block-wide and uses PipelineTMAReduce /
+ * PipelineTMACopy directly. It is used for pivot_count == 0 so the pivot
+ * kernel can be benchmarked as a true old-path equivalent.
+ */
+template <int StageDepth, int FillDepth, typename Apply>
+__device__ void run_tma_window_pipeline_sm90(
+    const unsigned char* src_bytes,
+    unsigned char* dst_bytes,
+    comm::utils::Window window,
+    size_t total_bytes,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    static_assert(StageDepth > 0, "StageDepth must be > 0");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+
+    if (window.chunk_count <= 0) {
+        return;
+    }
+
+    comm::PipelineTMALoad load{};
+    Apply apply{};
+
+    for (int warm = 0; warm < FillDepth; ++warm) {
+        if (warm >= window.chunk_count) {
+            break;
+        }
+
+        const int chunk = window.start_chunk + warm;
+        const int slot = warm;
+
+        const size_t offset =
+            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+        const size_t bytes =
+            comm::utils::min_sz(
+                TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                total_bytes - offset);
+
+        comm::PipelineStage stage = comm::make_pipeline_stage(
+            comm::make_pipeline_chunk(
+                src_bytes + offset,
+                dst_bytes + offset,
+                bytes),
+            stage_ptr(shared_raw, slot),
+            &barriers[slot]);
+
+        if (threadIdx.x == 0) {
+            load.issue(&stage);
+        }
+
+        __syncthreads();
+    }
+
+    for (int iter = 0; iter < window.chunk_count; ++iter) {
+        const int chunk = window.start_chunk + iter;
+        const int cur_slot = iter % StageDepth;
+
+        const size_t offset =
+            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+        const size_t bytes =
+            comm::utils::min_sz(
+                TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                total_bytes - offset);
+
+        comm::PipelineStage cur_stage = comm::make_pipeline_stage(
+            comm::make_pipeline_chunk(
+                src_bytes + offset,
+                dst_bytes + offset,
+                bytes),
+            stage_ptr(shared_raw, cur_slot),
+            &barriers[cur_slot]);
+
+        if (threadIdx.x == 0) {
+            load.wait_ready(&cur_stage);
+        }
+
+        __syncthreads();
+
+        const int future_iter = iter + FillDepth;
+
+        if (future_iter < window.chunk_count) {
+            const int future_chunk = window.start_chunk + future_iter;
+            const int future_slot = future_iter % StageDepth;
+
+            const size_t future_offset =
+                static_cast<size_t>(future_chunk) *
+                TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+            const size_t future_bytes =
+                comm::utils::min_sz(
+                    TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                    total_bytes - future_offset);
+
+            comm::PipelineStage future_stage = comm::make_pipeline_stage(
+                comm::make_pipeline_chunk(
+                    src_bytes + future_offset,
+                    dst_bytes + future_offset,
+                    future_bytes),
+                stage_ptr(shared_raw, future_slot),
+                &barriers[future_slot]);
+
+            if (threadIdx.x == 0) {
+                if (iter >= FillDepth) {
+                    apply.wait_before_stage_reuse();
+                }
+
+                load.issue(&future_stage);
+            }
+        }
+
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            apply.issue_bulk(&cur_stage);
+        }
+
+        apply.finish_tail(&cur_stage);
+
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        apply.wait_complete();
+        __threadfence_system();
+    }
+
+    __syncthreads();
+}
+
 template <typename ReduceOp>
 __device__ __forceinline__ void finish_reduce_tail_warp_sm90(
     const comm::PipelineStage* stage,
@@ -213,20 +347,11 @@ __device__ void reduce_window_and_signal_pivot_sm90(
         }
 
         if (lane == 0 && reduced_pivot_count[0] < publish_count) {
-            /*
-             * The full reduce wait happens before this function is called.
-             * This fence makes the global-memory reduce result visible before
-             * the consumer warp observes the shared-memory signal.
-             */
             __threadfence();
             reduced_pivot_count[0] = publish_count;
         }
     };
 
-    /*
-     * Warm up the TMA load pipeline exactly like the original implementation:
-     * issue FillDepth loads before consuming the first chunk.
-     */
     for (int warm = 0; warm < FillDepth; ++warm) {
         if (warm >= window.chunk_count) {
             break;
@@ -258,20 +383,6 @@ __device__ void reduce_window_and_signal_pivot_sm90(
         __syncwarp(mask);
     }
 
-    /*
-     * Main pipelined reduce loop.
-     *
-     * This mirrors the original pipeline:
-     *   wait current load
-     *   wait before stage reuse
-     *   issue future load
-     *   issue current reduce
-     *   finish scalar tail
-     *
-     * Difference from original:
-     *   the stage-reuse wait is a full reduce wait, not read-only wait,
-     *   so we can safely publish pivot progress to the fast-copy consumer.
-     */
     for (int iter = 0; iter < window.chunk_count; ++iter) {
         const int chunk = window.start_chunk + iter;
         const int cur_slot = iter % StageDepth;
@@ -323,19 +434,9 @@ __device__ void reduce_window_and_signal_pivot_sm90(
 
             if (lane == 0) {
                 if (iter >= FillDepth) {
-                    /*
-                     * Original pipeline used:
-                     *   reduce_async_read_wait<FillDepth - 1>()
-                     *
-                     * For pivot, the consumer is going to read dst_bytes after
-                     * seeing the signal. So we need global reduce completion,
-                     * not just shared-memory read completion.
-                     *
-                     * This still preserves the old pipeline shape: the wait
-                     * only happens when a stage is about to be reused.
-                     */
                     const int completed_count = iter - FillDepth + 1;
-                    if (pivot_count > 0 && completed_count <= pivot_count) {
+
+                    if (completed_count <= pivot_count) {
                         tma::reduce_async_wait<FillDepth - 1>();
                         publish_pivot_count(completed_count);
                     } else {
@@ -369,11 +470,6 @@ __device__ void reduce_window_and_signal_pivot_sm90(
     }
 
     if (lane == 0) {
-        /*
-         * Complete the tail of the reduce pipeline and publish any remaining
-         * pivot chunks. This covers the last FillDepth chunks, and also small
-         * windows where the stage-reuse wait never fired.
-         */
         tma::reduce_async_wait<0>();
         __threadfence();
 
@@ -590,12 +686,56 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
             pivot_denominator);
 
     /*
-     * Consumer path first in source order.
+     * True disabled-pivot path.
      *
-     * These warps start immediately and wait for the producer warp to publish
-     * reduced_pivot_count. They cannot copy a chunk before that chunk has been
-     * reduced, but they are already resident and spinning when the first signal
-     * arrives.
+     * This is the important debug/fallback path. When pivot_count is zero, this
+     * kernel should behave like the original normal implementation: reduce the
+     * full window, then TMA-copy the full window back. Do not route through the
+     * warp-specialized pivot producer/consumer helpers, because that changes
+     * the baseline.
+     */
+    if (pivot_count <= 0) {
+        using ReduceApply =
+            comm::PipelineTMAReduce<
+                TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+                TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+                ReduceOp>;
+
+        run_tma_window_pipeline_sm90<
+            TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+            TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+            ReduceApply>(
+                peer_buf_bytes,
+                local_buf_bytes,
+                window,
+                total_bytes,
+                shared_raw,
+                barriers);
+
+        using CopyApply =
+            comm::PipelineTMACopy<
+                TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
+                TMA_TWO_GPU_PEER_COPY_STAGE_GAP>;
+
+        run_tma_window_pipeline_sm90<
+            TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
+            TMA_TWO_GPU_PEER_COPY_STAGE_GAP,
+            CopyApply>(
+                local_buf_bytes,
+                peer_buf_bytes,
+                window,
+                total_bytes,
+                shared_raw,
+                barriers);
+
+        return;
+    }
+
+    /*
+     * Consumer path.
+     *
+     * These threads spin until the producer warp publishes each reduced chunk.
+     * This path is active only for pivot_count > 0.
      */
     if (threadIdx.x >= kPivotProducerWarpThreads) {
         const int copy_thread =
@@ -604,7 +744,7 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
         const int copy_threads =
             static_cast<int>(blockDim.x) - kPivotProducerWarpThreads;
 
-        if (copy_threads <= 0 || pivot_count <= 0) {
+        if (copy_threads <= 0) {
             return;
         }
 
@@ -640,7 +780,7 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
     /*
      * Producer warp:
      * 1. reduce peer_buf -> local_buf
-     * 2. signal each pivot chunk as soon as it is reduced
+     * 2. signal each pivot chunk as soon as it is safely reduced
      * 3. after the whole reduce window, TMA-copy the non-pivot suffix
      */
     reduce_window_and_signal_pivot_sm90<ReduceOp>(
