@@ -278,20 +278,20 @@ __global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
 
     // It seems loading from peer is faster than reducing into it.
     reduce_window_to_peer_sm90<ReduceApply>(
-        //local_in_bytes,
-        //peer_buf_bytes,
+        local_in_bytes,
         peer_buf_bytes,
-        local_buf_bytes,
+        //peer_buf_bytes,
+        //local_buf_bytes,
         window,
         total_bytes,
         shared_raw,
         barriers);
 
     copy_window_sm90(
-        //peer_buf_bytes,
-        //local_buf_bytes,
-        local_buf_bytes,
         peer_buf_bytes,
+        local_buf_bytes,
+        //local_buf_bytes,
+        //peer_buf_bytes,
         window,
         total_bytes,
         shared_raw,

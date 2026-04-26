@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
