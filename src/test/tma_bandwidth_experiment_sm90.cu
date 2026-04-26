@@ -239,7 +239,7 @@ __device__ void run_window_pipeline(
     __syncthreads();
 }
 
-__device__ __forceinline__ int experiment_compute_pivot_chunk_count(
+__host__ __device__ __forceinline__ int experiment_compute_pivot_chunk_count(
     int window_chunk_count,
     int pivot_numerator,
     int pivot_denominator) {
@@ -945,6 +945,63 @@ void add_result(
     results.push_back(row);
 }
 
+size_t pivot_prefix_copied_bytes_for_total(size_t total_bytes) {
+    const int num_chunks =
+        ceil_div_int64_to_int(total_bytes, kExperimentChunkBytes);
+
+    const int num_windows =
+        comm::utils::window_num_chunks(num_chunks);
+
+    size_t copied_bytes = 0;
+
+    for (int window_idx = 0; window_idx < num_windows; ++window_idx) {
+        const comm::utils::Window window =
+            comm::utils::make_window(window_idx, num_chunks, num_windows);
+
+        const int pivot_count =
+            experiment_compute_pivot_chunk_count(
+                window.chunk_count,
+                OOVERLAP_EXPERIMENT_PIVOT_NUMERATOR,
+                OOVERLAP_EXPERIMENT_PIVOT_DENOMINATOR);
+
+        if (pivot_count <= 0) {
+            continue;
+        }
+
+        const size_t begin_offset =
+            static_cast<size_t>(window.start_chunk) *
+            kExperimentChunkBytes;
+
+        size_t end_offset =
+            static_cast<size_t>(window.start_chunk + pivot_count) *
+            kExperimentChunkBytes;
+
+        if (begin_offset >= total_bytes) {
+            continue;
+        }
+
+        if (end_offset > total_bytes) {
+            end_offset = total_bytes;
+        }
+
+        if (end_offset > begin_offset) {
+            copied_bytes += end_offset - begin_offset;
+        }
+    }
+
+    return copied_bytes;
+}
+
+size_t measured_bytes_for_method(
+    ExperimentMethod method,
+    size_t total_bytes) {
+    if (method == ExperimentMethod::kPivotPrefixCopyU128) {
+        return pivot_prefix_copied_bytes_for_total(total_bytes);
+    }
+
+    return total_bytes;
+}
+
 void run_case_for_size(
     std::vector<std::map<std::string, double>>& results,
     int scenario_id,
@@ -1026,6 +1083,10 @@ void run_case_for_size(
                     iters,
                     warmup);
 
+
+            const size_t measured_bytes =
+                measured_bytes_for_method(method, bytes);
+            
             add_result(
                 results,
                 scenario_id,
@@ -1033,9 +1094,10 @@ void run_case_for_size(
                 src_device,
                 dst_device,
                 kernel_device,
-                bytes,
+                measured_bytes,
                 num_blocks,
                 latency_ms);
+
         }
 
         if (include_nccl && comms != nullptr && src_device != dst_device) {
