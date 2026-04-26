@@ -2,7 +2,7 @@
 
 #include "comm/ooverlap_comm.h"
 #include "comm/ooverlap_comm_internal.h"
-#include "comm/tma_two_gpu_peer_allreduce_pivot_sm90.h"
+#include "comm/tma_two_gpu_peer_allreduce_fast_gmem_sm90.h"
 #include "comm/tma_two_gpu_peer_allreduce_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
