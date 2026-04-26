@@ -25,7 +25,7 @@
 namespace ooverlap {
 namespace {
 
-constexpr int kPivotProducerWarpThreads = 32;
+constexpr int kPivotProducerWarpThreads = 128;
 
 __host__ __device__ __forceinline__ size_t dtype_size_bytes(
     oo_dtype_t dtype) {
