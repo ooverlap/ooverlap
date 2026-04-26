@@ -22,6 +22,10 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#ifndef OOVERLAP_PIVOT_DISABLE_FAST_COPY_ONLY
+#define OOVERLAP_PIVOT_DISABLE_FAST_COPY_ONLY 1
+#endif
+
 namespace ooverlap {
 namespace {
 
@@ -107,143 +111,11 @@ __device__ __forceinline__ comm::utils::Window make_sub_window_sm90(
     int local_start,
     int local_count) {
     comm::utils::Window out{};
+    out.index = window.index;
     out.start_chunk = window.start_chunk + local_start;
     out.chunk_count = local_count;
+    out.owner_rank = window.owner_rank;
     return out;
-}
-
-/*
- * Exact old-style TMA window pipeline.
- *
- * This is intentionally block-wide and uses PipelineTMAReduce /
- * PipelineTMACopy directly. It is used for pivot_count == 0 so the pivot
- * kernel can be benchmarked as a true old-path equivalent.
- */
-template <int StageDepth, int FillDepth, typename Apply>
-__device__ void run_tma_window_pipeline_sm90(
-    const unsigned char* src_bytes,
-    unsigned char* dst_bytes,
-    comm::utils::Window window,
-    size_t total_bytes,
-    unsigned char* shared_raw,
-    sync::semaphore* barriers) {
-    static_assert(StageDepth > 0, "StageDepth must be > 0");
-    static_assert(FillDepth > 0, "FillDepth must be > 0");
-    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
-
-    if (window.chunk_count <= 0) {
-        return;
-    }
-
-    comm::PipelineTMALoad load{};
-    Apply apply{};
-
-    for (int warm = 0; warm < FillDepth; ++warm) {
-        if (warm >= window.chunk_count) {
-            break;
-        }
-
-        const int chunk = window.start_chunk + warm;
-        const int slot = warm;
-
-        const size_t offset =
-            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
-
-        const size_t bytes =
-            comm::utils::min_sz(
-                TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                total_bytes - offset);
-
-        comm::PipelineStage stage = comm::make_pipeline_stage(
-            comm::make_pipeline_chunk(
-                src_bytes + offset,
-                dst_bytes + offset,
-                bytes),
-            stage_ptr(shared_raw, slot),
-            &barriers[slot]);
-
-        if (threadIdx.x == 0) {
-            load.issue(&stage);
-        }
-
-        __syncthreads();
-    }
-
-    for (int iter = 0; iter < window.chunk_count; ++iter) {
-        const int chunk = window.start_chunk + iter;
-        const int cur_slot = iter % StageDepth;
-
-        const size_t offset =
-            static_cast<size_t>(chunk) * TMA_TWO_GPU_PEER_CHUNK_BYTES;
-
-        const size_t bytes =
-            comm::utils::min_sz(
-                TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                total_bytes - offset);
-
-        comm::PipelineStage cur_stage = comm::make_pipeline_stage(
-            comm::make_pipeline_chunk(
-                src_bytes + offset,
-                dst_bytes + offset,
-                bytes),
-            stage_ptr(shared_raw, cur_slot),
-            &barriers[cur_slot]);
-
-        if (threadIdx.x == 0) {
-            load.wait_ready(&cur_stage);
-        }
-
-        __syncthreads();
-
-        const int future_iter = iter + FillDepth;
-
-        if (future_iter < window.chunk_count) {
-            const int future_chunk = window.start_chunk + future_iter;
-            const int future_slot = future_iter % StageDepth;
-
-            const size_t future_offset =
-                static_cast<size_t>(future_chunk) *
-                TMA_TWO_GPU_PEER_CHUNK_BYTES;
-
-            const size_t future_bytes =
-                comm::utils::min_sz(
-                    TMA_TWO_GPU_PEER_CHUNK_BYTES,
-                    total_bytes - future_offset);
-
-            comm::PipelineStage future_stage = comm::make_pipeline_stage(
-                comm::make_pipeline_chunk(
-                    src_bytes + future_offset,
-                    dst_bytes + future_offset,
-                    future_bytes),
-                stage_ptr(shared_raw, future_slot),
-                &barriers[future_slot]);
-
-            if (threadIdx.x == 0) {
-                if (iter >= FillDepth) {
-                    apply.wait_before_stage_reuse();
-                }
-
-                load.issue(&future_stage);
-            }
-        }
-
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            apply.issue_bulk(&cur_stage);
-        }
-
-        apply.finish_tail(&cur_stage);
-
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        apply.wait_complete();
-        __threadfence_system();
-    }
-
-    __syncthreads();
 }
 
 template <typename ReduceOp>
@@ -679,48 +551,75 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
 
     (void)local_in_bytes;
 
+#if OOVERLAP_PIVOT_DISABLE_FAST_COPY_ONLY
+    /*
+     * Narrow debug mode:
+     *
+     * Compile out only the fast-copy consumer path.
+     *
+     * This keeps the pivot implementation's producer-warp reduce and
+     * producer-warp TMA copy in place. That lets us test whether the slow path
+     * is caused by:
+     *
+     *   A) my pivot reduce/copy implementation itself, or
+     *   B) the extra fast-copy consumer code/register pressure.
+     *
+     * Only the producer warp does useful work here. Other threads exit after
+     * the shared initialization barrier above.
+     */
+    if (threadIdx.x >= kPivotProducerWarpThreads) {
+        return;
+    }
+
+    (void)pivot_numerator;
+    (void)pivot_denominator;
+
+    reduce_window_and_signal_pivot_sm90<ReduceOp>(
+        peer_buf_bytes,
+        local_buf_bytes,
+        window,
+        total_bytes,
+        0,
+        &reduced_pivot_count,
+        shared_raw,
+        barriers);
+
+    copy_window_tma_warp_sm90<
+        TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_COPY_STAGE_GAP>(
+            local_buf_bytes,
+            peer_buf_bytes,
+            window,
+            total_bytes,
+            shared_raw,
+            barriers);
+
+    return;
+#else
     const int pivot_count =
         compute_pivot_chunk_count(
             window.chunk_count,
             pivot_numerator,
             pivot_denominator);
 
-    /*
-     * True disabled-pivot path.
-     *
-     * This is the important debug/fallback path. When pivot_count is zero, this
-     * kernel should behave like the original normal implementation: reduce the
-     * full window, then TMA-copy the full window back. Do not route through the
-     * warp-specialized pivot producer/consumer helpers, because that changes
-     * the baseline.
-     */
     if (pivot_count <= 0) {
-        using ReduceApply =
-            comm::PipelineTMAReduce<
-                TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-                TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-                ReduceOp>;
+        if (threadIdx.x >= kPivotProducerWarpThreads) {
+            return;
+        }
 
-        run_tma_window_pipeline_sm90<
-            TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-            TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-            ReduceApply>(
-                peer_buf_bytes,
-                local_buf_bytes,
-                window,
-                total_bytes,
-                shared_raw,
-                barriers);
+        reduce_window_and_signal_pivot_sm90<ReduceOp>(
+            peer_buf_bytes,
+            local_buf_bytes,
+            window,
+            total_bytes,
+            0,
+            &reduced_pivot_count,
+            shared_raw,
+            barriers);
 
-        using CopyApply =
-            comm::PipelineTMACopy<
-                TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
-                TMA_TWO_GPU_PEER_COPY_STAGE_GAP>;
-
-        run_tma_window_pipeline_sm90<
+        copy_window_tma_warp_sm90<
             TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
-            TMA_TWO_GPU_PEER_COPY_STAGE_GAP,
-            CopyApply>(
+            TMA_TWO_GPU_PEER_COPY_STAGE_GAP>(
                 local_buf_bytes,
                 peer_buf_bytes,
                 window,
@@ -731,12 +630,6 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
         return;
     }
 
-    /*
-     * Consumer path.
-     *
-     * These threads spin until the producer warp publishes each reduced chunk.
-     * This path is active only for pivot_count > 0.
-     */
     if (threadIdx.x >= kPivotProducerWarpThreads) {
         const int copy_thread =
             static_cast<int>(threadIdx.x) - kPivotProducerWarpThreads;
@@ -777,12 +670,6 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
         return;
     }
 
-    /*
-     * Producer warp:
-     * 1. reduce peer_buf -> local_buf
-     * 2. signal each pivot chunk as soon as it is safely reduced
-     * 3. after the whole reduce window, TMA-copy the non-pivot suffix
-     */
     reduce_window_and_signal_pivot_sm90<ReduceOp>(
         peer_buf_bytes,
         local_buf_bytes,
@@ -812,6 +699,7 @@ __global__ void tma_two_gpu_allreduce_rank_pivot_kernel_sm90(
                 shared_raw,
                 barriers);
     }
+#endif
 }
 
 template <typename ReduceOp, int ElemBytes>
@@ -864,16 +752,16 @@ void configure_pivot_kernel_once_for(int device) {
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(dynamic_smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize pivot)");
-
-        system::runtime::check_cuda(
-            cudaFuncSetAttribute(
-                tma_two_gpu_allreduce_rank_pivot_kernel_sm90<
-                    ReduceOp,
-                    ElemBytes>,
-                cudaFuncAttributePreferredSharedMemoryCarveout,
-                100),
-            "cudaFuncSetAttribute(PreferredSharedMemoryCarveout pivot)");
     }
+
+    system::runtime::check_cuda(
+        cudaFuncSetAttribute(
+            tma_two_gpu_allreduce_rank_pivot_kernel_sm90<
+                ReduceOp,
+                ElemBytes>,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            100),
+        "cudaFuncSetAttribute(PreferredSharedMemoryCarveout pivot)");
 
     cache[device] = {true, dynamic_smem_bytes};
 }
@@ -1168,10 +1056,6 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_pivot_sm90(
     }
 
     if (dtype_size_bytes(dtype) == 0) {
-        return cudaErrorInvalidValue;
-    }
-
-    if (pivot_denominator <= 0) {
         return cudaErrorInvalidValue;
     }
 
