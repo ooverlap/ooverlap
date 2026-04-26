@@ -334,15 +334,13 @@ __device__ void reduce_window_and_signal_pivot_sm90(
                      * This still preserves the old pipeline shape: the wait
                      * only happens when a stage is about to be reused.
                      */
-                    tma::reduce_async_wait<FillDepth - 1>();
-
-                    /*
-                     * At this point, the oldest outstanding full reduce is
-                     * complete. The completed local chunks are:
-                     *   [0, iter - FillDepth]
-                     */
                     const int completed_count = iter - FillDepth + 1;
-                    publish_pivot_count(completed_count);
+                    if (pivot_count > 0 && completed_count <= pivot_count) {
+                        tma::reduce_async_wait<FillDepth - 1>();
+                        publish_pivot_count(completed_count);
+                    } else {
+                        tma::reduce_async_read_wait<FillDepth - 1>();
+                    }
                 }
 
                 load.issue(&future_stage);
