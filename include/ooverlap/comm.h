@@ -119,6 +119,38 @@ oo_buffer_kind_t oo_buffer_kind(
     const oo_buffer_t* buffer);
 
 /* Collectives */
+/* IPC / synchronization helpers */
+oo_status_t oo_group_sync(
+    oo_group_t* group);
+
+/*
+ * For multiprocess IPC groups:
+ * - exports this rank's local wrapped/allocation buffer through the group's broker
+ * - imports the peer rank's buffer
+ * - returns an oo_buffer_t for the peer buffer
+ *
+ * This is intended for externally allocated CUDA buffers, e.g. PyTorch tensors
+ * wrapped with oo_buffer_wrap().
+ */
+oo_status_t oo_buffer_exchange_ipc_peer(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t** out_peer);
+
+/*
+ * Run allreduce on a contiguous slice of already-registered local/peer buffers.
+ * element_offset and count are in elements, not bytes.
+ */
+oo_status_t oo_allreduce_offset(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* peer,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    cudaStream_t stream);
+
 oo_status_t oo_allreduce(
     oo_node_t* node,
     oo_buffer_t* local,

@@ -1063,6 +1063,179 @@ oo_buffer_kind_t oo_buffer_kind(
     return (buffer != nullptr) ? buffer->kind : OO_BUFFER_KIND_WRAPPED;
 }
 
+oo_status_t oo_group_sync(
+    oo_group_t* group) {
+    if (group == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (!group->broker) {
+        return OO_SUCCESS;
+    }
+
+    try {
+        group->broker->sync();
+        return OO_SUCCESS;
+    } catch (const std::bad_alloc&) {
+        return OO_ERROR_INTERNAL;
+    } catch (const std::exception& e) {
+        OOVERLAP_LOG_ERROR("oo_group_sync threw: %s\n", e.what());
+        return OO_ERROR_INTERNAL;
+    } catch (...) {
+        return OO_ERROR_INTERNAL;
+    }
+}
+
+oo_status_t oo_buffer_exchange_ipc_peer(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t** out_peer) {
+    if (out_peer == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+    *out_peer = nullptr;
+
+    if (node == nullptr || node->group == nullptr || local == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_group_t* group = node->group;
+
+    if (group->bootstrap_kind != oo_group_bootstrap_kind::multiprocess_ipc) {
+        return OO_ERROR_UNSUPPORTED;
+    }
+
+    if (!group->broker) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (group->num_devices != 2) {
+        return OO_ERROR_UNSUPPORTED;
+    }
+
+    if (node->rank < 0 || node->rank >= group->num_devices) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    ooverlap::system::legacy_peer_buffer_descriptor local_desc{};
+
+    oo_status_t st = oo_buffer_export_legacy_descriptor(
+        local,
+        &local_desc);
+
+    if (st != OO_SUCCESS) {
+        return st;
+    }
+
+    try {
+        std::vector<ooverlap::system::legacy_peer_buffer_descriptor> all_desc(
+            static_cast<size_t>(group->num_devices));
+
+        group->broker->exchange_data(
+            all_desc.data(),
+            &local_desc,
+            sizeof(local_desc));
+
+        const int peer_rank = node->rank ^ 1;
+
+        st = oo_buffer_import_legacy_descriptor(
+            node,
+            all_desc[peer_rank],
+            out_peer);
+
+        if (st != OO_SUCCESS) {
+            return st;
+        }
+
+        group->broker->sync();
+
+        return OO_SUCCESS;
+
+    } catch (const std::bad_alloc&) {
+        return OO_ERROR_INTERNAL;
+    } catch (const std::exception& e) {
+        OOVERLAP_LOG_ERROR("oo_buffer_exchange_ipc_peer threw: %s\n", e.what());
+        return OO_ERROR_INTERNAL;
+    } catch (...) {
+        return OO_ERROR_INTERNAL;
+    }
+}
+
+oo_status_t oo_allreduce_offset(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* peer,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    cudaStream_t stream) {
+    if (node == nullptr || local == nullptr || peer == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (count == 0) {
+        return OO_SUCCESS;
+    }
+
+    const size_t dtype_bytes = oo_dtype_size(dtype);
+    if (dtype_bytes == 0) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    size_t byte_offset = 0;
+    size_t bytes = 0;
+
+    if (!checked_mul_size(element_offset, dtype_bytes, &byte_offset) ||
+        !checked_mul_size(count, dtype_bytes, &bytes)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (local->bytes < byte_offset + bytes ||
+        peer->bytes < byte_offset + bytes) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_buffer_t local_view{};
+    local_view.ptr = reinterpret_cast<void*>(
+        reinterpret_cast<std::uint8_t*>(local->ptr) + byte_offset);
+    local_view.bytes = bytes;
+    local_view.mapped_bytes = bytes;
+    local_view.kind = local->kind;
+    local_view.group = local->group;
+    local_view.owner_rank = local->owner_rank;
+    local_view.owner_device = local->owner_device;
+    local_view.system_kind = local->system_kind;
+    local_view.mapped = local->mapped;
+
+    oo_buffer_t peer_view{};
+    peer_view.ptr = reinterpret_cast<void*>(
+        reinterpret_cast<std::uint8_t*>(peer->ptr) + byte_offset);
+    peer_view.bytes = bytes;
+    peer_view.mapped_bytes = bytes;
+    peer_view.kind = peer->kind;
+    peer_view.group = peer->group;
+    peer_view.owner_rank = peer->owner_rank;
+    peer_view.owner_device = peer->owner_device;
+    peer_view.system_kind = peer->system_kind;
+    peer_view.mapped = peer->mapped;
+
+    /*
+     * Do not copy peer->imported here. The imported mapping is owned by the
+     * original peer buffer. This temporary view only borrows the pointer and
+     * metadata for the duration of this call.
+     */
+
+    return oo_allreduce(
+        node,
+        &local_view,
+        &peer_view,
+        count,
+        dtype,
+        op,
+        stream);
+}
+
 oo_status_t oo_allreduce(
     oo_node_t* node,
     oo_buffer_t* local,
