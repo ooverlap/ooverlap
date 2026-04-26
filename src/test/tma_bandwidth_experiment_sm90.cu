@@ -36,7 +36,7 @@ namespace ooverlap {
 namespace {
 
 constexpr int kExperimentThreads = TMA_TWO_GPU_PEER_THREADS;
-constexpr int kExperimentGmemThreads = 256;
+constexpr int kExperimentGmemThreads = 128;
 
 constexpr int kExperimentChunkBytes = TMA_TWO_GPU_PEER_CHUNK_BYTES;
 constexpr int kExperimentStageDepth = TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH;
@@ -382,7 +382,7 @@ __device__ __forceinline__ uint4 load_copy_vec<uint4>(
         "{\n"
         "  .reg .u64 addr;\n"
         "  cvta.to.global.u64 addr, %4;\n"
-        "  ld.global.nc.v4.u32 {%0, %1, %2, %3}, [addr];\n"
+        "  ld.global.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [addr];\n"
         "}\n"
         : "=r"(value.x),
           "=r"(value.y),
@@ -401,7 +401,7 @@ __device__ __forceinline__ void store_copy_vec<uint4>(
         "{\n"
         "  .reg .u64 addr;\n"
         "  cvta.to.global.u64 addr, %0;\n"
-        "  st.global.v4.u32 [addr], {%1, %2, %3, %4};\n"
+        "  st.global.L1::no_allocate.v4.u32 [addr], {%1, %2, %3, %4};\n"
         "}\n"
         :
         : "l"(ptr),
@@ -429,20 +429,12 @@ __global__ void gmem_copy_coalesced_kernel(
     const size_t lane = static_cast<size_t>(threadIdx.x);
     const size_t block_threads = static_cast<size_t>(blockDim.x);
 
-    // Each CTA owns one contiguous slice instead of doing:
-    //     i = global_tid; i += gridDim.x * blockDim.x
-    //
-    // This keeps each CTA local to one region of memory. Within the CTA,
-    // consecutive threadIdx.x lanes still access consecutive VecT elements,
-    // which is the important coalescing rule.
     constexpr size_t kWarpElems = 32;
-    constexpr int kUnroll = 4;
+    constexpr int kUnroll = 8;
 
     const size_t raw_vecs_per_block =
         (total_vec + nblocks - 1) / nblocks;
 
-    // Round the slice size up to a warp-sized VecT multiple so each CTA starts
-    // closer to a naturally coalesced boundary.
     const size_t vecs_per_block =
         ((raw_vecs_per_block + kWarpElems - 1) / kWarpElems) * kWarpElems;
 
@@ -457,23 +449,67 @@ __global__ void gmem_copy_coalesced_kernel(
 
     const size_t step = block_threads * static_cast<size_t>(kUnroll);
 
-    for (size_t base = block_begin + lane;
-         base < block_end;
-         base += step) {
-#pragma unroll
-        for (int u = 0; u < kUnroll; ++u) {
-            const size_t i =
-                base + static_cast<size_t>(u) * block_threads;
+    size_t base = block_begin + lane;
 
-            if (i < block_end) {
-                const VecT value = load_copy_vec<VecT>(src_vec + i);
-                store_copy_vec<VecT>(dst_vec + i, value);
-            }
-        }
+    /*
+     * Fast path:
+     * Each thread loads 8 independent VecT values first, then stores them.
+     *
+     * For local_to_peer this creates a cleaner source-push stream:
+     * local HBM load -> register -> peer global store.
+     *
+     * This is intentionally not grid-stride across the full allocation.
+     * Each CTA owns one contiguous slice.
+     */
+    for (; base + static_cast<size_t>(7) * block_threads < block_end;
+         base += step) {
+        const VecT v0 = load_copy_vec<VecT>(
+            src_vec + base + static_cast<size_t>(0) * block_threads);
+        const VecT v1 = load_copy_vec<VecT>(
+            src_vec + base + static_cast<size_t>(1) * block_threads);
+        const VecT v2 = load_copy_vec<VecT>(
+            src_vec + base + static_cast<size_t>(2) * block_threads);
+        const VecT v3 = load_copy_vec<VecT>(
+            src_vec + base + static_cast<size_t>(3) * block_threads);
+        const VecT v4 = load_copy_vec<VecT>(
+            src_vec + base + static_cast<size_t>(4) * block_threads);
+        const VecT v5 = load_copy_vec<VecT>(
+            src_vec + base + static_cast<size_t>(5) * block_threads);
+        const VecT v6 = load_copy_vec<VecT>(
+            src_vec + base + static_cast<size_t>(6) * block_threads);
+        const VecT v7 = load_copy_vec<VecT>(
+            src_vec + base + static_cast<size_t>(7) * block_threads);
+
+        store_copy_vec<VecT>(
+            dst_vec + base + static_cast<size_t>(0) * block_threads, v0);
+        store_copy_vec<VecT>(
+            dst_vec + base + static_cast<size_t>(1) * block_threads, v1);
+        store_copy_vec<VecT>(
+            dst_vec + base + static_cast<size_t>(2) * block_threads, v2);
+        store_copy_vec<VecT>(
+            dst_vec + base + static_cast<size_t>(3) * block_threads, v3);
+        store_copy_vec<VecT>(
+            dst_vec + base + static_cast<size_t>(4) * block_threads, v4);
+        store_copy_vec<VecT>(
+            dst_vec + base + static_cast<size_t>(5) * block_threads, v5);
+        store_copy_vec<VecT>(
+            dst_vec + base + static_cast<size_t>(6) * block_threads, v6);
+        store_copy_vec<VecT>(
+            dst_vec + base + static_cast<size_t>(7) * block_threads, v7);
     }
 
-    // Byte tail after the vectorized region. Only CTA 0 handles this to avoid
-    // duplicated tail stores.
+    /*
+     * Slice tail. Still coalesced inside each warp.
+     */
+    for (; base < block_end; base += block_threads) {
+        const VecT value = load_copy_vec<VecT>(src_vec + base);
+        store_copy_vec<VecT>(dst_vec + base, value);
+    }
+
+    /*
+     * Byte tail after the vectorized region.
+     * Only CTA 0 handles this to avoid duplicate stores.
+     */
     const size_t tail_begin = total_vec * sizeof(VecT);
 
     if (blockIdx.x == 0) {
