@@ -13,6 +13,7 @@
 #include "test/persistent_allreduce_2gpu_sm90.h"
 #include "test/ipc_allreduce_2gpu_sm90.h"
 #include "test/ipc_allreduce_benchmark_2gpu_sm90.h"
+#include "test/tma_bandwidth_experiment_sm90.h"
 
 namespace py = pybind11;
 
@@ -224,6 +225,19 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("warmup"),
         py::arg("verify") = false,
         "Per-rank 2-process IPC benchmark: ooverlap IPC allreduce vs NCCL");
+  
+  m.def("benchmark_tma_bandwidth_experiment_sm90",
+        &ooverlap::benchmark_tma_bandwidth_experiment_sm90,
+        py::arg("min_bytes") = 512 * 1024,
+        py::arg("max_bytes") = 1024LL * 1024LL * 1024LL,
+        py::arg("iters") = 100,
+        py::arg("warmup") = 20,
+        py::arg("num_blocks") = 8,
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        py::arg("include_mem_async") = false,
+        "Experimental TMA/cuda::memcpy_async bandwidth sweep. "
+        "Returns rows for peer and same-GPU scenarios.");
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())

@@ -214,6 +214,7 @@ if(OOVERLAP_BUILD_TESTS AND EXISTS ${OOVERLAP_SRC_DIR}/test/persistent_allreduce
     ${OOVERLAP_SRC_DIR}/test/persistent_allreduce_2gpu_sm90.cu
     ${OOVERLAP_SRC_DIR}/test/ipc_allreduce_2gpu_sm90.cu
     ${OOVERLAP_SRC_DIR}/test/ipc_allreduce_benchmark_2gpu_sm90.cu
+    ${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu
   )
 
   ooverlap_force_sm90a(ooverlap_tests)
@@ -474,6 +475,15 @@ if(OOVERLAP_BUILD_PYTHON)
   else()
     message(FATAL_ERROR
       "pybind.cpp requires src/test/ipc_allreduce_benchmark_2gpu_sm90.cu, but it was not found")
+  endif()
+  
+  if(EXISTS ${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu)
+    list(APPEND OOVERLAP_EXT_SOURCES
+      ${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu
+    )
+  else()
+    message(FATAL_ERROR
+      "pybind.cpp requires src/test/tma_bandwidth_experiment_sm90.cu, but it was not found")
   endif()
 
   add_library(ooverlap_ext MODULE ${OOVERLAP_EXT_SOURCES})
