@@ -68,9 +68,10 @@ __device__ __forceinline__ void store_copy_vec<uint4>(
 /*
  * Copy a contiguous VecT span with a caller-selected thread group.
  *
- * This is the piece we will reuse inside the future allreduce kernel for the
- * warp-specialized consumer copy path. The caller chooses lane/lane_count, so
- * this can be driven by a full CTA, a single warp, or any contiguous subgroup.
+ * Important:
+ * For Unroll == 8, this intentionally loads all 8 values first and only then
+ * stores all 8 values. This matches the fast benchmark kernel. Do not turn this
+ * into load/store pairs; that was slower for the local-to-peer push path.
  */
 template <typename VecT, int Unroll>
 __device__ __forceinline__ void copy_vec_span(
@@ -84,13 +85,61 @@ __device__ __forceinline__ void copy_vec_span(
 
     size_t base = begin_vec + lane;
 
-    for (; base + static_cast<size_t>(Unroll - 1) * lane_count < end_vec;
-         base += step) {
+    if constexpr (Unroll == 8) {
+        for (; base + static_cast<size_t>(7) * lane_count < end_vec;
+             base += step) {
+            const VecT v0 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(0) * lane_count);
+            const VecT v1 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(1) * lane_count);
+            const VecT v2 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(2) * lane_count);
+            const VecT v3 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(3) * lane_count);
+            const VecT v4 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(4) * lane_count);
+            const VecT v5 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(5) * lane_count);
+            const VecT v6 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(6) * lane_count);
+            const VecT v7 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(7) * lane_count);
+
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(0) * lane_count,
+                v0);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(1) * lane_count,
+                v1);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(2) * lane_count,
+                v2);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(3) * lane_count,
+                v3);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(4) * lane_count,
+                v4);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(5) * lane_count,
+                v5);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(6) * lane_count,
+                v6);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(7) * lane_count,
+                v7);
+        }
+    } else {
+        for (; base + static_cast<size_t>(Unroll - 1) * lane_count < end_vec;
+             base += step) {
 #pragma unroll
-        for (int u = 0; u < Unroll; ++u) {
-            const size_t i = base + static_cast<size_t>(u) * lane_count;
-            const VecT value = load_copy_vec<VecT>(src_vec + i);
-            store_copy_vec<VecT>(dst_vec + i, value);
+            for (int u = 0; u < Unroll; ++u) {
+                const size_t i =
+                    base + static_cast<size_t>(u) * lane_count;
+                const VecT value = load_copy_vec<VecT>(src_vec + i);
+                store_copy_vec<VecT>(dst_vec + i, value);
+            }
         }
     }
 
@@ -126,7 +175,8 @@ __device__ __forceinline__ void copy_byte_range(
 
     const VecT* __restrict__ src_vec =
         reinterpret_cast<const VecT*>(src);
-    VecT* __restrict__ dst_vec = reinterpret_cast<VecT*>(dst);
+    VecT* __restrict__ dst_vec =
+        reinterpret_cast<VecT*>(dst);
 
     copy_vec_span<VecT, Unroll>(
         src_vec,
@@ -145,10 +195,12 @@ __device__ __forceinline__ void copy_byte_range(
 }
 
 /*
- * Standalone benchmark kernel. Each CTA owns one contiguous slice. Within the
- * CTA, consecutive lanes access consecutive VecT elements, and each thread
- * batches Unroll loads before stores. This matches the fast copy variant that
- * performed best for the local-to-peer path in the benchmark.
+ * Standalone benchmark kernel.
+ *
+ * This is intentionally written in the same shape as the fast version:
+ * - each CTA owns one contiguous slice,
+ * - each thread loads 8 VecT values first,
+ * - then stores those 8 VecT values.
  */
 template <typename VecT, int Unroll = 8>
 __global__ void gmem_copy_coalesced_kernel(
@@ -176,19 +228,81 @@ __global__ void gmem_copy_coalesced_kernel(
         ((raw_vecs_per_block + kWarpElems - 1) / kWarpElems) * kWarpElems;
 
     const size_t block_begin = block * vecs_per_block;
-    const size_t block_end = min_sz(total_vec, block_begin + vecs_per_block);
+    const size_t block_end =
+        min_sz(total_vec, block_begin + vecs_per_block);
 
     const VecT* __restrict__ src_vec =
         reinterpret_cast<const VecT*>(src);
-    VecT* __restrict__ dst_vec = reinterpret_cast<VecT*>(dst);
+    VecT* __restrict__ dst_vec =
+        reinterpret_cast<VecT*>(dst);
 
-    copy_vec_span<VecT, Unroll>(
-        src_vec,
-        dst_vec,
-        block_begin,
-        block_end,
-        lane,
-        block_threads);
+    const size_t step = block_threads * static_cast<size_t>(Unroll);
+
+    size_t base = block_begin + lane;
+
+    if constexpr (Unroll == 8) {
+        for (; base + static_cast<size_t>(7) * block_threads < block_end;
+             base += step) {
+            const VecT v0 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(0) * block_threads);
+            const VecT v1 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(1) * block_threads);
+            const VecT v2 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(2) * block_threads);
+            const VecT v3 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(3) * block_threads);
+            const VecT v4 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(4) * block_threads);
+            const VecT v5 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(5) * block_threads);
+            const VecT v6 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(6) * block_threads);
+            const VecT v7 = load_copy_vec<VecT>(
+                src_vec + base + static_cast<size_t>(7) * block_threads);
+
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(0) * block_threads,
+                v0);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(1) * block_threads,
+                v1);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(2) * block_threads,
+                v2);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(3) * block_threads,
+                v3);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(4) * block_threads,
+                v4);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(5) * block_threads,
+                v5);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(6) * block_threads,
+                v6);
+            store_copy_vec<VecT>(
+                dst_vec + base + static_cast<size_t>(7) * block_threads,
+                v7);
+        }
+    } else {
+        for (; base + static_cast<size_t>(Unroll - 1) * block_threads <
+               block_end;
+             base += step) {
+#pragma unroll
+            for (int u = 0; u < Unroll; ++u) {
+                const size_t i =
+                    base + static_cast<size_t>(u) * block_threads;
+                const VecT value = load_copy_vec<VecT>(src_vec + i);
+                store_copy_vec<VecT>(dst_vec + i, value);
+            }
+        }
+    }
+
+    for (; base < block_end; base += block_threads) {
+        const VecT value = load_copy_vec<VecT>(src_vec + base);
+        store_copy_vec<VecT>(dst_vec + base, value);
+    }
 
     const size_t tail_begin = total_vec * sizeof(VecT);
 
