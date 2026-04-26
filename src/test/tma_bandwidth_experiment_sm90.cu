@@ -6,6 +6,7 @@
 #include "comm/pipeline_tma_copy.h"
 #include "comm/pipeline_tma_load.h"
 #include "comm/pipeline_tma_reduce.h"
+#include "comm/utils.h"
 
 #include "ooverlap/system/peer_buffer.cuh"
 #include "ooverlap/system/runtime_utils.cuh"
@@ -32,6 +33,18 @@
                 std::string("NCCL error: ") + ncclGetErrorString(result__));     \
         }                                                                        \
     } while (0)
+
+#ifndef OOVERLAP_EXPERIMENT_PIVOT_NUMERATOR
+#define OOVERLAP_EXPERIMENT_PIVOT_NUMERATOR 1
+#endif
+
+#ifndef OOVERLAP_EXPERIMENT_PIVOT_DENOMINATOR
+#define OOVERLAP_EXPERIMENT_PIVOT_DENOMINATOR 4
+#endif
+
+#ifndef OOVERLAP_EXPERIMENT_PIVOT_BATCH_CHUNKS
+#define OOVERLAP_EXPERIMENT_PIVOT_BATCH_CHUNKS 16
+#endif
 
 namespace ooverlap {
 namespace {
@@ -67,6 +80,7 @@ enum class ExperimentMethod {
     kNcclSendRecv = 4,
     kGmemCopyU64 = 5,
     kGmemCopyU128 = 6,
+    kPivotPrefixCopyU128 = 7,
 };
 
 enum ExperimentScenarioId {
@@ -223,6 +237,112 @@ __device__ void run_window_pipeline(
     }
 
     __syncthreads();
+}
+
+__device__ __forceinline__ int experiment_compute_pivot_chunk_count(
+    int window_chunk_count,
+    int pivot_numerator,
+    int pivot_denominator) {
+    if (window_chunk_count <= 0 ||
+        pivot_numerator <= 0 ||
+        pivot_denominator <= 0) {
+        return 0;
+    }
+
+    int pivot =
+        static_cast<int>(
+            (static_cast<long long>(window_chunk_count) *
+             static_cast<long long>(pivot_numerator)) /
+            static_cast<long long>(pivot_denominator));
+
+    if (pivot < 0) {
+        pivot = 0;
+    }
+
+    if (pivot > window_chunk_count) {
+        pivot = window_chunk_count;
+    }
+
+    return pivot;
+}
+
+__global__ void pivot_prefix_copy_u128_kernel(
+    const void* __restrict__ src,
+    void* __restrict__ dst,
+    size_t total_bytes,
+    int num_chunks,
+    int pivot_numerator,
+    int pivot_denominator) {
+    const int num_windows = comm::utils::window_num_chunks(num_chunks);
+    const int window_idx = static_cast<int>(blockIdx.x);
+
+    if (window_idx >= num_windows) {
+        return;
+    }
+
+    const comm::utils::Window window =
+        comm::utils::make_window(window_idx, num_chunks, num_windows);
+
+    if (window.chunk_count <= 0) {
+        return;
+    }
+
+    const int pivot_count =
+        experiment_compute_pivot_chunk_count(
+            window.chunk_count,
+            pivot_numerator,
+            pivot_denominator);
+
+    if (pivot_count <= 0) {
+        return;
+    }
+
+    constexpr int kBatchChunks = OOVERLAP_EXPERIMENT_PIVOT_BATCH_CHUNKS;
+
+    const unsigned char* __restrict__ src_u8 =
+        reinterpret_cast<const unsigned char*>(src);
+    unsigned char* __restrict__ dst_u8 =
+        reinterpret_cast<unsigned char*>(dst);
+
+    const size_t lane = static_cast<size_t>(threadIdx.x);
+    const size_t lane_count = static_cast<size_t>(blockDim.x);
+
+    for (int begin = 0; begin < pivot_count; begin += kBatchChunks) {
+        int end = begin + kBatchChunks;
+
+        if (end > pivot_count) {
+            end = pivot_count;
+        }
+
+        const int begin_chunk = window.start_chunk + begin;
+        const int end_chunk = window.start_chunk + end;
+
+        const size_t begin_offset =
+            static_cast<size_t>(begin_chunk) *
+            TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+        size_t end_offset =
+            static_cast<size_t>(end_chunk) *
+            TMA_TWO_GPU_PEER_CHUNK_BYTES;
+
+        if (end_offset > total_bytes) {
+            end_offset = total_bytes;
+        }
+
+        if (begin_offset >= end_offset) {
+            continue;
+        }
+
+        const size_t bytes = end_offset - begin_offset;
+
+        comm::fast_copy::copy_byte_range<uint4, 8>(
+            src_u8 + begin_offset,
+            dst_u8 + begin_offset,
+            0,
+            bytes,
+            lane,
+            lane_count);
+    }
 }
 
 __global__ void tma_pipeline_copy_kernel(
@@ -448,6 +568,12 @@ void configure_experiment_kernels_once(int device) {
         0,
         device,
         "gmem_copy_coalesced_kernel<uint4>");
+    
+    configure_one_kernel(
+        reinterpret_cast<const void*>(pivot_prefix_copy_u128_kernel),
+        0,
+        device,
+        "pivot_prefix_copy_u128_kernel");
 
     if (device >= 0 && device < 16) {
         configured[device] = true;
@@ -533,6 +659,24 @@ cudaError_t launch_method(
                     dst,
                     bytes);
             return cudaGetLastError();
+
+        case ExperimentMethod::kPivotPrefixCopyU128: {
+            const int num_windows = comm::utils::window_num_chunks(num_chunks);
+        
+            pivot_prefix_copy_u128_kernel<<<
+                num_windows,
+                kExperimentGmemThreads,
+                0,
+                stream>>>(
+                    src,
+                    dst,
+                    bytes,
+                    num_chunks,
+                    OOVERLAP_EXPERIMENT_PIVOT_NUMERATOR,
+                    OOVERLAP_EXPERIMENT_PIVOT_DENOMINATOR);
+        
+            return cudaGetLastError();
+        }
 
         default:
             return cudaErrorInvalidValue;
@@ -862,6 +1006,7 @@ void run_case_for_size(
             ExperimentMethod::kGmemCopyU32,
             ExperimentMethod::kGmemCopyU64,
             ExperimentMethod::kGmemCopyU128,
+            ExperimentMethod::kPivotPrefixCopyU128,
         };
 
         if (include_mem_async) {

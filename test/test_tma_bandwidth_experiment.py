@@ -22,6 +22,7 @@ METHOD_NAME = {
     4: "nccl_sendrecv",
     5: "gmem_copy_u64",
     6: "gmem_copy_u128",
+    7: "pivot_prefix_copy_u128",
 }
 
 def load_ooverlap_ext():
@@ -78,6 +79,7 @@ def ordered_methods(rows):
         "gmem_copy_u32",
         "gmem_copy_u64",
         "gmem_copy_u128",
+        "pivot_prefix_copy_u128",
         "nccl_sendrecv",
         "tma_reduce_add_f16",
         "mem_async_copy",
