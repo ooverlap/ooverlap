@@ -14,6 +14,7 @@
 #include "test/ipc_allreduce_2gpu_sm90.h"
 #include "test/ipc_allreduce_benchmark_2gpu_sm90.h"
 #include "test/tma_bandwidth_experiment_sm90.h"
+#include "test/tma_allreduce_sweep_2gpu_sm90.h"
 
 namespace py = pybind11;
 
@@ -238,6 +239,19 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("include_mem_async") = false,
         py::arg("include_nccl") = false,
         "Experimental TMA/global-memory/NCCL bandwidth sweep.");
+
+  m.def("benchmark_tma_two_gpu_allreduce_sweep_sm90",
+        &ooverlap::benchmark_tma_two_gpu_allreduce_sweep_sm90,
+        py::arg("numels"),
+        py::arg("kernels"),
+        py::arg("threads"),
+        py::arg("max_ctas"),
+        py::arg("window_chunks"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        "Sweep SM90 2-GPU TMA allreduce runtime launch configs and return JSONL rows.");
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())

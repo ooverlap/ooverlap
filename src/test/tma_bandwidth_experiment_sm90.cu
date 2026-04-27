@@ -36,7 +36,7 @@
 namespace ooverlap {
 namespace {
 
-constexpr int kExperimentThreads = TMA_TWO_GPU_PEER_THREADS;
+constexpr int kExperimentThreads = TMA_TWO_GPU_PEER_DEFAULT_THREADS;
 constexpr int kExperimentGmemThreads = 1024;
 
 constexpr int kExperimentChunkBytes = TMA_TWO_GPU_PEER_CHUNK_BYTES;
