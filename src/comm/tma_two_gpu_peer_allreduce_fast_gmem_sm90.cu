@@ -7,6 +7,7 @@
 #include "comm/utils.h"
 #include "comm/window_pipeline_sm90.cuh"
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -21,10 +22,7 @@
 namespace ooverlap {
 namespace {
 
-struct SignalCacheEntry {
-    int* ptr = nullptr;
-    size_t capacity = 0;
-};
+namespace cg = cooperative_groups;
 
 __host__ __device__ __forceinline__ size_t dtype_size_bytes(
     oo_dtype_t dtype) {
@@ -38,6 +36,17 @@ __host__ __device__ __forceinline__ size_t dtype_size_bytes(
         default:
             return 0;
     }
+}
+
+__host__ __device__ __forceinline__ int overlap_pair_count_for_windows(
+    int owned_windows) {
+    if (owned_windows <= 0) {
+        return 0;
+    }
+
+    return comm::utils::min_int(
+        owned_windows,
+        TMA_TWO_GPU_PEER_MAX_CTAS / 2);
 }
 
 template <typename ReduceApply, int ElemBytes>
@@ -121,7 +130,7 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
 }
 
 template <typename ReduceApply, int ElemBytes>
-__global__ void tma_overlap_fastcopy_rank_kernel_sm90(
+__global__ void tma_overlap_fastcopy_dsm_rank_kernel_sm90(
     const void* local_in,
     void* local_buf,
     void* peer_buf,
@@ -130,24 +139,14 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch,
-    int* window_ready_flags,
-    int ctas_per_rank) {
-    comm::window_pipeline::wait_for_collective_ready(
-        local_ready_signal,
-        peer_ready_signal,
-        collective_epoch);
+    int pair_count) {
+    cg::cluster_group cluster = cg::this_cluster();
 
-    const int cta_idx =
-        static_cast<int>(blockIdx.x) /
-        TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
+    const int cluster_block_rank = cluster.block_rank();
+    const int pair_idx = cluster_block_rank / 2;
+    const int role = cluster_block_rank & 1;
 
-    const int role =
-        static_cast<int>(blockIdx.x) %
-        TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
-
-    if (ctas_per_rank <= 0 || cta_idx >= ctas_per_rank) {
-        return;
-    }
+    __shared__ int dsm_ready_window_exclusive;
 
     const size_t total_bytes = count * static_cast<size_t>(ElemBytes);
 
@@ -164,18 +163,38 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
     const comm::utils::WindowRange rank_range =
         comm::utils::rank_window_range(num_windows, rank);
 
-    const comm::utils::WindowRange cta_range =
+    const comm::utils::WindowRange pair_range =
         comm::utils::cta_window_range(
-            cta_idx,
-            ctas_per_rank,
+            pair_idx,
+            pair_count,
             rank_range);
 
-    if (cta_range.begin >= cta_range.end) {
+    if (threadIdx.x == 0) {
+        dsm_ready_window_exclusive = pair_range.begin;
+    }
+
+    cluster.sync();
+
+    comm::window_pipeline::wait_for_collective_ready(
+        local_ready_signal,
+        peer_ready_signal,
+        collective_epoch);
+
+    if (pair_count <= 0 ||
+        pair_idx >= pair_count ||
+        pair_range.begin >= pair_range.end) {
         return;
     }
 
+    const int producer_cluster_rank = pair_idx * 2;
+
+    int* producer_ready_window_exclusive =
+        cluster.map_shared_rank(
+            &dsm_ready_window_exclusive,
+            producer_cluster_rank);
+
     if (role == 1) {
-        comm::window_pipeline::copy_window_range_gmem_after_ready<
+        comm::window_pipeline::copy_window_range_gmem_after_counter<
             uint4,
             TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
             TMA_TWO_GPU_PEER_CHUNK_BYTES,
@@ -183,10 +202,9 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
                 peer_buf,
                 local_buf,
                 total_bytes,
-                cta_range.begin,
-                cta_range.end,
-                window_ready_flags,
-                rank_range.begin);
+                pair_range.begin,
+                pair_range.end,
+                producer_ready_window_exclusive);
         return;
     }
 
@@ -197,7 +215,7 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
 
     __shared__ sync::semaphore barriers[TMA_TWO_GPU_PEER_BARRIER_COUNT];
 
-    comm::window_pipeline::run_window_range_signal<
+    comm::window_pipeline::run_window_range_signal_counter<
         TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
         TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
         TMA_TWO_GPU_PEER_CHUNK_BYTES,
@@ -206,51 +224,15 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
             local_in,
             peer_buf,
             total_bytes,
-            cta_range.begin,
-            cta_range.end,
-            window_ready_flags,
-            rank_range.begin,
+            pair_range.begin,
+            pair_range.end,
+            producer_ready_window_exclusive,
             shared_raw,
             barriers);
 }
 
-SignalCacheEntry& signal_cache_for_device(int device) {
-    static std::mutex mutex;
-    static std::unordered_map<int, SignalCacheEntry> cache;
-
-    std::lock_guard<std::mutex> lock(mutex);
-    return cache[device];
-}
-
-int* ensure_signal_capacity(int device, size_t required_count) {
-    if (required_count == 0) {
-        return nullptr;
-    }
-
-    SignalCacheEntry& entry = signal_cache_for_device(device);
-
-    if (entry.ptr != nullptr && entry.capacity >= required_count) {
-        return entry.ptr;
-    }
-
-    system::runtime::set_device(device);
-
-    if (entry.ptr != nullptr) {
-        cudaFree(entry.ptr);
-        entry.ptr = nullptr;
-        entry.capacity = 0;
-    }
-
-    system::runtime::check_cuda(
-        cudaMalloc(&entry.ptr, required_count * sizeof(int)),
-        "cudaMalloc(overlap window ready flags)");
-
-    entry.capacity = required_count;
-    return entry.ptr;
-}
-
-template <typename ReduceApply, int ElemBytes, bool Overlap>
-void configure_kernel_once_for(int device) {
+template <typename ReduceApply, int ElemBytes>
+void configure_seq_kernel_once_for(int device) {
     struct CacheEntry {
         bool configured = false;
         size_t dynamic_smem_bytes = 0;
@@ -289,55 +271,106 @@ void configure_kernel_once_for(int device) {
             "tma_fastcopy_allreduce_configure_kernel_once: requested shared memory exceeds opt-in limit");
     }
 
-    if constexpr (Overlap) {
-        if (dynamic_smem_bytes >
-            static_cast<size_t>(prop.sharedMemPerBlock)) {
-            system::runtime::check_cuda(
-                cudaFuncSetAttribute(
-                    tma_overlap_fastcopy_rank_kernel_sm90<
-                        ReduceApply,
-                        ElemBytes>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    static_cast<int>(dynamic_smem_bytes)),
-                "cudaFuncSetAttribute(MaxDynamicSharedMemorySize overlap)");
-        }
-
-        system::runtime::check_cuda(
-            cudaFuncSetAttribute(
-                tma_overlap_fastcopy_rank_kernel_sm90<
-                    ReduceApply,
-                    ElemBytes>,
-                cudaFuncAttributePreferredSharedMemoryCarveout,
-                100),
-            "cudaFuncSetAttribute(PreferredSharedMemoryCarveout overlap)");
-    } else {
-        if (dynamic_smem_bytes >
-            static_cast<size_t>(prop.sharedMemPerBlock)) {
-            system::runtime::check_cuda(
-                cudaFuncSetAttribute(
-                    tma_then_fastcopy_rank_kernel_sm90<
-                        ReduceApply,
-                        ElemBytes>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    static_cast<int>(dynamic_smem_bytes)),
-                "cudaFuncSetAttribute(MaxDynamicSharedMemorySize seq)");
-        }
-
+    if (dynamic_smem_bytes >
+        static_cast<size_t>(prop.sharedMemPerBlock)) {
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
                 tma_then_fastcopy_rank_kernel_sm90<
                     ReduceApply,
                     ElemBytes>,
-                cudaFuncAttributePreferredSharedMemoryCarveout,
-                100),
-            "cudaFuncSetAttribute(PreferredSharedMemoryCarveout seq)");
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(dynamic_smem_bytes)),
+            "cudaFuncSetAttribute(MaxDynamicSharedMemorySize seq)");
     }
+
+    system::runtime::check_cuda(
+        cudaFuncSetAttribute(
+            tma_then_fastcopy_rank_kernel_sm90<
+                ReduceApply,
+                ElemBytes>,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            100),
+        "cudaFuncSetAttribute(PreferredSharedMemoryCarveout seq)");
 
     cache[device] = {true, dynamic_smem_bytes};
 }
 
-template <typename ReduceApply, int ElemBytes, bool Overlap>
-cudaError_t launch_rank_kernel_sm90(
+template <typename ReduceApply, int ElemBytes>
+void configure_overlap_dsm_kernel_once_for(int device) {
+    struct CacheEntry {
+        bool configured = false;
+        size_t dynamic_smem_bytes = 0;
+    };
+
+    static std::mutex mutex;
+    static std::unordered_map<int, CacheEntry> cache;
+
+    const size_t dynamic_smem_bytes =
+        TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES;
+
+    const size_t total_smem_bytes =
+        dynamic_smem_bytes + TMA_TWO_GPU_PEER_STATIC_SHARED_BYTES;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto it = cache.find(device);
+
+    if (it != cache.end() &&
+        it->second.configured &&
+        it->second.dynamic_smem_bytes == dynamic_smem_bytes) {
+        return;
+    }
+
+    system::runtime::set_device(device);
+
+    cudaDeviceProp prop{};
+
+    system::runtime::check_cuda(
+        cudaGetDeviceProperties(&prop, device),
+        "cudaGetDeviceProperties");
+
+    if (total_smem_bytes >
+        static_cast<size_t>(prop.sharedMemPerBlockOptin)) {
+        throw std::runtime_error(
+            "tma_fastcopy_allreduce_configure_dsm_kernel_once: requested shared memory exceeds opt-in limit");
+    }
+
+    auto kernel =
+        tma_overlap_fastcopy_dsm_rank_kernel_sm90<
+            ReduceApply,
+            ElemBytes>;
+
+    if constexpr (TMA_TWO_GPU_PEER_MAX_CTAS == 16) {
+        system::runtime::check_cuda(
+            cudaFuncSetAttribute(
+                kernel,
+                cudaFuncAttributeNonPortableClusterSizeAllowed,
+                1),
+            "cudaFuncSetAttribute(NonPortableClusterSizeAllowed)");
+    }
+
+    if (dynamic_smem_bytes >
+        static_cast<size_t>(prop.sharedMemPerBlock)) {
+        system::runtime::check_cuda(
+            cudaFuncSetAttribute(
+                kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(dynamic_smem_bytes)),
+            "cudaFuncSetAttribute(MaxDynamicSharedMemorySize overlap dsm)");
+    }
+
+    system::runtime::check_cuda(
+        cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            100),
+        "cudaFuncSetAttribute(PreferredSharedMemoryCarveout overlap dsm)");
+
+    cache[device] = {true, dynamic_smem_bytes};
+}
+
+template <typename ReduceApply, int ElemBytes>
+cudaError_t launch_seq_rank_kernel_sm90(
     const void* local_in,
     void* local_buf,
     void* peer_buf,
@@ -376,82 +409,161 @@ cudaError_t launch_rank_kernel_sm90(
         peer_ready_signal != nullptr &&
         collective_epoch > 0;
 
-    int num_blocks = 0;
-
-    if constexpr (Overlap) {
-        num_blocks =
-            ctas_per_rank * TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
-    } else {
-        num_blocks = ctas_per_rank;
-    }
-
-    if (needs_rendezvous) {
-        num_blocks = std::max(1, num_blocks);
-    }
+    const int num_blocks =
+        needs_rendezvous ? std::max(1, ctas_per_rank) : ctas_per_rank;
 
     if (num_blocks <= 0) {
         return cudaSuccess;
     }
 
-    configure_kernel_once_for<ReduceApply, ElemBytes, Overlap>(device);
+    configure_seq_kernel_once_for<ReduceApply, ElemBytes>(device);
 
     system::runtime::set_device(device);
 
-    if constexpr (Overlap) {
-        int* ready_flags = nullptr;
-
-        if (owned_windows > 0) {
-            ready_flags =
-                ensure_signal_capacity(
-                    device,
-                    static_cast<size_t>(owned_windows));
-
-            system::runtime::check_cuda(
-                cudaMemsetAsync(
-                    ready_flags,
-                    0,
-                    static_cast<size_t>(owned_windows) * sizeof(int),
-                    stream),
-                "cudaMemsetAsync(overlap window ready flags)");
-        }
-
-        tma_overlap_fastcopy_rank_kernel_sm90<
-            ReduceApply,
-            ElemBytes><<<
-                num_blocks,
-                TMA_TWO_GPU_PEER_THREADS,
-                TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES,
-                stream>>>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch,
-                    ready_flags,
-                    ctas_per_rank);
-    } else {
-        tma_then_fastcopy_rank_kernel_sm90<
-            ReduceApply,
-            ElemBytes><<<
-                num_blocks,
-                TMA_TWO_GPU_PEER_THREADS,
-                TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES,
-                stream>>>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch,
-                    ctas_per_rank);
-    }
+    tma_then_fastcopy_rank_kernel_sm90<
+        ReduceApply,
+        ElemBytes><<<
+            num_blocks,
+            TMA_TWO_GPU_PEER_THREADS,
+            TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES,
+            stream>>>(
+                local_in,
+                local_buf,
+                peer_buf,
+                count,
+                rank,
+                local_ready_signal,
+                peer_ready_signal,
+                collective_epoch,
+                ctas_per_rank);
 
     return cudaGetLastError();
+}
+
+template <typename ReduceApply, int ElemBytes>
+cudaError_t launch_overlap_dsm_rank_kernel_sm90(
+    const void* local_in,
+    void* local_buf,
+    void* peer_buf,
+    size_t count,
+    int rank,
+    int dev0,
+    int dev1,
+    cudaStream_t stream,
+    int* local_ready_signal,
+    const int* peer_ready_signal,
+    int collective_epoch) {
+    const int device = (rank == 0) ? dev0 : dev1;
+
+    const size_t total_bytes = count * static_cast<size_t>(ElemBytes);
+
+    const int num_chunks =
+        comm::utils::ceil_div_int64_to_int(
+            total_bytes,
+            TMA_TWO_GPU_PEER_CHUNK_BYTES);
+
+    const int num_windows =
+        comm::utils::window_count_for_chunks(
+            num_chunks,
+            TMA_TWO_GPU_PEER_WINDOW_CHUNKS);
+
+    const int owned_windows =
+        comm::utils::rank_window_count(num_windows, rank);
+
+    const int pair_count =
+        overlap_pair_count_for_windows(owned_windows);
+
+    const bool needs_rendezvous =
+        local_ready_signal != nullptr &&
+        peer_ready_signal != nullptr &&
+        collective_epoch > 0;
+
+    if (pair_count <= 0 && !needs_rendezvous) {
+        return cudaSuccess;
+    }
+
+    configure_overlap_dsm_kernel_once_for<ReduceApply, ElemBytes>(device);
+
+    system::runtime::set_device(device);
+
+    auto kernel =
+        tma_overlap_fastcopy_dsm_rank_kernel_sm90<
+            ReduceApply,
+            ElemBytes>;
+
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(TMA_TWO_GPU_PEER_MAX_CTAS, 1, 1);
+    config.blockDim = dim3(TMA_TWO_GPU_PEER_THREADS, 1, 1);
+    config.dynamicSmemBytes = TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES;
+    config.stream = stream;
+
+    cudaLaunchAttribute attrs[1]{};
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = TMA_TWO_GPU_PEER_MAX_CTAS;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+
+    config.attrs = attrs;
+    config.numAttrs = 1;
+
+    return cudaLaunchKernelEx(
+        &config,
+        kernel,
+        local_in,
+        local_buf,
+        peer_buf,
+        count,
+        rank,
+        local_ready_signal,
+        peer_ready_signal,
+        collective_epoch,
+        pair_count);
+}
+
+template <typename ReduceApply, int ElemBytes, bool Overlap>
+cudaError_t launch_rank_kernel_sm90(
+    const void* local_in,
+    void* local_buf,
+    void* peer_buf,
+    size_t count,
+    int rank,
+    int dev0,
+    int dev1,
+    cudaStream_t stream,
+    int* local_ready_signal,
+    const int* peer_ready_signal,
+    int collective_epoch) {
+    if constexpr (Overlap) {
+        return launch_overlap_dsm_rank_kernel_sm90<
+            ReduceApply,
+            ElemBytes>(
+                local_in,
+                local_buf,
+                peer_buf,
+                count,
+                rank,
+                dev0,
+                dev1,
+                stream,
+                local_ready_signal,
+                peer_ready_signal,
+                collective_epoch);
+    } else {
+        return launch_seq_rank_kernel_sm90<
+            ReduceApply,
+            ElemBytes>(
+                local_in,
+                local_buf,
+                peer_buf,
+                count,
+                rank,
+                dev0,
+                dev1,
+                stream,
+                local_ready_signal,
+                peer_ready_signal,
+                collective_epoch);
+    }
 }
 
 template <typename ReduceOp, int ElemBytes, bool Overlap>

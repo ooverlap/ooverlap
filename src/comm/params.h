@@ -27,7 +27,7 @@
 
 // Window = signaling / work-assignment granularity.
 // Each window contains this many chunks, except the final tail window.
-#define TMA_TWO_GPU_PEER_WINDOW_CHUNKS 16
+#define TMA_TWO_GPU_PEER_WINDOW_CHUNKS 64
 
 #define TMA_TWO_GPU_PEER_MAX_WINDOW_BYTES \
     (static_cast<size_t>(TMA_TWO_GPU_PEER_WINDOW_CHUNKS) * \
@@ -44,7 +44,7 @@
     (TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH / 2)
 
 // Fast global-memory copy path.
-#define TMA_TWO_GPU_PEER_FAST_COPY_UNROLL 8
+#define TMA_TWO_GPU_PEER_FAST_COPY_UNROLL 16
 
 // Overlapped TMA-reduce + fast-copy path.
 //
@@ -77,6 +77,15 @@ static_assert(TMA_TWO_GPU_PEER_COPY_STAGE_GAP <=
 
 static_assert(TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA == 2,
               "overlap path expects exactly producer+consumer CTA roles");
+
+static_assert(TMA_TWO_GPU_PEER_MAX_CTAS == 2 ||
+                  TMA_TWO_GPU_PEER_MAX_CTAS == 4 ||
+                  TMA_TWO_GPU_PEER_MAX_CTAS == 8 ||
+                  TMA_TWO_GPU_PEER_MAX_CTAS == 16,
+              "TMA_TWO_GPU_PEER_MAX_CTAS must be 2, 4, 8, or non-portable 16");
+
+static_assert((TMA_TWO_GPU_PEER_MAX_CTAS % 2) == 0,
+              "TMA_TWO_GPU_PEER_MAX_CTAS must be even for producer/consumer pairs");
 
 #define TMA_TWO_GPU_PEER_REDUCE_SHARED_BYTES \
     (static_cast<size_t>(TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH) * \
