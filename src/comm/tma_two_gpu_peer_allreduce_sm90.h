@@ -28,6 +28,6 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch,
-    comm::LaunchConfig launch_config);
+    comm::LaunchConfig launch_config = comm::default_launch_config());
 
 } // namespace ooverlap
