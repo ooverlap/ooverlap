@@ -96,8 +96,10 @@ __global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
         TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
         TMA_TWO_GPU_PEER_CHUNK_BYTES,
         ReduceApply>(
-            local_in,
+            //local_in,
+            //peer_buf,
             peer_buf,
+            local_buf,
             total_bytes,
             cta_range.begin,
             cta_range.end,
@@ -109,8 +111,10 @@ __global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
         TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
         TMA_TWO_GPU_PEER_COPY_STAGE_GAP,
         TMA_TWO_GPU_PEER_CHUNK_BYTES>(
-            peer_buf,
+            //peer_buf,
+            //local_buf,
             local_buf,
+            peer_buf,
             total_bytes,
             cta_range.begin,
             cta_range.end,
