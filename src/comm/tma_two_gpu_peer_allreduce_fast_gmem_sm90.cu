@@ -143,8 +143,17 @@ __global__ void tma_overlap_fastcopy_dsm_rank_kernel_sm90(
     cg::cluster_group cluster = cg::this_cluster();
 
     const int cluster_block_rank = cluster.block_rank();
-    const int pair_idx = cluster_block_rank / 2;
     const int role = cluster_block_rank & 1;
+
+    /*
+     * Cluster size is exactly 2:
+     *
+     *   cluster block rank 0 = producer
+     *   cluster block rank 1 = consumer
+     *
+     * One cluster owns one producer/consumer pair.
+     */
+    const int pair_idx = static_cast<int>(blockIdx.x) / 2;
 
     __shared__ int dsm_ready_window_exclusive;
 
@@ -180,55 +189,60 @@ __global__ void tma_overlap_fastcopy_dsm_rank_kernel_sm90(
         peer_ready_signal,
         collective_epoch);
 
-    if (pair_count <= 0 ||
-        pair_idx >= pair_count ||
-        pair_range.begin >= pair_range.end) {
-        return;
+    const bool active_pair =
+        pair_count > 0 &&
+        pair_idx < pair_count &&
+        pair_range.begin < pair_range.end;
+
+    if (active_pair) {
+        int* producer_ready_window_exclusive =
+            cluster.map_shared_rank(
+                &dsm_ready_window_exclusive,
+                0);
+
+        if (role == 1) {
+            comm::window_pipeline::copy_window_range_gmem_after_counter<
+                uint4,
+                TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
+                TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                TMA_TWO_GPU_PEER_WINDOW_CHUNKS>(
+                    peer_buf,
+                    local_buf,
+                    total_bytes,
+                    pair_range.begin,
+                    pair_range.end,
+                    producer_ready_window_exclusive);
+        } else {
+            extern __shared__ uint4 shared_storage_u4[];
+
+            unsigned char* shared_raw =
+                reinterpret_cast<unsigned char*>(shared_storage_u4);
+
+            __shared__ sync::semaphore barriers[
+                TMA_TWO_GPU_PEER_BARRIER_COUNT];
+
+            comm::window_pipeline::run_window_range_signal_counter<
+                TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+                TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+                TMA_TWO_GPU_PEER_CHUNK_BYTES,
+                TMA_TWO_GPU_PEER_WINDOW_CHUNKS,
+                ReduceApply>(
+                    local_in,
+                    peer_buf,
+                    total_bytes,
+                    pair_range.begin,
+                    pair_range.end,
+                    producer_ready_window_exclusive,
+                    shared_raw,
+                    barriers);
+        }
     }
 
-    const int producer_cluster_rank = pair_idx * 2;
-
-    int* producer_ready_window_exclusive =
-        cluster.map_shared_rank(
-            &dsm_ready_window_exclusive,
-            producer_cluster_rank);
-
-    if (role == 1) {
-        comm::window_pipeline::copy_window_range_gmem_after_counter<
-            uint4,
-            TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-            TMA_TWO_GPU_PEER_CHUNK_BYTES,
-            TMA_TWO_GPU_PEER_WINDOW_CHUNKS>(
-                peer_buf,
-                local_buf,
-                total_bytes,
-                pair_range.begin,
-                pair_range.end,
-                producer_ready_window_exclusive);
-        return;
-    }
-
-    extern __shared__ uint4 shared_storage_u4[];
-
-    unsigned char* shared_raw =
-        reinterpret_cast<unsigned char*>(shared_storage_u4);
-
-    __shared__ sync::semaphore barriers[TMA_TWO_GPU_PEER_BARRIER_COUNT];
-
-    comm::window_pipeline::run_window_range_signal_counter<
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES,
-        TMA_TWO_GPU_PEER_WINDOW_CHUNKS,
-        ReduceApply>(
-            local_in,
-            peer_buf,
-            total_bytes,
-            pair_range.begin,
-            pair_range.end,
-            producer_ready_window_exclusive,
-            shared_raw,
-            barriers);
+    /*
+     * DSM lifetime rule: producer block owns the DSM signal, so it must not exit
+     * until the consumer is done polling/copying.
+     */
+    cluster.sync();
 }
 
 template <typename ReduceApply, int ElemBytes>
@@ -340,15 +354,6 @@ void configure_overlap_dsm_kernel_once_for(int device) {
             ReduceApply,
             ElemBytes>;
 
-    if constexpr (TMA_TWO_GPU_PEER_MAX_CTAS == 16) {
-        system::runtime::check_cuda(
-            cudaFuncSetAttribute(
-                kernel,
-                cudaFuncAttributeNonPortableClusterSizeAllowed,
-                1),
-            "cudaFuncSetAttribute(NonPortableClusterSizeAllowed)");
-    }
-
     if (dynamic_smem_bytes >
         static_cast<size_t>(prop.sharedMemPerBlock)) {
         system::runtime::check_cuda(
@@ -453,6 +458,8 @@ cudaError_t launch_overlap_dsm_rank_kernel_sm90(
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch) {
+    constexpr int ClusterBlocks = 2;
+
     const int device = (rank == 0) ? dev0 : dev1;
 
     const size_t total_bytes = count * static_cast<size_t>(ElemBytes);
@@ -482,6 +489,13 @@ cudaError_t launch_overlap_dsm_rank_kernel_sm90(
         return cudaSuccess;
     }
 
+    const int num_clusters =
+        needs_rendezvous
+            ? std::max(1, pair_count)
+            : pair_count;
+
+    const int num_blocks = num_clusters * ClusterBlocks;
+
     configure_overlap_dsm_kernel_once_for<ReduceApply, ElemBytes>(device);
 
     system::runtime::set_device(device);
@@ -492,14 +506,14 @@ cudaError_t launch_overlap_dsm_rank_kernel_sm90(
             ElemBytes>;
 
     cudaLaunchConfig_t config{};
-    config.gridDim = dim3(TMA_TWO_GPU_PEER_MAX_CTAS, 1, 1);
+    config.gridDim = dim3(num_blocks, 1, 1);
     config.blockDim = dim3(TMA_TWO_GPU_PEER_THREADS, 1, 1);
     config.dynamicSmemBytes = TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES;
     config.stream = stream;
 
     cudaLaunchAttribute attrs[1]{};
     attrs[0].id = cudaLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = TMA_TWO_GPU_PEER_MAX_CTAS;
+    attrs[0].val.clusterDim.x = ClusterBlocks;
     attrs[0].val.clusterDim.y = 1;
     attrs[0].val.clusterDim.z = 1;
 
