@@ -2,6 +2,7 @@
 
 #include "ooverlap/system/runtime_utils.cuh"
 
+#include "comm/launch_config.h"
 #include "comm/params.h"
 #include "comm/pipeline_tma_reduce.h"
 #include "comm/utils.h"
@@ -40,6 +41,18 @@ __host__ __device__ __forceinline__ size_t dtype_size_bytes(
     }
 }
 
+__host__ __device__ __forceinline__ int overlap_pair_count_for_windows(
+    int owned_windows,
+    int max_ctas) {
+    if (owned_windows <= 0 || max_ctas < TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA) {
+        return 0;
+    }
+
+    return comm::utils::min_int(
+        owned_windows,
+        max_ctas / TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA);
+}
+
 template <typename ReduceApply, int ElemBytes>
 __global__ void tma_then_fastcopy_rank_kernel_sm90(
     const void* local_in,
@@ -50,7 +63,8 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch,
-    int ctas_per_rank) {
+    int ctas_per_rank,
+    int window_chunks) {
     comm::window_pipeline::wait_for_collective_ready(
         local_ready_signal,
         peer_ready_signal,
@@ -72,7 +86,7 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
     const int num_windows =
         comm::utils::window_count_for_chunks(
             num_chunks,
-            TMA_TWO_GPU_PEER_WINDOW_CHUNKS);
+            window_chunks);
 
     const comm::utils::WindowRange rank_range =
         comm::utils::rank_window_range(num_windows, rank);
@@ -98,26 +112,26 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
         TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
         TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
         TMA_TWO_GPU_PEER_CHUNK_BYTES,
-        TMA_TWO_GPU_PEER_WINDOW_CHUNKS,
         ReduceApply>(
             local_in,
             peer_buf,
             total_bytes,
             cta_range.begin,
             cta_range.end,
+            window_chunks,
             shared_raw,
             barriers);
 
     comm::window_pipeline::copy_window_range_gmem<
         uint4,
         TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES,
-        TMA_TWO_GPU_PEER_WINDOW_CHUNKS>(
+        TMA_TWO_GPU_PEER_CHUNK_BYTES>(
             peer_buf,
             local_buf,
             total_bytes,
             cta_range.begin,
-            cta_range.end);
+            cta_range.end,
+            window_chunks);
 }
 
 template <typename ReduceApply, int ElemBytes>
@@ -131,13 +145,14 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
     const int* peer_ready_signal,
     int collective_epoch,
     int* window_ready_flags,
-    int ctas_per_rank) {
+    int pair_count,
+    int window_chunks) {
     comm::window_pipeline::wait_for_collective_ready(
         local_ready_signal,
         peer_ready_signal,
         collective_epoch);
 
-    const int cta_idx =
+    const int pair_idx =
         static_cast<int>(blockIdx.x) /
         TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
 
@@ -145,7 +160,7 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
         static_cast<int>(blockIdx.x) %
         TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
 
-    if (ctas_per_rank <= 0 || cta_idx >= ctas_per_rank) {
+    if (pair_count <= 0 || pair_idx >= pair_count) {
         return;
     }
 
@@ -159,18 +174,18 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
     const int num_windows =
         comm::utils::window_count_for_chunks(
             num_chunks,
-            TMA_TWO_GPU_PEER_WINDOW_CHUNKS);
+            window_chunks);
 
     const comm::utils::WindowRange rank_range =
         comm::utils::rank_window_range(num_windows, rank);
 
-    const comm::utils::WindowRange cta_range =
+    const comm::utils::WindowRange pair_range =
         comm::utils::cta_window_range(
-            cta_idx,
-            ctas_per_rank,
+            pair_idx,
+            pair_count,
             rank_range);
 
-    if (cta_range.begin >= cta_range.end) {
+    if (pair_range.begin >= pair_range.end) {
         return;
     }
 
@@ -178,13 +193,13 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
         comm::window_pipeline::copy_window_range_gmem_after_ready<
             uint4,
             TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-            TMA_TWO_GPU_PEER_CHUNK_BYTES,
-            TMA_TWO_GPU_PEER_WINDOW_CHUNKS>(
+            TMA_TWO_GPU_PEER_CHUNK_BYTES>(
                 peer_buf,
                 local_buf,
                 total_bytes,
-                cta_range.begin,
-                cta_range.end,
+                pair_range.begin,
+                pair_range.end,
+                window_chunks,
                 window_ready_flags,
                 rank_range.begin);
         return;
@@ -201,13 +216,13 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
         TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
         TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
         TMA_TWO_GPU_PEER_CHUNK_BYTES,
-        TMA_TWO_GPU_PEER_WINDOW_CHUNKS,
         ReduceApply>(
             local_in,
             peer_buf,
             total_bytes,
-            cta_range.begin,
-            cta_range.end,
+            pair_range.begin,
+            pair_range.end,
+            window_chunks,
             window_ready_flags,
             rank_range.begin,
             shared_raw,
@@ -348,7 +363,18 @@ cudaError_t launch_rank_kernel_sm90(
     cudaStream_t stream,
     int* local_ready_signal,
     const int* peer_ready_signal,
-    int collective_epoch) {
+    int collective_epoch,
+    comm::LaunchConfig launch_config) {
+    if constexpr (Overlap) {
+        if (!comm::launch_config_valid_for_overlap(launch_config)) {
+            return cudaErrorInvalidValue;
+        }
+    } else {
+        if (!comm::launch_config_valid(launch_config)) {
+            return cudaErrorInvalidValue;
+        }
+    }
+
     const int device = (rank == 0) ? dev0 : dev1;
 
     const size_t total_bytes = count * static_cast<size_t>(ElemBytes);
@@ -361,43 +387,37 @@ cudaError_t launch_rank_kernel_sm90(
     const int num_windows =
         comm::utils::window_count_for_chunks(
             num_chunks,
-            TMA_TWO_GPU_PEER_WINDOW_CHUNKS);
+            launch_config.window_chunks);
 
     const int owned_windows =
         comm::utils::rank_window_count(num_windows, rank);
-
-    const int ctas_per_rank =
-        comm::utils::cta_count_for_windows(
-            owned_windows,
-            TMA_TWO_GPU_PEER_MAX_CTAS);
 
     const bool needs_rendezvous =
         local_ready_signal != nullptr &&
         peer_ready_signal != nullptr &&
         collective_epoch > 0;
 
-    int num_blocks = 0;
-
-    if constexpr (Overlap) {
-        num_blocks =
-            ctas_per_rank * TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
-    } else {
-        num_blocks = ctas_per_rank;
-    }
-
-    if (needs_rendezvous) {
-        num_blocks = std::max(1, num_blocks);
-    }
-
-    if (num_blocks <= 0) {
-        return cudaSuccess;
-    }
-
     configure_kernel_once_for<ReduceApply, ElemBytes, Overlap>(device);
 
     system::runtime::set_device(device);
 
     if constexpr (Overlap) {
+        const int pair_count =
+            overlap_pair_count_for_windows(
+                owned_windows,
+                launch_config.max_ctas);
+
+        int num_blocks =
+            pair_count * TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
+
+        if (needs_rendezvous) {
+            num_blocks = std::max(1, num_blocks);
+        }
+
+        if (num_blocks <= 0) {
+            return cudaSuccess;
+        }
+
         int* ready_flags = nullptr;
 
         if (owned_windows > 0) {
@@ -419,7 +439,7 @@ cudaError_t launch_rank_kernel_sm90(
             ReduceApply,
             ElemBytes><<<
                 num_blocks,
-                TMA_TWO_GPU_PEER_THREADS,
+                launch_config.threads,
                 TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES,
                 stream>>>(
                     local_in,
@@ -431,13 +451,26 @@ cudaError_t launch_rank_kernel_sm90(
                     peer_ready_signal,
                     collective_epoch,
                     ready_flags,
-                    ctas_per_rank);
+                    pair_count,
+                    launch_config.window_chunks);
     } else {
+        const int ctas_per_rank =
+            comm::utils::cta_count_for_windows(
+                owned_windows,
+                launch_config.max_ctas);
+
+        int num_blocks =
+            needs_rendezvous ? std::max(1, ctas_per_rank) : ctas_per_rank;
+
+        if (num_blocks <= 0) {
+            return cudaSuccess;
+        }
+
         tma_then_fastcopy_rank_kernel_sm90<
             ReduceApply,
             ElemBytes><<<
                 num_blocks,
-                TMA_TWO_GPU_PEER_THREADS,
+                launch_config.threads,
                 TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES,
                 stream>>>(
                     local_in,
@@ -448,7 +481,8 @@ cudaError_t launch_rank_kernel_sm90(
                     local_ready_signal,
                     peer_ready_signal,
                     collective_epoch,
-                    ctas_per_rank);
+                    ctas_per_rank,
+                    launch_config.window_chunks);
     }
 
     return cudaGetLastError();
@@ -466,7 +500,8 @@ cudaError_t launch_reduce_op_sm90(
     cudaStream_t stream,
     int* local_ready_signal,
     const int* peer_ready_signal,
-    int collective_epoch) {
+    int collective_epoch,
+    comm::LaunchConfig launch_config) {
     using ReduceApply = comm::PipelineTMAReduce<
         TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
         TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
@@ -483,7 +518,8 @@ cudaError_t launch_reduce_op_sm90(
         stream,
         local_ready_signal,
         peer_ready_signal,
-        collective_epoch);
+        collective_epoch,
+        launch_config);
 }
 
 template <bool Overlap>
@@ -500,24 +536,17 @@ cudaError_t dispatch_rank_kernel_sm90(
     cudaStream_t stream,
     int* local_ready_signal,
     const int* peer_ready_signal,
-    int collective_epoch) {
+    int collective_epoch,
+    comm::LaunchConfig launch_config) {
     if (dtype == OO_DTYPE_FLOAT16) {
         if (op == OO_REDUCE_ADD) {
             return launch_reduce_op_sm90<
                 comm::PipelineReduceAddNoFtzF16,
                 static_cast<int>(sizeof(half)),
                 Overlap>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    dev0,
-                    dev1,
-                    stream,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch);
+                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
+                    stream, local_ready_signal, peer_ready_signal,
+                    collective_epoch, launch_config);
         }
 
         if (op == OO_REDUCE_MIN) {
@@ -525,17 +554,9 @@ cudaError_t dispatch_rank_kernel_sm90(
                 comm::PipelineReduceMinF16,
                 static_cast<int>(sizeof(half)),
                 Overlap>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    dev0,
-                    dev1,
-                    stream,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch);
+                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
+                    stream, local_ready_signal, peer_ready_signal,
+                    collective_epoch, launch_config);
         }
 
         if (op == OO_REDUCE_MAX) {
@@ -543,17 +564,9 @@ cudaError_t dispatch_rank_kernel_sm90(
                 comm::PipelineReduceMaxF16,
                 static_cast<int>(sizeof(half)),
                 Overlap>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    dev0,
-                    dev1,
-                    stream,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch);
+                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
+                    stream, local_ready_signal, peer_ready_signal,
+                    collective_epoch, launch_config);
         }
     }
 
@@ -563,17 +576,9 @@ cudaError_t dispatch_rank_kernel_sm90(
                 comm::PipelineReduceAddBF16,
                 static_cast<int>(sizeof(__nv_bfloat16)),
                 Overlap>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    dev0,
-                    dev1,
-                    stream,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch);
+                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
+                    stream, local_ready_signal, peer_ready_signal,
+                    collective_epoch, launch_config);
         }
 
         if (op == OO_REDUCE_MIN) {
@@ -581,17 +586,9 @@ cudaError_t dispatch_rank_kernel_sm90(
                 comm::PipelineReduceMinBF16,
                 static_cast<int>(sizeof(__nv_bfloat16)),
                 Overlap>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    dev0,
-                    dev1,
-                    stream,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch);
+                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
+                    stream, local_ready_signal, peer_ready_signal,
+                    collective_epoch, launch_config);
         }
 
         if (op == OO_REDUCE_MAX) {
@@ -599,17 +596,9 @@ cudaError_t dispatch_rank_kernel_sm90(
                 comm::PipelineReduceMaxBF16,
                 static_cast<int>(sizeof(__nv_bfloat16)),
                 Overlap>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    dev0,
-                    dev1,
-                    stream,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch);
+                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
+                    stream, local_ready_signal, peer_ready_signal,
+                    collective_epoch, launch_config);
         }
     }
 
@@ -619,17 +608,9 @@ cudaError_t dispatch_rank_kernel_sm90(
                 comm::PipelineReduceAddF32,
                 static_cast<int>(sizeof(float)),
                 Overlap>(
-                    local_in,
-                    local_buf,
-                    peer_buf,
-                    count,
-                    rank,
-                    dev0,
-                    dev1,
-                    stream,
-                    local_ready_signal,
-                    peer_ready_signal,
-                    collective_epoch);
+                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
+                    stream, local_ready_signal, peer_ready_signal,
+                    collective_epoch, launch_config);
         }
     }
 
@@ -682,7 +663,8 @@ cudaError_t enqueue_rank_kernel_sm90(
     cudaStream_t stream,
     int* local_ready_signal,
     const int* peer_ready_signal,
-    int collective_epoch) {
+    int collective_epoch,
+    comm::LaunchConfig launch_config) {
     cudaError_t status = validate_args(
         local_in,
         local_buf,
@@ -695,6 +677,16 @@ cudaError_t enqueue_rank_kernel_sm90(
 
     if (status != cudaSuccess) {
         return status;
+    }
+
+    if constexpr (Overlap) {
+        if (!comm::launch_config_valid_for_overlap(launch_config)) {
+            return cudaErrorInvalidValue;
+        }
+    } else {
+        if (!comm::launch_config_valid(launch_config)) {
+            return cudaErrorInvalidValue;
+        }
     }
 
     return dispatch_rank_kernel_sm90<Overlap>(
@@ -710,7 +702,8 @@ cudaError_t enqueue_rank_kernel_sm90(
         stream,
         local_ready_signal,
         peer_ready_signal,
-        collective_epoch);
+        collective_epoch,
+        launch_config);
 }
 
 } // namespace
@@ -728,7 +721,8 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
     cudaStream_t stream,
     int* local_ready_signal,
     const int* peer_ready_signal,
-    int collective_epoch) {
+    int collective_epoch,
+    comm::LaunchConfig launch_config) {
     return enqueue_rank_kernel_sm90<false>(
         local_in,
         local_buf,
@@ -742,7 +736,8 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
         stream,
         local_ready_signal,
         peer_ready_signal,
-        collective_epoch);
+        collective_epoch,
+        launch_config);
 }
 
 cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
@@ -758,7 +753,8 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
     cudaStream_t stream,
     int* local_ready_signal,
     const int* peer_ready_signal,
-    int collective_epoch) {
+    int collective_epoch,
+    comm::LaunchConfig launch_config) {
     return enqueue_rank_kernel_sm90<true>(
         local_in,
         local_buf,
@@ -772,7 +768,8 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
         stream,
         local_ready_signal,
         peer_ready_signal,
-        collective_epoch);
+        collective_epoch,
+        launch_config);
 }
 
 } // namespace ooverlap

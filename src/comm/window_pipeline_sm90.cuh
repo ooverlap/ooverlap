@@ -19,11 +19,6 @@ struct ChunkRange {
     int end = 0;
 };
 
-struct WindowRange {
-    int begin = 0;
-    int end = 0;
-};
-
 __host__ __device__ __forceinline__ size_t min_size(
     size_t a,
     size_t b) {
@@ -34,12 +29,6 @@ __host__ __device__ __forceinline__ int min_int(
     int a,
     int b) {
     return (a < b) ? a : b;
-}
-
-__host__ __device__ __forceinline__ int max_int(
-    int a,
-    int b) {
-    return (a > b) ? a : b;
 }
 
 template <size_t ChunkBytes>
@@ -80,60 +69,54 @@ __host__ __device__ __forceinline__ size_t chunk_size_bytes_abs(
         total_bytes - offset);
 }
 
-template <int WindowChunks>
 __host__ __device__ __forceinline__ int window_begin_chunk(
-    int window_idx) {
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
+    int window_idx,
+    int window_chunks) {
+    if (window_idx < 0 || window_chunks <= 0) {
+        return 0;
+    }
 
-    return window_idx * WindowChunks;
+    return window_idx * window_chunks;
 }
 
-template <int WindowChunks>
 __host__ __device__ __forceinline__ int window_end_chunk_raw(
-    int window_idx) {
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
+    int window_idx,
+    int window_chunks) {
+    if (window_idx < 0 || window_chunks <= 0) {
+        return 0;
+    }
 
-    return (window_idx + 1) * WindowChunks;
+    return (window_idx + 1) * window_chunks;
 }
 
-template <int WindowChunks>
-__host__ __device__ __forceinline__ int window_index_for_chunk(
-    int chunk_idx) {
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
-
-    return chunk_idx / WindowChunks;
-}
-
-template <int WindowChunks>
 __host__ __device__ __forceinline__ int window_end_chunk_clamped(
     int window_idx,
-    int total_chunks) {
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
-
+    int total_chunks,
+    int window_chunks) {
     return min_int(
-        window_end_chunk_raw<WindowChunks>(window_idx),
+        window_end_chunk_raw(window_idx, window_chunks),
         total_chunks);
 }
 
-template <int WindowChunks>
 __host__ __device__ __forceinline__ ChunkRange chunk_range_for_window_range(
     int begin_window,
     int end_window,
-    int total_chunks) {
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
-
+    int total_chunks,
+    int window_chunks) {
     ChunkRange range{};
 
-    if (begin_window >= end_window || total_chunks <= 0) {
+    if (begin_window >= end_window ||
+        total_chunks <= 0 ||
+        window_chunks <= 0) {
         return range;
     }
 
     range.begin = min_int(
-        window_begin_chunk<WindowChunks>(begin_window),
+        window_begin_chunk(begin_window, window_chunks),
         total_chunks);
 
     range.end = min_int(
-        window_begin_chunk<WindowChunks>(end_window),
+        window_begin_chunk(end_window, window_chunks),
         total_chunks);
 
     if (range.begin > range.end) {
@@ -233,49 +216,45 @@ __device__ __forceinline__ void wait_window_ready(
     }
 }
 
-template <int WindowChunks>
 struct WindowSignalCursor {
     int begin_window = 0;
     int end_window = 0;
     int next_window = 0;
     int next_window_end_chunk = 0;
     int total_chunks = 0;
+    int window_chunks = 0;
     int ready_window_base = 0;
     int* window_ready_flags = nullptr;
 };
 
-template <int WindowChunks>
-__device__ __forceinline__ WindowSignalCursor<WindowChunks>
-make_window_signal_cursor(
+__device__ __forceinline__ WindowSignalCursor make_window_signal_cursor(
     int begin_window,
     int end_window,
     int total_chunks,
+    int window_chunks,
     int* window_ready_flags,
     int ready_window_base) {
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
-
-    WindowSignalCursor<WindowChunks> cursor{};
+    WindowSignalCursor cursor{};
     cursor.begin_window = begin_window;
     cursor.end_window = end_window;
     cursor.next_window = begin_window;
     cursor.total_chunks = total_chunks;
+    cursor.window_chunks = window_chunks;
     cursor.ready_window_base = ready_window_base;
     cursor.window_ready_flags = window_ready_flags;
 
     cursor.next_window_end_chunk =
-        window_end_chunk_clamped<WindowChunks>(
+        window_end_chunk_clamped(
             begin_window,
-            total_chunks);
+            total_chunks,
+            window_chunks);
 
     return cursor;
 }
 
-template <int WindowChunks>
 __device__ __forceinline__ void advance_window_signal_cursor(
-    WindowSignalCursor<WindowChunks>* cursor,
+    WindowSignalCursor* cursor,
     int safe_completed_chunk_exclusive) {
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
-
     if (threadIdx.x != 0 || cursor == nullptr) {
         return;
     }
@@ -303,17 +282,15 @@ __device__ __forceinline__ void advance_window_signal_cursor(
 
     if (cursor->next_window < cursor->end_window) {
         cursor->next_window_end_chunk =
-            window_end_chunk_clamped<WindowChunks>(
+            window_end_chunk_clamped(
                 cursor->next_window,
-                cursor->total_chunks);
+                cursor->total_chunks,
+                cursor->window_chunks);
     }
 }
 
-template <int WindowChunks>
 __device__ __forceinline__ void publish_remaining_windows(
-    WindowSignalCursor<WindowChunks>* cursor) {
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
-
+    WindowSignalCursor* cursor) {
     if (threadIdx.x != 0 || cursor == nullptr) {
         return;
     }
@@ -335,14 +312,6 @@ __device__ __forceinline__ void publish_remaining_windows(
 
 /*
  * Streaming TMA-load + apply pipeline over an absolute chunk range.
- *
- * This is the important primitive:
- *
- *   - fills once
- *   - streams all chunks in [begin_chunk, end_chunk)
- *   - drains once
- *
- * It does not know about windows and does not signal.
  */
 template <
     int StageDepth,
@@ -464,16 +433,12 @@ __device__ void run_chunk_range(
 }
 
 /*
- * Streaming TMA-load + apply pipeline over a window range.
- *
- * Windows are only used to determine the absolute chunk interval.
- * The pipeline itself is continuous across all windows in the range.
+ * Streaming TMA-load + apply pipeline over a runtime window range.
  */
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    int WindowChunks,
     typename Apply>
 __device__ void run_window_range(
     const void* src_base,
@@ -481,18 +446,18 @@ __device__ void run_window_range(
     size_t total_bytes,
     int begin_window,
     int end_window,
+    int window_chunks,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
-
     const int total_chunks =
         chunk_count_for_bytes<ChunkBytes>(total_bytes);
 
     const ChunkRange chunks =
-        chunk_range_for_window_range<WindowChunks>(
+        chunk_range_for_window_range(
             begin_window,
             end_window,
-            total_chunks);
+            total_chunks,
+            window_chunks);
 
     run_chunk_range<
         StageDepth,
@@ -509,21 +474,12 @@ __device__ void run_window_range(
 }
 
 /*
- * Streaming reduce producer over a window range.
- *
- * This is the window-signaling version.
- *
- * Important:
- *   - the TMA pipeline is continuous across the full window range
- *   - a window is published only after its last chunk is known complete
- *   - no per-chunk signal exists anymore
- *   - the pipeline drains only once, at the end of the whole range
+ * Streaming reduce producer over a runtime window range.
  */
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    int WindowChunks,
     typename ReduceApply>
 __device__ void run_window_range_signal(
     const void* src_base,
@@ -531,6 +487,7 @@ __device__ void run_window_range_signal(
     size_t total_bytes,
     int begin_window,
     int end_window,
+    int window_chunks,
     int* window_ready_flags,
     int ready_window_base,
     unsigned char* shared_raw,
@@ -539,9 +496,10 @@ __device__ void run_window_range_signal(
     static_assert(FillDepth > 0, "FillDepth must be > 0");
     static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
 
-    if (begin_window >= end_window || total_bytes == 0) {
+    if (begin_window >= end_window ||
+        window_chunks <= 0 ||
+        total_bytes == 0) {
         return;
     }
 
@@ -549,10 +507,11 @@ __device__ void run_window_range_signal(
         chunk_count_for_bytes<ChunkBytes>(total_bytes);
 
     const ChunkRange chunks =
-        chunk_range_for_window_range<WindowChunks>(
+        chunk_range_for_window_range(
             begin_window,
             end_window,
-            total_chunks);
+            total_chunks,
+            window_chunks);
 
     if (chunks.begin >= chunks.end) {
         return;
@@ -569,11 +528,12 @@ __device__ void run_window_range_signal(
 
     const int total_range_chunks = chunks.end - chunks.begin;
 
-    WindowSignalCursor<WindowChunks> signal_cursor =
-        make_window_signal_cursor<WindowChunks>(
+    WindowSignalCursor signal_cursor =
+        make_window_signal_cursor(
             begin_window,
             end_window,
             total_chunks,
+            window_chunks,
             window_ready_flags,
             ready_window_base);
 
@@ -642,7 +602,7 @@ __device__ void run_window_range_signal(
                     const int safe_completed_chunk_exclusive =
                         chunks.begin + (iter - FillDepth + 1);
 
-                    advance_window_signal_cursor<WindowChunks>(
+                    advance_window_signal_cursor(
                         &signal_cursor,
                         safe_completed_chunk_exclusive);
                 }
@@ -665,8 +625,7 @@ __device__ void run_window_range_signal(
     if (threadIdx.x == 0) {
         apply.wait_complete();
 
-        publish_remaining_windows<WindowChunks>(
-            &signal_cursor);
+        publish_remaining_windows(&signal_cursor);
 
         __threadfence_system();
     }
@@ -674,23 +633,17 @@ __device__ void run_window_range_signal(
     __syncthreads();
 }
 
-/*
- * Streaming TMA copy over a full window range.
- *
- * This is a continuous copy pipeline over all chunks in the range.
- * It does not drain between windows.
- */
 template <
     int StageDepth,
     int FillDepth,
-    size_t ChunkBytes,
-    int WindowChunks>
+    size_t ChunkBytes>
 __device__ void copy_window_range_tma(
     const void* src_base,
     void* dst_base,
     size_t total_bytes,
     int begin_window,
     int end_window,
+    int window_chunks,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
     using CopyApply = PipelineTMACopy<StageDepth, FillDepth>;
@@ -699,45 +652,13 @@ __device__ void copy_window_range_tma(
         StageDepth,
         FillDepth,
         ChunkBytes,
-        WindowChunks,
         CopyApply>(
             src_base,
             dst_base,
             total_bytes,
             begin_window,
             end_window,
-            shared_raw,
-            barriers);
-}
-
-/*
- * Compatibility wrapper for one window.
- *
- * Do not use this inside a loop when a CTA owns multiple windows. Use
- * copy_window_range_tma or run_window_range instead.
- */
-template <
-    int StageDepth,
-    int FillDepth,
-    size_t ChunkBytes>
-__device__ void copy_window_tma(
-    const void* src_window,
-    void* dst_window,
-    size_t window_bytes,
-    unsigned char* shared_raw,
-    sync::semaphore* barriers) {
-    using CopyApply = PipelineTMACopy<StageDepth, FillDepth>;
-
-    run_chunk_range<
-        StageDepth,
-        FillDepth,
-        ChunkBytes,
-        CopyApply>(
-            src_window,
-            dst_window,
-            window_bytes,
-            0,
-            chunk_count_for_bytes<ChunkBytes>(window_bytes),
+            window_chunks,
             shared_raw,
             barriers);
 }
@@ -763,80 +684,88 @@ __device__ __forceinline__ void copy_gmem_range_no_fence(
         static_cast<size_t>(blockDim.x));
 }
 
-template <size_t ChunkBytes, int WindowChunks>
+template <size_t ChunkBytes>
 __host__ __device__ __forceinline__ size_t window_range_begin_byte(
     int begin_window,
-    size_t total_bytes) {
+    size_t total_bytes,
+    int window_chunks) {
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
+
+    if (begin_window <= 0 || window_chunks <= 0) {
+        return 0;
+    }
 
     const size_t begin =
         static_cast<size_t>(begin_window) *
-        static_cast<size_t>(WindowChunks) *
+        static_cast<size_t>(window_chunks) *
         static_cast<size_t>(ChunkBytes);
 
     return min_size(begin, total_bytes);
 }
 
-template <size_t ChunkBytes, int WindowChunks>
+template <size_t ChunkBytes>
 __host__ __device__ __forceinline__ size_t window_range_end_byte(
     int end_window,
-    size_t total_bytes) {
+    size_t total_bytes,
+    int window_chunks) {
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
+
+    if (end_window <= 0 || window_chunks <= 0) {
+        return 0;
+    }
 
     const size_t end =
         static_cast<size_t>(end_window) *
-        static_cast<size_t>(WindowChunks) *
+        static_cast<size_t>(window_chunks) *
         static_cast<size_t>(ChunkBytes);
 
     return min_size(end, total_bytes);
 }
 
-template <size_t ChunkBytes, int WindowChunks>
+template <size_t ChunkBytes>
 __host__ __device__ __forceinline__ size_t window_range_size_bytes(
     int begin_window,
     int end_window,
-    size_t total_bytes) {
+    size_t total_bytes,
+    int window_chunks) {
     const size_t begin =
-        window_range_begin_byte<ChunkBytes, WindowChunks>(
+        window_range_begin_byte<ChunkBytes>(
             begin_window,
-            total_bytes);
+            total_bytes,
+            window_chunks);
 
     const size_t end =
-        window_range_end_byte<ChunkBytes, WindowChunks>(
+        window_range_end_byte<ChunkBytes>(
             end_window,
-            total_bytes);
+            total_bytes,
+            window_chunks);
 
     return (begin < end) ? (end - begin) : 0;
 }
 
-/*
- * Fast gmem copy over a full contiguous window range.
- *
- * This copies the full range and fences once at the end.
- */
 template <
     typename VecT,
     int Unroll,
-    size_t ChunkBytes,
-    int WindowChunks>
+    size_t ChunkBytes>
 __device__ void copy_window_range_gmem(
     const void* __restrict__ src_base,
     void* __restrict__ dst_base,
     size_t total_bytes,
     int begin_window,
-    int end_window) {
+    int end_window,
+    int window_chunks) {
     const size_t begin =
-        window_range_begin_byte<ChunkBytes, WindowChunks>(
+        window_range_begin_byte<ChunkBytes>(
             begin_window,
-            total_bytes);
+            total_bytes,
+            window_chunks);
 
     const size_t bytes =
-        window_range_size_bytes<ChunkBytes, WindowChunks>(
+        window_range_size_bytes<ChunkBytes>(
             begin_window,
             end_window,
-            total_bytes);
+            total_bytes,
+            window_chunks);
 
     copy_gmem_range_no_fence<VecT, Unroll>(
         src_base,
@@ -853,29 +782,22 @@ __device__ void copy_window_range_gmem(
     __syncthreads();
 }
 
-/*
- * Fast gmem copy consumer for overlap.
- *
- * The copy is not signaled. It waits on reduce's per-window ready flag, then
- * copies that ready window. The final fence happens once after the full range.
- */
 template <
     typename VecT,
     int Unroll,
-    size_t ChunkBytes,
-    int WindowChunks>
+    size_t ChunkBytes>
 __device__ void copy_window_range_gmem_after_ready(
     const void* __restrict__ src_base,
     void* __restrict__ dst_base,
     size_t total_bytes,
     int begin_window,
     int end_window,
+    int window_chunks,
     const int* window_ready_flags,
     int ready_window_base) {
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-    static_assert(WindowChunks > 0, "WindowChunks must be > 0");
 
-    if (begin_window >= end_window) {
+    if (begin_window >= end_window || window_chunks <= 0) {
         return;
     }
 
@@ -892,15 +814,17 @@ __device__ void copy_window_range_gmem_after_ready(
         wait_window_ready(window_ready);
 
         const size_t begin =
-            window_range_begin_byte<ChunkBytes, WindowChunks>(
+            window_range_begin_byte<ChunkBytes>(
                 window_idx,
-                total_bytes);
+                total_bytes,
+                window_chunks);
 
         const size_t bytes =
-            window_range_size_bytes<ChunkBytes, WindowChunks>(
+            window_range_size_bytes<ChunkBytes>(
                 window_idx,
                 window_idx + 1,
-                total_bytes);
+                total_bytes,
+                window_chunks);
 
         copy_gmem_range_no_fence<VecT, Unroll>(
             src_base,

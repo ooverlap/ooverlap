@@ -1,5 +1,6 @@
 #pragma once
 
+#include "comm/launch_config.h"
 #include "ooverlap/comm.h"
 
 #include <cuda_runtime.h>
@@ -26,6 +27,7 @@ cudaError_t enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
     cudaStream_t stream,
     int* local_ready_signal,
     const int* peer_ready_signal,
-    int collective_epoch);
+    int collective_epoch,
+    comm::LaunchConfig launch_config);
 
 } // namespace ooverlap
