@@ -40,151 +40,6 @@ __host__ __device__ __forceinline__ size_t dtype_size_bytes(
     }
 }
 
-__host__ __device__ __forceinline__ size_t window_begin_byte_sm90(
-    comm::utils::Window window) {
-    return static_cast<size_t>(window.start_chunk) *
-           TMA_TWO_GPU_PEER_CHUNK_BYTES;
-}
-
-__host__ __device__ __forceinline__ size_t window_end_byte_sm90(
-    comm::utils::Window window,
-    size_t total_bytes) {
-    const size_t end =
-        static_cast<size_t>(window.start_chunk + window.chunk_count) *
-        TMA_TWO_GPU_PEER_CHUNK_BYTES;
-
-    return comm::utils::min_sz(end, total_bytes);
-}
-
-__host__ __device__ __forceinline__ size_t window_size_bytes_sm90(
-    comm::utils::Window window,
-    size_t total_bytes) {
-    const size_t begin = window_begin_byte_sm90(window);
-    const size_t end = window_end_byte_sm90(window, total_bytes);
-
-    return (begin < end) ? (end - begin) : 0;
-}
-
-template <typename ReduceApply>
-__device__ void reduce_window_tma_sm90(
-    const unsigned char* local_in_bytes,
-    unsigned char* peer_buf_bytes,
-    comm::utils::Window window,
-    size_t total_bytes,
-    unsigned char* shared_raw,
-    sync::semaphore* barriers) {
-    const size_t begin = window_begin_byte_sm90(window);
-    const size_t bytes = window_size_bytes_sm90(window, total_bytes);
-
-    comm::window_pipeline::run_window<
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES,
-        ReduceApply>(
-            local_in_bytes + begin,
-            peer_buf_bytes + begin,
-            bytes,
-            shared_raw,
-            barriers);
-}
-
-template <typename ReduceApply>
-__device__ void reduce_window_tma_and_signal_sm90(
-    const unsigned char* local_in_bytes,
-    unsigned char* peer_buf_bytes,
-    comm::utils::Window window,
-    size_t total_bytes,
-    int* ready_count,
-    unsigned char* shared_raw,
-    sync::semaphore* barriers) {
-    const size_t begin = window_begin_byte_sm90(window);
-    const size_t bytes = window_size_bytes_sm90(window, total_bytes);
-
-    comm::window_pipeline::run_window_signal<
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES,
-        TMA_TWO_GPU_PEER_OVERLAP_SIGNAL_BATCH_CHUNKS,
-        ReduceApply>(
-            local_in_bytes + begin,
-            peer_buf_bytes + begin,
-            bytes,
-            ready_count,
-            shared_raw,
-            barriers);
-}
-
-__device__ void fast_copy_window_cta_sm90(
-    const unsigned char* __restrict__ src_bytes,
-    unsigned char* __restrict__ dst_bytes,
-    comm::utils::Window window,
-    size_t total_bytes) {
-    const size_t begin = window_begin_byte_sm90(window);
-    const size_t bytes = window_size_bytes_sm90(window, total_bytes);
-
-    comm::window_pipeline::copy_window_gmem<
-        uint4,
-        TMA_TWO_GPU_PEER_FAST_COPY_UNROLL>(
-            src_bytes + begin,
-            dst_bytes + begin,
-            bytes);
-}
-
-__device__ void fast_copy_window_after_reduce_ready_sm90(
-    const unsigned char* __restrict__ peer_buf_bytes,
-    unsigned char* __restrict__ local_buf_bytes,
-    comm::utils::Window window,
-    size_t total_bytes,
-    const int* ready_count) {
-    constexpr int BatchChunks =
-        TMA_TWO_GPU_PEER_OVERLAP_SIGNAL_BATCH_CHUNKS;
-
-    static_assert(BatchChunks > 0, "BatchChunks must be > 0");
-
-    if (window.chunk_count <= 0 || ready_count == nullptr) {
-        return;
-    }
-
-    const size_t window_begin = window_begin_byte_sm90(window);
-    const size_t window_bytes = window_size_bytes_sm90(window, total_bytes);
-
-    const unsigned char* peer_window = peer_buf_bytes + window_begin;
-    unsigned char* local_window = local_buf_bytes + window_begin;
-
-    for (int begin = 0; begin < window.chunk_count; begin += BatchChunks) {
-        int end = begin + BatchChunks;
-
-        if (end > window.chunk_count) {
-            end = window.chunk_count;
-        }
-
-        comm::window_pipeline::wait_reduce_ready_count(
-            ready_count,
-            end);
-
-        const size_t begin_byte =
-            comm::window_pipeline::chunk_range_begin_byte<
-                TMA_TWO_GPU_PEER_CHUNK_BYTES>(begin);
-
-        const size_t bytes =
-            comm::window_pipeline::chunk_range_size_bytes<
-                TMA_TWO_GPU_PEER_CHUNK_BYTES>(
-                    begin,
-                    end,
-                    window_bytes);
-
-        comm::window_pipeline::copy_window_gmem_range_no_fence<
-            uint4,
-            TMA_TWO_GPU_PEER_FAST_COPY_UNROLL>(
-                peer_window,
-                local_window,
-                begin_byte,
-                bytes);
-    }
-
-    comm::window_pipeline::finish_window_gmem_copy();
-}
-
 template <typename ReduceApply, int ElemBytes>
 __global__ void tma_then_fastcopy_rank_kernel_sm90(
     const void* local_in,
@@ -195,15 +50,15 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch,
-    int owned_windows) {
+    int ctas_per_rank) {
     comm::window_pipeline::wait_for_collective_ready(
         local_ready_signal,
         peer_ready_signal,
         collective_epoch);
 
-    const int owned_window_idx = static_cast<int>(blockIdx.x);
+    const int cta_idx = static_cast<int>(blockIdx.x);
 
-    if (owned_window_idx >= owned_windows) {
+    if (ctas_per_rank <= 0 || cta_idx >= ctas_per_rank) {
         return;
     }
 
@@ -214,17 +69,21 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
             total_bytes,
             TMA_TWO_GPU_PEER_CHUNK_BYTES);
 
-    const int num_windows = comm::utils::window_num_chunks(num_chunks);
-    const int window_idx = 2 * owned_window_idx + rank;
+    const int num_windows =
+        comm::utils::window_count_for_chunks(
+            num_chunks,
+            TMA_TWO_GPU_PEER_WINDOW_CHUNKS);
 
-    if (window_idx >= num_windows) {
-        return;
-    }
+    const comm::utils::WindowRange rank_range =
+        comm::utils::rank_window_range(num_windows, rank);
 
-    const comm::utils::Window window =
-        comm::utils::make_window(window_idx, num_chunks, num_windows);
+    const comm::utils::WindowRange cta_range =
+        comm::utils::cta_window_range(
+            cta_idx,
+            ctas_per_rank,
+            rank_range);
 
-    if (window.chunk_count <= 0) {
+    if (cta_range.begin >= cta_range.end) {
         return;
     }
 
@@ -235,28 +94,30 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
 
     __shared__ sync::semaphore barriers[TMA_TWO_GPU_PEER_BARRIER_COUNT];
 
-    const unsigned char* local_in_bytes =
-        reinterpret_cast<const unsigned char*>(local_in);
+    comm::window_pipeline::run_window_range<
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+        TMA_TWO_GPU_PEER_CHUNK_BYTES,
+        TMA_TWO_GPU_PEER_WINDOW_CHUNKS,
+        ReduceApply>(
+            local_in,
+            peer_buf,
+            total_bytes,
+            cta_range.begin,
+            cta_range.end,
+            shared_raw,
+            barriers);
 
-    unsigned char* local_buf_bytes =
-        reinterpret_cast<unsigned char*>(local_buf);
-
-    unsigned char* peer_buf_bytes =
-        reinterpret_cast<unsigned char*>(peer_buf);
-
-    reduce_window_tma_sm90<ReduceApply>(
-        local_in_bytes,
-        peer_buf_bytes,
-        window,
-        total_bytes,
-        shared_raw,
-        barriers);
-
-    fast_copy_window_cta_sm90(
-        peer_buf_bytes,
-        local_buf_bytes,
-        window,
-        total_bytes);
+    comm::window_pipeline::copy_window_range_gmem<
+        uint4,
+        TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
+        TMA_TWO_GPU_PEER_CHUNK_BYTES,
+        TMA_TWO_GPU_PEER_WINDOW_CHUNKS>(
+            peer_buf,
+            local_buf,
+            total_bytes,
+            cta_range.begin,
+            cta_range.end);
 }
 
 template <typename ReduceApply, int ElemBytes>
@@ -269,22 +130,22 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch,
-    int* window_ready_counts,
-    int owned_windows) {
+    int* window_ready_flags,
+    int ctas_per_rank) {
     comm::window_pipeline::wait_for_collective_ready(
         local_ready_signal,
         peer_ready_signal,
         collective_epoch);
 
-    const int owned_window_idx =
+    const int cta_idx =
         static_cast<int>(blockIdx.x) /
-        TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_WINDOW;
+        TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
 
     const int role =
         static_cast<int>(blockIdx.x) %
-        TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_WINDOW;
+        TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
 
-    if (owned_window_idx >= owned_windows) {
+    if (ctas_per_rank <= 0 || cta_idx >= ctas_per_rank) {
         return;
     }
 
@@ -295,41 +156,37 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
             total_bytes,
             TMA_TWO_GPU_PEER_CHUNK_BYTES);
 
-    const int num_windows = comm::utils::window_num_chunks(num_chunks);
-    const int window_idx = 2 * owned_window_idx + rank;
+    const int num_windows =
+        comm::utils::window_count_for_chunks(
+            num_chunks,
+            TMA_TWO_GPU_PEER_WINDOW_CHUNKS);
 
-    if (window_idx >= num_windows) {
+    const comm::utils::WindowRange rank_range =
+        comm::utils::rank_window_range(num_windows, rank);
+
+    const comm::utils::WindowRange cta_range =
+        comm::utils::cta_window_range(
+            cta_idx,
+            ctas_per_rank,
+            rank_range);
+
+    if (cta_range.begin >= cta_range.end) {
         return;
     }
-
-    const comm::utils::Window window =
-        comm::utils::make_window(window_idx, num_chunks, num_windows);
-
-    if (window.chunk_count <= 0) {
-        return;
-    }
-
-    const unsigned char* local_in_bytes =
-        reinterpret_cast<const unsigned char*>(local_in);
-
-    unsigned char* local_buf_bytes =
-        reinterpret_cast<unsigned char*>(local_buf);
-
-    unsigned char* peer_buf_bytes =
-        reinterpret_cast<unsigned char*>(peer_buf);
-
-    int* ready_count =
-        (window_ready_counts != nullptr)
-            ? window_ready_counts + owned_window_idx
-            : nullptr;
 
     if (role == 1) {
-        fast_copy_window_after_reduce_ready_sm90(
-            peer_buf_bytes,
-            local_buf_bytes,
-            window,
-            total_bytes,
-            ready_count);
+        comm::window_pipeline::copy_window_range_gmem_after_ready<
+            uint4,
+            TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
+            TMA_TWO_GPU_PEER_CHUNK_BYTES,
+            TMA_TWO_GPU_PEER_WINDOW_CHUNKS>(
+                peer_buf,
+                local_buf,
+                total_bytes,
+                cta_range.begin,
+                cta_range.end,
+                window_ready_flags,
+                rank_range.begin);
         return;
     }
 
@@ -340,14 +197,21 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
 
     __shared__ sync::semaphore barriers[TMA_TWO_GPU_PEER_BARRIER_COUNT];
 
-    reduce_window_tma_and_signal_sm90<ReduceApply>(
-        local_in_bytes,
-        peer_buf_bytes,
-        window,
-        total_bytes,
-        ready_count,
-        shared_raw,
-        barriers);
+    comm::window_pipeline::run_window_range_signal<
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
+        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+        TMA_TWO_GPU_PEER_CHUNK_BYTES,
+        TMA_TWO_GPU_PEER_WINDOW_CHUNKS,
+        ReduceApply>(
+            local_in,
+            peer_buf,
+            total_bytes,
+            cta_range.begin,
+            cta_range.end,
+            window_ready_flags,
+            rank_range.begin,
+            shared_raw,
+            barriers);
 }
 
 SignalCacheEntry& signal_cache_for_device(int device) {
@@ -379,7 +243,7 @@ int* ensure_signal_capacity(int device, size_t required_count) {
 
     system::runtime::check_cuda(
         cudaMalloc(&entry.ptr, required_count * sizeof(int)),
-        "cudaMalloc(overlap ready counts)");
+        "cudaMalloc(overlap window ready flags)");
 
     entry.capacity = required_count;
     return entry.ptr;
@@ -494,10 +358,18 @@ cudaError_t launch_rank_kernel_sm90(
             total_bytes,
             TMA_TWO_GPU_PEER_CHUNK_BYTES);
 
-    const int num_windows = comm::utils::window_num_chunks(num_chunks);
+    const int num_windows =
+        comm::utils::window_count_for_chunks(
+            num_chunks,
+            TMA_TWO_GPU_PEER_WINDOW_CHUNKS);
 
     const int owned_windows =
-        (rank == 0) ? ((num_windows + 1) / 2) : (num_windows / 2);
+        comm::utils::rank_window_count(num_windows, rank);
+
+    const int ctas_per_rank =
+        comm::utils::cta_count_for_windows(
+            owned_windows,
+            TMA_TWO_GPU_PEER_MAX_CTAS);
 
     const bool needs_rendezvous =
         local_ready_signal != nullptr &&
@@ -508,9 +380,9 @@ cudaError_t launch_rank_kernel_sm90(
 
     if constexpr (Overlap) {
         num_blocks =
-            owned_windows * TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_WINDOW;
+            ctas_per_rank * TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
     } else {
-        num_blocks = owned_windows;
+        num_blocks = ctas_per_rank;
     }
 
     if (needs_rendezvous) {
@@ -526,21 +398,21 @@ cudaError_t launch_rank_kernel_sm90(
     system::runtime::set_device(device);
 
     if constexpr (Overlap) {
-        int* ready_counts = nullptr;
+        int* ready_flags = nullptr;
 
         if (owned_windows > 0) {
-            ready_counts =
+            ready_flags =
                 ensure_signal_capacity(
                     device,
                     static_cast<size_t>(owned_windows));
 
             system::runtime::check_cuda(
                 cudaMemsetAsync(
-                    ready_counts,
+                    ready_flags,
                     0,
                     static_cast<size_t>(owned_windows) * sizeof(int),
                     stream),
-                "cudaMemsetAsync(overlap ready counts)");
+                "cudaMemsetAsync(overlap window ready flags)");
         }
 
         tma_overlap_fastcopy_rank_kernel_sm90<
@@ -558,8 +430,8 @@ cudaError_t launch_rank_kernel_sm90(
                     local_ready_signal,
                     peer_ready_signal,
                     collective_epoch,
-                    ready_counts,
-                    owned_windows);
+                    ready_flags,
+                    ctas_per_rank);
     } else {
         tma_then_fastcopy_rank_kernel_sm90<
             ReduceApply,
@@ -576,7 +448,7 @@ cudaError_t launch_rank_kernel_sm90(
                     local_ready_signal,
                     peer_ready_signal,
                     collective_epoch,
-                    owned_windows);
+                    ctas_per_rank);
     }
 
     return cudaGetLastError();
