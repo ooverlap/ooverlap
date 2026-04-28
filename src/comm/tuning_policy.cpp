@@ -4,11 +4,14 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ooverlap {
@@ -27,12 +30,82 @@ struct LoadedPolicy {
     std::vector<PolicyEntry> entries;
 };
 
+struct SelectionCacheKey {
+    size_t bytes_per_rank = 0;
+
+    int preference = 0;
+
+    bool has_max_ctas = false;
+    int max_ctas = 0;
+
+    bool has_max_threads = false;
+    int max_threads = 0;
+
+    /*
+     * OOVERLAP_TUNING_TOLERANCE is represented in parts-per-million so that
+     * the cache key stays integer-only.
+     *
+     * 0.05 -> 50000.
+     */
+    long long tolerance_ppm = 50000;
+};
+
+struct SelectionCacheKeyHash {
+    size_t operator()(const SelectionCacheKey& key) const {
+        size_t h = std::hash<size_t>{}(key.bytes_per_rank);
+
+        auto mix = [&](size_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+
+        mix(std::hash<int>{}(key.preference));
+        mix(std::hash<bool>{}(key.has_max_ctas));
+        mix(std::hash<int>{}(key.max_ctas));
+        mix(std::hash<bool>{}(key.has_max_threads));
+        mix(std::hash<int>{}(key.max_threads));
+        mix(std::hash<long long>{}(key.tolerance_ppm));
+
+        return h;
+    }
+};
+
+struct SelectionCacheKeyEqual {
+    bool operator()(
+        const SelectionCacheKey& a,
+        const SelectionCacheKey& b) const {
+        return a.bytes_per_rank == b.bytes_per_rank &&
+               a.preference == b.preference &&
+               a.has_max_ctas == b.has_max_ctas &&
+               a.max_ctas == b.max_ctas &&
+               a.has_max_threads == b.has_max_threads &&
+               a.max_threads == b.max_threads &&
+               a.tolerance_ppm == b.tolerance_ppm;
+    }
+};
+
+using SelectionCache =
+    std::unordered_map<
+        SelectionCacheKey,
+        LaunchConfig,
+        SelectionCacheKeyHash,
+        SelectionCacheKeyEqual>;
+
 LoadedPolicy& global_policy() {
     static LoadedPolicy policy;
     return policy;
 }
 
 std::mutex& global_policy_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+SelectionCache& selection_cache() {
+    static SelectionCache cache;
+    return cache;
+}
+
+std::mutex& selection_cache_mutex() {
     static std::mutex mutex;
     return mutex;
 }
@@ -93,11 +166,37 @@ bool parse_double_env(
     return true;
 }
 
-double runtime_tolerance_fraction() {
+long long tolerance_ppm_from_fraction(double tolerance) {
+    if (!(tolerance >= 0.0)) {
+        tolerance = 0.05;
+    }
+
+    const double scaled = tolerance * 1000000.0;
+
+    if (scaled <= 0.0) {
+        return 0;
+    }
+
+    if (scaled >= static_cast<double>(std::numeric_limits<long long>::max())) {
+        return std::numeric_limits<long long>::max();
+    }
+
+    return static_cast<long long>(scaled + 0.5);
+}
+
+double tolerance_fraction_from_ppm(long long tolerance_ppm) {
+    if (tolerance_ppm <= 0) {
+        return 0.0;
+    }
+
+    return static_cast<double>(tolerance_ppm) / 1000000.0;
+}
+
+long long runtime_tolerance_ppm() {
     double value = 0.05;
 
     /*
-     * Optional runtime override. User asked for 5%; this keeps it tunable.
+     * Optional runtime override.
      *
      * Example:
      *   OOVERLAP_TUNING_TOLERANCE=0.03
@@ -107,7 +206,7 @@ double runtime_tolerance_fraction() {
         value = env_value;
     }
 
-    return value;
+    return tolerance_ppm_from_fraction(value);
 }
 
 bool find_json_key(
@@ -449,44 +548,55 @@ size_t select_policy_size(
         return requested_bytes;
     }
 
-    size_t selected = entries.front().bytes_per_rank;
-    bool found_ge = false;
+    size_t prev = 0;
+    size_t next = 0;
 
     for (const PolicyEntry& entry : entries) {
-        if (entry.bytes_per_rank >= requested_bytes) {
-            selected = entry.bytes_per_rank;
-            found_ge = true;
-            break;
+        const size_t b = entry.bytes_per_rank;
+
+        if (b == requested_bytes) {
+            return b;
         }
+
+        if (b < requested_bytes) {
+            prev = b;
+            continue;
+        }
+
+        next = b;
+        break;
     }
 
-    if (!found_ge) {
-        selected = entries.back().bytes_per_rank;
+    if (prev == 0) {
+        return entries.front().bytes_per_rank;
     }
 
-    return selected;
-}
-
-int legal_threads_from_env_or_default() {
-    int max_threads = 0;
-    LaunchConfig config{};
-
-    if (!parse_positive_int_env("OOVERLAP_MAX_THREADS", &max_threads)) {
-        return config.threads;
+    if (next == 0) {
+        return entries.back().bytes_per_rank;
     }
 
-    if (max_threads < 32) {
-        return config.threads;
+    /*
+     * Choose nearest size in multiplicative/log distance.
+     *
+     * This avoids pathological jumps:
+     *
+     *   requested = 32.35 MiB
+     *
+     * should map to 32 MiB, not 64 MiB.
+     */
+    const long double prev_ratio =
+        static_cast<long double>(requested_bytes) /
+        static_cast<long double>(prev);
+
+    const long double next_ratio =
+        static_cast<long double>(next) /
+        static_cast<long double>(requested_bytes);
+
+    if (prev_ratio <= next_ratio) {
+        return prev;
     }
 
-    int threads = std::min(config.threads, max_threads);
-    threads = (threads / 32) * 32;
-
-    if (threads < 32) {
-        threads = 32;
-    }
-
-    return threads;
+    return next;
 }
 
 LaunchConfig fallback_config() {
@@ -553,6 +663,7 @@ bool better_efficiency_choice(
 bool select_from_candidates(
     const std::vector<PolicyEntry>& candidates,
     TuningPreference preference,
+    long long tolerance_ppm,
     PolicyEntry* selected) {
     if (selected == nullptr || candidates.empty()) {
         return false;
@@ -571,7 +682,7 @@ bool select_from_candidates(
         return true;
     }
 
-    const double tolerance = runtime_tolerance_fraction();
+    const double tolerance = tolerance_fraction_from_ppm(tolerance_ppm);
     const double max_allowed = best->avg_ms * (1.0 + tolerance);
 
     const PolicyEntry* efficient = nullptr;
@@ -596,6 +707,54 @@ bool select_from_candidates(
     return true;
 }
 
+SelectionCacheKey make_selection_cache_key(
+    size_t bytes_per_rank,
+    TuningPreference preference,
+    bool has_max_ctas,
+    int env_max_ctas,
+    bool has_max_threads,
+    int env_max_threads,
+    long long tolerance_ppm) {
+    SelectionCacheKey key{};
+    key.bytes_per_rank = bytes_per_rank;
+    key.preference = static_cast<int>(preference);
+    key.has_max_ctas = has_max_ctas;
+    key.max_ctas = has_max_ctas ? env_max_ctas : 0;
+    key.has_max_threads = has_max_threads;
+    key.max_threads = has_max_threads ? env_max_threads : 0;
+    key.tolerance_ppm =
+        (preference == TuningPreference::BestEfficiency) ? tolerance_ppm : 0;
+    return key;
+}
+
+bool selection_cache_lookup(
+    const SelectionCacheKey& key,
+    LaunchConfig* out) {
+    if (out == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(selection_cache_mutex());
+
+    const SelectionCache& cache = selection_cache();
+    const auto it = cache.find(key);
+
+    if (it == cache.end()) {
+        return false;
+    }
+
+    *out = it->second;
+    return true;
+}
+
+void selection_cache_store(
+    const SelectionCacheKey& key,
+    LaunchConfig config) {
+    std::lock_guard<std::mutex> lock(selection_cache_mutex());
+
+    selection_cache()[key] = config;
+}
+
 } // namespace
 
 TuningPreference tuning_preference_from_public(
@@ -612,17 +771,6 @@ TuningPreference tuning_preference_from_public(
 LaunchConfig select_launch_config_for_allreduce(
     size_t bytes_per_rank,
     TuningPreference preference) {
-    ensure_policy_loaded();
-
-    LoadedPolicy& policy = global_policy();
-
-    if (!policy.loaded || policy.entries.empty()) {
-        return fallback_config();
-    }
-
-    const size_t selected_size =
-        select_policy_size(policy.entries, bytes_per_rank);
-
     int env_max_ctas = 0;
     const bool has_max_ctas =
         parse_positive_int_env("OOVERLAP_MAX_CTAS", &env_max_ctas);
@@ -631,7 +779,40 @@ LaunchConfig select_launch_config_for_allreduce(
     const bool has_max_threads =
         parse_positive_int_env("OOVERLAP_MAX_THREADS", &env_max_threads);
 
+    const long long tolerance_ppm = runtime_tolerance_ppm();
+
+    const SelectionCacheKey cache_key =
+        make_selection_cache_key(
+            bytes_per_rank,
+            preference,
+            has_max_ctas,
+            env_max_ctas,
+            has_max_threads,
+            env_max_threads,
+            tolerance_ppm);
+
+    LaunchConfig cached{};
+    if (selection_cache_lookup(cache_key, &cached)) {
+        return cached;
+    }
+
+    ensure_policy_loaded();
+
+    LoadedPolicy& policy = global_policy();
+
+    LaunchConfig selected_config{};
+
+    if (!policy.loaded || policy.entries.empty()) {
+        selected_config = fallback_config();
+        selection_cache_store(cache_key, selected_config);
+        return selected_config;
+    }
+
+    const size_t selected_size =
+        select_policy_size(policy.entries, bytes_per_rank);
+
     std::vector<PolicyEntry> candidates;
+    candidates.reserve(64);
 
     for (const PolicyEntry& entry : policy.entries) {
         if (entry.bytes_per_rank != selected_size) {
@@ -652,11 +833,19 @@ LaunchConfig select_launch_config_for_allreduce(
 
     PolicyEntry selected{};
 
-    if (!select_from_candidates(candidates, preference, &selected)) {
-        return fallback_config();
+    if (!select_from_candidates(
+            candidates,
+            preference,
+            tolerance_ppm,
+            &selected)) {
+        selected_config = fallback_config();
+    } else {
+        selected_config = selected.config;
     }
 
-    return selected.config;
+    selection_cache_store(cache_key, selected_config);
+
+    return selected_config;
 }
 
 } // namespace comm
