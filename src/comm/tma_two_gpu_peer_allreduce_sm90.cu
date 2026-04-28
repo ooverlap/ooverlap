@@ -7,7 +7,8 @@
 #include "comm/pipeline_tma_reduce.h"
 #include "comm/tma_variant_config.h"
 #include "comm/utils.h"
-#include "comm/window_pipeline_sm90.cuh"
+#include "comm/window_task.cuh"
+#include "comm/window_task_executor_sm90.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -23,6 +24,16 @@
 namespace ooverlap {
 namespace {
 
+constexpr int kTasksPerCTA = 2;
+
+/*
+ * Enough for max_ctas <= 32 with two tasks per CTA.
+ *
+ * This keeps the task plan in kernel parameters, so the measured stream work
+ * does not include a cudaMemcpyAsync task-upload before every launch.
+ */
+constexpr int kMaxWindowTasks = 64;
+
 __host__ __device__ __forceinline__ size_t dtype_size_bytes(
     oo_dtype_t dtype) {
     switch (dtype) {
@@ -37,95 +48,140 @@ __host__ __device__ __forceinline__ size_t dtype_size_bytes(
     }
 }
 
-template <
-    typename ReduceApply,
-    int ElemBytes,
-    int ChunkBytes,
-    int StageDepth>
-__global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
+template <int MaxTasks>
+bool build_inplace_tma_allreduce_plan(
+    comm::WindowTaskExecutorPlan<MaxTasks>* plan,
     const void* local_in,
     void* local_buf,
     void* peer_buf,
-    size_t count,
+    size_t total_bytes,
     int rank,
-    int* local_ready_signal,
-    const int* peer_ready_signal,
-    int collective_epoch,
+    int num_windows,
     int ctas_per_rank,
     int window_chunks) {
-    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
-
     (void)local_in;
 
-    comm::window_pipeline::wait_for_collective_ready(
-        local_ready_signal,
-        peer_ready_signal,
-        collective_epoch);
+    comm::window_task_executor_plan_clear(plan);
 
-    const int cta_idx = static_cast<int>(blockIdx.x);
-
-    if (ctas_per_rank <= 0 || cta_idx >= ctas_per_rank) {
-        return;
+    if (plan == nullptr) {
+        return false;
     }
 
-    const size_t total_bytes = count * static_cast<size_t>(ElemBytes);
+    plan->tasks_per_cta = kTasksPerCTA;
+    plan->total_tasks = ctas_per_rank * kTasksPerCTA;
 
-    const int num_chunks =
-        comm::utils::ceil_div_int64_to_int(
-            total_bytes,
-            Variant::chunk_bytes);
-
-    const int num_windows =
-        comm::utils::window_count_for_chunks(
-            num_chunks,
-            window_chunks);
+    if (plan->total_tasks > MaxTasks) {
+        return false;
+    }
 
     const comm::utils::WindowRange rank_range =
         comm::utils::rank_window_range(num_windows, rank);
 
-    const comm::utils::WindowRange cta_range =
-        comm::utils::cta_window_range(
-            cta_idx,
-            ctas_per_rank,
-            rank_range);
+    for (int cta_idx = 0; cta_idx < ctas_per_rank; ++cta_idx) {
+        const comm::utils::WindowRange cta_range =
+            comm::utils::cta_window_range(
+                cta_idx,
+                ctas_per_rank,
+                rank_range);
 
-    if (cta_range.begin >= cta_range.end) {
-        return;
+        const int base = cta_idx * kTasksPerCTA;
+
+        /*
+         * Current in-place policy, unchanged:
+         *
+         *   reduce peer -> local
+         *   copy   local -> peer
+         */
+        plan->tasks[base + 0] =
+            comm::make_reduce_tma_task(
+                peer_buf,
+                local_buf,
+                total_bytes,
+                cta_range.begin,
+                cta_range.end,
+                window_chunks,
+                false);
+
+        plan->tasks[base + 1] =
+            comm::make_copy_tma_task(
+                local_buf,
+                peer_buf,
+                total_bytes,
+                cta_range.begin,
+                cta_range.end,
+                window_chunks,
+                true);
     }
 
-    extern __shared__ uint4 shared_storage_u4[];
+    return true;
+}
 
-    unsigned char* shared_raw =
-        reinterpret_cast<unsigned char*>(shared_storage_u4);
+template <int MaxTasks>
+bool build_out_of_place_tma_allreduce_plan(
+    comm::WindowTaskExecutorPlan<MaxTasks>* plan,
+    const void* local_in,
+    void* local_buf,
+    void* peer_buf,
+    size_t total_bytes,
+    int num_windows,
+    int ctas_per_rank,
+    int window_chunks) {
+    comm::window_task_executor_plan_clear(plan);
 
-    __shared__ sync::semaphore barriers[Variant::barrier_count];
+    if (plan == nullptr) {
+        return false;
+    }
 
-    comm::window_pipeline::run_window_range<
-        Variant::stage_depth,
-        Variant::stage_gap,
-        Variant::chunk_bytes,
-        ReduceApply>(
-            peer_buf,
-            local_buf,
-            total_bytes,
-            cta_range.begin,
-            cta_range.end,
-            window_chunks,
-            shared_raw,
-            barriers);
+    plan->tasks_per_cta = kTasksPerCTA;
+    plan->total_tasks = ctas_per_rank * kTasksPerCTA;
 
-    comm::window_pipeline::copy_window_range_tma<
-        Variant::stage_depth,
-        Variant::stage_gap,
-        Variant::chunk_bytes>(
-            local_buf,
-            peer_buf,
-            total_bytes,
-            cta_range.begin,
-            cta_range.end,
-            window_chunks,
-            shared_raw,
-            barriers);
+    if (plan->total_tasks > MaxTasks) {
+        return false;
+    }
+
+    comm::utils::WindowRange full_range{};
+    full_range.begin = 0;
+    full_range.end = num_windows;
+
+    for (int cta_idx = 0; cta_idx < ctas_per_rank; ++cta_idx) {
+        const comm::utils::WindowRange cta_range =
+            comm::utils::cta_window_range(
+                cta_idx,
+                ctas_per_rank,
+                full_range);
+
+        const int base = cta_idx * kTasksPerCTA;
+
+        /*
+         * Experimental out-of-place policy:
+         *
+         *   copy   peer  -> local output
+         *   reduce local -> local output
+         *
+         * This path is selected only when local_in != local_buf.
+         */
+        plan->tasks[base + 0] =
+            comm::make_copy_tma_task(
+                peer_buf,
+                local_buf,
+                total_bytes,
+                cta_range.begin,
+                cta_range.end,
+                window_chunks,
+                false);
+
+        plan->tasks[base + 1] =
+            comm::make_reduce_tma_task(
+                local_in,
+                local_buf,
+                total_bytes,
+                cta_range.begin,
+                cta_range.end,
+                window_chunks,
+                true);
+    }
+
+    return true;
 }
 
 template <
@@ -171,22 +227,22 @@ void configure_kernel_once_for(int device) {
     if (total_smem_bytes > static_cast<size_t>(prop.sharedMemPerBlock)) {
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
-                tma_two_gpu_allreduce_rank_kernel_sm90<
+                comm::window_task_executor_kernel_sm90<
                     ReduceApply,
-                    ElemBytes,
                     ChunkBytes,
-                    StageDepth>,
+                    StageDepth,
+                    kMaxWindowTasks>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(dynamic_smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
 
         system::runtime::check_cuda(
             cudaFuncSetAttribute(
-                tma_two_gpu_allreduce_rank_kernel_sm90<
+                comm::window_task_executor_kernel_sm90<
                     ReduceApply,
-                    ElemBytes,
                     ChunkBytes,
-                    StageDepth>,
+                    StageDepth,
+                    kMaxWindowTasks>,
                 cudaFuncAttributePreferredSharedMemoryCarveout,
                 100),
             "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
@@ -238,8 +294,12 @@ cudaError_t launch_rank_kernel_sm90(
             num_chunks,
             launch_config.window_chunks);
 
+    const bool out_of_place = (local_in != local_buf);
+
     const int owned_windows =
-        comm::utils::rank_window_count(num_windows, rank);
+        out_of_place
+            ? num_windows
+            : comm::utils::rank_window_count(num_windows, rank);
 
     const int ctas_per_rank =
         comm::utils::cta_count_for_windows(
@@ -258,6 +318,39 @@ cudaError_t launch_rank_kernel_sm90(
         return cudaSuccess;
     }
 
+    if (ctas_per_rank > 0 &&
+        ctas_per_rank * kTasksPerCTA > kMaxWindowTasks) {
+        return cudaErrorInvalidValue;
+    }
+
+    comm::WindowTaskExecutorPlan<kMaxWindowTasks> plan{};
+
+    const bool plan_ok =
+        out_of_place
+            ? build_out_of_place_tma_allreduce_plan(
+                  &plan,
+                  local_in,
+                  local_buf,
+                  peer_buf,
+                  total_bytes,
+                  num_windows,
+                  ctas_per_rank,
+                  launch_config.window_chunks)
+            : build_inplace_tma_allreduce_plan(
+                  &plan,
+                  local_in,
+                  local_buf,
+                  peer_buf,
+                  total_bytes,
+                  rank,
+                  num_windows,
+                  ctas_per_rank,
+                  launch_config.window_chunks);
+
+    if (!plan_ok) {
+        return cudaErrorInvalidValue;
+    }
+
     configure_kernel_once_for<
         ReduceApply,
         ElemBytes,
@@ -266,27 +359,18 @@ cudaError_t launch_rank_kernel_sm90(
 
     system::runtime::set_device(device);
 
-    tma_two_gpu_allreduce_rank_kernel_sm90<
+    return comm::launch_window_task_executor_sm90<
         ReduceApply,
-        ElemBytes,
         ChunkBytes,
-        StageDepth><<<
+        StageDepth,
+        kMaxWindowTasks>(
+            plan,
             num_blocks,
             launch_config.threads,
-            Variant::dynamic_shared_bytes,
-            stream>>>(
-                local_in,
-                local_buf,
-                peer_buf,
-                count,
-                rank,
-                local_ready_signal,
-                peer_ready_signal,
-                collective_epoch,
-                ctas_per_rank,
-                launch_config.window_chunks);
-
-    return cudaGetLastError();
+            local_ready_signal,
+            peer_ready_signal,
+            collective_epoch,
+            stream);
 }
 
 template <
@@ -370,7 +454,7 @@ cudaError_t dispatch_rank_kernel_variant_sm90(
     int collective_epoch,
     comm::LaunchConfig launch_config) {
     if (dtype == OO_DTYPE_FLOAT16) {
-        if (op == OO_REDUCE_ADD) {
+        if (op == OO_REDUCE_ADD || op == OO_REDUCE_SUM) {
             return launch_reduce_op_sm90<
                 comm::PipelineReduceAddNoFtzF16,
                 static_cast<int>(sizeof(half)),
@@ -432,7 +516,7 @@ cudaError_t dispatch_rank_kernel_variant_sm90(
     }
 
     if (dtype == OO_DTYPE_BFLOAT16) {
-        if (op == OO_REDUCE_ADD) {
+        if (op == OO_REDUCE_ADD || op == OO_REDUCE_SUM) {
             return launch_reduce_op_sm90<
                 comm::PipelineReduceAddBF16,
                 static_cast<int>(sizeof(__nv_bfloat16)),
@@ -494,7 +578,7 @@ cudaError_t dispatch_rank_kernel_variant_sm90(
     }
 
     if (dtype == OO_DTYPE_FLOAT32) {
-        if (op == OO_REDUCE_ADD) {
+        if (op == OO_REDUCE_ADD || op == OO_REDUCE_SUM) {
             return launch_reduce_op_sm90<
                 comm::PipelineReduceAddF32,
                 static_cast<int>(sizeof(float)),
@@ -568,7 +652,7 @@ void configure_dispatch_variant_sm90(
     oo_reduce_op_t op,
     int device) {
     if (dtype == OO_DTYPE_FLOAT16) {
-        if (op == OO_REDUCE_ADD) {
+        if (op == OO_REDUCE_ADD || op == OO_REDUCE_SUM) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceAddNoFtzF16,
                 static_cast<int>(sizeof(half)),
@@ -597,7 +681,7 @@ void configure_dispatch_variant_sm90(
     }
 
     if (dtype == OO_DTYPE_BFLOAT16) {
-        if (op == OO_REDUCE_ADD) {
+        if (op == OO_REDUCE_ADD || op == OO_REDUCE_SUM) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceAddBF16,
                 static_cast<int>(sizeof(__nv_bfloat16)),
@@ -626,7 +710,7 @@ void configure_dispatch_variant_sm90(
     }
 
     if (dtype == OO_DTYPE_FLOAT32) {
-        if (op == OO_REDUCE_ADD) {
+        if (op == OO_REDUCE_ADD || op == OO_REDUCE_SUM) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceAddF32,
                 static_cast<int>(sizeof(float)),
@@ -645,9 +729,8 @@ void configure_dispatch_sm90(
     oo_reduce_op_t op,
     int device) {
     /*
-     * This compatibility configure function only configures the default
-     * pipeline variant. Launch-time dispatch still configures the exact
-     * requested runtime-selected variant.
+     * Compatibility configure path: configure the default selected variant.
+     * Runtime launches still configure the exact task-executor variant.
      */
     configure_dispatch_variant_sm90<
         TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES,
