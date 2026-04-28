@@ -5,6 +5,7 @@
 #include "comm/launch_config.h"
 #include "comm/params.h"
 #include "comm/pipeline_tma_reduce.h"
+#include "comm/tma_variant_config.h"
 #include "comm/utils.h"
 #include "comm/window_pipeline_sm90.cuh"
 
@@ -44,7 +45,8 @@ __host__ __device__ __forceinline__ size_t dtype_size_bytes(
 __host__ __device__ __forceinline__ int overlap_pair_count_for_windows(
     int owned_windows,
     int max_ctas) {
-    if (owned_windows <= 0 || max_ctas < TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA) {
+    if (owned_windows <= 0 ||
+        max_ctas < TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA) {
         return 0;
     }
 
@@ -53,7 +55,11 @@ __host__ __device__ __forceinline__ int overlap_pair_count_for_windows(
         max_ctas / TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA);
 }
 
-template <typename ReduceApply, int ElemBytes>
+template <
+    typename ReduceApply,
+    int ElemBytes,
+    int ChunkBytes,
+    int StageDepth>
 __global__ void tma_then_fastcopy_rank_kernel_sm90(
     const void* local_in,
     void* local_buf,
@@ -65,6 +71,10 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
     int collective_epoch,
     int ctas_per_rank,
     int window_chunks) {
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
+    (void)local_in;
+
     comm::window_pipeline::wait_for_collective_ready(
         local_ready_signal,
         peer_ready_signal,
@@ -81,7 +91,7 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
     const int num_chunks =
         comm::utils::ceil_div_int64_to_int(
             total_bytes,
-            TMA_TWO_GPU_PEER_CHUNK_BYTES);
+            Variant::chunk_bytes);
 
     const int num_windows =
         comm::utils::window_count_for_chunks(
@@ -106,15 +116,13 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
     unsigned char* shared_raw =
         reinterpret_cast<unsigned char*>(shared_storage_u4);
 
-    __shared__ sync::semaphore barriers[TMA_TWO_GPU_PEER_BARRIER_COUNT];
+    __shared__ sync::semaphore barriers[Variant::barrier_count];
 
     comm::window_pipeline::run_window_range<
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES,
+        Variant::stage_depth,
+        Variant::stage_gap,
+        Variant::chunk_bytes,
         ReduceApply>(
-            //local_in,
-            //peer_buf,
             peer_buf,
             local_buf,
             total_bytes,
@@ -127,9 +135,7 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
     comm::window_pipeline::copy_window_range_gmem<
         uint4,
         TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES>(
-            //peer_buf,
-            //local_buf,
+        Variant::chunk_bytes>(
             local_buf,
             peer_buf,
             total_bytes,
@@ -138,7 +144,11 @@ __global__ void tma_then_fastcopy_rank_kernel_sm90(
             window_chunks);
 }
 
-template <typename ReduceApply, int ElemBytes>
+template <
+    typename ReduceApply,
+    int ElemBytes,
+    int ChunkBytes,
+    int StageDepth>
 __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
     const void* local_in,
     void* local_buf,
@@ -151,6 +161,10 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
     int* window_ready_flags,
     int pair_count,
     int window_chunks) {
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
+    (void)local_in;
+
     comm::window_pipeline::wait_for_collective_ready(
         local_ready_signal,
         peer_ready_signal,
@@ -173,7 +187,7 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
     const int num_chunks =
         comm::utils::ceil_div_int64_to_int(
             total_bytes,
-            TMA_TWO_GPU_PEER_CHUNK_BYTES);
+            Variant::chunk_bytes);
 
     const int num_windows =
         comm::utils::window_count_for_chunks(
@@ -197,9 +211,7 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
         comm::window_pipeline::copy_window_range_gmem_after_ready<
             uint4,
             TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-            TMA_TWO_GPU_PEER_CHUNK_BYTES>(
-                //peer_buf,
-                //local_buf,
+            Variant::chunk_bytes>(
                 local_buf,
                 peer_buf,
                 total_bytes,
@@ -216,15 +228,13 @@ __global__ void tma_overlap_fastcopy_rank_kernel_sm90(
     unsigned char* shared_raw =
         reinterpret_cast<unsigned char*>(shared_storage_u4);
 
-    __shared__ sync::semaphore barriers[TMA_TWO_GPU_PEER_BARRIER_COUNT];
+    __shared__ sync::semaphore barriers[Variant::barrier_count];
 
     comm::window_pipeline::run_window_range_signal<
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES,
+        Variant::stage_depth,
+        Variant::stage_gap,
+        Variant::chunk_bytes,
         ReduceApply>(
-            //local_in,
-            //peer_buf,
             peer_buf,
             local_buf,
             total_bytes,
@@ -272,8 +282,15 @@ int* ensure_signal_capacity(int device, size_t required_count) {
     return entry.ptr;
 }
 
-template <typename ReduceApply, int ElemBytes, bool Overlap>
+template <
+    typename ReduceApply,
+    int ElemBytes,
+    bool Overlap,
+    int ChunkBytes,
+    int StageDepth>
 void configure_kernel_once_for(int device) {
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
     struct CacheEntry {
         bool configured = false;
         size_t dynamic_smem_bytes = 0;
@@ -282,11 +299,8 @@ void configure_kernel_once_for(int device) {
     static std::mutex mutex;
     static std::unordered_map<int, CacheEntry> cache;
 
-    const size_t dynamic_smem_bytes =
-        TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES;
-
-    const size_t total_smem_bytes =
-        dynamic_smem_bytes + TMA_TWO_GPU_PEER_STATIC_SHARED_BYTES;
+    const size_t dynamic_smem_bytes = Variant::dynamic_shared_bytes;
+    const size_t total_smem_bytes = Variant::total_shared_bytes;
 
     std::lock_guard<std::mutex> lock(mutex);
 
@@ -313,13 +327,15 @@ void configure_kernel_once_for(int device) {
     }
 
     if constexpr (Overlap) {
-        if (dynamic_smem_bytes >
+        if (total_smem_bytes >
             static_cast<size_t>(prop.sharedMemPerBlock)) {
             system::runtime::check_cuda(
                 cudaFuncSetAttribute(
                     tma_overlap_fastcopy_rank_kernel_sm90<
                         ReduceApply,
-                        ElemBytes>,
+                        ElemBytes,
+                        ChunkBytes,
+                        StageDepth>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     static_cast<int>(dynamic_smem_bytes)),
                 "cudaFuncSetAttribute(MaxDynamicSharedMemorySize overlap)");
@@ -329,18 +345,22 @@ void configure_kernel_once_for(int device) {
             cudaFuncSetAttribute(
                 tma_overlap_fastcopy_rank_kernel_sm90<
                     ReduceApply,
-                    ElemBytes>,
+                    ElemBytes,
+                    ChunkBytes,
+                    StageDepth>,
                 cudaFuncAttributePreferredSharedMemoryCarveout,
                 100),
             "cudaFuncSetAttribute(PreferredSharedMemoryCarveout overlap)");
     } else {
-        if (dynamic_smem_bytes >
+        if (total_smem_bytes >
             static_cast<size_t>(prop.sharedMemPerBlock)) {
             system::runtime::check_cuda(
                 cudaFuncSetAttribute(
                     tma_then_fastcopy_rank_kernel_sm90<
                         ReduceApply,
-                        ElemBytes>,
+                        ElemBytes,
+                        ChunkBytes,
+                        StageDepth>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     static_cast<int>(dynamic_smem_bytes)),
                 "cudaFuncSetAttribute(MaxDynamicSharedMemorySize seq)");
@@ -350,7 +370,9 @@ void configure_kernel_once_for(int device) {
             cudaFuncSetAttribute(
                 tma_then_fastcopy_rank_kernel_sm90<
                     ReduceApply,
-                    ElemBytes>,
+                    ElemBytes,
+                    ChunkBytes,
+                    StageDepth>,
                 cudaFuncAttributePreferredSharedMemoryCarveout,
                 100),
             "cudaFuncSetAttribute(PreferredSharedMemoryCarveout seq)");
@@ -359,7 +381,12 @@ void configure_kernel_once_for(int device) {
     cache[device] = {true, dynamic_smem_bytes};
 }
 
-template <typename ReduceApply, int ElemBytes, bool Overlap>
+template <
+    typename ReduceApply,
+    int ElemBytes,
+    bool Overlap,
+    int ChunkBytes,
+    int StageDepth>
 cudaError_t launch_rank_kernel_sm90(
     const void* local_in,
     void* local_buf,
@@ -373,6 +400,8 @@ cudaError_t launch_rank_kernel_sm90(
     const int* peer_ready_signal,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
     if constexpr (Overlap) {
         if (!comm::launch_config_valid_for_overlap(launch_config)) {
             return cudaErrorInvalidValue;
@@ -383,6 +412,11 @@ cudaError_t launch_rank_kernel_sm90(
         }
     }
 
+    if (launch_config.chunk_bytes != Variant::chunk_bytes ||
+        launch_config.stage_depth != Variant::stage_depth) {
+        return cudaErrorInvalidValue;
+    }
+
     const int device = (rank == 0) ? dev0 : dev1;
 
     const size_t total_bytes = count * static_cast<size_t>(ElemBytes);
@@ -390,7 +424,7 @@ cudaError_t launch_rank_kernel_sm90(
     const int num_chunks =
         comm::utils::ceil_div_int64_to_int(
             total_bytes,
-            TMA_TWO_GPU_PEER_CHUNK_BYTES);
+            Variant::chunk_bytes);
 
     const int num_windows =
         comm::utils::window_count_for_chunks(
@@ -405,7 +439,12 @@ cudaError_t launch_rank_kernel_sm90(
         peer_ready_signal != nullptr &&
         collective_epoch > 0;
 
-    configure_kernel_once_for<ReduceApply, ElemBytes, Overlap>(device);
+    configure_kernel_once_for<
+        ReduceApply,
+        ElemBytes,
+        Overlap,
+        ChunkBytes,
+        StageDepth>(device);
 
     system::runtime::set_device(device);
 
@@ -445,10 +484,12 @@ cudaError_t launch_rank_kernel_sm90(
 
         tma_overlap_fastcopy_rank_kernel_sm90<
             ReduceApply,
-            ElemBytes><<<
+            ElemBytes,
+            ChunkBytes,
+            StageDepth><<<
                 num_blocks,
                 launch_config.threads,
-                TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES,
+                Variant::dynamic_shared_bytes,
                 stream>>>(
                     local_in,
                     local_buf,
@@ -476,10 +517,12 @@ cudaError_t launch_rank_kernel_sm90(
 
         tma_then_fastcopy_rank_kernel_sm90<
             ReduceApply,
-            ElemBytes><<<
+            ElemBytes,
+            ChunkBytes,
+            StageDepth><<<
                 num_blocks,
                 launch_config.threads,
-                TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES,
+                Variant::dynamic_shared_bytes,
                 stream>>>(
                     local_in,
                     local_buf,
@@ -496,12 +539,17 @@ cudaError_t launch_rank_kernel_sm90(
     return cudaGetLastError();
 }
 
-template <typename ReduceOp, int ElemBytes, bool Overlap>
-cudaError_t launch_reduce_op_sm90(
+template <
+    int ChunkBytes,
+    int StageDepth,
+    bool Overlap>
+cudaError_t dispatch_rank_kernel_variant_sm90(
     const void* local_in,
     void* local_buf,
     void* peer_buf,
     size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
     int rank,
     int dev0,
     int dev1,
@@ -510,24 +558,197 @@ cudaError_t launch_reduce_op_sm90(
     const int* peer_ready_signal,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
-    using ReduceApply = comm::PipelineTMAReduce<
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-        ReduceOp>;
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
 
-    return launch_rank_kernel_sm90<ReduceApply, ElemBytes, Overlap>(
-        local_in,
-        local_buf,
-        peer_buf,
-        count,
-        rank,
-        dev0,
-        dev1,
-        stream,
-        local_ready_signal,
-        peer_ready_signal,
-        collective_epoch,
-        launch_config);
+    if (dtype == OO_DTYPE_FLOAT16) {
+        if (op == OO_REDUCE_ADD) {
+            using ReduceApply = comm::PipelineTMAReduce<
+                Variant::stage_depth,
+                Variant::stage_gap,
+                comm::PipelineReduceAddNoFtzF16>;
+
+            return launch_rank_kernel_sm90<
+                ReduceApply,
+                static_cast<int>(sizeof(half)),
+                Overlap,
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            using ReduceApply = comm::PipelineTMAReduce<
+                Variant::stage_depth,
+                Variant::stage_gap,
+                comm::PipelineReduceMinF16>;
+
+            return launch_rank_kernel_sm90<
+                ReduceApply,
+                static_cast<int>(sizeof(half)),
+                Overlap,
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            using ReduceApply = comm::PipelineTMAReduce<
+                Variant::stage_depth,
+                Variant::stage_gap,
+                comm::PipelineReduceMaxF16>;
+
+            return launch_rank_kernel_sm90<
+                ReduceApply,
+                static_cast<int>(sizeof(half)),
+                Overlap,
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+    }
+
+    if (dtype == OO_DTYPE_BFLOAT16) {
+        if (op == OO_REDUCE_ADD) {
+            using ReduceApply = comm::PipelineTMAReduce<
+                Variant::stage_depth,
+                Variant::stage_gap,
+                comm::PipelineReduceAddBF16>;
+
+            return launch_rank_kernel_sm90<
+                ReduceApply,
+                static_cast<int>(sizeof(__nv_bfloat16)),
+                Overlap,
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            using ReduceApply = comm::PipelineTMAReduce<
+                Variant::stage_depth,
+                Variant::stage_gap,
+                comm::PipelineReduceMinBF16>;
+
+            return launch_rank_kernel_sm90<
+                ReduceApply,
+                static_cast<int>(sizeof(__nv_bfloat16)),
+                Overlap,
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            using ReduceApply = comm::PipelineTMAReduce<
+                Variant::stage_depth,
+                Variant::stage_gap,
+                comm::PipelineReduceMaxBF16>;
+
+            return launch_rank_kernel_sm90<
+                ReduceApply,
+                static_cast<int>(sizeof(__nv_bfloat16)),
+                Overlap,
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+    }
+
+    if (dtype == OO_DTYPE_FLOAT32) {
+        if (op == OO_REDUCE_ADD) {
+            using ReduceApply = comm::PipelineTMAReduce<
+                Variant::stage_depth,
+                Variant::stage_gap,
+                comm::PipelineReduceAddF32>;
+
+            return launch_rank_kernel_sm90<
+                ReduceApply,
+                static_cast<int>(sizeof(float)),
+                Overlap,
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+    }
+
+    return cudaErrorInvalidValue;
 }
 
 template <bool Overlap>
@@ -546,81 +767,32 @@ cudaError_t dispatch_rank_kernel_sm90(
     const int* peer_ready_signal,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
-    if (dtype == OO_DTYPE_FLOAT16) {
-        if (op == OO_REDUCE_ADD) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceAddNoFtzF16,
-                static_cast<int>(sizeof(half)),
-                Overlap>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-
-        if (op == OO_REDUCE_MIN) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMinF16,
-                static_cast<int>(sizeof(half)),
-                Overlap>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-
-        if (op == OO_REDUCE_MAX) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMaxF16,
-                static_cast<int>(sizeof(half)),
-                Overlap>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
+#define OO_TRY_VARIANT(CHUNK_BYTES_VALUE, STAGE_DEPTH_VALUE)                 \
+    if (launch_config.chunk_bytes == (CHUNK_BYTES_VALUE) &&                  \
+        launch_config.stage_depth == (STAGE_DEPTH_VALUE)) {                  \
+        return dispatch_rank_kernel_variant_sm90<                            \
+            (CHUNK_BYTES_VALUE),                                             \
+            (STAGE_DEPTH_VALUE),                                             \
+            Overlap>(                                                        \
+                local_in,                                                    \
+                local_buf,                                                   \
+                peer_buf,                                                    \
+                count,                                                       \
+                dtype,                                                       \
+                op,                                                          \
+                rank,                                                        \
+                dev0,                                                        \
+                dev1,                                                        \
+                stream,                                                      \
+                local_ready_signal,                                          \
+                peer_ready_signal,                                           \
+                collective_epoch,                                            \
+                launch_config);                                              \
     }
 
-    if (dtype == OO_DTYPE_BFLOAT16) {
-        if (op == OO_REDUCE_ADD) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceAddBF16,
-                static_cast<int>(sizeof(__nv_bfloat16)),
-                Overlap>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
+    OOVERLAP_TMA_TWO_GPU_PEER_FOR_EACH_VARIANT(OO_TRY_VARIANT)
 
-        if (op == OO_REDUCE_MIN) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMinBF16,
-                static_cast<int>(sizeof(__nv_bfloat16)),
-                Overlap>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-
-        if (op == OO_REDUCE_MAX) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMaxBF16,
-                static_cast<int>(sizeof(__nv_bfloat16)),
-                Overlap>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-    }
-
-    if (dtype == OO_DTYPE_FLOAT32) {
-        if (op == OO_REDUCE_ADD) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceAddF32,
-                static_cast<int>(sizeof(float)),
-                Overlap>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-    }
+#undef OO_TRY_VARIANT
 
     return cudaErrorInvalidValue;
 }

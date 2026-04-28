@@ -29,6 +29,45 @@ def parse_str_list(text):
     return values
 
 
+def parse_variant_list(text):
+    """
+    Parse explicit chunk_bytes:stage_depth pairs.
+
+    Example:
+      16384:8,32768:4,65536:2,102400:2
+    """
+    chunk_bytes = []
+    stage_depths = []
+
+    for item in str(text).split(","):
+        item = item.strip()
+        if not item:
+            continue
+
+        if ":" not in item:
+            raise ValueError(
+                f"Invalid variant {item!r}. Expected chunk_bytes:stage_depth"
+            )
+
+        chunk_text, depth_text = item.split(":", 1)
+
+        chunk = int(chunk_text.strip())
+        depth = int(depth_text.strip())
+
+        if chunk <= 0:
+            raise ValueError(f"Invalid chunk size in variant {item!r}")
+        if depth <= 0:
+            raise ValueError(f"Invalid stage depth in variant {item!r}")
+
+        chunk_bytes.append(chunk)
+        stage_depths.append(depth)
+
+    if not chunk_bytes:
+        raise ValueError("variant list is empty")
+
+    return chunk_bytes, stage_depths
+
+
 def load_ooverlap_ext():
     root = Path(__file__).resolve().parents[1]
     so = root / "build" / "lib" / "ooverlap_ext.so"
@@ -64,7 +103,7 @@ def main():
     parser.add_argument(
         "--max-ctas",
         type=str,
-        default="16",
+        default="8",
         help="Comma-separated max total CTAs per rank",
     )
     parser.add_argument(
@@ -72,6 +111,15 @@ def main():
         type=str,
         default="16,32,64",
         help="Comma-separated chunks per signaling/work window",
+    )
+    parser.add_argument(
+        "--variants",
+        type=str,
+        default="16384:8",
+        help=(
+            "Comma-separated chunk_bytes:stage_depth pairs. "
+            "Example: 16384:8,32768:4,65536:2,102400:2"
+        ),
     )
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=20)
@@ -124,6 +172,7 @@ def main():
     threads = parse_int_list(args.threads)
     max_ctas = parse_int_list(args.max_ctas)
     window_chunks = parse_int_list(args.window_chunks)
+    chunk_bytes, stage_depths = parse_variant_list(args.variants)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +185,7 @@ def main():
     print(f"[info] threads={threads}")
     print(f"[info] max_ctas={max_ctas}")
     print(f"[info] window_chunks={window_chunks}")
+    print(f"[info] variants={list(zip(chunk_bytes, stage_depths))}")
     print(f"[info] iters={args.iters} warmup={args.warmup}")
     print(f"[info] NCCL_MAX_CTAS={os.environ.get('NCCL_MAX_CTAS')}")
     print(f"[info] NCCL_MIN_CTAS={os.environ.get('NCCL_MIN_CTAS')}")
@@ -151,6 +201,8 @@ def main():
         [int(x) for x in threads],
         [int(x) for x in max_ctas],
         [int(x) for x in window_chunks],
+        [int(x) for x in chunk_bytes],
+        [int(x) for x in stage_depths],
         int(args.iters),
         int(args.warmup),
         int(args.dev0),
@@ -169,7 +221,10 @@ def main():
     print(f"[result] wrote {len(rows)} rows to {out_path}")
 
     if candidate_rows:
-        best = max(candidate_rows, key=lambda r: float(r.get("speedup_vs_nccl", 0.0)))
+        best = max(
+            candidate_rows,
+            key=lambda r: float(r.get("speedup_vs_nccl", 0.0)),
+        )
         print("[best]")
         print(json.dumps(best, indent=2, sort_keys=True))
 

@@ -150,25 +150,58 @@ void append_json_string_or_null(
     }
 }
 
-void append_compile_metadata(std::ostringstream& out) {
-    out << ",\"compile_chunk_bytes\":" << TMA_TWO_GPU_PEER_CHUNK_BYTES;
-    out << ",\"compile_reduce_stage_depth\":"
-        << TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH;
-    out << ",\"compile_reduce_stage_gap\":"
-        << TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP;
-    out << ",\"compile_copy_stage_depth\":"
-        << TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH;
-    out << ",\"compile_copy_stage_gap\":"
-        << TMA_TWO_GPU_PEER_COPY_STAGE_GAP;
-    out << ",\"compile_fast_copy_unroll\":"
-        << TMA_TWO_GPU_PEER_FAST_COPY_UNROLL;
+void append_nccl_env_metadata(std::ostringstream& out) {
+    append_json_string_or_null(
+        out,
+        "nccl_max_ctas_env",
+        getenv_or_empty("NCCL_MAX_CTAS"));
+    append_json_string_or_null(
+        out,
+        "nccl_min_ctas_env",
+        getenv_or_empty("NCCL_MIN_CTAS"));
+    append_json_string_or_null(
+        out,
+        "nccl_algo_env",
+        getenv_or_empty("NCCL_ALGO"));
+    append_json_string_or_null(
+        out,
+        "nccl_proto_env",
+        getenv_or_empty("NCCL_PROTO"));
 }
 
-void append_nccl_env_metadata(std::ostringstream& out) {
-    append_json_string_or_null(out, "nccl_max_ctas_env", getenv_or_empty("NCCL_MAX_CTAS"));
-    append_json_string_or_null(out, "nccl_min_ctas_env", getenv_or_empty("NCCL_MIN_CTAS"));
-    append_json_string_or_null(out, "nccl_algo_env", getenv_or_empty("NCCL_ALGO"));
-    append_json_string_or_null(out, "nccl_proto_env", getenv_or_empty("NCCL_PROTO"));
+void append_variant_null_metadata(std::ostringstream& out) {
+    out << ",\"chunk_bytes\":null";
+    out << ",\"stage_depth\":null";
+    out << ",\"stage_gap\":null";
+
+    out << ",\"compile_chunk_bytes\":null";
+    out << ",\"compile_reduce_stage_depth\":null";
+    out << ",\"compile_reduce_stage_gap\":null";
+    out << ",\"compile_copy_stage_depth\":null";
+    out << ",\"compile_copy_stage_gap\":null";
+    out << ",\"compile_fast_copy_unroll\":null";
+}
+
+void append_variant_metadata(
+    std::ostringstream& out,
+    comm::LaunchConfig config) {
+    const int stage_gap = config.stage_depth / 2;
+
+    out << ",\"chunk_bytes\":" << config.chunk_bytes;
+    out << ",\"stage_depth\":" << config.stage_depth;
+    out << ",\"stage_gap\":" << stage_gap;
+
+    /*
+     * Keep the old compile_* names too because the policy builder already
+     * consumes them. They now describe the selected precompiled variant.
+     */
+    out << ",\"compile_chunk_bytes\":" << config.chunk_bytes;
+    out << ",\"compile_reduce_stage_depth\":" << config.stage_depth;
+    out << ",\"compile_reduce_stage_gap\":" << stage_gap;
+    out << ",\"compile_copy_stage_depth\":" << config.stage_depth;
+    out << ",\"compile_copy_stage_gap\":" << stage_gap;
+    out << ",\"compile_fast_copy_unroll\":"
+        << TMA_TWO_GPU_PEER_FAST_COPY_UNROLL;
 }
 
 void sync_two_streams(
@@ -691,13 +724,13 @@ void append_nccl_row(
     rows << ",\"threads\":null";
     rows << ",\"max_ctas\":null";
     rows << ",\"window_chunks\":null";
+    append_variant_null_metadata(rows);
     rows << ",\"total_ms\":" << nccl_total_ms;
     rows << ",\"avg_ms\":" << avg_ms;
     rows << ",\"nccl_avg_ms\":" << avg_ms;
     rows << ",\"speedup_vs_nccl\":1.0";
     rows << ",\"effective_gbps_per_rank\":" << gbps_per_rank;
     rows << ",\"effective_gbps_aggregate_2gpu\":" << gbps_aggregate;
-    append_compile_metadata(rows);
     append_nccl_env_metadata(rows);
     rows << "}\n";
 }
@@ -739,13 +772,13 @@ void append_candidate_row(
     rows << ",\"threads\":" << config.threads;
     rows << ",\"max_ctas\":" << config.max_ctas;
     rows << ",\"window_chunks\":" << config.window_chunks;
+    append_variant_metadata(rows, config);
     rows << ",\"total_ms\":" << total_ms;
     rows << ",\"avg_ms\":" << avg_ms;
     rows << ",\"nccl_avg_ms\":" << nccl_avg_ms;
     rows << ",\"speedup_vs_nccl\":" << speedup;
     rows << ",\"effective_gbps_per_rank\":" << gbps_per_rank;
     rows << ",\"effective_gbps_aggregate_2gpu\":" << gbps_aggregate;
-    append_compile_metadata(rows);
     append_nccl_env_metadata(rows);
     rows << "}\n";
 }
@@ -758,6 +791,8 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_sm90(
     const std::vector<int>& threads,
     const std::vector<int>& max_ctas,
     const std::vector<int>& window_chunks,
+    const std::vector<int>& chunk_bytes,
+    const std::vector<int>& stage_depths,
     int iters,
     int warmup,
     int dev0,
@@ -766,9 +801,16 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_sm90(
         kernels.empty() ||
         threads.empty() ||
         max_ctas.empty() ||
-        window_chunks.empty()) {
+        window_chunks.empty() ||
+        chunk_bytes.empty() ||
+        stage_depths.empty()) {
         throw std::invalid_argument(
             "benchmark_tma_two_gpu_allreduce_sweep_sm90: sweep lists must be non-empty");
+    }
+
+    if (chunk_bytes.size() != stage_depths.size()) {
+        throw std::invalid_argument(
+            "benchmark_tma_two_gpu_allreduce_sweep_sm90: chunk_bytes and stage_depths must have the same length");
     }
 
     if (iters <= 0 || warmup < 0) {
@@ -842,11 +884,17 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_sm90(
                 cudaMalloc(&nccl_rank1_out, bytes),
                 "cudaMalloc(nccl_rank1_out)");
 
-            check_oo(oo_buffer_alloc(node0, bytes, &rank0_buf), "oo_buffer_alloc(rank0)");
-            check_oo(oo_buffer_alloc(node1, bytes, &rank1_buf), "oo_buffer_alloc(rank1)");
+            check_oo(
+                oo_buffer_alloc(node0, bytes, &rank0_buf),
+                "oo_buffer_alloc(rank0)");
+            check_oo(
+                oo_buffer_alloc(node1, bytes, &rank1_buf),
+                "oo_buffer_alloc(rank1)");
 
-            half* rank0_work = reinterpret_cast<half*>(oo_buffer_ptr(rank0_buf));
-            half* rank1_work = reinterpret_cast<half*>(oo_buffer_ptr(rank1_buf));
+            half* rank0_work =
+                reinterpret_cast<half*>(oo_buffer_ptr(rank0_buf));
+            half* rank1_work =
+                reinterpret_cast<half*>(oo_buffer_ptr(rank1_buf));
 
             fill_inputs(
                 rank0_src,
@@ -906,64 +954,37 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_sm90(
                 for (int thread_count : threads) {
                     for (int max_cta_count : max_ctas) {
                         for (int window_chunk_count : window_chunks) {
-                            comm::LaunchConfig config{};
-                            config.threads = thread_count;
-                            config.max_ctas = max_cta_count;
-                            config.window_chunks = window_chunk_count;
+                            for (size_t variant_idx = 0;
+                                 variant_idx < chunk_bytes.size();
+                                 ++variant_idx) {
+                                comm::LaunchConfig config{};
+                                config.threads = thread_count;
+                                config.max_ctas = max_cta_count;
+                                config.window_chunks = window_chunk_count;
+                                config.chunk_bytes = chunk_bytes[variant_idx];
+                                config.stage_depth = stage_depths[variant_idx];
 
-                            const bool config_ok =
-                                (kernel == SweepKernelKind::kOverlapFastGmem)
-                                    ? comm::launch_config_valid_for_overlap(config)
-                                    : comm::launch_config_valid(config);
+                                const bool config_ok =
+                                    (kernel == SweepKernelKind::kOverlapFastGmem)
+                                        ? comm::launch_config_valid_for_overlap(config)
+                                        : comm::launch_config_valid(config);
 
-                            if (!config_ok) {
-                                continue;
-                            }
+                                if (!config_ok) {
+                                    continue;
+                                }
 
-                            prepare_work_buffers(
-                                rank0_src,
-                                rank1_src,
-                                rank0_work,
-                                rank1_work,
-                                bytes,
-                                node0_dev,
-                                node1_dev,
-                                stream0,
-                                stream1);
+                                prepare_work_buffers(
+                                    rank0_src,
+                                    rank1_src,
+                                    rank0_work,
+                                    rank1_work,
+                                    bytes,
+                                    node0_dev,
+                                    node1_dev,
+                                    stream0,
+                                    stream1);
 
-                            run_candidate_iters(
-                                group,
-                                kernel,
-                                rank0_work,
-                                rank1_work,
-                                static_cast<size_t>(numel),
-                                node0_dev,
-                                node1_dev,
-                                stream0,
-                                stream1,
-                                warmup,
-                                config);
-
-                            sync_two_streams(
-                                node0_dev,
-                                stream0,
-                                node1_dev,
-                                stream1,
-                                "sync candidate warmup");
-
-                            prepare_work_buffers(
-                                rank0_src,
-                                rank1_src,
-                                rank0_work,
-                                rank1_work,
-                                bytes,
-                                node0_dev,
-                                node1_dev,
-                                stream0,
-                                stream1);
-
-                            const double total_ms =
-                                elapsed_ms_candidate(
+                                run_candidate_iters(
                                     group,
                                     kernel,
                                     rank0_work,
@@ -973,21 +994,54 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_sm90(
                                     node1_dev,
                                     stream0,
                                     stream1,
-                                    iters,
+                                    warmup,
                                     config);
 
-                            append_candidate_row(
-                                rows,
-                                numel,
-                                bytes,
-                                iters,
-                                warmup,
-                                node0_dev,
-                                node1_dev,
-                                kernel,
-                                config,
-                                total_ms,
-                                nccl_total_ms);
+                                sync_two_streams(
+                                    node0_dev,
+                                    stream0,
+                                    node1_dev,
+                                    stream1,
+                                    "sync candidate warmup");
+
+                                prepare_work_buffers(
+                                    rank0_src,
+                                    rank1_src,
+                                    rank0_work,
+                                    rank1_work,
+                                    bytes,
+                                    node0_dev,
+                                    node1_dev,
+                                    stream0,
+                                    stream1);
+
+                                const double total_ms =
+                                    elapsed_ms_candidate(
+                                        group,
+                                        kernel,
+                                        rank0_work,
+                                        rank1_work,
+                                        static_cast<size_t>(numel),
+                                        node0_dev,
+                                        node1_dev,
+                                        stream0,
+                                        stream1,
+                                        iters,
+                                        config);
+
+                                append_candidate_row(
+                                    rows,
+                                    numel,
+                                    bytes,
+                                    iters,
+                                    warmup,
+                                    node0_dev,
+                                    node1_dev,
+                                    kernel,
+                                    config,
+                                    total_ms,
+                                    nccl_total_ms);
+                            }
                         }
                     }
                 }
@@ -1039,8 +1093,10 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_sm90(
             system::runtime::destroy_stream_on_device(node1_dev, stream1);
             stream1 = nullptr;
         } catch (...) {
-            const int node0_dev = (node0 != nullptr) ? oo_node_device(node0) : dev0;
-            const int node1_dev = (node1 != nullptr) ? oo_node_device(node1) : dev1;
+            const int node0_dev =
+                (node0 != nullptr) ? oo_node_device(node0) : dev0;
+            const int node1_dev =
+                (node1 != nullptr) ? oo_node_device(node1) : dev1;
 
             if (comms[0] != nullptr) {
                 ncclCommDestroy(comms[0]);

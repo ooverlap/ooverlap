@@ -5,6 +5,7 @@
 #include "comm/launch_config.h"
 #include "comm/params.h"
 #include "comm/pipeline_tma_reduce.h"
+#include "comm/tma_variant_config.h"
 #include "comm/utils.h"
 #include "comm/window_pipeline_sm90.cuh"
 
@@ -36,7 +37,11 @@ __host__ __device__ __forceinline__ size_t dtype_size_bytes(
     }
 }
 
-template <typename ReduceApply, int ElemBytes>
+template <
+    typename ReduceApply,
+    int ElemBytes,
+    int ChunkBytes,
+    int StageDepth>
 __global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
     const void* local_in,
     void* local_buf,
@@ -48,6 +53,10 @@ __global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
     int collective_epoch,
     int ctas_per_rank,
     int window_chunks) {
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
+    (void)local_in;
+
     comm::window_pipeline::wait_for_collective_ready(
         local_ready_signal,
         peer_ready_signal,
@@ -64,7 +73,7 @@ __global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
     const int num_chunks =
         comm::utils::ceil_div_int64_to_int(
             total_bytes,
-            TMA_TWO_GPU_PEER_CHUNK_BYTES);
+            Variant::chunk_bytes);
 
     const int num_windows =
         comm::utils::window_count_for_chunks(
@@ -89,15 +98,13 @@ __global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
     unsigned char* shared_raw =
         reinterpret_cast<unsigned char*>(shared_storage_u4);
 
-    __shared__ sync::semaphore barriers[TMA_TWO_GPU_PEER_BARRIER_COUNT];
+    __shared__ sync::semaphore barriers[Variant::barrier_count];
 
     comm::window_pipeline::run_window_range<
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES,
+        Variant::stage_depth,
+        Variant::stage_gap,
+        Variant::chunk_bytes,
         ReduceApply>(
-            //local_in,
-            //peer_buf,
             peer_buf,
             local_buf,
             total_bytes,
@@ -108,11 +115,9 @@ __global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
             barriers);
 
     comm::window_pipeline::copy_window_range_tma<
-        TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_COPY_STAGE_GAP,
-        TMA_TWO_GPU_PEER_CHUNK_BYTES>(
-            //peer_buf,
-            //local_buf,
+        Variant::stage_depth,
+        Variant::stage_gap,
+        Variant::chunk_bytes>(
             local_buf,
             peer_buf,
             total_bytes,
@@ -123,8 +128,14 @@ __global__ void tma_two_gpu_allreduce_rank_kernel_sm90(
             barriers);
 }
 
-template <typename ReduceApply, int ElemBytes>
+template <
+    typename ReduceApply,
+    int ElemBytes,
+    int ChunkBytes,
+    int StageDepth>
 void configure_kernel_once_for(int device) {
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
     struct CacheEntry {
         bool configured = false;
         size_t dynamic_smem_bytes = 0;
@@ -133,9 +144,8 @@ void configure_kernel_once_for(int device) {
     static std::mutex mutex;
     static std::unordered_map<int, CacheEntry> cache;
 
-    const size_t dynamic_smem_bytes = TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES;
-    const size_t total_smem_bytes =
-        dynamic_smem_bytes + TMA_TWO_GPU_PEER_STATIC_SHARED_BYTES;
+    const size_t dynamic_smem_bytes = Variant::dynamic_shared_bytes;
+    const size_t total_smem_bytes = Variant::total_shared_bytes;
 
     std::lock_guard<std::mutex> lock(mutex);
 
@@ -163,7 +173,9 @@ void configure_kernel_once_for(int device) {
             cudaFuncSetAttribute(
                 tma_two_gpu_allreduce_rank_kernel_sm90<
                     ReduceApply,
-                    ElemBytes>,
+                    ElemBytes,
+                    ChunkBytes,
+                    StageDepth>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(dynamic_smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
@@ -172,7 +184,9 @@ void configure_kernel_once_for(int device) {
             cudaFuncSetAttribute(
                 tma_two_gpu_allreduce_rank_kernel_sm90<
                     ReduceApply,
-                    ElemBytes>,
+                    ElemBytes,
+                    ChunkBytes,
+                    StageDepth>,
                 cudaFuncAttributePreferredSharedMemoryCarveout,
                 100),
             "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
@@ -181,7 +195,11 @@ void configure_kernel_once_for(int device) {
     cache[device] = {true, dynamic_smem_bytes};
 }
 
-template <typename ReduceApply, int ElemBytes>
+template <
+    typename ReduceApply,
+    int ElemBytes,
+    int ChunkBytes,
+    int StageDepth>
 cudaError_t launch_rank_kernel_sm90(
     const void* local_in,
     void* local_buf,
@@ -195,7 +213,14 @@ cudaError_t launch_rank_kernel_sm90(
     const int* peer_ready_signal,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
     if (!comm::launch_config_valid(launch_config)) {
+        return cudaErrorInvalidValue;
+    }
+
+    if (launch_config.chunk_bytes != Variant::chunk_bytes ||
+        launch_config.stage_depth != Variant::stage_depth) {
         return cudaErrorInvalidValue;
     }
 
@@ -206,7 +231,7 @@ cudaError_t launch_rank_kernel_sm90(
     const int num_chunks =
         comm::utils::ceil_div_int64_to_int(
             total_bytes,
-            TMA_TWO_GPU_PEER_CHUNK_BYTES);
+            Variant::chunk_bytes);
 
     const int num_windows =
         comm::utils::window_count_for_chunks(
@@ -233,16 +258,22 @@ cudaError_t launch_rank_kernel_sm90(
         return cudaSuccess;
     }
 
-    configure_kernel_once_for<ReduceApply, ElemBytes>(device);
+    configure_kernel_once_for<
+        ReduceApply,
+        ElemBytes,
+        ChunkBytes,
+        StageDepth>(device);
 
     system::runtime::set_device(device);
 
     tma_two_gpu_allreduce_rank_kernel_sm90<
         ReduceApply,
-        ElemBytes><<<
+        ElemBytes,
+        ChunkBytes,
+        StageDepth><<<
             num_blocks,
             launch_config.threads,
-            TMA_TWO_GPU_PEER_DYNAMIC_SHARED_BYTES,
+            Variant::dynamic_shared_bytes,
             stream>>>(
                 local_in,
                 local_buf,
@@ -258,12 +289,11 @@ cudaError_t launch_rank_kernel_sm90(
     return cudaGetLastError();
 }
 
-template <typename ReduceApply, int ElemBytes>
-void configure_dispatch_for(int device) {
-    configure_kernel_once_for<ReduceApply, ElemBytes>(device);
-}
-
-template <typename ReduceOp, int ElemBytes>
+template <
+    typename ReduceOp,
+    int ElemBytes,
+    int ChunkBytes,
+    int StageDepth>
 cudaError_t launch_reduce_op_sm90(
     const void* local_in,
     void* local_buf,
@@ -277,34 +307,215 @@ cudaError_t launch_reduce_op_sm90(
     const int* peer_ready_signal,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
     using ReduceApply = comm::PipelineTMAReduce<
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+        Variant::stage_depth,
+        Variant::stage_gap,
         ReduceOp>;
 
-    return launch_rank_kernel_sm90<ReduceApply, ElemBytes>(
-        local_in,
-        local_buf,
-        peer_buf,
-        count,
-        rank,
-        dev0,
-        dev1,
-        stream,
-        local_ready_signal,
-        peer_ready_signal,
-        collective_epoch,
-        launch_config);
+    return launch_rank_kernel_sm90<
+        ReduceApply,
+        ElemBytes,
+        ChunkBytes,
+        StageDepth>(
+            local_in,
+            local_buf,
+            peer_buf,
+            count,
+            rank,
+            dev0,
+            dev1,
+            stream,
+            local_ready_signal,
+            peer_ready_signal,
+            collective_epoch,
+            launch_config);
 }
 
-template <typename ReduceOp, int ElemBytes>
+template <
+    typename ReduceOp,
+    int ElemBytes,
+    int ChunkBytes,
+    int StageDepth>
 void configure_reduce_op_sm90(int device) {
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
     using ReduceApply = comm::PipelineTMAReduce<
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_DEPTH,
-        TMA_TWO_GPU_PEER_REDUCE_STAGE_GAP,
+        Variant::stage_depth,
+        Variant::stage_gap,
         ReduceOp>;
 
-    configure_dispatch_for<ReduceApply, ElemBytes>(device);
+    configure_kernel_once_for<
+        ReduceApply,
+        ElemBytes,
+        ChunkBytes,
+        StageDepth>(device);
+}
+
+template <int ChunkBytes, int StageDepth>
+cudaError_t dispatch_rank_kernel_variant_sm90(
+    const void* local_in,
+    void* local_buf,
+    void* peer_buf,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    int rank,
+    int dev0,
+    int dev1,
+    cudaStream_t stream,
+    int* local_ready_signal,
+    const int* peer_ready_signal,
+    int collective_epoch,
+    comm::LaunchConfig launch_config) {
+    if (dtype == OO_DTYPE_FLOAT16) {
+        if (op == OO_REDUCE_ADD) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceAddNoFtzF16,
+                static_cast<int>(sizeof(half)),
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMinF16,
+                static_cast<int>(sizeof(half)),
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMaxF16,
+                static_cast<int>(sizeof(half)),
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+    }
+
+    if (dtype == OO_DTYPE_BFLOAT16) {
+        if (op == OO_REDUCE_ADD) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceAddBF16,
+                static_cast<int>(sizeof(__nv_bfloat16)),
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+
+        if (op == OO_REDUCE_MIN) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMinBF16,
+                static_cast<int>(sizeof(__nv_bfloat16)),
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+
+        if (op == OO_REDUCE_MAX) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceMaxBF16,
+                static_cast<int>(sizeof(__nv_bfloat16)),
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+    }
+
+    if (dtype == OO_DTYPE_FLOAT32) {
+        if (op == OO_REDUCE_ADD) {
+            return launch_reduce_op_sm90<
+                comm::PipelineReduceAddF32,
+                static_cast<int>(sizeof(float)),
+                ChunkBytes,
+                StageDepth>(
+                    local_in,
+                    local_buf,
+                    peer_buf,
+                    count,
+                    rank,
+                    dev0,
+                    dev1,
+                    stream,
+                    local_ready_signal,
+                    peer_ready_signal,
+                    collective_epoch,
+                    launch_config);
+        }
+    }
+
+    return cudaErrorInvalidValue;
 }
 
 cudaError_t dispatch_rank_kernel_sm90(
@@ -322,79 +533,37 @@ cudaError_t dispatch_rank_kernel_sm90(
     const int* peer_ready_signal,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
-    if (dtype == OO_DTYPE_FLOAT16) {
-        if (op == OO_REDUCE_ADD) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceAddNoFtzF16,
-                static_cast<int>(sizeof(half))>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-
-        if (op == OO_REDUCE_MIN) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMinF16,
-                static_cast<int>(sizeof(half))>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-
-        if (op == OO_REDUCE_MAX) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMaxF16,
-                static_cast<int>(sizeof(half))>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
+#define OO_TRY_VARIANT(CHUNK_BYTES_VALUE, STAGE_DEPTH_VALUE)                 \
+    if (launch_config.chunk_bytes == (CHUNK_BYTES_VALUE) &&                  \
+        launch_config.stage_depth == (STAGE_DEPTH_VALUE)) {                  \
+        return dispatch_rank_kernel_variant_sm90<                            \
+            (CHUNK_BYTES_VALUE),                                             \
+            (STAGE_DEPTH_VALUE)>(                                            \
+                local_in,                                                    \
+                local_buf,                                                   \
+                peer_buf,                                                    \
+                count,                                                       \
+                dtype,                                                       \
+                op,                                                          \
+                rank,                                                        \
+                dev0,                                                        \
+                dev1,                                                        \
+                stream,                                                      \
+                local_ready_signal,                                          \
+                peer_ready_signal,                                           \
+                collective_epoch,                                            \
+                launch_config);                                              \
     }
 
-    if (dtype == OO_DTYPE_BFLOAT16) {
-        if (op == OO_REDUCE_ADD) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceAddBF16,
-                static_cast<int>(sizeof(__nv_bfloat16))>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
+    OOVERLAP_TMA_TWO_GPU_PEER_FOR_EACH_VARIANT(OO_TRY_VARIANT)
 
-        if (op == OO_REDUCE_MIN) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMinBF16,
-                static_cast<int>(sizeof(__nv_bfloat16))>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-
-        if (op == OO_REDUCE_MAX) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceMaxBF16,
-                static_cast<int>(sizeof(__nv_bfloat16))>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-    }
-
-    if (dtype == OO_DTYPE_FLOAT32) {
-        if (op == OO_REDUCE_ADD) {
-            return launch_reduce_op_sm90<
-                comm::PipelineReduceAddF32,
-                static_cast<int>(sizeof(float))>(
-                    local_in, local_buf, peer_buf, count, rank, dev0, dev1,
-                    stream, local_ready_signal, peer_ready_signal,
-                    collective_epoch, launch_config);
-        }
-    }
+#undef OO_TRY_VARIANT
 
     return cudaErrorInvalidValue;
 }
 
-void configure_dispatch_sm90(
+template <int ChunkBytes, int StageDepth>
+void configure_dispatch_variant_sm90(
     oo_dtype_t dtype,
     oo_reduce_op_t op,
     int device) {
@@ -402,21 +571,27 @@ void configure_dispatch_sm90(
         if (op == OO_REDUCE_ADD) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceAddNoFtzF16,
-                static_cast<int>(sizeof(half))>(device);
+                static_cast<int>(sizeof(half)),
+                ChunkBytes,
+                StageDepth>(device);
             return;
         }
 
         if (op == OO_REDUCE_MIN) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceMinF16,
-                static_cast<int>(sizeof(half))>(device);
+                static_cast<int>(sizeof(half)),
+                ChunkBytes,
+                StageDepth>(device);
             return;
         }
 
         if (op == OO_REDUCE_MAX) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceMaxF16,
-                static_cast<int>(sizeof(half))>(device);
+                static_cast<int>(sizeof(half)),
+                ChunkBytes,
+                StageDepth>(device);
             return;
         }
     }
@@ -425,21 +600,27 @@ void configure_dispatch_sm90(
         if (op == OO_REDUCE_ADD) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceAddBF16,
-                static_cast<int>(sizeof(__nv_bfloat16))>(device);
+                static_cast<int>(sizeof(__nv_bfloat16)),
+                ChunkBytes,
+                StageDepth>(device);
             return;
         }
 
         if (op == OO_REDUCE_MIN) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceMinBF16,
-                static_cast<int>(sizeof(__nv_bfloat16))>(device);
+                static_cast<int>(sizeof(__nv_bfloat16)),
+                ChunkBytes,
+                StageDepth>(device);
             return;
         }
 
         if (op == OO_REDUCE_MAX) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceMaxBF16,
-                static_cast<int>(sizeof(__nv_bfloat16))>(device);
+                static_cast<int>(sizeof(__nv_bfloat16)),
+                ChunkBytes,
+                StageDepth>(device);
             return;
         }
     }
@@ -448,13 +629,32 @@ void configure_dispatch_sm90(
         if (op == OO_REDUCE_ADD) {
             configure_reduce_op_sm90<
                 comm::PipelineReduceAddF32,
-                static_cast<int>(sizeof(float))>(device);
+                static_cast<int>(sizeof(float)),
+                ChunkBytes,
+                StageDepth>(device);
             return;
         }
     }
 
     throw std::invalid_argument(
         "tma_two_gpu_peer_allreduce_configure_kernel_once: unsupported dtype/op");
+}
+
+void configure_dispatch_sm90(
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    int device) {
+    /*
+     * This compatibility configure function only configures the default
+     * pipeline variant. Launch-time dispatch still configures the exact
+     * requested runtime-selected variant.
+     */
+    configure_dispatch_variant_sm90<
+        TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES,
+        TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH>(
+            dtype,
+            op,
+            device);
 }
 
 } // namespace
