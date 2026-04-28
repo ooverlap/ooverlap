@@ -15,6 +15,7 @@
 #include "test/ipc_allreduce_benchmark_2gpu_sm90.h"
 #include "test/tma_bandwidth_experiment_sm90.h"
 #include "test/tma_allreduce_sweep_2gpu_sm90.h"
+#include "test/public_allreduce_benchmark_2gpu_sm90.h"
 
 namespace py = pybind11;
 
@@ -254,6 +255,19 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev0") = 0,
         py::arg("dev1") = 1,
         "Sweep SM90 2-GPU TMA allreduce runtime launch configs and selected chunk/stage variants.");
+  
+  m.def("benchmark_public_allreduce_2gpu_sm90",
+        &ooverlap::benchmark_public_allreduce_2gpu_sm90,
+        py::arg("min_bytes"),
+        py::arg("max_bytes"),
+        py::arg("points"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("tuning_mode"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1,
+        "Benchmark public oo_allreduce_tuned API vs NCCL in one process.");
+
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
       .def("cutlass_init", &OverlapImpl::CutlassInit)
