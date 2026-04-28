@@ -83,7 +83,6 @@ if(OOVERLAP_BUILD_CORE)
   add_library(ooverlap_comm STATIC
     ${OOVERLAP_SRC_DIR}/comm/ooverlap_comm.cu
     ${OOVERLAP_SRC_DIR}/comm/tma_two_gpu_peer_allreduce_sm90.cu
-    ${OOVERLAP_SRC_DIR}/comm/tma_two_gpu_peer_allreduce_fast_gmem_sm90.cu
   )
 
   add_library(ooverlap::comm ALIAS ooverlap_comm)
