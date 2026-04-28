@@ -247,12 +247,13 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("threads"),
         py::arg("max_ctas"),
         py::arg("window_chunks"),
+        py::arg("chunk_bytes"),
+        py::arg("stage_depths"),
         py::arg("iters"),
         py::arg("warmup"),
         py::arg("dev0") = 0,
         py::arg("dev1") = 1,
-        "Sweep SM90 2-GPU TMA allreduce runtime launch configs and return JSONL rows.");
-
+        "Sweep SM90 2-GPU TMA allreduce runtime launch configs and selected chunk/stage variants.");
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
       .def("cutlass_init", &OverlapImpl::CutlassInit)
