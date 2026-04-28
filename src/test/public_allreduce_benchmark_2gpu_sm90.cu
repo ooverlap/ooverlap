@@ -323,8 +323,25 @@ std::vector<int64_t> make_byte_points(
     int64_t min_bytes,
     int64_t max_bytes,
     int points) {
+    constexpr int64_t kAlignBytes = 16;
+
+    auto align_down = [](int64_t x) {
+        return (x / kAlignBytes) * kAlignBytes;
+    };
+
+    auto align_up = [](int64_t x) {
+        return ((x + kAlignBytes - 1) / kAlignBytes) * kAlignBytes;
+    };
+
     if (min_bytes <= 0 || max_bytes <= 0 || max_bytes < min_bytes || points <= 0) {
         throw std::invalid_argument("invalid byte sweep range");
+    }
+
+    min_bytes = align_up(min_bytes);
+    max_bytes = align_down(max_bytes);
+
+    if (min_bytes <= 0 || max_bytes <= 0 || max_bytes < min_bytes) {
+        throw std::invalid_argument("aligned byte sweep range is empty");
     }
 
     std::vector<int64_t> out;
@@ -348,25 +365,22 @@ std::vector<int64_t> make_byte_points(
             static_cast<int64_t>(
                 std::llround(std::exp(log_min + t * (log_max - log_min))));
 
-        /*
-         * We benchmark float16, so force bytes to a positive even count.
-         */
-        bytes = std::max<int64_t>(2, bytes);
-        bytes = (bytes / 2) * 2;
+        bytes = align_down(bytes);
 
-        /*
-         * Avoid duplicate adjacent points after rounding.
-         */
-        if (bytes <= last) {
-            bytes = last + 2;
+        if (bytes < min_bytes) {
+            bytes = min_bytes;
         }
 
         if (bytes > max_bytes) {
-            bytes = (max_bytes / 2) * 2;
+            bytes = max_bytes;
         }
 
-        if (bytes <= 0) {
-            bytes = 2;
+        if (bytes <= last) {
+            bytes = align_up(last + kAlignBytes);
+        }
+
+        if (bytes > max_bytes) {
+            bytes = max_bytes;
         }
 
         if (!out.empty() && out.back() == bytes) {
@@ -377,17 +391,12 @@ std::vector<int64_t> make_byte_points(
         last = bytes;
     }
 
-    if (out.empty() || out.front() != ((min_bytes / 2) * 2)) {
-        int64_t first = (min_bytes / 2) * 2;
-        if (first <= 0) {
-            first = 2;
-        }
-        out.insert(out.begin(), first);
+    if (out.empty() || out.front() != min_bytes) {
+        out.insert(out.begin(), min_bytes);
     }
 
-    const int64_t last_target = (max_bytes / 2) * 2;
-    if (out.back() != last_target) {
-        out.push_back(last_target);
+    if (out.back() != max_bytes) {
+        out.push_back(max_bytes);
     }
 
     return out;
