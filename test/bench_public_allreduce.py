@@ -35,19 +35,63 @@ def parse_bytes(text):
 
     return int(float(s))
 
-
 def bytes_label(num_bytes):
     num_bytes = float(num_bytes)
 
-    if num_bytes >= 1024**3:
-        return f"{num_bytes / 1024**3:.1f} GiB"
     if num_bytes >= 1024**2:
-        return f"{num_bytes / 1024**2:.1f} MiB"
+        value = num_bytes / 1024**2
+        if abs(value - round(value)) < 1e-9:
+            return f"{int(round(value))} MB"
+        return f"{value:.1f} MB"
+
     if num_bytes >= 1024:
-        return f"{num_bytes / 1024:.1f} KiB"
+        value = num_bytes / 1024
+        if abs(value - round(value)) < 1e-9:
+            return f"{int(round(value))} KB"
+        return f"{value:.1f} KB"
 
     return f"{num_bytes:.0f} B"
 
+def set_size_axis_ticks(ax, min_x, max_x):
+    """
+    Use power-of-two tick locations, but label them as human sizes:
+
+      2 KB, 4 KB, ..., 512 KB, 1 MB, 2 MB, ..., 512 MB
+
+    This avoids matplotlib labels like 2^29 bytes.
+    """
+    min_x = max(1, int(min_x))
+    max_x = max(min_x, int(max_x))
+
+    start_exp = math.floor(math.log2(min_x))
+    end_exp = math.ceil(math.log2(max_x))
+
+    ticks = []
+
+    for exp in range(start_exp, end_exp + 1):
+        value = 1 << exp
+        if min_x <= value <= max_x:
+            ticks.append(value)
+
+    if min_x not in ticks:
+        ticks.insert(0, min_x)
+
+    if max_x not in ticks:
+        ticks.append(max_x)
+
+    # Avoid unreadable axes when there are too many decades.
+    if len(ticks) > 18:
+        stride = math.ceil(len(ticks) / 18)
+        ticks = ticks[::stride]
+        if ticks[-1] != max_x:
+            ticks.append(max_x)
+
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(
+        [bytes_label(x) for x in ticks],
+        rotation=35,
+        ha="right",
+    )
 
 def repo_root():
     return Path(__file__).resolve().parents[1]
@@ -87,12 +131,15 @@ def write_jsonl(path, rows):
 
 
 def run_one(ext, args, cta_cap):
-    old = os.environ.get("OOVERLAP_MAX_CTAS")
+    old_ooverlap_max_ctas = os.environ.get("OOVERLAP_MAX_CTAS")
+    old_nccl_max_ctas = os.environ.get("NCCL_MAX_CTAS")
 
     if cta_cap is None:
         os.environ.pop("OOVERLAP_MAX_CTAS", None)
+        os.environ.pop("NCCL_MAX_CTAS", None)
     else:
         os.environ["OOVERLAP_MAX_CTAS"] = str(cta_cap)
+        os.environ["NCCL_MAX_CTAS"] = str(cta_cap)
 
     try:
         text = ext.benchmark_public_allreduce_2gpu_sm90(
@@ -106,18 +153,24 @@ def run_one(ext, args, cta_cap):
             int(args.dev1),
         )
     finally:
-        if old is None:
+        if old_ooverlap_max_ctas is None:
             os.environ.pop("OOVERLAP_MAX_CTAS", None)
         else:
-            os.environ["OOVERLAP_MAX_CTAS"] = old
+            os.environ["OOVERLAP_MAX_CTAS"] = old_ooverlap_max_ctas
+
+        if old_nccl_max_ctas is None:
+            os.environ.pop("NCCL_MAX_CTAS", None)
+        else:
+            os.environ["NCCL_MAX_CTAS"] = old_nccl_max_ctas
 
     rows = parse_jsonl(text)
 
     for row in rows:
         row["cta_cap"] = cta_cap
+        row["ooverlap_max_ctas_env"] = cta_cap
+        row["nccl_max_ctas_env"] = cta_cap
 
     return rows
-
 
 def plot_rows(rows, out_dir, metric):
     cta_values = sorted({row.get("cta_cap") for row in rows}, key=lambda x: (-1 if x is None else x))
@@ -147,8 +200,9 @@ def plot_rows(rows, out_dir, metric):
             label = backend
             plt.plot(xs, ys, marker="o", linewidth=1.5, markersize=3, label=label)
 
-        plt.xscale("log", base=2)
-        plt.xlabel("Bytes per rank")
+        ax = plt.gca()
+        ax.set_xscale("log", base=2)
+        plt.xlabel("Data size per rank")
 
         if metric == "gbps_aggregate_2gpu":
             plt.ylabel("Aggregate payload bandwidth, 2 GPU (GB/s)")
@@ -166,8 +220,8 @@ def plot_rows(rows, out_dir, metric):
         plt.legend()
 
         unique_xs = sorted({int(row["bytes_per_rank"]) for row in subset})
-        if len(unique_xs) <= 24:
-            plt.xticks(unique_xs, [bytes_label(x) for x in unique_xs], rotation=35, ha="right")
+        if unique_xs:
+            set_size_axis_ticks(ax, min(unique_xs), max(unique_xs))
 
         plt.tight_layout()
 
