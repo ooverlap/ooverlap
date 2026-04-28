@@ -180,23 +180,25 @@ bool build_tma_copy_inplace_plan(
 }
 
 template <int MaxTasks>
-bool build_tma_copy_out_of_place_plan(
+bool build_tma_copy_out_of_place_overlap_plan(
     comm::WindowTaskExecutorPlan<MaxTasks>* plan,
     const void* local_in,
     void* local_buf,
     void* peer_buf,
     size_t total_bytes,
     int num_windows,
-    int ctas_per_rank,
-    int window_chunks) {
+    int pair_count,
+    int window_chunks,
+    int* window_ready_flags) {
     if (plan == nullptr) {
         return false;
     }
 
     comm::window_task_executor_plan_clear(plan);
 
-    plan->tasks_per_cta = kSeqTasksPerCTA;
-    plan->total_tasks = ctas_per_rank * kSeqTasksPerCTA;
+    plan->tasks_per_cta = kOverlapTasksPerCTA;
+    plan->total_tasks =
+        pair_count * TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
 
     if (plan->total_tasks > MaxTasks) {
         return false;
@@ -206,42 +208,51 @@ bool build_tma_copy_out_of_place_plan(
     full_range.begin = 0;
     full_range.end = num_windows;
 
-    for (int cta_idx = 0; cta_idx < ctas_per_rank; ++cta_idx) {
-        const comm::utils::WindowRange cta_range =
+    for (int pair_idx = 0; pair_idx < pair_count; ++pair_idx) {
+        const comm::utils::WindowRange pair_range =
             comm::utils::cta_window_range(
-                cta_idx,
-                ctas_per_rank,
+                pair_idx,
+                pair_count,
                 full_range);
 
-        const int base = cta_idx * kSeqTasksPerCTA;
+        const int producer_block =
+            pair_idx * TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA + 0;
+        const int consumer_block =
+            pair_idx * TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA + 1;
 
         /*
-         * Normal TMA-copy different-buffer policy:
+         * Different-buffer normal-TMA overlap policy:
          *
-         *   copy   peer  -> local output using TMA
-         *   reduce local -> local output using TMA reduce
+         *   producer CTA:
+         *     copy peer -> local output and signal completed windows
          *
-         * This path is selected only when local_in != local_buf and only for
-         * AllreducePlanKind::TmaCopy.
+         *   consumer CTA:
+         *     wait for signal, then reduce local input -> local output
+         *
+         * This is selected only for normal TMA when local_in != local_buf.
          */
-        plan->tasks[base + 0] =
-            comm::make_copy_tma_task(
+        plan->tasks[producer_block] =
+            comm::make_copy_tma_signal_task(
                 peer_buf,
                 local_buf,
                 total_bytes,
-                cta_range.begin,
-                cta_range.end,
+                pair_range.begin,
+                pair_range.end,
                 window_chunks,
-                false);
+                window_ready_flags,
+                0,
+                true);
 
-        plan->tasks[base + 1] =
-            comm::make_reduce_tma_task(
+        plan->tasks[consumer_block] =
+            comm::make_reduce_tma_after_signal_task(
                 local_in,
                 local_buf,
                 total_bytes,
-                cta_range.begin,
-                cta_range.end,
+                pair_range.begin,
+                pair_range.end,
                 window_chunks,
+                window_ready_flags,
+                0,
                 true);
     }
 
@@ -533,52 +544,110 @@ cudaError_t launch_rank_kernel_sm90(
 
     switch (launch_config.plan_kind) {
         case comm::AllreducePlanKind::TmaCopy: {
-            const bool out_of_place = (local_in != local_buf);
+           const bool out_of_place = (local_in != local_buf);
 
-            const int owned_windows =
-                out_of_place
-                    ? num_windows
-                    : comm::utils::rank_window_count(num_windows, rank);
+            if (out_of_place) {
+                /*
+                 * Different-buffer normal TMA now uses the TMA-overlap task
+                 * topology:
+                 *
+                 *   CopyTMASignal
+                 *   ReduceTMAAfterSignal
+                 *
+                 * This requires CTA pairs.
+                 */
+                if (!comm::launch_config_valid_for_overlap(launch_config)) {
+                    return cudaErrorInvalidValue;
+                }
 
-            const int ctas_per_rank =
-                comm::utils::cta_count_for_windows(
-                    owned_windows,
-                    launch_config.max_ctas);
+                const int owned_windows = num_windows;
 
-            num_blocks =
-                needs_rendezvous
-                    ? std::max(1, ctas_per_rank)
-                    : ctas_per_rank;
+                const int pair_count =
+                    overlap_pair_count_for_windows(
+                        owned_windows,
+                        launch_config.max_ctas);
 
-            if (num_blocks <= 0) {
-                return cudaSuccess;
-            }
+                num_blocks =
+                    pair_count * TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA;
 
-            if (ctas_per_rank * kSeqTasksPerCTA > kMaxWindowTasks) {
-                return cudaErrorInvalidValue;
-            }
+                if (needs_rendezvous) {
+                    num_blocks = std::max(1, num_blocks);
+                }
 
-            plan_ok =
-                out_of_place
-                    ? build_tma_copy_out_of_place_plan(
-                          &plan,
-                          local_in,
-                          local_buf,
-                          peer_buf,
-                          total_bytes,
-                          num_windows,
-                          ctas_per_rank,
-                          launch_config.window_chunks)
-                    : build_tma_copy_inplace_plan(
-                          &plan,
-                          local_in,
-                          local_buf,
-                          peer_buf,
-                          total_bytes,
-                          rank,
-                          num_windows,
-                          ctas_per_rank,
-                          launch_config.window_chunks);
+                if (num_blocks <= 0) {
+                    return cudaSuccess;
+                }
+
+                if (pair_count *
+                        TMA_TWO_GPU_PEER_OVERLAP_BLOCKS_PER_CTA *
+                        kOverlapTasksPerCTA >
+                    kMaxWindowTasks) {
+                    return cudaErrorInvalidValue;
+                }
+
+                int* ready_flags = nullptr;
+
+                if (owned_windows > 0) {
+                    ready_flags =
+                        ensure_signal_capacity(
+                            device,
+                            static_cast<size_t>(owned_windows));
+
+                    system::runtime::check_cuda(
+                        cudaMemsetAsync(
+                            ready_flags,
+                            0,
+                            static_cast<size_t>(owned_windows) * sizeof(int),
+                            stream),
+                        "cudaMemsetAsync(tma out-of-place overlap window ready flags)");
+                }
+
+                plan_ok =
+                    build_tma_copy_out_of_place_overlap_plan(
+                        &plan,
+                        local_in,
+                        local_buf,
+                        peer_buf,
+                        total_bytes,
+                        num_windows,
+                        pair_count,
+                        launch_config.window_chunks,
+                        ready_flags);
+            } else {
+                const int owned_windows =
+                    comm::utils::rank_window_count(num_windows, rank);
+
+                const int ctas_per_rank =
+                    comm::utils::cta_count_for_windows(
+                        owned_windows,
+                        launch_config.max_ctas);
+
+                num_blocks =
+                    needs_rendezvous
+                        ? std::max(1, ctas_per_rank)
+                        : ctas_per_rank;
+
+                if (num_blocks <= 0) {
+                    return cudaSuccess;
+                }
+
+                if (ctas_per_rank * kSeqTasksPerCTA > kMaxWindowTasks) {
+                    return cudaErrorInvalidValue;
+                }
+
+                plan_ok =
+                    build_tma_copy_inplace_plan(
+                        &plan,
+                        local_in,
+                        local_buf,
+                        peer_buf,
+                        total_bytes,
+                        rank,
+                        num_windows,
+                        ctas_per_rank,
+                        launch_config.window_chunks);
+            } 
+            
             break;
         }
 
