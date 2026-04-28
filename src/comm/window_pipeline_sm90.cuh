@@ -633,6 +633,266 @@ __device__ void run_window_range_signal(
     __syncthreads();
 }
 
+__device__ __forceinline__ void wait_window_signal_for_window(
+    const int* window_ready_flags,
+    int window_idx,
+    int ready_window_base) {
+    if (window_ready_flags == nullptr) {
+        return;
+    }
+
+    const int flag_idx = window_idx - ready_window_base;
+
+    const int* window_ready =
+        (flag_idx >= 0) ? window_ready_flags + flag_idx : nullptr;
+
+    if (threadIdx.x == 0) {
+        wait_window_ready(window_ready);
+    }
+
+    __syncthreads();
+}
+
+/*
+ * Streaming TMA-load + apply pipeline over a runtime window range, but each
+ * window is allowed to enter the issue stream only after its signal is ready.
+ *
+ * This is the consumer side for:
+ *
+ *   CopyTMASignal -> ReduceTMAAfterSignal
+ *
+ * The pipeline is still one flowing pipeline across the whole window range.
+ * We only wait when the first chunk of a new window is about to be issued.
+ */
+template <
+    int StageDepth,
+    int FillDepth,
+    size_t ChunkBytes,
+    typename Apply>
+__device__ void run_window_range_after_ready(
+    const void* src_base,
+    void* dst_base,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    const int* window_ready_flags,
+    int ready_window_base,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    static_assert(StageDepth > 0, "StageDepth must be > 0");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+
+    if (begin_window >= end_window ||
+        window_chunks <= 0 ||
+        total_bytes == 0) {
+        return;
+    }
+
+    const int total_chunks =
+        chunk_count_for_bytes<ChunkBytes>(total_bytes);
+
+    const ChunkRange chunks =
+        chunk_range_for_window_range(
+            begin_window,
+            end_window,
+            total_chunks,
+            window_chunks);
+
+    if (chunks.begin >= chunks.end) {
+        return;
+    }
+
+    const unsigned char* src_bytes =
+        reinterpret_cast<const unsigned char*>(src_base);
+
+    unsigned char* dst_bytes =
+        reinterpret_cast<unsigned char*>(dst_base);
+
+    PipelineTMALoad load{};
+    Apply apply{};
+
+    const int total_range_chunks = chunks.end - chunks.begin;
+
+    int last_waited_window = -1;
+
+    for (int warm = 0; warm < FillDepth; ++warm) {
+        if (warm >= total_range_chunks) {
+            break;
+        }
+
+        const int abs_chunk = chunks.begin + warm;
+        const int window_idx = abs_chunk / window_chunks;
+
+        if (window_idx != last_waited_window) {
+            wait_window_signal_for_window(
+                window_ready_flags,
+                window_idx,
+                ready_window_base);
+
+            last_waited_window = window_idx;
+        }
+
+        const int slot = warm;
+
+        PipelineStage stage = make_stage_for_abs_chunk<ChunkBytes>(
+            src_bytes,
+            dst_bytes,
+            total_bytes,
+            abs_chunk,
+            slot,
+            shared_raw,
+            barriers);
+
+        if (threadIdx.x == 0) {
+            load.issue(&stage);
+        }
+
+        __syncthreads();
+    }
+
+    for (int iter = 0; iter < total_range_chunks; ++iter) {
+        const int abs_chunk = chunks.begin + iter;
+        const int cur_slot = iter % StageDepth;
+
+        PipelineStage cur_stage = make_stage_for_abs_chunk<ChunkBytes>(
+            src_bytes,
+            dst_bytes,
+            total_bytes,
+            abs_chunk,
+            cur_slot,
+            shared_raw,
+            barriers);
+
+        if (threadIdx.x == 0) {
+            load.wait_ready(&cur_stage);
+        }
+
+        __syncthreads();
+
+        const int future_iter = iter + FillDepth;
+
+        if (future_iter < total_range_chunks) {
+            const int future_abs_chunk = chunks.begin + future_iter;
+            const int future_window_idx = future_abs_chunk / window_chunks;
+
+            if (future_window_idx != last_waited_window) {
+                wait_window_signal_for_window(
+                    window_ready_flags,
+                    future_window_idx,
+                    ready_window_base);
+
+                last_waited_window = future_window_idx;
+            }
+
+            const int future_slot = future_iter % StageDepth;
+
+            PipelineStage future_stage = make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                future_abs_chunk,
+                future_slot,
+                shared_raw,
+                barriers);
+
+            if (threadIdx.x == 0) {
+                if (iter >= FillDepth) {
+                    apply.wait_before_stage_reuse();
+                }
+
+                load.issue(&future_stage);
+            }
+        }
+
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            apply.issue_bulk(&cur_stage);
+        }
+
+        apply.finish_tail(&cur_stage);
+
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        apply.wait_complete();
+        __threadfence_system();
+    }
+
+    __syncthreads();
+}
+
+template <
+    int StageDepth,
+    int FillDepth,
+    size_t ChunkBytes>
+__device__ void copy_window_range_tma_signal(
+    const void* src_base,
+    void* dst_base,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    int* window_ready_flags,
+    int ready_window_base,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    using CopyApply = PipelineTMACopy<StageDepth, FillDepth>;
+
+    run_window_range_signal<
+        StageDepth,
+        FillDepth,
+        ChunkBytes,
+        CopyApply>(
+            src_base,
+            dst_base,
+            total_bytes,
+            begin_window,
+            end_window,
+            window_chunks,
+            window_ready_flags,
+            ready_window_base,
+            shared_raw,
+            barriers);
+}
+
+template <
+    int StageDepth,
+    int FillDepth,
+    size_t ChunkBytes,
+    typename ReduceApply>
+__device__ void reduce_window_range_tma_after_ready(
+    const void* src_base,
+    void* dst_base,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    const int* window_ready_flags,
+    int ready_window_base,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    run_window_range_after_ready<
+        StageDepth,
+        FillDepth,
+        ChunkBytes,
+        ReduceApply>(
+            src_base,
+            dst_base,
+            total_bytes,
+            begin_window,
+            end_window,
+            window_chunks,
+            window_ready_flags,
+            ready_window_base,
+            shared_raw,
+            barriers);
+}
+
 template <
     int StageDepth,
     int FillDepth,

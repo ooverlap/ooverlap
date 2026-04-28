@@ -41,6 +41,18 @@ enum class WindowTaskOp : uint8_t {
      * per-window producer signal before copying each window.
      */
     CopyFastAfterSignal = 5,
+
+    /*
+     * TMA copy task.src -> task.dst and publish task.signal_flags as windows
+     * complete.
+     */
+    CopyTMASignal = 6,
+
+    /*
+     * Wait for task.signal_flags window-by-window, then TMA-reduce task.src
+     * into task.dst.
+     */
+    ReduceTMAAfterSignal = 7,
 };
 
 struct WindowTask {
@@ -166,6 +178,58 @@ __host__ __device__ __forceinline__ WindowTask make_copy_tma_task(
         terminal);
 }
 
+__host__ __device__ __forceinline__ WindowTask make_copy_tma_signal_task(
+    const void* src,
+    void* dst,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    int* signal_flags,
+    int signal_base_window,
+    bool terminal = false) {
+    WindowTask task =
+        make_window_task(
+            WindowTaskOp::CopyTMASignal,
+            src,
+            dst,
+            total_bytes,
+            begin_window,
+            end_window,
+            window_chunks,
+            terminal);
+
+    task.signal_flags = signal_flags;
+    task.signal_base_window = signal_base_window;
+    return task;
+}
+
+__host__ __device__ __forceinline__ WindowTask make_reduce_tma_after_signal_task(
+    const void* src,
+    void* dst,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    const int* signal_flags,
+    int signal_base_window,
+    bool terminal = false) {
+    WindowTask task =
+        make_window_task(
+            WindowTaskOp::ReduceTMAAfterSignal,
+            src,
+            dst,
+            total_bytes,
+            begin_window,
+            end_window,
+            window_chunks,
+            terminal);
+
+    task.signal_flags = const_cast<int*>(signal_flags);
+    task.signal_base_window = signal_base_window;
+    return task;
+}
+
 __host__ __device__ __forceinline__ WindowTask make_copy_fast_task(
     const void* src,
     void* dst,
@@ -228,7 +292,9 @@ __host__ __device__ __forceinline__ bool window_task_has_work(
 __host__ __device__ __forceinline__ bool window_task_uses_signal(
     const WindowTask& task) {
     return task.op == WindowTaskOp::ReduceTMASignal ||
-           task.op == WindowTaskOp::CopyFastAfterSignal;
+           task.op == WindowTaskOp::CopyFastAfterSignal ||
+           task.op == WindowTaskOp::CopyTMASignal ||
+           task.op == WindowTaskOp::ReduceTMAAfterSignal;
 }
 
 /*
@@ -335,6 +401,40 @@ __device__ __forceinline__ void execute_window_task(
                     task.window_chunks,
                     task.signal_flags,
                     task.signal_base_window);
+            return;
+        case WindowTaskOp::CopyTMASignal:
+            window_pipeline::copy_window_range_tma_signal<
+                StageDepth,
+                FillDepth,
+                ChunkBytes>(
+                    task.src,
+                    task.dst,
+                    task.total_bytes,
+                    task.begin_window,
+                    task.end_window,
+                    task.window_chunks,
+                    task.signal_flags,
+                    task.signal_base_window,
+                    shared_raw,
+                    barriers);
+            return;
+
+        case WindowTaskOp::ReduceTMAAfterSignal:
+            window_pipeline::reduce_window_range_tma_after_ready<
+                StageDepth,
+                FillDepth,
+                ChunkBytes,
+                ReduceApply>(
+                    task.src,
+                    task.dst,
+                    task.total_bytes,
+                    task.begin_window,
+                    task.end_window,
+                    task.window_chunks,
+                    task.signal_flags,
+                    task.signal_base_window,
+                    shared_raw,
+                    barriers);
             return;
 
         case WindowTaskOp::None:
