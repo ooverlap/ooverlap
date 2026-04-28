@@ -75,16 +75,16 @@ const char* kernel_kind_name(SweepKernelKind kind) {
     }
 }
 
-comm::AllreduceKernelKind launch_kernel_kind(SweepKernelKind kind) {
+comm::AllreducePlanKind launch_kernel_kind(SweepKernelKind kind) {
     switch (kind) {
         case SweepKernelKind::kTmaCopy:
-            return comm::AllreduceKernelKind::TmaCopy;
+            return comm::AllreducePlanKind::TmaCopy;
         case SweepKernelKind::kSeqFastGmem:
-            return comm::AllreduceKernelKind::SeqFastGmem;
+            return comm::AllreducePlanKind::SeqFastGmem;
         case SweepKernelKind::kOverlapFastGmem:
-            return comm::AllreduceKernelKind::OverlapFastGmem;
+            return comm::AllreducePlanKind::OverlapFastGmem;
         default:
-            return comm::AllreduceKernelKind::TmaCopy;
+            return comm::AllreducePlanKind::TmaCopy;
     }
 }
 
@@ -426,7 +426,7 @@ void launch_candidate_once(
     int* rank1_ready,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
-    launch_config.kernel_kind = launch_kernel_kind(kernel);
+    launch_config.plan_kind = launch_kernel_kind(kernel);
 
     cudaError_t err0 =
         enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
@@ -901,7 +901,7 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_sm90(
                                 config.window_chunks = window_chunk_count;
                                 config.chunk_bytes = chunk_bytes[variant_idx];
                                 config.stage_depth = stage_depths[variant_idx];
-                                config.kernel_kind = launch_kernel_kind(kernel);
+                                config.plan_kind = launch_kernel_kind(kernel);
 
                                 if (!comm::launch_config_valid(config)) {
                                     continue;

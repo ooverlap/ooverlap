@@ -287,14 +287,14 @@ double elapsed_ms_two_stream_max(
 }
 
 comm::LaunchConfig config_for_kind(
-    comm::AllreduceKernelKind kind) {
+    comm::AllreducePlanKind kind) {
     comm::LaunchConfig config{};
-    config.kernel_kind = kind;
+    config.plan_kind = kind;
     return config;
 }
 
 void launch_unified_once(
-    comm::AllreduceKernelKind kind,
+    comm::AllreducePlanKind kind,
     const void* rank0_in,
     const void* rank1_in,
     void* rank0_buf,
@@ -360,7 +360,7 @@ void launch_normal_once(
     int* rank1_ready,
     int collective_epoch) {
     launch_unified_once(
-        comm::AllreduceKernelKind::TmaCopy,
+        comm::AllreducePlanKind::TmaCopy,
         rank0_work,
         rank1_work,
         rank0_work,
@@ -391,7 +391,7 @@ void launch_normal_diff_buffer_once(
     int* rank1_ready,
     int collective_epoch) {
     launch_unified_once(
-        comm::AllreduceKernelKind::TmaCopy,
+        comm::AllreducePlanKind::TmaCopy,
         rank0_src,
         rank1_src,
         rank0_out,
@@ -420,7 +420,7 @@ void launch_not_fused_once(
     int* rank1_ready,
     int collective_epoch) {
     launch_unified_once(
-        comm::AllreduceKernelKind::SeqFastGmem,
+        comm::AllreducePlanKind::SeqFastGmem,
         rank0_work,
         rank1_work,
         rank0_work,
@@ -449,7 +449,7 @@ void launch_fused_once(
     int* rank1_ready,
     int collective_epoch) {
     launch_unified_once(
-        comm::AllreduceKernelKind::OverlapFastGmem,
+        comm::AllreducePlanKind::OverlapFastGmem,
         rank0_work,
         rank1_work,
         rank0_work,

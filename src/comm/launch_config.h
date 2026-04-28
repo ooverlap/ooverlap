@@ -5,7 +5,7 @@
 namespace ooverlap {
 namespace comm {
 
-enum class AllreduceKernelKind : int {
+enum class AllreducePlanKind : int {
     TmaCopy = 0,
     SeqFastGmem = 1,
     OverlapFastGmem = 2,
@@ -19,7 +19,7 @@ struct LaunchConfig {
     int chunk_bytes = TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES;
     int stage_depth = TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH;
 
-    AllreduceKernelKind kernel_kind = AllreduceKernelKind::TmaCopy;
+    AllreducePlanKind plan_kind = AllreducePlanKind::TmaCopy;
 };
 
 __host__ __device__ __forceinline__ LaunchConfig default_launch_config() {
@@ -60,7 +60,7 @@ __host__ __device__ __forceinline__ bool launch_config_valid(
         return false;
     }
 
-    if (config.kernel_kind == AllreduceKernelKind::OverlapFastGmem) {
+    if (config.plan_kind == AllreducePlanKind::OverlapFastGmem) {
         return config.max_ctas >= 2;
     }
     
