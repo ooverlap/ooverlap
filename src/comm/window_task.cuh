@@ -383,3 +383,35 @@ __device__ __forceinline__ void execute_window_task_stripe(
         return;
     }
 
+    const int base = cta_idx * tasks_per_cta;
+
+    if (base >= total_tasks) {
+        return;
+    }
+
+    for (int local_task = 0; local_task < tasks_per_cta; ++local_task) {
+        const int task_idx = base + local_task;
+
+        if (task_idx >= total_tasks) {
+            return;
+        }
+
+        const WindowTask task = tasks[task_idx];
+
+        execute_window_task<
+            StageDepth,
+            FillDepth,
+            ChunkBytes,
+            ReduceApply,
+            FastCopyVecT,
+            FastCopyUnroll>(
+                task,
+                shared_raw,
+                barriers);
+
+        if (task.terminal) {
+            return;
+        }
+    }
+}
+
