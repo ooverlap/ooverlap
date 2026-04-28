@@ -42,6 +42,11 @@ typedef enum {
     OO_BUFFER_KIND_WRAPPED = 1
 } oo_buffer_kind_t;
 
+typedef enum {
+    OO_TUNING_BEST_PERFORMANCE = 0,
+    OO_TUNING_BEST_EFFICIENCY = 1
+} oo_tuning_mode_t;
+
 /* Utility */
 size_t oo_dtype_size(
     oo_dtype_t dtype);
@@ -158,6 +163,27 @@ oo_status_t oo_allreduce(
     size_t count,
     oo_dtype_t dtype,
     oo_reduce_op_t op,
+    cudaStream_t stream);
+
+oo_status_t oo_allreduce_offset_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* peer,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream);
+
+oo_status_t oo_allreduce_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* peer,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
     cudaStream_t stream);
 
 #ifdef __cplusplus
