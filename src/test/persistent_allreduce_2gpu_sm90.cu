@@ -1,8 +1,8 @@
 #include "test/persistent_allreduce_2gpu_sm90.h"
 
+#include "comm/launch_config.h"
 #include "comm/ooverlap_comm.h"
 #include "comm/ooverlap_comm_internal.h"
-#include "comm/tma_two_gpu_peer_allreduce_fast_gmem_sm90.h"
 #include "comm/tma_two_gpu_peer_allreduce_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
@@ -150,6 +150,27 @@ void prepare_work_buffers(
         "sync reset working inputs");
 }
 
+void clear_buffers(
+    half* rank0_buf,
+    half* rank1_buf,
+    size_t bytes,
+    int dev0,
+    int dev1,
+    cudaStream_t stream0,
+    cudaStream_t stream1) {
+    system::runtime::set_device(dev0);
+    system::runtime::check_cuda(
+        cudaMemsetAsync(rank0_buf, 0, bytes, stream0),
+        "cudaMemsetAsync(rank0_buf)");
+
+    system::runtime::set_device(dev1);
+    system::runtime::check_cuda(
+        cudaMemsetAsync(rank1_buf, 0, bytes, stream1),
+        "cudaMemsetAsync(rank1_buf)");
+
+    sync_two_streams(dev0, stream0, dev1, stream1, "sync clear buffers");
+}
+
 int* ready_signal_ptr(
     oo_group_t* group,
     int rank) {
@@ -265,6 +286,68 @@ double elapsed_ms_two_stream_max(
     return static_cast<double>(std::max(ms0, ms1));
 }
 
+comm::LaunchConfig config_for_kind(
+    comm::AllreduceKernelKind kind) {
+    comm::LaunchConfig config{};
+    config.kernel_kind = kind;
+    return config;
+}
+
+void launch_unified_once(
+    comm::AllreduceKernelKind kind,
+    const void* rank0_in,
+    const void* rank1_in,
+    void* rank0_buf,
+    void* rank1_buf,
+    void* rank0_peer,
+    void* rank1_peer,
+    size_t numel,
+    int dev0,
+    int dev1,
+    cudaStream_t stream0,
+    cudaStream_t stream1,
+    int* rank0_ready,
+    int* rank1_ready,
+    int collective_epoch) {
+    comm::LaunchConfig config = config_for_kind(kind);
+
+    system::runtime::check_cuda(
+        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
+            rank0_in,
+            rank0_buf,
+            rank0_peer,
+            numel,
+            OO_DTYPE_FLOAT16,
+            OO_REDUCE_SUM,
+            0,
+            dev0,
+            dev1,
+            stream0,
+            rank0_ready,
+            rank1_ready,
+            collective_epoch,
+            config),
+        "enqueue unified allreduce rank0");
+
+    system::runtime::check_cuda(
+        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
+            rank1_in,
+            rank1_buf,
+            rank1_peer,
+            numel,
+            OO_DTYPE_FLOAT16,
+            OO_REDUCE_SUM,
+            1,
+            dev0,
+            dev1,
+            stream1,
+            rank1_ready,
+            rank0_ready,
+            collective_epoch,
+            config),
+        "enqueue unified allreduce rank1");
+}
+
 void launch_normal_once(
     half* rank0_work,
     half* rank1_work,
@@ -276,39 +359,22 @@ void launch_normal_once(
     int* rank0_ready,
     int* rank1_ready,
     int collective_epoch) {
-    system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            rank0_work,
-            rank0_work,
-            rank1_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            0,
-            dev0,
-            dev1,
-            stream0,
-            rank0_ready,
-            rank1_ready,
-            collective_epoch),
-        "enqueue normal allreduce rank0");
-
-    system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            rank1_work,
-            rank1_work,
-            rank0_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            1,
-            dev0,
-            dev1,
-            stream1,
-            rank1_ready,
-            rank0_ready,
-            collective_epoch),
-        "enqueue normal allreduce rank1");
+    launch_unified_once(
+        comm::AllreduceKernelKind::TmaCopy,
+        rank0_work,
+        rank1_work,
+        rank0_work,
+        rank1_work,
+        rank1_work,
+        rank0_work,
+        numel,
+        dev0,
+        dev1,
+        stream0,
+        stream1,
+        rank0_ready,
+        rank1_ready,
+        collective_epoch);
 }
 
 void launch_normal_diff_buffer_once(
@@ -324,39 +390,22 @@ void launch_normal_diff_buffer_once(
     int* rank0_ready,
     int* rank1_ready,
     int collective_epoch) {
-    system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            rank0_src,
-            rank0_out,
-            const_cast<half*>(rank1_src),
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            0,
-            dev0,
-            dev1,
-            stream0,
-            rank0_ready,
-            rank1_ready,
-            collective_epoch),
-        "enqueue normal diff-buffer allreduce rank0");
-
-    system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            rank1_src,
-            rank1_out,
-            const_cast<half*>(rank0_src),
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            1,
-            dev0,
-            dev1,
-            stream1,
-            rank1_ready,
-            rank0_ready,
-            collective_epoch),
-        "enqueue normal diff-buffer allreduce rank1");
+    launch_unified_once(
+        comm::AllreduceKernelKind::TmaCopy,
+        rank0_src,
+        rank1_src,
+        rank0_out,
+        rank1_out,
+        const_cast<half*>(rank1_src),
+        const_cast<half*>(rank0_src),
+        numel,
+        dev0,
+        dev1,
+        stream0,
+        stream1,
+        rank0_ready,
+        rank1_ready,
+        collective_epoch);
 }
 
 void launch_not_fused_once(
@@ -370,39 +419,22 @@ void launch_not_fused_once(
     int* rank0_ready,
     int* rank1_ready,
     int collective_epoch) {
-    system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
-            rank0_work,
-            rank0_work,
-            rank1_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            0,
-            dev0,
-            dev1,
-            stream0,
-            rank0_ready,
-            rank1_ready,
-            collective_epoch),
-        "enqueue not_fused allreduce rank0");
-
-    system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
-            rank1_work,
-            rank1_work,
-            rank0_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            1,
-            dev0,
-            dev1,
-            stream1,
-            rank1_ready,
-            rank0_ready,
-            collective_epoch),
-        "enqueue not_fused allreduce rank1");
+    launch_unified_once(
+        comm::AllreduceKernelKind::SeqFastGmem,
+        rank0_work,
+        rank1_work,
+        rank0_work,
+        rank1_work,
+        rank1_work,
+        rank0_work,
+        numel,
+        dev0,
+        dev1,
+        stream0,
+        stream1,
+        rank0_ready,
+        rank1_ready,
+        collective_epoch);
 }
 
 void launch_fused_once(
@@ -416,39 +448,22 @@ void launch_fused_once(
     int* rank0_ready,
     int* rank1_ready,
     int collective_epoch) {
-    system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
-            rank0_work,
-            rank0_work,
-            rank1_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            0,
-            dev0,
-            dev1,
-            stream0,
-            rank0_ready,
-            rank1_ready,
-            collective_epoch),
-        "enqueue fused allreduce rank0");
-
-    system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
-            rank1_work,
-            rank1_work,
-            rank0_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            1,
-            dev0,
-            dev1,
-            stream1,
-            rank1_ready,
-            rank0_ready,
-            collective_epoch),
-        "enqueue fused allreduce rank1");
+    launch_unified_once(
+        comm::AllreduceKernelKind::OverlapFastGmem,
+        rank0_work,
+        rank1_work,
+        rank0_work,
+        rank1_work,
+        rank1_work,
+        rank0_work,
+        numel,
+        dev0,
+        dev1,
+        stream0,
+        stream1,
+        rank0_ready,
+        rank1_ready,
+        collective_epoch);
 }
 
 void run_normal_iters(
@@ -484,12 +499,7 @@ void run_normal_iters(
             i + 1);
     }
 
-    sync_two_streams(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        "sync normal warmup");
+    sync_two_streams(dev0, stream0, dev1, stream1, "sync normal warmup");
 }
 
 void run_normal_diff_buffer_iters(
@@ -570,12 +580,7 @@ void run_not_fused_iters(
             i + 1);
     }
 
-    sync_two_streams(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        "sync not_fused warmup");
+    sync_two_streams(dev0, stream0, dev1, stream1, "sync not_fused warmup");
 }
 
 void run_fused_iters(
@@ -611,12 +616,7 @@ void run_fused_iters(
             i + 1);
     }
 
-    sync_two_streams(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        "sync fused warmup");
+    sync_two_streams(dev0, stream0, dev1, stream1, "sync fused warmup");
 }
 
 double elapsed_ms_normal_allreduce(
@@ -632,7 +632,6 @@ double elapsed_ms_normal_allreduce(
     reset_ready_signals(group);
 
     int epoch = 1;
-
     int* rank0_ready = ready_signal_ptr(group, 0);
     int* rank1_ready = ready_signal_ptr(group, 1);
 
@@ -643,8 +642,6 @@ double elapsed_ms_normal_allreduce(
         stream1,
         iters,
         [&](int) {
-            const int collective_epoch = epoch++;
-
             launch_normal_once(
                 rank0_work,
                 rank1_work,
@@ -655,7 +652,7 @@ double elapsed_ms_normal_allreduce(
                 stream1,
                 rank0_ready,
                 rank1_ready,
-                collective_epoch);
+                epoch++);
         });
 }
 
@@ -674,7 +671,6 @@ double elapsed_ms_normal_diff_buffer_allreduce(
     reset_ready_signals(group);
 
     int epoch = 1;
-
     int* rank0_ready = ready_signal_ptr(group, 0);
     int* rank1_ready = ready_signal_ptr(group, 1);
 
@@ -685,8 +681,6 @@ double elapsed_ms_normal_diff_buffer_allreduce(
         stream1,
         iters,
         [&](int) {
-            const int collective_epoch = epoch++;
-
             launch_normal_diff_buffer_once(
                 rank0_src,
                 rank1_src,
@@ -699,7 +693,7 @@ double elapsed_ms_normal_diff_buffer_allreduce(
                 stream1,
                 rank0_ready,
                 rank1_ready,
-                collective_epoch);
+                epoch++);
         });
 }
 
@@ -716,7 +710,6 @@ double elapsed_ms_not_fused_allreduce(
     reset_ready_signals(group);
 
     int epoch = 1;
-
     int* rank0_ready = ready_signal_ptr(group, 0);
     int* rank1_ready = ready_signal_ptr(group, 1);
 
@@ -727,8 +720,6 @@ double elapsed_ms_not_fused_allreduce(
         stream1,
         iters,
         [&](int) {
-            const int collective_epoch = epoch++;
-
             launch_not_fused_once(
                 rank0_work,
                 rank1_work,
@@ -739,7 +730,7 @@ double elapsed_ms_not_fused_allreduce(
                 stream1,
                 rank0_ready,
                 rank1_ready,
-                collective_epoch);
+                epoch++);
         });
 }
 
@@ -756,7 +747,6 @@ double elapsed_ms_fused_allreduce(
     reset_ready_signals(group);
 
     int epoch = 1;
-
     int* rank0_ready = ready_signal_ptr(group, 0);
     int* rank1_ready = ready_signal_ptr(group, 1);
 
@@ -767,8 +757,6 @@ double elapsed_ms_fused_allreduce(
         stream1,
         iters,
         [&](int) {
-            const int collective_epoch = epoch++;
-
             launch_fused_once(
                 rank0_work,
                 rank1_work,
@@ -779,7 +767,7 @@ double elapsed_ms_fused_allreduce(
                 stream1,
                 rank0_ready,
                 rank1_ready,
-                collective_epoch);
+                epoch++);
         });
 }
 
@@ -904,16 +892,6 @@ void verify_two_gpu_allreduce_result(
         got1,
         ref,
         (std::string(label) + " rank1").c_str());
-}
-
-void verify_nccl_result(
-    const char* label,
-    half* rank0,
-    half* rank1,
-    int64_t numel,
-    int dev0,
-    int dev1) {
-    verify_two_gpu_allreduce_result(label, rank0, rank1, numel, dev0, dev1);
 }
 
 } // namespace
@@ -1119,14 +1097,12 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         check_oo(
             oo_buffer_alloc(node1, bytes, &normal_rank1_buf),
             "oo_buffer_alloc(normal rank1)");
-
         check_oo(
             oo_buffer_alloc(node0, bytes, &not_fused_rank0_buf),
             "oo_buffer_alloc(not_fused rank0)");
         check_oo(
             oo_buffer_alloc(node1, bytes, &not_fused_rank1_buf),
             "oo_buffer_alloc(not_fused rank1)");
-
         check_oo(
             oo_buffer_alloc(node0, bytes, &fused_rank0_buf),
             "oo_buffer_alloc(fused rank0)");
@@ -1138,12 +1114,10 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             reinterpret_cast<half*>(oo_buffer_ptr(normal_rank0_buf));
         half* normal_rank1_work =
             reinterpret_cast<half*>(oo_buffer_ptr(normal_rank1_buf));
-
         half* not_fused_rank0_work =
             reinterpret_cast<half*>(oo_buffer_ptr(not_fused_rank0_buf));
         half* not_fused_rank1_work =
             reinterpret_cast<half*>(oo_buffer_ptr(not_fused_rank1_buf));
-
         half* fused_rank0_work =
             reinterpret_cast<half*>(oo_buffer_ptr(fused_rank0_buf));
         half* fused_rank1_work =
@@ -1160,6 +1134,38 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
 
         int nccl_devices[2] = {node0_dev, node1_dev};
         OOVERLAP_PERSIST_NCCL_CHECK(ncclCommInitAll(comms, 2, nccl_devices));
+
+        run_nccl_iters(
+            rank0_src,
+            rank1_src,
+            nccl_rank0_out,
+            nccl_rank1_out,
+            static_cast<size_t>(numel),
+            comms,
+            stream0,
+            stream1,
+            warmup);
+
+        sync_two_streams(
+            node0_dev,
+            stream0,
+            node1_dev,
+            stream1,
+            "sync nccl warmup");
+
+        const double nccl_total_ms =
+            elapsed_ms_nccl_allreduce(
+                rank0_src,
+                rank1_src,
+                nccl_rank0_out,
+                nccl_rank1_out,
+                static_cast<size_t>(numel),
+                node0_dev,
+                node1_dev,
+                stream0,
+                stream1,
+                comms,
+                iters);
 
         prepare_work_buffers(
             rank0_src,
@@ -1206,6 +1212,15 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                 stream1,
                 iters);
 
+        clear_buffers(
+            normal_rank0_work,
+            normal_rank1_work,
+            bytes,
+            node0_dev,
+            node1_dev,
+            stream0,
+            stream1);
+
         run_normal_diff_buffer_iters(
             group,
             rank0_src,
@@ -1218,7 +1233,16 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             stream0,
             stream1,
             warmup);
-        
+
+        clear_buffers(
+            normal_rank0_work,
+            normal_rank1_work,
+            bytes,
+            node0_dev,
+            node1_dev,
+            stream0,
+            stream1);
+
         const double normal_diff_buffer_total_ms =
             elapsed_ms_normal_diff_buffer_allreduce(
                 group,
@@ -1232,7 +1256,7 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                 stream0,
                 stream1,
                 iters);
-        
+
         prepare_work_buffers(
             rank0_src,
             rank1_src,
@@ -1323,279 +1347,139 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                 stream1,
                 iters);
 
-        run_nccl_iters(
-            rank0_src,
-            rank1_src,
-            nccl_rank0_out,
-            nccl_rank1_out,
-            static_cast<size_t>(numel),
-            comms,
-            stream0,
-            stream1,
-            warmup);
-
-        sync_two_streams(
-            node0_dev,
-            stream0,
-            node1_dev,
-            stream1,
-            "sync NCCL warmup");
-
-        const double nccl_total_ms =
-            elapsed_ms_nccl_allreduce(
-                rank0_src,
-                rank1_src,
-                nccl_rank0_out,
-                nccl_rank1_out,
-                static_cast<size_t>(numel),
-                node0_dev,
-                node1_dev,
-                stream0,
-                stream1,
-                comms,
-                iters);
-
 #if OOVERLAP_BENCH_VERIFY_RESULTS
-        prepare_work_buffers(
-            rank0_src,
-            rank1_src,
-            normal_rank0_work,
-            normal_rank1_work,
-            bytes,
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1);
-
-        reset_ready_signals(group);
-        launch_normal_once(
-            normal_rank0_work,
-            normal_rank1_work,
-            static_cast<size_t>(numel),
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1,
-            ready_signal_ptr(group, 0),
-            ready_signal_ptr(group, 1),
-            1);
-
-        sync_two_streams(
-            node0_dev,
-            stream0,
-            node1_dev,
-            stream1,
-            "sync normal verify");
-
         verify_two_gpu_allreduce_result(
-            "normal benchmark verify",
+            "normal",
             normal_rank0_work,
             normal_rank1_work,
             numel,
             node0_dev,
             node1_dev);
 
-        prepare_work_buffers(
-            rank0_src,
-            rank1_src,
-            not_fused_rank0_work,
-            not_fused_rank1_work,
-            bytes,
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1);
-
-        reset_ready_signals(group);
-        launch_not_fused_once(
-            not_fused_rank0_work,
-            not_fused_rank1_work,
-            static_cast<size_t>(numel),
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1,
-            ready_signal_ptr(group, 0),
-            ready_signal_ptr(group, 1),
-            1);
-
-        sync_two_streams(
-            node0_dev,
-            stream0,
-            node1_dev,
-            stream1,
-            "sync not_fused verify");
-
         verify_two_gpu_allreduce_result(
-            "not_fused benchmark verify",
+            "not_fused",
             not_fused_rank0_work,
             not_fused_rank1_work,
             numel,
             node0_dev,
             node1_dev);
 
-        prepare_work_buffers(
-            rank0_src,
-            rank1_src,
-            fused_rank0_work,
-            fused_rank1_work,
-            bytes,
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1);
-
-        reset_ready_signals(group);
-        launch_fused_once(
-            fused_rank0_work,
-            fused_rank1_work,
-            static_cast<size_t>(numel),
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1,
-            ready_signal_ptr(group, 0),
-            ready_signal_ptr(group, 1),
-            1);
-
-        sync_two_streams(
-            node0_dev,
-            stream0,
-            node1_dev,
-            stream1,
-            "sync fused verify");
-
         verify_two_gpu_allreduce_result(
-            "fused benchmark verify",
+            "fused",
             fused_rank0_work,
             fused_rank1_work,
-            numel,
-            node0_dev,
-            node1_dev);
-
-        OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupStart());
-
-        OOVERLAP_PERSIST_NCCL_CHECK(
-            ncclAllReduce(
-                rank0_src,
-                nccl_rank0_out,
-                static_cast<size_t>(numel),
-                ncclFloat16,
-                ncclSum,
-                comms[0],
-                stream0));
-
-        OOVERLAP_PERSIST_NCCL_CHECK(
-            ncclAllReduce(
-                rank1_src,
-                nccl_rank1_out,
-                static_cast<size_t>(numel),
-                ncclFloat16,
-                ncclSum,
-                comms[1],
-                stream1));
-
-        OOVERLAP_PERSIST_NCCL_CHECK(ncclGroupEnd());
-
-        sync_two_streams(
-            node0_dev,
-            stream0,
-            node1_dev,
-            stream1,
-            "sync NCCL verify");
-
-        verify_nccl_result(
-            "NCCL benchmark verify",
-            nccl_rank0_out,
-            nccl_rank1_out,
             numel,
             node0_dev,
             node1_dev);
 #endif
 
-        ncclCommDestroy(comms[0]);
-        ncclCommDestroy(comms[1]);
-        comms[0] = nullptr;
-        comms[1] = nullptr;
+        const double avg_ms_nccl =
+            nccl_total_ms / static_cast<double>(iters);
+        const double avg_ms_normal =
+            normal_total_ms / static_cast<double>(iters);
+        const double avg_ms_normal_diff_buffer =
+            normal_diff_buffer_total_ms / static_cast<double>(iters);
+        const double avg_ms_not_fused =
+            not_fused_total_ms / static_cast<double>(iters);
+        const double avg_ms_fused =
+            fused_total_ms / static_cast<double>(iters);
+
+        std::map<std::string, double> metrics;
+
+        metrics["avg_ms_fused"] = avg_ms_fused;
+        metrics["avg_ms_nccl"] = avg_ms_nccl;
+        metrics["avg_ms_normal"] = avg_ms_normal;
+        metrics["avg_ms_normal_diff_buffer"] = avg_ms_normal_diff_buffer;
+        metrics["avg_ms_not_fused"] = avg_ms_not_fused;
+        metrics["iters"] = static_cast<double>(iters);
+        metrics["numel"] = static_cast<double>(numel);
+        metrics["speedup_fused_over_nccl"] =
+            (avg_ms_fused > 0.0) ? (avg_ms_nccl / avg_ms_fused) : 0.0;
+        metrics["speedup_fused_over_normal"] =
+            (avg_ms_fused > 0.0) ? (avg_ms_normal / avg_ms_fused) : 0.0;
+        metrics["speedup_normal_diff_buffer_over_nccl"] =
+            (avg_ms_normal_diff_buffer > 0.0)
+                ? (avg_ms_nccl / avg_ms_normal_diff_buffer)
+                : 0.0;
+        metrics["speedup_normal_diff_buffer_over_normal"] =
+            (avg_ms_normal_diff_buffer > 0.0)
+                ? (avg_ms_normal / avg_ms_normal_diff_buffer)
+                : 0.0;
+        metrics["speedup_normal_over_nccl"] =
+            (avg_ms_normal > 0.0) ? (avg_ms_nccl / avg_ms_normal) : 0.0;
+        metrics["speedup_not_fused_over_nccl"] =
+            (avg_ms_not_fused > 0.0)
+                ? (avg_ms_nccl / avg_ms_not_fused)
+                : 0.0;
+        metrics["speedup_not_fused_over_normal"] =
+            (avg_ms_not_fused > 0.0)
+                ? (avg_ms_normal / avg_ms_not_fused)
+                : 0.0;
+        metrics["verify_results"] =
+            static_cast<double>(OOVERLAP_BENCH_VERIFY_RESULTS);
+        metrics["warmup"] = static_cast<double>(warmup);
+
+        sync_two_streams(
+            node0_dev,
+            stream0,
+            node1_dev,
+            stream1,
+            "sync benchmark cleanup");
+
+        if (comms[0] != nullptr) {
+            ncclCommDestroy(comms[0]);
+            comms[0] = nullptr;
+        }
+
+        if (comms[1] != nullptr) {
+            ncclCommDestroy(comms[1]);
+            comms[1] = nullptr;
+        }
 
         system::runtime::set_device(node0_dev);
-        system::runtime::check_cuda(
-            cudaFree(rank0_src),
-            "cudaFree(rank0_src)");
-        system::runtime::check_cuda(
-            cudaFree(nccl_rank0_out),
-            "cudaFree(nccl_rank0_out)");
+        cudaFree(rank0_src);
         rank0_src = nullptr;
+        cudaFree(nccl_rank0_out);
         nccl_rank0_out = nullptr;
 
         system::runtime::set_device(node1_dev);
-        system::runtime::check_cuda(
-            cudaFree(rank1_src),
-            "cudaFree(rank1_src)");
-        system::runtime::check_cuda(
-            cudaFree(nccl_rank1_out),
-            "cudaFree(nccl_rank1_out)");
+        cudaFree(rank1_src);
         rank1_src = nullptr;
+        cudaFree(nccl_rank1_out);
         nccl_rank1_out = nullptr;
 
         oo_buffer_destroy(normal_rank0_buf);
-        oo_buffer_destroy(normal_rank1_buf);
-        oo_buffer_destroy(not_fused_rank0_buf);
-        oo_buffer_destroy(not_fused_rank1_buf);
-        oo_buffer_destroy(fused_rank0_buf);
-        oo_buffer_destroy(fused_rank1_buf);
         normal_rank0_buf = nullptr;
+        oo_buffer_destroy(normal_rank1_buf);
         normal_rank1_buf = nullptr;
+        oo_buffer_destroy(not_fused_rank0_buf);
         not_fused_rank0_buf = nullptr;
+        oo_buffer_destroy(not_fused_rank1_buf);
         not_fused_rank1_buf = nullptr;
+        oo_buffer_destroy(fused_rank0_buf);
         fused_rank0_buf = nullptr;
+        oo_buffer_destroy(fused_rank1_buf);
         fused_rank1_buf = nullptr;
 
         oo_node_destroy(node0);
-        oo_node_destroy(node1);
-        oo_group_destroy(group);
         node0 = nullptr;
+        oo_node_destroy(node1);
         node1 = nullptr;
+        oo_group_destroy(group);
         group = nullptr;
 
         system::runtime::destroy_stream_on_device(node0_dev, stream0);
-        system::runtime::destroy_stream_on_device(node1_dev, stream1);
         stream0 = nullptr;
+        system::runtime::destroy_stream_on_device(node1_dev, stream1);
         stream1 = nullptr;
 
-        const double avg_normal_ms =
-            normal_total_ms / static_cast<double>(iters);
-        const double avg_not_fused_ms =
-            not_fused_total_ms / static_cast<double>(iters);
-        const double avg_fused_ms =
-            fused_total_ms / static_cast<double>(iters);
-        const double avg_nccl_ms =
-            nccl_total_ms / static_cast<double>(iters);
-        const double avg_ms_normal_diff_buffer =
-            normal_diff_buffer_total_ms / static_cast<double>(iters);
-
-        return {
-            {"numel", static_cast<double>(numel)},
-            {"iters", static_cast<double>(iters)},
-            {"warmup", static_cast<double>(warmup)},
-
-            {"avg_ms_normal", avg_normal_ms},
-            {"avg_ms_not_fused", avg_not_fused_ms},
-            {"avg_ms_fused", avg_fused_ms},
-            {"avg_ms_nccl", avg_nccl_ms},
-            {"avg_ms_normal_diff_buffer", avg_ms_normal_diff_buffer},
-
-            {"speedup_normal_over_nccl", avg_nccl_ms / avg_normal_ms},
-            {"speedup_fused_over_nccl", avg_nccl_ms / avg_fused_ms},
-            {"speedup_not_fused_over_nccl", avg_nccl_ms / avg_not_fused_ms},
-            {"speedup_normal_diff_buffer_over_nccl", avg_nccl_ms / avg_ms_normal_diff_buffer},
-            {"speedup_fused_over_normal", avg_normal_ms / avg_fused_ms},
-            {"speedup_not_fused_over_normal", avg_normal_ms / avg_not_fused_ms},
-            {"speedup_normal_diff_buffer_over_normal", avg_normal_ms / avg_ms_normal_diff_buffer},
-
-            {"verify_results", static_cast<double>(OOVERLAP_BENCH_VERIFY_RESULTS)}
-        };
+        return metrics;
     } catch (...) {
+        const int node0_dev =
+            (node0 != nullptr) ? oo_node_device(node0) : dev0;
+        const int node1_dev =
+            (node1 != nullptr) ? oo_node_device(node1) : dev1;
+
         if (comms[0] != nullptr) {
             ncclCommDestroy(comms[0]);
         }
@@ -1604,20 +1488,19 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         }
 
         if (rank0_src != nullptr) {
-            system::runtime::set_device(dev0);
+            system::runtime::set_device(node0_dev);
             cudaFree(rank0_src);
         }
-        if (nccl_rank0_out != nullptr) {
-            system::runtime::set_device(dev0);
-            cudaFree(nccl_rank0_out);
-        }
-
         if (rank1_src != nullptr) {
-            system::runtime::set_device(dev1);
+            system::runtime::set_device(node1_dev);
             cudaFree(rank1_src);
         }
+        if (nccl_rank0_out != nullptr) {
+            system::runtime::set_device(node0_dev);
+            cudaFree(nccl_rank0_out);
+        }
         if (nccl_rank1_out != nullptr) {
-            system::runtime::set_device(dev1);
+            system::runtime::set_device(node1_dev);
             cudaFree(nccl_rank1_out);
         }
 
@@ -1627,14 +1510,12 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         if (normal_rank1_buf != nullptr) {
             oo_buffer_destroy(normal_rank1_buf);
         }
-
         if (not_fused_rank0_buf != nullptr) {
             oo_buffer_destroy(not_fused_rank0_buf);
         }
         if (not_fused_rank1_buf != nullptr) {
             oo_buffer_destroy(not_fused_rank1_buf);
         }
-
         if (fused_rank0_buf != nullptr) {
             oo_buffer_destroy(fused_rank0_buf);
         }
@@ -1653,10 +1534,10 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
         }
 
         if (stream0 != nullptr) {
-            system::runtime::destroy_stream_on_device(dev0, stream0);
+            system::runtime::destroy_stream_on_device(node0_dev, stream0);
         }
         if (stream1 != nullptr) {
-            system::runtime::destroy_stream_on_device(dev1, stream1);
+            system::runtime::destroy_stream_on_device(node1_dev, stream1);
         }
 
         throw;

@@ -4,7 +4,6 @@
 #include "comm/ooverlap_comm.h"
 #include "comm/ooverlap_comm_internal.h"
 #include "comm/params.h"
-#include "comm/tma_two_gpu_peer_allreduce_fast_gmem_sm90.h"
 #include "comm/tma_two_gpu_peer_allreduce_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
@@ -73,6 +72,19 @@ const char* kernel_kind_name(SweepKernelKind kind) {
             return "overlap_fast_gmem";
         default:
             return "unknown";
+    }
+}
+
+comm::AllreduceKernelKind launch_kernel_kind(SweepKernelKind kind) {
+    switch (kind) {
+        case SweepKernelKind::kTmaCopy:
+            return comm::AllreduceKernelKind::TmaCopy;
+        case SweepKernelKind::kSeqFastGmem:
+            return comm::AllreduceKernelKind::SeqFastGmem;
+        case SweepKernelKind::kOverlapFastGmem:
+            return comm::AllreduceKernelKind::OverlapFastGmem;
+        default:
+            return comm::AllreduceKernelKind::TmaCopy;
     }
 }
 
@@ -191,10 +203,6 @@ void append_variant_metadata(
     out << ",\"stage_depth\":" << config.stage_depth;
     out << ",\"stage_gap\":" << stage_gap;
 
-    /*
-     * Keep the old compile_* names too because the policy builder already
-     * consumes them. They now describe the selected precompiled variant.
-     */
     out << ",\"compile_chunk_bytes\":" << config.chunk_bytes;
     out << ",\"compile_reduce_stage_depth\":" << config.stage_depth;
     out << ",\"compile_reduce_stage_gap\":" << stage_gap;
@@ -418,11 +426,10 @@ void launch_candidate_once(
     int* rank1_ready,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
-    cudaError_t err0 = cudaSuccess;
-    cudaError_t err1 = cudaSuccess;
+    launch_config.kernel_kind = launch_kernel_kind(kernel);
 
-    if (kernel == SweepKernelKind::kTmaCopy) {
-        err0 = enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
+    cudaError_t err0 =
+        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
             rank0_work,
             rank0_work,
             rank1_work,
@@ -438,7 +445,8 @@ void launch_candidate_once(
             collective_epoch,
             launch_config);
 
-        err1 = enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
+    cudaError_t err1 =
+        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
             rank1_work,
             rank1_work,
             rank0_work,
@@ -453,73 +461,6 @@ void launch_candidate_once(
             rank0_ready,
             collective_epoch,
             launch_config);
-    } else if (kernel == SweepKernelKind::kSeqFastGmem) {
-        err0 = enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
-            rank0_work,
-            rank0_work,
-            rank1_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            0,
-            dev0,
-            dev1,
-            stream0,
-            rank0_ready,
-            rank1_ready,
-            collective_epoch,
-            launch_config);
-
-        err1 = enqueue_tma_two_gpu_peer_allreduce_rank_seq_fastcopy_sm90(
-            rank1_work,
-            rank1_work,
-            rank0_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            1,
-            dev0,
-            dev1,
-            stream1,
-            rank1_ready,
-            rank0_ready,
-            collective_epoch,
-            launch_config);
-    } else if (kernel == SweepKernelKind::kOverlapFastGmem) {
-        err0 = enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
-            rank0_work,
-            rank0_work,
-            rank1_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            0,
-            dev0,
-            dev1,
-            stream0,
-            rank0_ready,
-            rank1_ready,
-            collective_epoch,
-            launch_config);
-
-        err1 = enqueue_tma_two_gpu_peer_allreduce_rank_overlap_fastcopy_sm90(
-            rank1_work,
-            rank1_work,
-            rank0_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            1,
-            dev0,
-            dev1,
-            stream1,
-            rank1_ready,
-            rank0_ready,
-            collective_epoch,
-            launch_config);
-    } else {
-        throw std::invalid_argument("launch_candidate_once: unknown kernel");
-    }
 
     system::runtime::check_cuda(err0, "enqueue sweep candidate rank0");
     system::runtime::check_cuda(err1, "enqueue sweep candidate rank1");
@@ -578,7 +519,6 @@ double elapsed_ms_candidate(
     reset_ready_signals(group);
 
     int epoch = 1;
-
     int* rank0_ready = ready_signal_ptr(group, 0);
     int* rank1_ready = ready_signal_ptr(group, 1);
 
@@ -589,8 +529,6 @@ double elapsed_ms_candidate(
         stream1,
         iters,
         [&](int) {
-            const int collective_epoch = epoch++;
-
             launch_candidate_once(
                 kernel,
                 rank0_work,
@@ -602,7 +540,7 @@ double elapsed_ms_candidate(
                 stream1,
                 rank0_ready,
                 rank1_ready,
-                collective_epoch,
+                epoch++,
                 launch_config);
         });
 }
@@ -963,13 +901,14 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_sm90(
                                 config.window_chunks = window_chunk_count;
                                 config.chunk_bytes = chunk_bytes[variant_idx];
                                 config.stage_depth = stage_depths[variant_idx];
+                                config.kernel_kind = launch_kernel_kind(kernel);
 
-                                const bool config_ok =
-                                    (kernel == SweepKernelKind::kOverlapFastGmem)
-                                        ? comm::launch_config_valid_for_overlap(config)
-                                        : comm::launch_config_valid(config);
+                                if (!comm::launch_config_valid(config)) {
+                                    continue;
+                                }
 
-                                if (!config_ok) {
+                                if (kernel == SweepKernelKind::kOverlapFastGmem &&
+                                    !comm::launch_config_valid_for_overlap(config)) {
                                     continue;
                                 }
 
