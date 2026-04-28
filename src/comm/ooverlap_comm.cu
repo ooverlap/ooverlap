@@ -1162,6 +1162,187 @@ oo_status_t oo_buffer_exchange_ipc_peer(
     }
 }
 
+oo_status_t oo_allreduce_offset_impl(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* peer,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    if (node == nullptr || node->group == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (local == nullptr || peer == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (count == 0) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_group_t* group = node->group;
+
+    if (group->num_devices != 2) {
+        return OO_ERROR_UNSUPPORTED;
+    }
+
+    const int rank = node->rank;
+
+    if (rank != 0 && rank != 1) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const int peer_rank = 1 - rank;
+
+    if (!same_group(local->group, group) ||
+        !same_group(peer->group, group)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (local->owner_rank != rank) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (peer->owner_rank != peer_rank) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (!reduce_op_supported_for_dtype(dtype, op)) {
+        return OO_ERROR_UNSUPPORTED;
+    }
+
+    const size_t dtype_bytes = oo_dtype_size(dtype);
+
+    if (dtype_bytes == 0) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    size_t end_element = 0;
+    if (element_offset > static_cast<size_t>(-1) - count) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+    end_element = element_offset + count;
+
+    size_t required_bytes = 0;
+    if (!checked_mul_size(end_element, dtype_bytes, &required_bytes)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    size_t byte_offset = 0;
+    if (!checked_mul_size(element_offset, dtype_bytes, &byte_offset)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const size_t transfer_bytes = count * dtype_bytes;
+
+    if (!buffer_is_valid_for_allreduce(local, required_bytes)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (!buffer_is_valid_for_allreduce(peer, required_bytes)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    /*
+     * Multiprocess IPC correctness guard:
+     *
+     * In IPC mode, the peer buffer must actually be an imported peer mapping.
+     * Otherwise a user could accidentally pass a local/wrapped pointer for the
+     * peer side and bypass the provenance guarantee.
+     */
+    if (group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc &&
+        !buffer_is_imported(peer)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (group->ready_signal_slots[rank].ptr == nullptr ||
+        group->ready_signal_slots[peer_rank].ptr == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    void* local_ptr =
+        reinterpret_cast<void*>(
+            reinterpret_cast<unsigned char*>(local->ptr) + byte_offset);
+
+    void* peer_ptr =
+        reinterpret_cast<void*>(
+            reinterpret_cast<unsigned char*>(peer->ptr) + byte_offset);
+
+    int* local_ready_signal =
+        reinterpret_cast<int*>(group->ready_signal_slots[rank].ptr);
+
+    const int* peer_ready_signal =
+        reinterpret_cast<const int*>(group->ready_signal_slots[peer_rank].ptr);
+
+    const int dev0 = group->devices[0];
+    const int dev1 = group->devices[1];
+
+    const int collective_epoch = ++node->collective_epoch;
+
+    const ooverlap::comm::TuningPreference preference =
+        ooverlap::comm::tuning_preference_from_public(tuning_mode);
+
+    ooverlap::comm::LaunchConfig launch_config =
+        ooverlap::comm::select_launch_config_for_allreduce(
+            transfer_bytes,
+            preference);
+
+    cudaError_t err =
+        ooverlap::enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
+            local_ptr,
+            local_ptr,
+            peer_ptr,
+            count,
+            dtype,
+            op,
+            rank,
+            dev0,
+            dev1,
+            stream,
+            local_ready_signal,
+            peer_ready_signal,
+            collective_epoch,
+            launch_config);
+
+    return report_cuda_error(
+        err,
+        "enqueue_tma_two_gpu_peer_allreduce_rank_sm90");
+}
+
+oo_status_t oo_allreduce_offset_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* peer,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    try {
+        return oo_allreduce_offset_impl(
+            node,
+            local,
+            peer,
+            element_offset,
+            count,
+            dtype,
+            op,
+            tuning_mode,
+            stream);
+    } catch (const std::bad_alloc&) {
+        return OO_ERROR_INTERNAL;
+    } catch (const std::exception& e) {
+        return report_exception("oo_allreduce_offset_tuned", e);
+    } catch (...) {
+        return report_unknown_exception("oo_allreduce_offset_tuned");
+    }
+}
+
 oo_status_t oo_allreduce_offset(
     oo_node_t* node,
     oo_buffer_t* local,
@@ -1171,69 +1352,36 @@ oo_status_t oo_allreduce_offset(
     oo_dtype_t dtype,
     oo_reduce_op_t op,
     cudaStream_t stream) {
-    if (node == nullptr || local == nullptr || peer == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (count == 0) {
-        return OO_SUCCESS;
-    }
-
-    const size_t dtype_bytes = oo_dtype_size(dtype);
-    if (dtype_bytes == 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    size_t byte_offset = 0;
-    size_t bytes = 0;
-
-    if (!checked_mul_size(element_offset, dtype_bytes, &byte_offset) ||
-        !checked_mul_size(count, dtype_bytes, &bytes)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (local->bytes < byte_offset + bytes ||
-        peer->bytes < byte_offset + bytes) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    oo_buffer_t local_view{};
-    local_view.ptr = reinterpret_cast<void*>(
-        reinterpret_cast<std::uint8_t*>(local->ptr) + byte_offset);
-    local_view.bytes = bytes;
-    local_view.mapped_bytes = bytes;
-    local_view.kind = local->kind;
-    local_view.group = local->group;
-    local_view.owner_rank = local->owner_rank;
-    local_view.owner_device = local->owner_device;
-    local_view.system_kind = local->system_kind;
-    local_view.mapped = local->mapped;
-
-    oo_buffer_t peer_view{};
-    peer_view.ptr = reinterpret_cast<void*>(
-        reinterpret_cast<std::uint8_t*>(peer->ptr) + byte_offset);
-    peer_view.bytes = bytes;
-    peer_view.mapped_bytes = bytes;
-    peer_view.kind = peer->kind;
-    peer_view.group = peer->group;
-    peer_view.owner_rank = peer->owner_rank;
-    peer_view.owner_device = peer->owner_device;
-    peer_view.system_kind = peer->system_kind;
-    peer_view.mapped = peer->mapped;
-
-    /*
-     * Do not copy peer->imported here. The imported mapping is owned by the
-     * original peer buffer. This temporary view only borrows the pointer and
-     * metadata for the duration of this call.
-     */
-
-    return oo_allreduce(
+    return oo_allreduce_offset_tuned(
         node,
-        &local_view,
-        &peer_view,
+        local,
+        peer,
+        element_offset,
         count,
         dtype,
         op,
+        OO_TUNING_BEST_PERFORMANCE,
+        stream);
+}
+
+oo_status_t oo_allreduce_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* peer,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    return oo_allreduce_offset_tuned(
+        node,
+        local,
+        peer,
+        0,
+        count,
+        dtype,
+        op,
+        tuning_mode,
         stream);
 }
 
@@ -1245,119 +1393,15 @@ oo_status_t oo_allreduce(
     oo_dtype_t dtype,
     oo_reduce_op_t op,
     cudaStream_t stream) {
-    if (node == nullptr || node->group == nullptr ||
-        local == nullptr || peer == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (node->group->num_devices != 2) {
-        return OO_ERROR_UNSUPPORTED;
-    }
-
-    const size_t elem_bytes = oo_dtype_size(dtype);
-    if (elem_bytes == 0) {
-        return OO_ERROR_UNSUPPORTED;
-    }
-
-    if (!reduce_op_supported_for_dtype(dtype, op)) {
-        return OO_ERROR_UNSUPPORTED;
-    }
-
-    if (count == 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (!same_group(local->group, node->group) ||
-        !same_group(peer->group, node->group)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    const int peer_rank = node->rank ^ 1;
-    const int expected_local_device = node->device;
-    const int expected_peer_device = node->group->devices[peer_rank];
-
-    if (local->owner_device != expected_local_device ||
-        peer->owner_device != expected_peer_device) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (local->owner_rank != node->rank ||
-        peer->owner_rank != peer_rank) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (node->group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc &&
-        !buffer_is_imported(peer)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    size_t required_bytes = 0;
-    if (!checked_mul_size(count, elem_bytes, &required_bytes)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (!buffer_is_valid_for_allreduce(local, required_bytes) ||
-        !buffer_is_valid_for_allreduce(peer, required_bytes)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    oo_ready_signal& local_signal_slot =
-        node->group->ready_signal_slots[node->rank];
-    oo_ready_signal& peer_signal_slot =
-        node->group->ready_signal_slots[peer_rank];
-
-    if (local_signal_slot.ptr == nullptr ||
-        peer_signal_slot.ptr == nullptr) {
-        return OO_ERROR_INTERNAL;
-    }
-
-    const int collective_epoch = ++node->collective_epoch;
-
-    int* local_ready_signal =
-        reinterpret_cast<int*>(local_signal_slot.ptr);
-    const int* peer_ready_signal =
-        reinterpret_cast<const int*>(peer_signal_slot.ptr);
-
-    try {
-        cudaError_t set_err = cudaSetDevice(node->device);
-        if (set_err != cudaSuccess) {
-            return OO_ERROR_CUDA;
-        }
-
-        OOVERLAP_LOG_TRACE(
-            "oo_allreduce rank=%d count=%zu dtype=%d op=%d local=%p peer=%p epoch=%d local_signal=%p peer_signal=%p\n",
-            node->rank,
-            count,
-            static_cast<int>(dtype),
-            static_cast<int>(op),
-            local->ptr,
-            peer->ptr,
-            collective_epoch,
-            static_cast<void*>(local_ready_signal),
-            static_cast<const void*>(peer_ready_signal));
-
-        cudaError_t err = ooverlap::enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            local->ptr,
-            local->ptr,
-            peer->ptr,
-            count,
-            dtype,
-            op,
-            node->rank,
-            node->group->devices[0],
-            node->group->devices[1],
-            stream,
-            local_ready_signal,
-            peer_ready_signal,
-            collective_epoch);
-
-        return cuda_status_to_oo(err);
-    } catch (const std::exception& e) {
-        OOVERLAP_LOG_ERROR("oo_allreduce threw: %s\n", e.what());
-        return OO_ERROR_CUDA;
-    } catch (...) {
-        return OO_ERROR_INTERNAL;
-    }
+    return oo_allreduce_tuned(
+        node,
+        local,
+        peer,
+        count,
+        dtype,
+        op,
+        OO_TUNING_BEST_PERFORMANCE,
+        stream);
 }
 
 } // extern "C"
