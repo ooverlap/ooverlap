@@ -772,8 +772,8 @@ double elapsed_ms_fused_allreduce(
 }
 
 void run_nccl_iters(
-    const half* rank0_src,
-    const half* rank1_src,
+    half* rank0_src,
+    half* rank1_src,
     half* nccl_rank0_out,
     half* nccl_rank1_out,
     size_t numel,
@@ -791,7 +791,8 @@ void run_nccl_iters(
         OOVERLAP_PERSIST_NCCL_CHECK(
             ncclAllReduce(
                 rank0_src,
-                nccl_rank0_out,
+                rank0_src,
+                //nccl_rank0_out,
                 numel,
                 ncclFloat16,
                 ncclSum,
@@ -801,7 +802,8 @@ void run_nccl_iters(
         OOVERLAP_PERSIST_NCCL_CHECK(
             ncclAllReduce(
                 rank1_src,
-                nccl_rank1_out,
+                rank1_src,
+                //nccl_rank1_out,
                 numel,
                 ncclFloat16,
                 ncclSum,
@@ -813,8 +815,8 @@ void run_nccl_iters(
 }
 
 double elapsed_ms_nccl_allreduce(
-    const half* rank0_src,
-    const half* rank1_src,
+    half* rank0_src,
+    half* rank1_src,
     half* nccl_rank0_out,
     half* nccl_rank1_out,
     size_t numel,
@@ -836,7 +838,8 @@ double elapsed_ms_nccl_allreduce(
             OOVERLAP_PERSIST_NCCL_CHECK(
                 ncclAllReduce(
                     rank0_src,
-                    nccl_rank0_out,
+                    rank0_src,
+                    //nccl_rank0_out,
                     numel,
                     ncclFloat16,
                     ncclSum,
@@ -846,7 +849,8 @@ double elapsed_ms_nccl_allreduce(
             OOVERLAP_PERSIST_NCCL_CHECK(
                 ncclAllReduce(
                     rank1_src,
-                    nccl_rank1_out,
+                    rank1_src,
+                    //nccl_rank1_out,
                     numel,
                     ncclFloat16,
                     ncclSum,
