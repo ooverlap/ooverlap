@@ -415,3 +415,5 @@ __device__ __forceinline__ void execute_window_task_stripe(
     }
 }
 
+} // namespace comm
+} // namespace ooverlap

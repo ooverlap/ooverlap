@@ -311,6 +311,54 @@ void launch_normal_once(
         "enqueue normal allreduce rank1");
 }
 
+void launch_normal_diff_buffer_once(
+    const half* rank0_src,
+    const half* rank1_src,
+    half* rank0_out,
+    half* rank1_out,
+    size_t numel,
+    int dev0,
+    int dev1,
+    cudaStream_t stream0,
+    cudaStream_t stream1,
+    int* rank0_ready,
+    int* rank1_ready,
+    int collective_epoch) {
+    system::runtime::check_cuda(
+        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
+            rank0_src,
+            rank0_out,
+            const_cast<half*>(rank1_src),
+            numel,
+            OO_DTYPE_FLOAT16,
+            OO_REDUCE_SUM,
+            0,
+            dev0,
+            dev1,
+            stream0,
+            rank0_ready,
+            rank1_ready,
+            collective_epoch),
+        "enqueue normal diff-buffer allreduce rank0");
+
+    system::runtime::check_cuda(
+        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
+            rank1_src,
+            rank1_out,
+            const_cast<half*>(rank0_src),
+            numel,
+            OO_DTYPE_FLOAT16,
+            OO_REDUCE_SUM,
+            1,
+            dev0,
+            dev1,
+            stream1,
+            rank1_ready,
+            rank0_ready,
+            collective_epoch),
+        "enqueue normal diff-buffer allreduce rank1");
+}
+
 void launch_not_fused_once(
     half* rank0_work,
     half* rank1_work,
@@ -444,6 +492,51 @@ void run_normal_iters(
         "sync normal warmup");
 }
 
+void run_normal_diff_buffer_iters(
+    oo_group_t* group,
+    const half* rank0_src,
+    const half* rank1_src,
+    half* rank0_out,
+    half* rank1_out,
+    size_t numel,
+    int dev0,
+    int dev1,
+    cudaStream_t stream0,
+    cudaStream_t stream1,
+    int iters) {
+    if (iters <= 0) {
+        return;
+    }
+
+    reset_ready_signals(group);
+
+    int* rank0_ready = ready_signal_ptr(group, 0);
+    int* rank1_ready = ready_signal_ptr(group, 1);
+
+    for (int i = 0; i < iters; ++i) {
+        launch_normal_diff_buffer_once(
+            rank0_src,
+            rank1_src,
+            rank0_out,
+            rank1_out,
+            numel,
+            dev0,
+            dev1,
+            stream0,
+            stream1,
+            rank0_ready,
+            rank1_ready,
+            i + 1);
+    }
+
+    sync_two_streams(
+        dev0,
+        stream0,
+        dev1,
+        stream1,
+        "sync normal diff-buffer warmup");
+}
+
 void run_not_fused_iters(
     oo_group_t* group,
     half* rank0_work,
@@ -555,6 +648,50 @@ double elapsed_ms_normal_allreduce(
             launch_normal_once(
                 rank0_work,
                 rank1_work,
+                numel,
+                dev0,
+                dev1,
+                stream0,
+                stream1,
+                rank0_ready,
+                rank1_ready,
+                collective_epoch);
+        });
+}
+
+double elapsed_ms_normal_diff_buffer_allreduce(
+    oo_group_t* group,
+    const half* rank0_src,
+    const half* rank1_src,
+    half* rank0_out,
+    half* rank1_out,
+    size_t numel,
+    int dev0,
+    int dev1,
+    cudaStream_t stream0,
+    cudaStream_t stream1,
+    int iters) {
+    reset_ready_signals(group);
+
+    int epoch = 1;
+
+    int* rank0_ready = ready_signal_ptr(group, 0);
+    int* rank1_ready = ready_signal_ptr(group, 1);
+
+    return elapsed_ms_two_stream_max(
+        dev0,
+        stream0,
+        dev1,
+        stream1,
+        iters,
+        [&](int) {
+            const int collective_epoch = epoch++;
+
+            launch_normal_diff_buffer_once(
+                rank0_src,
+                rank1_src,
+                rank0_out,
+                rank1_out,
                 numel,
                 dev0,
                 dev1,
@@ -1069,6 +1206,33 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
                 stream1,
                 iters);
 
+        run_normal_diff_buffer_iters(
+            group,
+            rank0_src,
+            rank1_src,
+            normal_rank0_work,
+            normal_rank1_work,
+            static_cast<size_t>(numel),
+            node0_dev,
+            node1_dev,
+            stream0,
+            stream1,
+            warmup);
+        
+        const double normal_diff_buffer_total_ms =
+            elapsed_ms_normal_diff_buffer_allreduce(
+                group,
+                rank0_src,
+                rank1_src,
+                normal_rank0_work,
+                normal_rank1_work,
+                static_cast<size_t>(numel),
+                node0_dev,
+                node1_dev,
+                stream0,
+                stream1,
+                iters);
+        
         prepare_work_buffers(
             rank0_src,
             rank1_src,
@@ -1407,6 +1571,8 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             fused_total_ms / static_cast<double>(iters);
         const double avg_nccl_ms =
             nccl_total_ms / static_cast<double>(iters);
+        const double avg_ms_normal_diff_buffer =
+            normal_diff_buffer_total_ms / static_cast<double>(iters);
 
         return {
             {"numel", static_cast<double>(numel)},
@@ -1417,12 +1583,15 @@ std::map<std::string, double> benchmark_persistent_two_gpu_allreduce_sm90(
             {"avg_ms_not_fused", avg_not_fused_ms},
             {"avg_ms_fused", avg_fused_ms},
             {"avg_ms_nccl", avg_nccl_ms},
+            {"avg_ms_normal_diff_buffer", avg_ms_normal_diff_buffer},
 
             {"speedup_normal_over_nccl", avg_nccl_ms / avg_normal_ms},
             {"speedup_fused_over_nccl", avg_nccl_ms / avg_fused_ms},
-            {"speedup_fused_over_normal", avg_normal_ms / avg_fused_ms},
             {"speedup_not_fused_over_nccl", avg_nccl_ms / avg_not_fused_ms},
+            {"speedup_normal_diff_buffer_over_nccl", avg_nccl_ms / avg_ms_normal_diff_buffer},
+            {"speedup_fused_over_normal", avg_normal_ms / avg_fused_ms},
             {"speedup_not_fused_over_normal", avg_normal_ms / avg_not_fused_ms},
+            {"speedup_normal_diff_buffer_over_normal", avg_normal_ms / avg_ms_normal_diff_buffer},
 
             {"verify_results", static_cast<double>(OOVERLAP_BENCH_VERIFY_RESULTS)}
         };
