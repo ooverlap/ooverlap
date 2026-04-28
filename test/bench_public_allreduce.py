@@ -3,6 +3,9 @@ import importlib.util
 import json
 import math
 import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -35,6 +38,7 @@ def parse_bytes(text):
 
     return int(float(s))
 
+
 def bytes_label(num_bytes):
     num_bytes = float(num_bytes)
 
@@ -52,14 +56,8 @@ def bytes_label(num_bytes):
 
     return f"{num_bytes:.0f} B"
 
+
 def set_size_axis_ticks(ax, min_x, max_x):
-    """
-    Use power-of-two tick locations, but label them as human sizes:
-
-      2 KB, 4 KB, ..., 512 KB, 1 MB, 2 MB, ..., 512 MB
-
-    This avoids matplotlib labels like 2^29 bytes.
-    """
     min_x = max(1, int(min_x))
     max_x = max(min_x, int(max_x))
 
@@ -79,7 +77,6 @@ def set_size_axis_ticks(ax, min_x, max_x):
     if max_x not in ticks:
         ticks.append(max_x)
 
-    # Avoid unreadable axes when there are too many decades.
     if len(ticks) > 18:
         stride = math.ceil(len(ticks) / 18)
         ticks = ticks[::stride]
@@ -92,6 +89,7 @@ def set_size_axis_ticks(ax, min_x, max_x):
         rotation=35,
         ha="right",
     )
+
 
 def repo_root():
     return Path(__file__).resolve().parents[1]
@@ -110,70 +108,151 @@ def load_ooverlap_ext():
     return mod
 
 
-def parse_jsonl(text):
+def parse_jsonl_text(text):
     rows = []
+
     for line_no, line in enumerate(text.splitlines(), start=1):
         line = line.strip()
         if not line:
             continue
+
         try:
             rows.append(json.loads(line))
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Invalid JSONL line {line_no}: {exc}") from exc
+
+    return rows
+
+
+def load_jsonl(path):
+    rows = []
+
+    with Path(path).open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSONL line {line_no}: {exc}") from exc
+
     return rows
 
 
 def write_jsonl(path, rows):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def run_one(ext, args, cta_cap):
-    old_ooverlap_max_ctas = os.environ.get("OOVERLAP_MAX_CTAS")
-    old_nccl_max_ctas = os.environ.get("NCCL_MAX_CTAS")
+def run_child_direct(args):
+    """
+    This runs inside a fresh process.
 
-    if cta_cap is None:
-        os.environ.pop("OOVERLAP_MAX_CTAS", None)
-        os.environ.pop("NCCL_MAX_CTAS", None)
-    else:
-        os.environ["OOVERLAP_MAX_CTAS"] = str(cta_cap)
-        os.environ["NCCL_MAX_CTAS"] = str(cta_cap)
+    Important:
+      OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS are already present in os.environ
+      before this function imports ooverlap_ext and before NCCL initializes.
+    """
+    ext = load_ooverlap_ext()
 
-    try:
-        text = ext.benchmark_public_allreduce_2gpu_sm90(
-            int(args.min_bytes),
-            int(args.max_bytes),
-            int(args.points),
-            int(args.iters),
-            int(args.warmup),
-            int(TUNING_MODES[args.tuning_mode]),
-            int(args.dev0),
-            int(args.dev1),
-        )
-    finally:
-        if old_ooverlap_max_ctas is None:
-            os.environ.pop("OOVERLAP_MAX_CTAS", None)
-        else:
-            os.environ["OOVERLAP_MAX_CTAS"] = old_ooverlap_max_ctas
+    text = ext.benchmark_public_allreduce_2gpu_sm90(
+        int(args.min_bytes),
+        int(args.max_bytes),
+        int(args.points),
+        int(args.iters),
+        int(args.warmup),
+        int(TUNING_MODES[args.tuning_mode]),
+        int(args.dev0),
+        int(args.dev1),
+    )
 
-        if old_nccl_max_ctas is None:
-            os.environ.pop("NCCL_MAX_CTAS", None)
-        else:
-            os.environ["NCCL_MAX_CTAS"] = old_nccl_max_ctas
+    rows = parse_jsonl_text(text)
 
-    rows = parse_jsonl(text)
+    cta_cap = None
+    if args.child_cta_cap != "default":
+        cta_cap = int(args.child_cta_cap)
 
     for row in rows:
         row["cta_cap"] = cta_cap
-        row["ooverlap_max_ctas_env"] = cta_cap
-        row["nccl_max_ctas_env"] = cta_cap
+        row["ooverlap_max_ctas_env"] = os.environ.get("OOVERLAP_MAX_CTAS")
+        row["nccl_max_ctas_env"] = os.environ.get("NCCL_MAX_CTAS")
+        row["ooverlap_max_threads_env"] = os.environ.get("OOVERLAP_MAX_THREADS")
+        row["nccl_algo_env"] = os.environ.get("NCCL_ALGO")
+        row["nccl_proto_env"] = os.environ.get("NCCL_PROTO")
+
+    write_jsonl(args.child_out, rows)
+
+
+def run_one_isolated(args, cta_cap):
+    """
+    Parent-side launcher.
+
+    We intentionally use a subprocess per CTA cap because NCCL may cache env
+    config after first NCCL init in a process. Setting NCCL_MAX_CTAS inside the
+    same process is not reliable.
+    """
+    env = os.environ.copy()
+
+    if cta_cap is None:
+        env.pop("OOVERLAP_MAX_CTAS", None)
+        env.pop("NCCL_MAX_CTAS", None)
+        cta_label = "default"
+    else:
+        env["OOVERLAP_MAX_CTAS"] = str(cta_cap)
+        env["NCCL_MAX_CTAS"] = str(cta_cap)
+        cta_label = str(cta_cap)
+
+    with tempfile.TemporaryDirectory(prefix="ooverlap_public_bench_") as tmpdir:
+        child_out = Path(tmpdir) / "rows.jsonl"
+
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--child-run",
+            "--child-cta-cap",
+            cta_label,
+            "--child-out",
+            str(child_out),
+            "--min-bytes",
+            str(args.min_bytes),
+            "--max-bytes",
+            str(args.max_bytes),
+            "--points",
+            str(args.points),
+            "--iters",
+            str(args.iters),
+            "--warmup",
+            str(args.warmup),
+            "--dev0",
+            str(args.dev0),
+            "--dev1",
+            str(args.dev1),
+            "--tuning-mode",
+            args.tuning_mode,
+        ]
+
+        subprocess.run(
+            cmd,
+            env=env,
+            cwd=str(repo_root()),
+            check=True,
+        )
+
+        rows = load_jsonl(child_out)
 
     return rows
 
+
 def plot_rows(rows, out_dir, metric):
-    cta_values = sorted({row.get("cta_cap") for row in rows}, key=lambda x: (-1 if x is None else x))
+    cta_values = sorted(
+        {row.get("cta_cap") for row in rows},
+        key=lambda x: (-1 if x is None else int(x)),
+    )
 
     written = []
 
@@ -184,8 +263,14 @@ def plot_rows(rows, out_dir, metric):
             continue
 
         plt.figure(figsize=(10, 6))
+        ax = plt.gca()
 
-        for backend in ["ooverlap", "nccl"]:
+        if metric == "speedup_vs_nccl":
+            backends = ["ooverlap"]
+        else:
+            backends = ["ooverlap", "nccl"]
+
+        for backend in backends:
             backend_rows = sorted(
                 [row for row in subset if row["backend"] == backend],
                 key=lambda r: int(r["bytes_per_rank"]),
@@ -197,10 +282,17 @@ def plot_rows(rows, out_dir, metric):
             xs = [int(row["bytes_per_rank"]) for row in backend_rows]
             ys = [float(row[metric]) for row in backend_rows]
 
-            label = backend
-            plt.plot(xs, ys, marker="o", linewidth=1.5, markersize=3, label=label)
+            label = "ooverlap / nccl" if metric == "speedup_vs_nccl" else backend
 
-        ax = plt.gca()
+            plt.plot(
+                xs,
+                ys,
+                marker="o",
+                linewidth=1.5,
+                markersize=3,
+                label=label,
+            )
+
         ax.set_xscale("log", base=2)
         plt.xlabel("Data size per rank")
 
@@ -210,12 +302,16 @@ def plot_rows(rows, out_dir, metric):
         elif metric == "gbps_per_rank":
             plt.ylabel("Per-rank payload bandwidth (GB/s)")
             metric_label = "per_rank_bandwidth"
+        elif metric == "speedup_vs_nccl":
+            plt.ylabel("Speedup vs NCCL")
+            metric_label = "speedup_vs_nccl"
+            plt.axhline(1.0, linestyle="--", linewidth=1)
         else:
             plt.ylabel(metric)
             metric_label = metric
 
-        title_cta = "default CTA policy" if cta is None else f"OOVERLAP_MAX_CTAS={cta}"
-        plt.title(f"Public allreduce vs NCCL: {metric_label}, {title_cta}")
+        title_cta = "default CTA policy" if cta is None else f"CTA cap={cta}"
+        plt.title(f"Public allreduce: {metric_label}, {title_cta}")
         plt.grid(True, which="both", linestyle="--", linewidth=0.5)
         plt.legend()
 
@@ -234,9 +330,11 @@ def plot_rows(rows, out_dir, metric):
 
     return written
 
+def build_parser():
+    parser = argparse.ArgumentParser(
+        "Benchmark public ooverlap allreduce API vs NCCL"
+    )
 
-def main():
-    parser = argparse.ArgumentParser("Benchmark public ooverlap allreduce API vs NCCL")
     parser.add_argument("--min-bytes", type=parse_bytes, required=True)
     parser.add_argument("--max-bytes", type=parse_bytes, required=True)
     parser.add_argument("--points", type=int, required=True)
@@ -244,41 +342,71 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--dev0", type=int, default=0)
     parser.add_argument("--dev1", type=int, default=1)
+
     parser.add_argument(
         "--tuning-mode",
         choices=sorted(TUNING_MODES.keys()),
         default="best_performance",
     )
+
     parser.add_argument(
         "--ctas",
         type=str,
         default="",
-        help="Comma-separated OOVERLAP_MAX_CTAS caps, e.g. 2,4,8,16. Empty means default policy only.",
+        help=(
+            "Comma-separated CTA caps, e.g. 2,4,8,16. "
+            "Each cap runs in a fresh subprocess with both "
+            "OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS set before import/init."
+        ),
     )
+
     parser.add_argument(
         "--include-default-ctas",
         action="store_true",
-        help="Also run once without OOVERLAP_MAX_CTAS when --ctas is set.",
+        help="Also run once without OOVERLAP_MAX_CTAS/NCCL_MAX_CTAS.",
     )
+
     parser.add_argument(
         "--out",
         type=str,
         default="results/public_allreduce_benchmark.jsonl",
     )
+
     parser.add_argument(
         "--out-dir",
         type=str,
         default="results",
     )
+
     parser.add_argument(
         "--metric",
-        choices=["gbps_aggregate_2gpu", "gbps_per_rank"],
-        default="gbps_aggregate_2gpu",
+        choices=[
+            "gbps_aggregate_2gpu",
+            "gbps_per_rank",
+            "speedup_vs_nccl",
+            "all",
+        ],
+        default="all",
+        help="Which plot to emit. 'all' writes bandwidth and speedup plots.",
     )
+    
+    # Internal subprocess mode.
+    parser.add_argument("--child-run", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--child-cta-cap", type=str, default="default", help=argparse.SUPPRESS)
+    parser.add_argument("--child-out", type=str, default="", help=argparse.SUPPRESS)
 
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    ext = load_ooverlap_ext()
+    if args.child_run:
+        if not args.child_out:
+            raise RuntimeError("--child-out is required in --child-run mode")
+        run_child_direct(args)
+        return
 
     cta_caps = []
 
@@ -293,13 +421,14 @@ def main():
     print(f"[info] iters={args.iters} warmup={args.warmup}")
     print(f"[info] tuning_mode={args.tuning_mode}")
     print(f"[info] cta_caps={cta_caps}")
+    print("[info] each CTA cap runs in a fresh process so NCCL_MAX_CTAS is applied before NCCL init")
 
     all_rows = []
 
     for cta in cta_caps:
         label = "default" if cta is None else str(cta)
-        print(f"[run] OOVERLAP_MAX_CTAS={label}")
-        rows = run_one(ext, args, cta)
+        print(f"[run] OOVERLAP_MAX_CTAS={label} NCCL_MAX_CTAS={label}")
+        rows = run_one_isolated(args, cta)
         all_rows.extend(rows)
 
     out_path = Path(args.out)
@@ -308,14 +437,24 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    plots = plot_rows(all_rows, out_dir, args.metric)
+    if args.metric == "all":
+        metrics = [
+            "gbps_aggregate_2gpu",
+            "speedup_vs_nccl",
+        ]
+    else:
+        metrics = [args.metric]
+
+    plots = []
+
+    for metric in metrics:
+        plots.extend(plot_rows(all_rows, out_dir, metric))
 
     print(f"[result] wrote {len(all_rows)} rows to {out_path}")
     for path in plots:
         print(f"[plot] {path}")
 
     print("PASS ✅ public allreduce benchmark complete")
-
 
 if __name__ == "__main__":
     main()
