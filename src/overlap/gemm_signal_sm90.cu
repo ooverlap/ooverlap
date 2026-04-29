@@ -150,20 +150,87 @@ bool gemm_signal_sm90_dispatch(
           64,  64,  32,
           16,  8,   16,
           3,   1,   1>(
-          M, N, K,
-          ReLDN, reinterpret_cast<int*>(CommThr),
-          reinterpret_cast<half*>(A),
-          reinterpret_cast<half*>(B),
-          reinterpret_cast<half*>(D),
-          reinterpret_cast<int*>(MM),
-          reinterpret_cast<int*>(RA),
-          Monitor,
-          stream);
+          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
+          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
+          reinterpret_cast<int*>(RA), Monitor, stream);
+      return true;
+
+    case 1:
+      cutlass_gemm_signal_sm90<
+          128, 128, 64,
+          64,  64,  32,
+          16,  8,   16,
+          3,   1,   1>(
+          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
+          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
+          reinterpret_cast<int*>(RA), Monitor, stream);
+      return true;
+
+    case 2:
+      cutlass_gemm_signal_sm90<
+          128, 128, 64,
+          64,  64,  64,
+          16,  8,   16,
+          3,   1,   1>(
+          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
+          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
+          reinterpret_cast<int*>(RA), Monitor, stream);
+      return true;
+
+    case 3:
+      cutlass_gemm_signal_sm90<
+          128, 256, 32,
+          64,  64,  32,
+          16,  8,   16,
+          3,   1,   1>(
+          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
+          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
+          reinterpret_cast<int*>(RA), Monitor, stream);
+      return true;
+
+    case 4:
+      cutlass_gemm_signal_sm90<
+          128, 256, 64,
+          64,  64,  64,
+          16,  8,   16,
+          3,   1,   1>(
+          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
+          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
+          reinterpret_cast<int*>(RA), Monitor, stream);
+      return true;
+
+    case 5:
+      cutlass_gemm_signal_sm90<
+          256, 128, 32,
+          64,  64,  32,
+          16,  8,   16,
+          3,   1,   1>(
+          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
+          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
+          reinterpret_cast<int*>(RA), Monitor, stream);
+      return true;
+
+    case 6:
+      cutlass_gemm_signal_sm90<
+          256, 128, 64,
+          64,  64,  64,
+          16,  8,   16,
+          3,   1,   1>(
+          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
+          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
+          reinterpret_cast<int*>(RA), Monitor, stream);
       return true;
 
     default:
       return false;
-  }
+  } 
 }
 
 } // namespace ooverlap

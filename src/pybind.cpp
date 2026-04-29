@@ -58,7 +58,7 @@ static void gemm_signal_sm90(
   constexpr int64_t TileM = 128;
   constexpr int64_t TileN = 128;
 
-  TORCH_CHECK(algo == 0, "Only algo=0 supported in bring-up");
+  //TORCH_CHECK(algo == 0, "Only algo=0 supported in bring-up");
   TORCH_CHECK(M % TileM == 0, "M must be multiple of 128 for algo=0");
   TORCH_CHECK(N % TileN == 0, "N must be multiple of 128 for algo=0");
 
@@ -78,7 +78,7 @@ static void gemm_signal_sm90(
   cudaError_t err = cudaSetDevice(dev);
   TORCH_CHECK(err == cudaSuccess, "cudaSetDevice failed: ", cudaGetErrorString(err));
 
-  cudaStream_t stream = at::cuda::getDefaultCUDAStream().stream();
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   bool ok = ooverlap::gemm_signal_sm90_dispatch(
       static_cast<int>(algo),
@@ -137,7 +137,7 @@ static void gemm_scatter_sm90(
   constexpr int64_t TileM = 128;
   constexpr int64_t TileN = 128;
 
-  TORCH_CHECK(algo == 0, "Only algo=0 supported in bring-up");
+  //TORCH_CHECK(algo == 0, "Only algo=0 supported in bring-up");
   TORCH_CHECK(M % TileM == 0, "M must be multiple of 128 for algo=0");
   TORCH_CHECK(N % TileN == 0, "N must be multiple of 128 for algo=0");
 
@@ -158,7 +158,7 @@ static void gemm_scatter_sm90(
   cudaError_t err = cudaSetDevice(dev);
   TORCH_CHECK(err == cudaSuccess, "cudaSetDevice failed: ", cudaGetErrorString(err));
 
-  cudaStream_t stream = at::cuda::getDefaultCUDAStream().stream();
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   bool ok = ooverlap::gemm_scatter_sm90_dispatch(
       static_cast<int>(algo),
