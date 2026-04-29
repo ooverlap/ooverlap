@@ -99,7 +99,7 @@ if(OOVERLAP_BUILD_CORE)
   set_property(TARGET ooverlap_comm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
   set_property(TARGET ooverlap_comm PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-  target_include_directories(ooverlap_comm
+   target_include_directories(ooverlap_comm
     PUBLIC
       $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
       $<INSTALL_INTERFACE:include>
@@ -295,8 +295,16 @@ if(OOVERLAP_BUILD_LEGACY_OVERLAP)
     ooverlap_force_sm90a(ooverlap_overlap)
 
     set_property(TARGET ooverlap_overlap PROPERTY POSITION_INDEPENDENT_CODE ON)
-    set_property(TARGET ooverlap_overlap PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-    set_property(TARGET ooverlap_overlap PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  
+    # CUTLASS SM90 WGMMA kernels must not be compiled with RDC/separable compilation.
+    # Otherwise ptxas may emit C7509:
+    #   wgmma.mma_async instructions are serialized due to Extern calls
+    set_property(TARGET ooverlap_overlap PROPERTY CUDA_SEPARABLE_COMPILATION OFF)
+    set_property(TARGET ooverlap_overlap PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+
+    #set_property(TARGET ooverlap_overlap PROPERTY POSITION_INDEPENDENT_CODE ON)
+    #set_property(TARGET ooverlap_overlap PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+    #set_property(TARGET ooverlap_overlap PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
     target_include_directories(ooverlap_overlap PUBLIC
       ${PROJECT_SOURCE_DIR}/include

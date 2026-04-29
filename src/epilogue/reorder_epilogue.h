@@ -32,6 +32,10 @@
 #include "cute/tensor.hpp"
 #include "epilogue/helper.h"
 
+#ifndef OOVERLAP_DEVICE_INLINE
+#define OOVERLAP_DEVICE_INLINE CUTLASS_DEVICE
+#endif
+
 namespace cutlass {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -199,12 +203,12 @@ struct ReorderSignalEpilogue {
     return BaseEpilogue::initialize_workspace(problem_shape, args.base, workspace, stream, cuda_adapter);
   }
 
-  CUTLASS_DEVICE
+  OOVERLAP_DEVICE_INLINE
   static void prefetch_tma_descriptors(Params const& params) {
     BaseEpilogue::prefetch_tma_descriptors(params.base);
   }
 
-  CUTLASS_DEVICE
+  OOVERLAP_DEVICE_INLINE
   static int get_transaction_bytes(Params const& params) {
     return BaseEpilogue::get_transaction_bytes(params.base);
   }
@@ -221,7 +225,7 @@ struct ReorderSignalEpilogue {
     return BaseEpilogue::get_store_pipe_increment(tile_shape_mnk);
   }
 
-  CUTLASS_DEVICE
+  OOVERLAP_DEVICE_INLINE
   ReorderSignalEpilogue(Params const& params, TensorStorage& tensor_storage)
     : params_(params)
     , base_(params.base, tensor_storage)
@@ -229,28 +233,28 @@ struct ReorderSignalEpilogue {
     , M_(0)
     , N_(0) {}
 
-  CUTLASS_DEVICE
+  OOVERLAP_DEVICE_INLINE
   bool is_producer_load_needed() const {
     return base_.is_producer_load_needed();
   }
 
   template <class... Args>
-  CUTLASS_DEVICE decltype(auto) load_init(Args&&... args) {
+  OOVERLAP_DEVICE_INLINE decltype(auto) load_init(Args&&... args) {
     return base_.load_init(std::forward<Args>(args)...);
   }
 
   template <class... Args>
-  CUTLASS_DEVICE decltype(auto) store_init(Args&&... args) {
+  OOVERLAP_DEVICE_INLINE decltype(auto) store_init(Args&&... args) {
     return base_.store_init(std::forward<Args>(args)...);
   }
 
   template <class... Args>
-  CUTLASS_DEVICE decltype(auto) load(Args&&... args) {
+  OOVERLAP_DEVICE_INLINE decltype(auto) load(Args&&... args) {
     return base_.load(std::forward<Args>(args)...);
   }
 
   template <class... Args>
-  CUTLASS_DEVICE decltype(auto) load_tail(Args&&... args) {
+  OOVERLAP_DEVICE_INLINE decltype(auto) load_tail(Args&&... args) {
     return base_.load_tail(std::forward<Args>(args)...);
   }
 
@@ -290,7 +294,7 @@ struct ReorderSignalEpilogue {
     class ProblemShape, class TileShape, class TileCoord,
     class AccumTensor, class TiledMma, class EpiSharedStorage
   >
-  CUTLASS_DEVICE
+  OOVERLAP_DEVICE_INLINE
   decltype(auto) store(
       EpiLoadPipe&&   epi_load_pipe,
       EpiLoadState&&  epi_load_state,
@@ -304,61 +308,67 @@ struct ReorderSignalEpilogue {
       int thread_idx,
       EpiSharedStorage& shared_storage) {
 
-    // Cache ORIGINAL logical M,N for store_tail bookkeeping.
-    M_ = int(cute::get<0>(problem_shape));
-    N_ = int(cute::get<1>(problem_shape));
+/*    // Cache ORIGINAL logical M,N for store_tail bookkeeping.*/
+    /*M_ = int(cute::get<0>(problem_shape));*/
+    /*N_ = int(cute::get<1>(problem_shape));*/
 
-    int cta_m = int(cute::get<0>(tile_coord));
-    int cta_n = int(cute::get<1>(tile_coord));
+    /*int cta_m = int(cute::get<0>(tile_coord));*/
+    /*int cta_n = int(cute::get<1>(tile_coord));*/
 
-    int tile_m = params_.signal.ThreadblockM;
-    int tile_n = params_.signal.ThreadblockN;
+    /*int tile_m = params_.signal.ThreadblockM;*/
+    /*int tile_n = params_.signal.ThreadblockN;*/
 
-    int original_tile_cols = params_.signal.kMonitoredColumn;
-    int packed_tile_cols   = params_.signal.kReorderedColumn;
+    /*int original_tile_cols = params_.signal.kMonitoredColumn;*/
+    /*int packed_tile_cols   = params_.signal.kReorderedColumn;*/
 
-    if (packed_tile_cols <= 0) {
-      packed_tile_cols = original_tile_cols;
-    }
+    /*if (packed_tile_cols <= 0) {*/
+      /*packed_tile_cols = original_tile_cols;*/
+    /*}*/
 
-    int logical_tile = cta_m * original_tile_cols + cta_n;
+    /*int logical_tile = cta_m * original_tile_cols + cta_n;*/
 
-    int packed_tile = logical_tile;
-    if (params_.signal.ptr_Reorder_Array != nullptr) {
-      packed_tile = params_.signal.ptr_Reorder_Array[logical_tile];
-    }
+    /*int packed_tile = logical_tile;*/
+    /*if (params_.signal.ptr_Reorder_Array != nullptr) {*/
+      /*packed_tile = params_.signal.ptr_Reorder_Array[logical_tile];*/
+    /*}*/
 
-    reordered_tile_ = packed_tile;
+    /*reordered_tile_ = packed_tile;*/
 
-    int original_tile_rows = (M_ + tile_m - 1) / tile_m;
-    int original_tile_num  = original_tile_rows * original_tile_cols;
+    /*int original_tile_rows = (M_ + tile_m - 1) / tile_m;*/
+    /*int original_tile_num  = original_tile_rows * original_tile_cols;*/
 
-    int packed_tile_rows = (original_tile_num + packed_tile_cols - 1) / packed_tile_cols;
+    /*int packed_tile_rows = (original_tile_num + packed_tile_cols - 1) / packed_tile_cols;*/
 
-    int packed_M = packed_tile_rows * tile_m;
-    int packed_N = packed_tile_cols * tile_n;
+    /*int packed_M = packed_tile_rows * tile_m;*/
+    /*int packed_N = packed_tile_cols * tile_n;*/
 
-    int packed_cta_m = packed_tile / packed_tile_cols;
-    int packed_cta_n = packed_tile - packed_cta_m * packed_tile_cols;
+    /*int packed_cta_m = packed_tile / packed_tile_cols;*/
+    /*int packed_cta_n = packed_tile - packed_cta_m * packed_tile_cols;*/
 
-    // Preserve the original type/rank of problem_shape and tile_coord.
-    // This is less brittle than constructing a new CuTe coord and guessing rank.
-    auto packed_problem_shape = problem_shape;
-    cute::get<0>(packed_problem_shape) = packed_M;
-    cute::get<1>(packed_problem_shape) = packed_N;
+    /*// Preserve the original type/rank of problem_shape and tile_coord.*/
+    /*// This is less brittle than constructing a new CuTe coord and guessing rank.*/
+    /*auto packed_problem_shape = problem_shape;*/
+    /*cute::get<0>(packed_problem_shape) = packed_M;*/
+    /*cute::get<1>(packed_problem_shape) = packed_N;*/
 
-    auto packed_tile_coord = tile_coord;
-    cute::get<0>(packed_tile_coord) = packed_cta_m;
-    cute::get<1>(packed_tile_coord) = packed_cta_n;
+    /*auto packed_tile_coord = tile_coord;*/
+    /*cute::get<0>(packed_tile_coord) = packed_cta_m;*/
+    /*cute::get<1>(packed_tile_coord) = packed_cta_n;*/
 
     return base_.store(
-      std::forward<EpiLoadPipe>(epi_load_pipe),
-      std::forward<EpiLoadState>(epi_load_state),
-      std::forward<EpiStorePipe>(epi_store_pipe),
-      std::forward<EpiStoreState>(epi_store_state),
-      packed_problem_shape,
+      //std::forward<EpiLoadPipe>(epi_load_pipe),
+      //std::forward<EpiLoadState>(epi_load_state),
+      //std::forward<EpiStorePipe>(epi_store_pipe),
+      //std::forward<EpiStoreState>(epi_store_state),
+      static_cast<EpiLoadPipe&&>(epi_load_pipe),
+      static_cast<EpiLoadState&&>(epi_load_state),
+      static_cast<EpiStorePipe&&>(epi_store_pipe),
+      static_cast<EpiStoreState&&>(epi_store_state),
+      //packed_problem_shape,
+      problem_shape,
       tile_shape,
-      packed_tile_coord,
+      //packed_tile_coord,
+      tile_coord,
       accum,
       tiled_mma,
       thread_idx,
@@ -388,84 +398,84 @@ struct ReorderSignalEpilogue {
   // signal.kEpilogueArrivalsPerTile from the host after measuring.
   // --------------------------------------------------------------------------
   template <class... Args>
-  CUTLASS_DEVICE
+  OOVERLAP_DEVICE_INLINE
   decltype(auto) store_tail(Args&&... args) {
-    auto ret = base_.store_tail(std::forward<Args>(args)...);
+    auto ret = base_.store_tail(static_cast<Args&&>(args)...);
 
-    int linear_tid =
-      int(threadIdx.x) +
-      int(blockDim.x) * (int(threadIdx.y) + int(blockDim.y) * int(threadIdx.z));
+    /*int linear_tid =*/
+      /*int(threadIdx.x) +*/
+      /*int(blockDim.x) * (int(threadIdx.y) + int(blockDim.y) * int(threadIdx.z));*/
 
-    int lane_idx = linear_tid & 31;
-    int warp_idx = linear_tid >> 5;
+    /*int lane_idx = linear_tid & 31;*/
+    /*int warp_idx = linear_tid >> 5;*/
 
-    constexpr int kWarpsPerWarpGroup = 4;
-    int warp_idx_in_wg = warp_idx & (kWarpsPerWarpGroup - 1);
+    /*constexpr int kWarpsPerWarpGroup = 4;*/
+    /*int warp_idx_in_wg = warp_idx & (kWarpsPerWarpGroup - 1);*/
 
-    bool one_thread_per_warpgroup = (lane_idx == 0) && (warp_idx_in_wg == 0);
+    /*bool one_thread_per_warpgroup = (lane_idx == 0) && (warp_idx_in_wg == 0);*/
 
-    if (one_thread_per_warpgroup) {
+    /*if (one_thread_per_warpgroup) {*/
 
-      int tile = reordered_tile_;
+      /*int tile = reordered_tile_;*/
 
-      // Total logical tile count.
-      int tile_rows = (M_ + params_.signal.ThreadblockM - 1) / params_.signal.ThreadblockM;
-      int tile_cols = (N_ + params_.signal.ThreadblockN - 1) / params_.signal.ThreadblockN;
-      int num_tiles = tile_rows * tile_cols;
+      /*// Total logical tile count.*/
+      /*int tile_rows = (M_ + params_.signal.ThreadblockM - 1) / params_.signal.ThreadblockM;*/
+      /*int tile_cols = (N_ + params_.signal.ThreadblockN - 1) / params_.signal.ThreadblockN;*/
+      /*int num_tiles = tile_rows * tile_cols;*/
 
-      // Number of segments.
-      int num_segments = 0;
-      int sum = 0;
-      while (sum < num_tiles) {
-        sum += params_.signal.kCommu_Seg_Array[num_segments];
-        ++num_segments;
-      }
+      /*// Number of segments.*/
+      /*int num_segments = 0;*/
+      /*int sum = 0;*/
+      /*while (sum < num_tiles) {*/
+        /*sum += params_.signal.kCommu_Seg_Array[num_segments];*/
+        /*++num_segments;*/
+      /*}*/
 
-      // Which segment contains this reordered/packed tile?
-      int idx_bound = params_.signal.kCommu_Seg_Array[0];
-      int seg = 0;
-      while (idx_bound <= tile) {
-        ++seg;
-        idx_bound += params_.signal.kCommu_Seg_Array[seg];
-      }
+      /*// Which segment contains this reordered/packed tile?*/
+      /*int idx_bound = params_.signal.kCommu_Seg_Array[0];*/
+      /*int seg = 0;*/
+      /*while (idx_bound <= tile) {*/
+        /*++seg;*/
+        /*idx_bound += params_.signal.kCommu_Seg_Array[seg];*/
+      /*}*/
 
-      // Optional debug: count actual bookkeeping arrivals per tile.
-      if (params_.signal.ptr_Debug_Arrivals) {
-        atomicAdd(&params_.signal.ptr_Debug_Arrivals[tile], 1);
-      }
+      /*// Optional debug: count actual bookkeeping arrivals per tile.*/
+      /*if (params_.signal.ptr_Debug_Arrivals) {*/
+        /*atomicAdd(&params_.signal.ptr_Debug_Arrivals[tile], 1);*/
+      /*}*/
 
-      // Count one arrival per warp-group, not per warp.
-      int* tile_done = params_.signal.ptr_Monitored_Matrix + num_segments;
+      /*// Count one arrival per warp-group, not per warp.*/
+      /*int* tile_done = params_.signal.ptr_Monitored_Matrix + num_segments;*/
 
-      int expected_arrivals =
-          (params_.signal.kEpilogueArrivalsPerTile > 0)
-              ? params_.signal.kEpilogueArrivalsPerTile
-              : kNumEpilogueWarpGroups;
+      /*int expected_arrivals =*/
+          /*(params_.signal.kEpilogueArrivalsPerTile > 0)*/
+              /*? params_.signal.kEpilogueArrivalsPerTile*/
+              /*: kNumEpilogueWarpGroups;*/
 
-      if (expected_arrivals <= 0) {
-        expected_arrivals = 1;
-      }
+      /*if (expected_arrivals <= 0) {*/
+        /*expected_arrivals = 1;*/
+      /*}*/
 
-      int old = atomicAdd(&tile_done[tile], 1);
+      /*int old = atomicAdd(&tile_done[tile], 1);*/
 
-      // Last warp-group to finish this tile signals its segment exactly once.
-      if (old == (expected_arrivals - 1)) {
-        __threadfence();
+      /*// Last warp-group to finish this tile signals its segment exactly once.*/
+      /*if (old == (expected_arrivals - 1)) {*/
+        /*__threadfence();*/
 
-        atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);
+        /*atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);*/
 
-        if (params_.signal.if_monitor) {
-          int global_order =
-            atomicAdd(&params_.signal.ptr_Monitored_Matrix[tile_cols - 1], 1);
+        /*if (params_.signal.if_monitor) {*/
+          /*int global_order =*/
+            /*atomicAdd(&params_.signal.ptr_Monitored_Matrix[tile_cols - 1], 1);*/
 
-          cutlass::arch::global_store<int, sizeof(int)>(
-            global_order,
-            (void*)(params_.signal.ptr_Monitored_Matrix + tile_cols + tile),
-            true
-          );
-        }
-      }
-    }
+          /*cutlass::arch::global_store<int, sizeof(int)>(*/
+            /*global_order,*/
+            /*(void*)(params_.signal.ptr_Monitored_Matrix + tile_cols + tile),*/
+            /*true*/
+          /*);*/
+        /*}*/
+      /*}*/
+    /*}*/
 
     return ret;
   }
