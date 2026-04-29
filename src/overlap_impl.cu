@@ -72,6 +72,11 @@ void OverlapImpl::OverlapInit() {
         cudaError_t err = cudaStreamCreateWithPriority(&comm_stream_, cudaStreamNonBlocking, -5);
         TORCH_CHECK(err == cudaSuccess,
                     "cudaStreamCreateWithPriority failed: ", cudaGetErrorString(err));
+
+        err = cudaEventCreateWithFlags(&gemm_finished_, cudaEventDisableTiming);
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaEventCreateWithFlags failed: ", cudaGetErrorString(err));
+
         overlap_init_done_ = true;
     }
 }
@@ -156,8 +161,15 @@ void OverlapImpl::GemmAllReduceOverlap(
                 cSEG_GPU.scalar_type() == torch::kInt32,
                 "cSEG tensors must be int32");
     TORCH_CHECK(rLDN > 0, "rLDN must be > 0");
-    TORCH_CHECK(Algo == 0, "Only algo=0 is currently supported");
+    TORCH_CHECK(Algo >= 0 && Algo <= 4, "Unsupported algo=", Algo);
+
     ooverlap::torch_utils::ensure_streams_ready(gemm_stream_, comm_stream_, overlap_init_done_);
+
+    if (gemm_finished_ == nullptr) {
+        cudaError_t err = cudaEventCreateWithFlags(&gemm_finished_, cudaEventDisableTiming);
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaEventCreateWithFlags failed: ", cudaGetErrorString(err));
+    }
 
     const int M = static_cast<int>(A.size(0));
     const int K = static_cast<int>(A.size(1));
@@ -225,10 +237,6 @@ void OverlapImpl::GemmAllReduceOverlap(
         acc_addr += comm_size;
     }
 
-    if (gemm_finished_ != nullptr) {
-        cudaEventDestroy(gemm_finished_);
-    }
-    cudaEventCreateWithFlags(&gemm_finished_, cudaEventDisableTiming);
     cudaEventRecord(gemm_finished_, comm_stream_);
     cudaStreamWaitEvent(gemm_stream_, gemm_finished_, 0);
 }
@@ -263,8 +271,15 @@ void OverlapImpl::GemmReduceScatterOverlap(
                 cSEG_GPU.scalar_type() == torch::kInt32,
                 "cSEG tensors must be int32");
     TORCH_CHECK(rLDN > 0, "rLDN must be > 0");
-    TORCH_CHECK(Algo == 0, "Only algo=0 is currently supported");
+    TORCH_CHECK(Algo == 0, "Only algo=0 is currently supported for scatter overlap");
+
     ooverlap::torch_utils::ensure_streams_ready(gemm_stream_, comm_stream_, overlap_init_done_);
+
+    if (gemm_finished_ == nullptr) {
+        cudaError_t err = cudaEventCreateWithFlags(&gemm_finished_, cudaEventDisableTiming);
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaEventCreateWithFlags failed: ", cudaGetErrorString(err));
+    }
 
     const int M = static_cast<int>(A.size(0));
     const int K = static_cast<int>(A.size(1));
@@ -361,10 +376,6 @@ void OverlapImpl::GemmReduceScatterOverlap(
         acc_addr += comm_size;
     }
 
-    if (gemm_finished_ != nullptr) {
-        cudaEventDestroy(gemm_finished_);
-    }
-    cudaEventCreateWithFlags(&gemm_finished_, cudaEventDisableTiming);
     cudaEventRecord(gemm_finished_, comm_stream_);
     cudaStreamWaitEvent(gemm_stream_, gemm_finished_, 0);
 }

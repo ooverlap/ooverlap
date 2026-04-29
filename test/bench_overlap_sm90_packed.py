@@ -68,7 +68,7 @@ def time_cuda(fn, warmup, iters):
     return start.elapsed_time(end) / iters
 
 
-def worker(rank, world, nccl_id, M, N, K, reldn, group_tiles, warmup, iters, reorder):
+def worker(rank, world, nccl_id, M, N, K, reldn, group_tiles, warmup, iters, reorder, algo, skip_extra):
     torch.cuda.set_device(rank)
     torch.manual_seed(1234 + rank)
 
@@ -122,7 +122,6 @@ def worker(rank, world, nccl_id, M, N, K, reldn, group_tiles, warmup, iters, reo
     MM_overlap = torch.empty((len(overlap_cseg) + num_tiles,), device="cuda", dtype=torch.int32)
     MM_full = torch.empty((len(full_cseg) + num_tiles,), device="cuda", dtype=torch.int32)
 
-    algo = 0
     monitor = False
 
     def run_packed_overlap():
@@ -136,7 +135,7 @@ def worker(rank, world, nccl_id, M, N, K, reldn, group_tiles, warmup, iters, reo
             int(reldn),
             overlap_cseg_cpu,
             overlap_cseg_gpu,
-            algo,
+            int(algo),
             monitor,
         )
 
@@ -151,13 +150,11 @@ def worker(rank, world, nccl_id, M, N, K, reldn, group_tiles, warmup, iters, reo
             int(reldn),
             full_cseg_cpu,
             full_cseg_gpu,
-            algo,
+            int(algo),
             monitor,
         )
 
     def run_torch_matmul_plus_nccl():
-        # This is NOT the same kernel as the CUTLASS path.
-        # It is only a rough external baseline.
         torch.matmul(A, B_ref, out=C_torch)
         ov.nccl_allreduce(C_torch)
 
@@ -166,25 +163,27 @@ def worker(rank, world, nccl_id, M, N, K, reldn, group_tiles, warmup, iters, reo
 
     overlap_ms = time_cuda(run_packed_overlap, warmup, iters)
     full_segment_ms = time_cuda(run_packed_full_segment, warmup, iters)
-    torch_baseline_ms = time_cuda(run_torch_matmul_plus_nccl, warmup, iters)
-    nccl_only_ms = time_cuda(run_nccl_only_full, warmup, iters)
 
-    # Optional GEMM-only approximate:
-    # If world == 1, gemm_allreduce_overlap returns after GEMM and no NCCL is launched.
-    # This only measures packed GEMM on a single GPU/process.
+    torch_baseline_ms = None
+    nccl_only_ms = None
+
+    if not skip_extra:
+        torch_baseline_ms = time_cuda(run_torch_matmul_plus_nccl, warmup, iters)
+        nccl_only_ms = time_cuda(run_nccl_only_full, warmup, iters)
+
     packed_gemm_only_ms = None
     if world == 1:
         packed_gemm_only_ms = full_segment_ms
 
     if rank == 0:
         speedup_vs_full = full_segment_ms / overlap_ms if overlap_ms > 0 else float("nan")
-        speedup_vs_torch = torch_baseline_ms / overlap_ms if overlap_ms > 0 else float("nan")
 
         print("========================================")
         print(f"M={M} N={N} K={K}")
         print(f"tile_rows={tile_rows} tile_cols={tile_cols} num_tiles={num_tiles}")
         print(f"reldn={reldn} packed_shape=({packed_M}, {packed_N})")
         print(f"reorder={reorder}")
+        print(f"algo={algo}")
         print("")
         print(f"overlap group_tiles={group_tiles}")
         print(f"overlap num_segments={len(overlap_cseg)}")
@@ -192,15 +191,16 @@ def worker(rank, world, nccl_id, M, N, K, reldn, group_tiles, warmup, iters, reo
         print("")
         print(f"packed overlap latency:        {overlap_ms:.4f} ms")
         print(f"packed full-segment latency:   {full_segment_ms:.4f} ms")
-        print(f"torch matmul + NCCL latency:   {torch_baseline_ms:.4f} ms")
-        print(f"NCCL-only full-buffer latency: {nccl_only_ms:.4f} ms")
 
+        if torch_baseline_ms is not None:
+            print(f"torch matmul + NCCL latency:   {torch_baseline_ms:.4f} ms")
+        if nccl_only_ms is not None:
+            print(f"NCCL-only full-buffer latency: {nccl_only_ms:.4f} ms")
         if packed_gemm_only_ms is not None:
             print(f"packed GEMM-only approx:       {packed_gemm_only_ms:.4f} ms")
 
         print("")
         print(f"speedup vs packed full-seg:    {speedup_vs_full:.4f}x")
-        print(f"speedup vs torch baseline:     {speedup_vs_torch:.4f}x")
         print("========================================")
 
 
@@ -215,6 +215,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--reorder", choices=["column_major", "identity"], default="column_major")
+    ap.add_argument("--algo", type=int, default=1)
+    ap.add_argument("--skip-extra", action="store_true")
     args = ap.parse_args()
 
     assert torch.cuda.is_available()
@@ -237,6 +239,8 @@ def main():
             args.warmup,
             args.iters,
             args.reorder,
+            args.algo,
+            args.skip_extra,
         ),
         nprocs=args.gpus,
         join=True,
