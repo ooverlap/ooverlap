@@ -78,6 +78,24 @@ def combo_key(combo):
         combo["epilogue"],
     )
 
+def sm90_two_stage_smem_ok(combo):
+    tm = combo["tile_m"]
+    tn = combo["tile_n"]
+    tk = combo["tile_k"]
+
+    # Conservative fp16 A/B mainloop smem estimate.
+    # One stage stores one A tile and one B tile.
+    bytes_per_element = 2
+    bytes_per_stage = (tm * tk + tn * tk) * bytes_per_element
+
+    # SM90 TMA warp-specialized kernels require at least 2 stages.
+    # Use a conservative budget because CUTLASS also needs barriers,
+    # descriptors, epilogue/pipeline storage, alignment, etc.
+    min_required = 2 * bytes_per_stage
+    conservative_budget = 220 * 1024
+
+    return min_required <= conservative_budget
+
 
 def combo_dict_from_key(key):
     return {
@@ -105,6 +123,13 @@ def is_reasonable_combo(combo, preset):
     if tm == 64 and tn == 64:
         return False
 
+    if (tm, tn) in [
+        (256, 256),
+        (256, 128),
+        (128, 256),
+    ]:
+        return False
+
     # Keep 256x256 out of the safe/default set. It can be useful for pure GEMM,
     # but for FlashOverlap-style overlap it gives fewer output tiles/signals.
     if preset == "safe" and tm == 256 and tn == 256:
@@ -129,6 +154,9 @@ def is_reasonable_combo(combo, preset):
     if preset != "extended":
         if tm == 256 and tn == 256:
             return False
+
+    if not sm90_two_stage_smem_ok(combo):
+        return False
 
     return True
 

@@ -340,6 +340,7 @@ void OverlapImpl::GemmReduceScatterOverlap(
         static_cast<int>(Algo),
         M, N, K,
         static_cast<int>(rLDN),
+        seg_size,
         reinterpret_cast<int32_t*>(cseg_gpu_ptr),
         reinterpret_cast<void*>(a_ptr),
         reinterpret_cast<void*>(b_ptr),

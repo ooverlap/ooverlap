@@ -191,21 +191,28 @@ static void gemm_scatter_sm90(
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+  const int64_t num_segments = CommThr.numel();
+
+  TORCH_CHECK(num_segments > 0, "CommThr must have at least one segment");
+  TORCH_CHECK(MM.numel() >= num_segments + num_tiles,
+            "MM must have at least num_segments + num_tiles elements");
+
   bool ok = ooverlap::gemm_scatter_sm90_dispatch(
-      static_cast<int>(algo),
-      static_cast<int>(M),
-      static_cast<int>(N),
-      static_cast<int>(K),
-      static_cast<int>(ReLDN),
-      reinterpret_cast<int32_t*>(CommThr.data_ptr<int32_t>()),
-      static_cast<void*>(A.data_ptr<at::Half>()),
-      static_cast<void*>(B_packed.data_ptr<at::Half>()),
-      static_cast<void*>(D.data_ptr<at::Half>()),
-      reinterpret_cast<int32_t*>(MM.data_ptr<int32_t>()),
-      reinterpret_cast<int32_t*>(RA.data_ptr<int32_t>()),
-      reinterpret_cast<int32_t*>(RE.data_ptr<int32_t>()),
-      monitor,
-      stream);
+    static_cast<int>(algo),
+    static_cast<int>(M),
+    static_cast<int>(N),
+    static_cast<int>(K),
+    static_cast<int>(ReLDN),
+    static_cast<int>(num_segments),
+    reinterpret_cast<int32_t*>(CommThr.data_ptr<int32_t>()),
+    static_cast<void*>(A.data_ptr<at::Half>()),
+    static_cast<void*>(B_packed.data_ptr<at::Half>()),
+    static_cast<void*>(D.data_ptr<at::Half>()),
+    reinterpret_cast<int32_t*>(MM.data_ptr<int32_t>()),
+    reinterpret_cast<int32_t*>(RA.data_ptr<int32_t>()),
+    reinterpret_cast<int32_t*>(RE.data_ptr<int32_t>()),
+    monitor,
+    stream); 
 
   TORCH_CHECK(ok, "Unsupported algo=", algo);
 }

@@ -1,6 +1,7 @@
 build/
 exper/
 results/
+configs/
 .cache
 .clangd
 *png
