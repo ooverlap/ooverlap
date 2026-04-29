@@ -352,9 +352,6 @@ struct ReorderSignalEpilogue {
 
       int tile = reordered_tile_;
 
-      int tile_rows = (M_ + params_.signal.ThreadblockM - 1) / params_.signal.ThreadblockM;
-      int tile_cols = (N_ + params_.signal.ThreadblockN - 1) / params_.signal.ThreadblockN;
-      int num_tiles = tile_rows * tile_cols;
 
 #if OOVERLAP_ENABLE_EPILOGUE_DEBUG
       if (params_.signal.ptr_Debug_Arrivals) {
@@ -389,6 +386,7 @@ struct ReorderSignalEpilogue {
         atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);
 
 #if OOVERLAP_ENABLE_EPILOGUE_MONITOR
+        int tile_cols = (N_ + params_.signal.ThreadblockN - 1) / params_.signal.ThreadblockN;
         if (params_.signal.if_monitor) {
           int global_order =
             atomicAdd(&params_.signal.ptr_Monitored_Matrix[tile_cols - 1], 1);
