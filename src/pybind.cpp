@@ -25,22 +25,17 @@ struct Sm90GemmAlgoInfo {
 };
 
 static Sm90GemmAlgoInfo get_sm90_gemm_algo_info(int64_t algo) {
-  switch (algo) {
-    // All currently tested algos use 128x128 output tiles.
-    case 0:
-    case 1:
-    case 2:
-    case 3:
-    case 4:
-    case 5:
-    case 6:
-    case 7:
-    case 8:
-      return {128, 128};
+  ooverlap::GemmSignalSm90AlgoMeta meta;
 
-    default:
-      TORCH_CHECK(false, "Unsupported algo=", algo);
-  }
+  bool ok = ooverlap::gemm_signal_sm90_get_algo_meta(
+      static_cast<int>(algo),
+      &meta);
+
+  TORCH_CHECK(ok, "Unsupported algo=", algo,
+              ". Generated SM90 algo count=",
+              ooverlap::gemm_signal_sm90_algo_count());
+
+  return {meta.tile_m, meta.tile_n};
 }
 
 // --------------------------------------------
@@ -83,9 +78,13 @@ static void gemm_signal_sm90(
   const int64_t TileM = info.tile_m;
   const int64_t TileN = info.tile_n;
 
-  //TORCH_CHECK(algo == 0, "Only algo=0 supported in bring-up");
-  TORCH_CHECK(M % TileM == 0, "M must be multiple of 128 for algo=0");
-  TORCH_CHECK(N % TileN == 0, "N must be multiple of 128 for algo=0");
+  TORCH_CHECK(M % TileM == 0,
+              "M must be multiple of TileM=", TileM,
+              " for algo=", algo);
+  
+  TORCH_CHECK(N % TileN == 0,
+              "N must be multiple of TileN=", TileN,
+              " for algo=", algo);
 
   const int64_t tile_rows = M / TileM;
   const int64_t tile_cols = N / TileN;
@@ -165,8 +164,9 @@ static void gemm_scatter_sm90(
   TORCH_CHECK(B_packed.size(1) == K, "B_packed must be (N,K) where K matches A");
   TORCH_CHECK(ReLDN > 0, "ReLDN must be > 0");
 
-  constexpr int64_t TileM = 128;
-  constexpr int64_t TileN = 128;
+  auto info = get_sm90_gemm_algo_info(algo);
+  const int64_t TileM = info.tile_m;
+  const int64_t TileN = info.tile_n;
 
   //TORCH_CHECK(algo == 0, "Only algo=0 supported in bring-up");
   TORCH_CHECK(M % TileM == 0, "M must be multiple of 128 for algo=0");

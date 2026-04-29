@@ -190,6 +190,35 @@ void cutlass_gemm_signal_sm90(
 
 namespace ooverlap {
 
+int gemm_signal_sm90_algo_count() {
+  return signal_sm90_func_count;
+}
+
+bool gemm_signal_sm90_get_algo_meta(
+    int algo,
+    GemmSignalSm90AlgoMeta* out) {
+  if (out == nullptr) {
+    return false;
+  }
+
+  if (algo < 0 || algo >= signal_sm90_func_count) {
+    return false;
+  }
+
+  auto const& src = signal_sm90_algo_meta[algo];
+
+  out->tile_m = src.tile_m;
+  out->tile_n = src.tile_n;
+  out->tile_k = src.tile_k;
+  out->cluster_m = src.cluster_m;
+  out->cluster_n = src.cluster_n;
+  out->cluster_k = src.cluster_k;
+  out->mainloop = src.mainloop;
+  out->epilogue = src.epilogue;
+
+  return true;
+}
+
 bool gemm_signal_sm90_dispatch(
     int algo,
     int M, int N, int K,
