@@ -40,6 +40,7 @@ struct GemmSignalCacheKey {
   int* MM;
   int* RA;
   bool Monitor;
+  int num_segments;
 
   GemmSignalCacheKey()
       : valid(false),
@@ -54,7 +55,8 @@ struct GemmSignalCacheKey {
         D(nullptr),
         MM(nullptr),
         RA(nullptr),
-        Monitor(false) {}
+        Monitor(false),
+        num_segments(0) {}
 
   bool same_as(GemmSignalCacheKey const& other) const {
     return valid &&
@@ -70,7 +72,8 @@ struct GemmSignalCacheKey {
            D       == other.D &&
            MM      == other.MM &&
            RA      == other.RA &&
-           Monitor == other.Monitor;
+           Monitor == other.Monitor &&
+           num_segments == other.num_segments;
   }
 };
 
@@ -137,6 +140,7 @@ void cutlass_gemm_signal_sm90(
   new_key.MM      = MM;
   new_key.RA      = RA;
   new_key.Monitor = Monitor;
+  new_key.num_segments = num_segments;
 
   cutlass::gemm::GemmCoord problem_size(M, N, K);
 
@@ -176,6 +180,12 @@ void cutlass_gemm_signal_sm90(
   CUTLASS_CHECK_SM90(gemm_op(stream));
 }
 
+// explicit instantiations
+#include "inc/signal_instances_sm90.inc"
+
+// function pointer table
+#include "tiling/signal_tiling_sm90.cuh"
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace ooverlap {
@@ -190,78 +200,25 @@ bool gemm_signal_sm90_dispatch(
     int32_t* MM, int32_t* RA,
     bool Monitor,
     cudaStream_t stream) {
-    
-  using Cluster1x1x1 = cute::Shape<cute::_1, cute::_1, cute::_1>;
-  using Cluster1x2x1 = cute::Shape<cute::_1, cute::_2, cute::_1>;
-  using Cluster2x1x1 = cute::Shape<cute::_2, cute::_1, cute::_1>;
 
-  using WS = cutlass::gemm::KernelTmaWarpSpecialized;
-  using EpiAuto = cutlass::epilogue::collective::EpilogueScheduleAuto;
-
-  switch (algo) {
-    case 0:
-      cutlass_gemm_signal_sm90<
-          128, 128, 32,
-          Cluster1x1x1,
-          WS,
-          EpiAuto>(
-          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
-          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
-          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
-          reinterpret_cast<int*>(RA), Monitor, stream);
-      return true;
-
-    case 1:
-      cutlass_gemm_signal_sm90<
-          128, 128, 64,
-          Cluster1x1x1,
-          WS,
-          EpiAuto>(
-          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
-          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
-          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
-          reinterpret_cast<int*>(RA), Monitor, stream);
-      return true;
-
-    case 2:
-      cutlass_gemm_signal_sm90<
-          128, 128, 128,
-          Cluster1x1x1,
-          WS,
-          EpiAuto>(
-          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
-          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
-          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
-          reinterpret_cast<int*>(RA), Monitor, stream);
-      return true;
-
-    case 3:
-      cutlass_gemm_signal_sm90<
-          128, 128, 64,
-          Cluster1x2x1,
-          WS,
-          EpiAuto>(
-          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
-          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
-          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
-          reinterpret_cast<int*>(RA), Monitor, stream);
-      return true;
-
-    case 4:
-      cutlass_gemm_signal_sm90<
-          128, 128, 64,
-          Cluster2x1x1,
-          WS,
-          EpiAuto>(
-          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
-          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
-          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
-          reinterpret_cast<int*>(RA), Monitor, stream);
-      return true;
-
-    default:
-      return false;
+  if (algo < 0 || algo >= signal_sm90_func_count) {
+    return false;
   }
+
+  signal_sm90_func_table[algo](
+      M, N, K,
+      ReLDN,
+      num_segments,
+      reinterpret_cast<int*>(CommThr),
+      reinterpret_cast<half*>(A),
+      reinterpret_cast<half*>(B),
+      reinterpret_cast<half*>(D),
+      reinterpret_cast<int*>(MM),
+      reinterpret_cast<int*>(RA),
+      Monitor,
+      stream);
+
+  return true;
 }
 
 } // namespace ooverlap

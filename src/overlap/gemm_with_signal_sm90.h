@@ -54,6 +54,104 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace detail {
+
+template <
+  class KernelArguments,
+  class ProblemShape,
+  class MainloopArguments,
+  class EpilogueArguments,
+  class TileSchedArguments
+>
+CUTLASS_HOST
+KernelArguments make_kernel_arguments(
+    ProblemShape const& problem_shape,
+    MainloopArguments const& mainloop_args,
+    EpilogueArguments const& epilogue_args,
+    cutlass::KernelHardwareInfo const& hw_info,
+    TileSchedArguments const& sched_args) {
+
+  if constexpr (std::is_constructible<
+      KernelArguments,
+      cutlass::gemm::GemmUniversalMode,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      cutlass::KernelHardwareInfo,
+      TileSchedArguments>::value) {
+
+    return KernelArguments(
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info,
+      sched_args
+    );
+
+  } else if constexpr (std::is_constructible<
+      KernelArguments,
+      cutlass::gemm::GemmUniversalMode,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      cutlass::KernelHardwareInfo>::value) {
+
+    return KernelArguments(
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info
+    );
+
+  } else if constexpr (std::is_constructible<
+      KernelArguments,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      cutlass::KernelHardwareInfo,
+      TileSchedArguments>::value) {
+
+    return KernelArguments(
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info,
+      sched_args
+    );
+
+  } else if constexpr (std::is_constructible<
+      KernelArguments,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      cutlass::KernelHardwareInfo>::value) {
+
+    return KernelArguments(
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info
+    );
+
+  } else {
+    static_assert(
+      std::is_constructible<
+        KernelArguments,
+        cutlass::gemm::GemmUniversalMode,
+        ProblemShape,
+        MainloopArguments,
+        EpilogueArguments,
+        cutlass::KernelHardwareInfo,
+        TileSchedArguments>::value,
+      "Unsupported CUTLASS SM90 KernelArguments constructor for this schedule."
+    );
+  }
+}
+
+} // namespace detail
+
 namespace cutlass {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -305,14 +403,14 @@ public:
 
     TileSchedArguments sched_args{};
 
-    KernelArguments gemm_args(
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      hw_info,
-      sched_args
-    );
+    KernelArguments gemm_args =
+      detail::make_kernel_arguments<KernelArguments>(
+        problem_shape,
+        mainloop_args,
+        epilogue_args,
+        hw_info,
+        sched_args
+      );
 
     Status status = gemm_device_.can_implement(gemm_args);
     if (status != Status::kSuccess) {
