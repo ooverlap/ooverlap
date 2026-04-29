@@ -1,27 +1,54 @@
 #!/usr/bin/env python3
 """
-Profile ooverlap SM90 GEMM-with-signal candidates against CUTLASS profiler CSV.
+Profile ooverlap SM90 GEMM candidates against a CUTLASS profiler CSV.
 
-This version expects the new 9-field AlgoDictSm90 key:
+Important details in this version:
 
-  TileM, TileN, TileK,
-  ClusterM, ClusterN, ClusterK,
-  Stages,
-  Mainloop,
-  Epilogue
+1. The default CSV filter is now apples-to-apples with the current ooverlap
+   wrapper:
 
-It can still run in --match-stages ignore mode, but exact matching is what we
-need now.
+     A = f16 row-major
+     B = f16 column-major
+     Accumulator = f32
+     C = f16
+     D = f16
+
+   The previous script allowed C=void rows from CUTLASS profiler. Those rows are
+   often the fastest, but they are NOT the same epilogue as the current wrapper,
+   which passes a half C pointer to CUTLASS even though beta=0.
+
+   If you later change the C++ wrapper to ElementC=void, run this script with:
+
+     --csv-c-dtype void
+
+2. The default timing mode is now an unrolled CUDA Graph:
+
+     capture graph_repeats GEMM launches in one CUDA graph
+     time graph replay
+     report per-GEMM latency = replay_time / graph_repeats
+
+   This removes Python enqueue gaps from candidate ranking.
+
+3. The AlgoDictSm90 key is expected to be:
+
+     TileM, TileN, TileK,
+     ClusterM, ClusterN, ClusterK,
+     Stages,
+     Mainloop,
+     Epilogue
+
+   Use --match-stages exact for strict CUTLASS-row matching.
 """
+
+from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
 import math
-import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -50,6 +77,9 @@ INST_N_NAMES = ["inst_n"]
 INST_K_NAMES = ["inst_k"]
 
 
+# ----------------------------- small parsing helpers -----------------------------
+
+
 def norm_col(x: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(x).strip().lower()).strip("_")
 
@@ -63,7 +93,7 @@ def col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
     return None
 
 
-def as_int(x, default=None):
+def as_int(x: Any, default: Optional[int] = None) -> Optional[int]:
     try:
         if x is None:
             return default
@@ -77,7 +107,7 @@ def as_int(x, default=None):
         return default
 
 
-def as_float(x, default=None):
+def as_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if x is None:
             return default
@@ -92,7 +122,7 @@ def as_float(x, default=None):
         return default
 
 
-def norm_layout(x) -> Optional[str]:
+def norm_layout(x: Any) -> Optional[str]:
     if x is None:
         return None
     s = str(x).strip().lower()
@@ -109,7 +139,7 @@ def norm_layout(x) -> Optional[str]:
     return None
 
 
-def norm_dtype(x) -> Optional[str]:
+def norm_dtype(x: Any) -> Optional[str]:
     if x is None:
         return None
     s = str(x).strip().lower()
@@ -119,29 +149,33 @@ def norm_dtype(x) -> Optional[str]:
         return "f16"
     if s in ("float", "fp32", "float32"):
         return "f32"
-    if s in ("void", "none"):
+    if s in ("void", "none", "null"):
         return "void"
     return s or None
 
 
 def parse_op_dtypes(op: str) -> Dict[str, Optional[str]]:
     """
-    CUTLASS names usually contain:
+    CUTLASS operation names usually contain:
+
       gemm_A_B_ACCUM_C_D_
-    e.g.
+
+    Examples:
+
       ...gemm_f16_f16_f32_void_f16_128x128x64...
-      ...gemm_f16_f16_f32_f32_f32_128x128x64...
+      ...gemm_f16_f16_f32_f16_f16_64x256x64...
+      ...gemm_f16_f16_f32_f32_f32_128x256x64...
     """
     s = str(op)
     m = re.search(r"gemm_([^_]+)_([^_]+)_([^_]+)_([^_]+)_([^_]+)_", s)
     if not m:
         return {"a": None, "b": None, "accum": None, "c": None, "d": None}
     return {
-        "a": m.group(1).lower(),
-        "b": m.group(2).lower(),
-        "accum": m.group(3).lower(),
-        "c": m.group(4).lower(),
-        "d": m.group(5).lower(),
+        "a": norm_dtype(m.group(1)),
+        "b": norm_dtype(m.group(2)),
+        "accum": norm_dtype(m.group(3)),
+        "c": norm_dtype(m.group(4)),
+        "d": norm_dtype(m.group(5)),
     }
 
 
@@ -156,19 +190,34 @@ def map_mainloop(op: str, default: str) -> str:
     return default
 
 
-def make_key8(tm, tn, tk, cm, cn, ck, mainloop, epilogue):
+def make_key8(tm: int, tn: int, tk: int, cm: int, cn: int, ck: int, mainloop: str, epilogue: str) -> Tuple[Any, ...]:
     return (int(tm), int(tn), int(tk), int(cm), int(cn), int(ck), str(mainloop), str(epilogue))
 
 
-def make_key9(tm, tn, tk, cm, cn, ck, stages, mainloop, epilogue):
+def make_key9(tm: int, tn: int, tk: int, cm: int, cn: int, ck: int, stages: int, mainloop: str, epilogue: str) -> Tuple[Any, ...]:
     return (int(tm), int(tn), int(tk), int(cm), int(cn), int(ck), int(stages), str(mainloop), str(epilogue))
 
 
-def filename_shape(path: Path):
+def filename_shape(path: Path) -> Optional[Tuple[int, int, int]]:
     m = re.search(r"m(\d+)n(\d+)k(\d+)", path.name, re.IGNORECASE)
     if not m:
         return None
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def gpu_name_slug() -> Tuple[str, str]:
+    name = torch.cuda.get_device_properties(torch.cuda.current_device()).name
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return slug, name
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+# ----------------------------- ooverlap / algos -----------------------------
 
 
 def load_ext(root: Path):
@@ -176,6 +225,8 @@ def load_ext(root: Path):
     if not so.exists():
         raise FileNotFoundError(f"Could not find {so}. Build first.")
     spec = importlib.util.spec_from_file_location("ooverlap_ext", str(so))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load Python extension spec from {so}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -185,9 +236,9 @@ def load_algo_dict(path: Path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    by8 = {}
-    by9 = {}
-    inverse = {}
+    by8: Dict[Tuple[Any, ...], int] = {}
+    by9: Dict[Tuple[Any, ...], int] = {}
+    inverse: Dict[int, Dict[str, Any]] = {}
 
     for item in data.get("algorithms", []):
         algo = int(item["algo"])
@@ -202,7 +253,7 @@ def load_algo_dict(path: Path):
         k8 = make_key8(tm, tn, tk, cm, cn, ck, mainloop, epilogue)
         by8.setdefault(k8, algo)
 
-        if stages is not None and str(stages).lower() != "auto":
+        if stages is not None and str(stages).lower() != "auto" and int(stages) >= 0:
             k9 = make_key9(tm, tn, tk, cm, cn, ck, int(stages), mainloop, epilogue)
             by9[k9] = algo
 
@@ -218,6 +269,9 @@ def load_algo_dict(path: Path):
         }
 
     return by8, by9, inverse
+
+
+# ----------------------------- CSV parsing -----------------------------
 
 
 def parse_csv(args, csv_path: Path):
@@ -250,11 +304,12 @@ def parse_csv(args, csv_path: Path):
 
     shape_from_name = filename_shape(csv_path)
 
-    records = []
+    records: List[Dict[str, Any]] = []
     counts = {
         "raw_rows": int(len(df)),
         "bad_runtime": 0,
         "split_k": 0,
+        "shape": 0,
         "layout_or_dtype": 0,
         "tile_parse": 0,
         "kept": 0,
@@ -271,10 +326,12 @@ def parse_csv(args, csv_path: Path):
             counts["split_k"] += 1
             continue
 
-        # Shape columns are not always present in CUTLASS profiler CSV.
+        # Shape columns are not always present in CUTLASS profiler CSV; the file
+        # name is usually the reliable source in this workflow.
         if shape_from_name is not None:
-            M, N, K = shape_from_name
-            if (M, N, K) != (args.m, args.n, args.k):
+            M0, N0, K0 = shape_from_name
+            if (M0, N0, K0) != (args.m, args.n, args.k):
+                counts["shape"] += 1
                 continue
 
         tm = as_int(r[c_tm]) if c_tm is not None else None
@@ -295,9 +352,9 @@ def parse_csv(args, csv_path: Path):
         op = str(r[c_op]) if c_op is not None else ""
         op_dt = parse_op_dtypes(op)
 
-        # Our wrapper is A=f16 row, B=f16 column, accum=f32, D=f16.
         a_layout = norm_layout(r[c_a]) if c_a is not None else None
         b_layout = norm_layout(r[c_b]) if c_b is not None else None
+
         a_dtype = norm_dtype(r[c_a]) if c_a is not None else op_dt["a"]
         b_dtype = norm_dtype(r[c_b]) if c_b is not None else op_dt["b"]
         c_dtype = norm_dtype(r[c_c]) if c_c is not None else op_dt["c"]
@@ -305,27 +362,28 @@ def parse_csv(args, csv_path: Path):
         accum = norm_dtype(r[c_accum]) if c_accum is not None else op_dt["accum"]
 
         ok = True
+
         if args.filter_layouts:
-            if a_layout is not None and a_layout != "row":
+            if a_layout is not None and a_layout != args.csv_a_layout:
                 ok = False
-            if b_layout is not None and b_layout != "column":
+            if b_layout is not None and b_layout != args.csv_b_layout:
                 ok = False
 
-        if a_dtype is not None and a_dtype != "f16":
+        if a_dtype is not None and a_dtype != args.csv_a_dtype:
             ok = False
-        if b_dtype is not None and b_dtype != "f16":
+        if b_dtype is not None and b_dtype != args.csv_b_dtype:
             ok = False
-        if accum is not None and accum != "f32":
-            ok = False
-
-        # Critical fix: reject profiler rows whose output D is f32.
-        # Our kernel instantiates ElementOutput=cutlass::half_t.
-        if d_dtype is not None and d_dtype != "f16":
+        if accum is not None and accum != args.csv_accum_dtype:
             ok = False
 
-        # C can be void or f16 because beta=0 and C is effectively unused.
-        if c_dtype is not None and c_dtype not in ("void", "f16"):
-            ok = False
+        # Critical default: current wrapper is ElementC=half and ElementD=half.
+        # Do not compare against C=void rows unless explicitly requested.
+        if args.csv_c_dtype != "any":
+            if c_dtype is None or c_dtype != args.csv_c_dtype:
+                ok = False
+        if args.csv_d_dtype != "any":
+            if d_dtype is None or d_dtype != args.csv_d_dtype:
+                ok = False
 
         if not ok:
             counts["layout_or_dtype"] += 1
@@ -342,18 +400,23 @@ def parse_csv(args, csv_path: Path):
             "cutlass_runtime": float(runtime),
             "key8": list(key8),
             "key9": list(key9),
-            "tile_m": tm,
-            "tile_n": tn,
-            "tile_k": tk,
-            "cluster": [cm, cn, ck],
-            "stages": stages,
+            "tile_m": int(tm),
+            "tile_n": int(tn),
+            "tile_k": int(tk),
+            "cluster": [int(cm), int(cn), int(ck)],
+            "stages": int(stages),
             "mainloop": mainloop,
             "epilogue": epilogue,
             "a": str(r[c_a]) if c_a is not None else None,
             "b": str(r[c_b]) if c_b is not None else None,
-            "c": str(r[c_c]) if c_c is not None else None,
-            "d": str(r[c_d]) if c_d is not None else None,
-            "accum": str(r[c_accum]) if c_accum is not None else None,
+            "c": str(r[c_c]) if c_c is not None else op_dt["c"],
+            "d": str(r[c_d]) if c_d is not None else op_dt["d"],
+            "a_dtype": a_dtype,
+            "b_dtype": b_dtype,
+            "c_dtype": c_dtype,
+            "d_dtype": d_dtype,
+            "accum": str(r[c_accum]) if c_accum is not None else op_dt["accum"],
+            "accum_dtype": accum,
             "operation": op,
             "csv_warps_m": as_int(r[c_wm]) if c_wm is not None else None,
             "csv_warps_n": as_int(r[c_wn]) if c_wn is not None else None,
@@ -368,50 +431,54 @@ def parse_csv(args, csv_path: Path):
     return records, counts
 
 
-def match_algo(row, by8, by9, match_stages):
+def match_algo(row: Dict[str, Any], by8, by9, match_stages: str):
     k8 = tuple(row["key8"])
     k9 = tuple(row["key9"])
+
     if match_stages in ("exact", "auto"):
         if k9 in by9:
             return by9[k9], "key9_exact"
         if match_stages == "exact":
             return None, "missing_key9"
+
     if k8 in by8:
         return by8[k8], "key8_no_stage"
     return None, "missing_key8"
 
 
-def dedupe_matched(rows):
-    out = {}
+def dedupe_matched(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
     for r in rows:
-        if r["algo"] not in out or r["cutlass_runtime"] < out[r["algo"]]["cutlass_runtime"]:
-            out[r["algo"]] = r
+        algo = int(r["algo"])
+        if algo not in out or r["cutlass_runtime"] < out[algo]["cutlass_runtime"]:
+            out[algo] = r
     vals = list(out.values())
     vals.sort(key=lambda x: x["cutlass_runtime"])
     return vals
 
 
-def make_ra(tile_rows, tile_cols, reorder, device):
+# ----------------------------- benchmark helpers -----------------------------
+
+
+def make_ra(tile_rows: int, tile_cols: int, reorder: str, device: torch.device) -> torch.Tensor:
     num_tiles = tile_rows * tile_cols
+
     if reorder == "identity":
         return torch.arange(num_tiles, device=device, dtype=torch.int32)
 
     if reorder == "column_major":
-        vals = []
+        ra = torch.empty((num_tiles,), device=device, dtype=torch.int32)
         for tm in range(tile_rows):
             for tn in range(tile_cols):
                 logical = tm * tile_cols + tn
                 packed = tn * tile_rows + tm
-                vals.append((logical, packed))
-        ra = torch.empty((num_tiles,), device=device, dtype=torch.int32)
-        for logical, packed in vals:
-            ra[logical] = packed
+                ra[logical] = packed
         return ra
 
     raise ValueError(f"unknown reorder={reorder}")
 
 
-def time_cuda(fn, warmup, iters):
+def time_cuda_eager(fn, warmup: int, iters: int) -> float:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -425,17 +492,50 @@ def time_cuda(fn, warmup, iters):
     end.record()
 
     torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
+    return float(start.elapsed_time(end) / iters)
 
 
-def benchmark_algo(ext, args, meta):
+def time_cuda_graph_unrolled(fn, warmup: int, iters: int, graph_repeats: int) -> float:
+    """Return per-GEMM ms using one CUDA graph containing graph_repeats GEMMs."""
+    # Warm up the already-initialized path.
+    for _ in range(max(1, warmup)):
+        fn()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(graph_repeats):
+            fn()
+
+    # Warm up graph replay.
+    for _ in range(max(1, warmup)):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+
+    torch.cuda.synchronize()
+    replay_ms = float(start.elapsed_time(end) / iters)
+    return replay_ms / float(graph_repeats)
+
+
+def benchmark_algo(ext, args, meta: Dict[str, Any]) -> Tuple[float, str, Optional[str]]:
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
 
     M, N, K = args.m, args.n, args.k
     tm, tn = int(meta["tile_m"]), int(meta["tile_n"])
-    assert M % tm == 0
-    assert N % tn == 0
+
+    if M % tm != 0:
+        raise ValueError(f"M={M} is not divisible by tile_m={tm}")
+    if N % tn != 0:
+        raise ValueError(f"N={N} is not divisible by tile_n={tn}")
 
     tile_rows = M // tm
     tile_cols = N // tn
@@ -456,7 +556,6 @@ def benchmark_algo(ext, args, meta):
     A = torch.randn((M, K), device=device, dtype=torch.float16)
     B_ref = torch.randn((K, N), device=device, dtype=torch.float16)
     B_packed = B_ref.t().contiguous()
-
     D = torch.empty((out_m, out_n), device=device, dtype=torch.float16)
 
     RA = make_ra(tile_rows, tile_cols, reorder, device)
@@ -476,25 +575,31 @@ def benchmark_algo(ext, args, meta):
             False,
         )
 
-    # Prime initialization/cache outside timing.
+    # Prime initialization/cache outside timing and outside CUDA graph capture.
     run()
     torch.cuda.synchronize()
 
-    ms = time_cuda(run, args.warmup, args.iters)
-    return float(ms)
+    if args.timing_mode == "eager":
+        ms = time_cuda_eager(run, args.warmup, args.iters)
+        return ms, "eager", None
+
+    if args.timing_mode == "graph":
+        ms = time_cuda_graph_unrolled(run, args.warmup, args.iters, args.graph_repeats)
+        return ms, f"graph_unrolled_{args.graph_repeats}", None
+
+    # auto: prefer graph-unrolled but fall back to eager if capture fails.
+    try:
+        ms = time_cuda_graph_unrolled(run, args.warmup, args.iters, args.graph_repeats)
+        return ms, f"graph_unrolled_{args.graph_repeats}", None
+    except Exception as e:
+        ms = time_cuda_eager(run, args.warmup, args.iters)
+        return ms, "eager_fallback", repr(e)
 
 
-def gpu_name_slug():
-    name = torch.cuda.get_device_properties(torch.cuda.current_device()).name
-    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_"), name
+# ----------------------------- main -----------------------------
 
 
-def write_json(path: Path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--m", type=int, required=True)
     ap.add_argument("--n", type=int, required=True)
@@ -507,16 +612,33 @@ def main():
     ap.add_argument("--reldn", type=int, default=0, help="0 means auto")
     ap.add_argument("--top-csv", type=int, default=40)
     ap.add_argument("--top-save", type=int, default=10)
-    ap.add_argument("--warmup", type=int, default=50)
-    ap.add_argument("--iters", type=int, default=1000)
+    ap.add_argument("--warmup", type=int, default=20)
+    ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--match-stages", choices=["auto", "exact", "ignore"], default="auto")
     ap.add_argument("--default-mainloop", choices=["ws", "pingpong", "cooperative"], default="ws")
+    ap.add_argument("--timing-mode", choices=["auto", "graph", "eager"], default="graph")
+    ap.add_argument("--graph-repeats", type=int, default=100)
+
+    # CSV compatibility filters. Defaults match the current C++ wrapper:
+    # ElementA=f16, ElementB=f16, ElementAccumulator=f32, ElementC=f16, ElementD=f16.
+    ap.add_argument("--csv-a-dtype", choices=["f16"], default="f16")
+    ap.add_argument("--csv-b-dtype", choices=["f16"], default="f16")
+    ap.add_argument("--csv-accum-dtype", choices=["f32"], default="f32")
+    ap.add_argument("--csv-c-dtype", choices=["f16", "void", "any"], default="f16")
+    ap.add_argument("--csv-d-dtype", choices=["f16", "f32", "any"], default="f16")
+    ap.add_argument("--csv-a-layout", choices=["row", "column"], default="row")
+    ap.add_argument("--csv-b-layout", choices=["row", "column"], default="column")
     ap.add_argument("--no-filter-layouts", dest="filter_layouts", action="store_false")
     ap.add_argument("--allow-split-k", action="store_true")
+
     args = ap.parse_args()
 
+    if args.graph_repeats < 1:
+        raise ValueError("--graph-repeats must be >= 1")
+
     root = Path(__file__).resolve().parents[1]
+
     csv_path = Path(args.csv).expanduser().resolve() if args.csv else None
     if csv_path is None:
         if args.csv_dir is None:
@@ -526,13 +648,17 @@ def main():
         raise FileNotFoundError(csv_path)
 
     algo_path = Path(args.algo_dict).expanduser().resolve() if args.algo_dict else root / "configs" / "AlgoDictSm90.json"
+    if not algo_path.exists():
+        raise FileNotFoundError(algo_path)
+
+    torch.cuda.set_device(args.device)
 
     records, counts = parse_csv(args, csv_path)
     by8, by9, inverse = load_algo_dict(algo_path)
 
     considered = records[: args.top_csv]
-    matched = []
-    missing = []
+    matched: List[Dict[str, Any]] = []
+    missing: List[Dict[str, Any]] = []
 
     for r in considered:
         algo, how = match_algo(r, by8, by9, args.match_stages)
@@ -552,16 +678,16 @@ def main():
             "algo_cluster": inverse[algo]["cluster"],
             "algo_stages": inverse[algo].get("stages"),
             "algo_mainloop": inverse[algo]["mainloop"],
+            "algo_epilogue": inverse[algo].get("epilogue", "auto"),
         })
         matched.append(rr)
 
     matched = dedupe_matched(matched)
 
-    torch.cuda.set_device(args.device)
     ext = load_ext(root)
 
-    ok = []
-    failed = []
+    ok: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
 
     print("========================================")
     print("gen_config_sm90")
@@ -575,6 +701,10 @@ def main():
     print(f"matched unique: {len(matched)}")
     print(f"missing rows:   {len(missing)}")
     print(f"match_stages:   {args.match_stages}")
+    print(f"timing_mode:    {args.timing_mode}")
+    print(f"graph_repeats:  {args.graph_repeats}")
+    print(f"csv A/B/C/D:    {args.csv_a_dtype}:{args.csv_a_layout} / {args.csv_b_dtype}:{args.csv_b_layout} / {args.csv_c_dtype} / {args.csv_d_dtype}")
+    print(f"csv accum:      {args.csv_accum_dtype}")
     print("")
     print("CSV filter counts:")
     for k, v in counts.items():
@@ -587,6 +717,7 @@ def main():
             f"algo={r['algo']} tile={r['tile_m']}x{r['tile_n']}x{r['tile_k']} "
             f"cluster={r['cluster']} stages={r['stages']} "
             f"mainloop={r['mainloop']} cutlass={r['cutlass_runtime']:.6f} "
+            f"C={r.get('c_dtype')} D={r.get('d_dtype')} "
             f"match={r['match']}"
         )
         try:
@@ -595,11 +726,15 @@ def main():
                 "tile_m": r["algo_tile_m"],
                 "tile_n": r["algo_tile_n"],
             }
-            ms = benchmark_algo(ext, args, meta)
+            ms, timing_used, graph_error = benchmark_algo(ext, args, meta)
             r["measured_ms"] = ms
             r[f"{args.layout}_gemm_ms"] = ms
+            r["timing_used"] = timing_used
+            r["graph_capture_error"] = graph_error
             ok.append(r)
-            print(f"  {args.layout}_gemm_ms={ms:.6f}")
+            print(f"  {args.layout}_gemm_ms={ms:.6f} timing={timing_used}")
+            if graph_error:
+                print(f"  graph_capture_error={graph_error}")
         except Exception as e:
             rr = dict(r)
             rr["error"] = repr(e)
@@ -624,6 +759,18 @@ def main():
         "warmup": args.warmup,
         "iters": args.iters,
         "match_stages": args.match_stages,
+        "timing_mode": args.timing_mode,
+        "graph_repeats": args.graph_repeats,
+        "csv_filter": {
+            "a_dtype": args.csv_a_dtype,
+            "b_dtype": args.csv_b_dtype,
+            "accum_dtype": args.csv_accum_dtype,
+            "c_dtype": args.csv_c_dtype,
+            "d_dtype": args.csv_d_dtype,
+            "a_layout": args.csv_a_layout,
+            "b_layout": args.csv_b_layout,
+            "filter_layouts": args.filter_layouts,
+        },
         "BM": [int(x["tile_m"]) for x in selected],
         "BN": [int(x["tile_n"]) for x in selected],
         "BK": [int(x["tile_k"]) for x in selected],
@@ -635,7 +782,8 @@ def main():
     }
 
     missing_obj = {
-        "description": "CUTLASS CSV rows that did not match AlgoDictSm90",
+        "description": "CUTLASS CSV rows that did not match AlgoDictSm90 after current filters",
+        "csv_filter_counts": counts,
         "missing": missing,
     }
 
@@ -661,8 +809,10 @@ def main():
             print(
                 f"  #{i}: algo={r['algo']} tile={r['tile_m']}x{r['tile_n']}x{r['tile_k']} "
                 f"cluster={r['cluster']} stages={r['stages']} mainloop={r['mainloop']} "
+                f"C={r.get('c_dtype')} D={r.get('d_dtype')} "
                 f"{args.layout}_gemm_ms={r['measured_ms']:.6f} "
-                f"cutlass_runtime={r['cutlass_runtime']:.6f} match={r['match']}"
+                f"cutlass_runtime={r['cutlass_runtime']:.6f} "
+                f"timing={r.get('timing_used')} match={r['match']}"
             )
     else:
         print("")
