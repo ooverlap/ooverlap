@@ -41,7 +41,7 @@ void cutlass_gemm_signal_sm90(
   using ElementC           = cutlass::half_t;
   using LayoutC            = cutlass::layout::RowMajor;
 
-  // Use float accumulation/compute on SM90
+  // Use float accumulation/compute on SM90.
   using ElementAccumulator = float;
 
   constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
@@ -62,24 +62,37 @@ void cutlass_gemm_signal_sm90(
     SwizzleSize
   >;
 
-  // In FlashOverlap-style use, beta==0 so C is not read.
-  // D is the output buffer that is interpreted as a "reshaped" matrix:
-  //   new_N = ReLDN * ThreadblockN
-  //   new_M = (M*N) / new_N
+  // FlashOverlap-style packed output:
   //
-  // This is the same idea as FlashOverlap SM80: reshape + tile-permutation to make segments contiguous.
+  //   ReLDN = packed tile columns
+  //
+  //   packed_N = ReLDN * ThreadblockN
+  //
+  // For true per-tile contiguous communication, use:
+  //
+  //   ReLDN = 1
+  //
+  // Then D is interpreted as:
+  //
+  //   [num_tiles * ThreadblockM, ThreadblockN]
+  //
+  // and every GEMM tile is a single contiguous slice.
   int64_t ld_D_reshaped = int64_t(ReLDN) * int64_t(ThreadblockN);
 
   typename GemmSignal::Arguments arguments(
     problem_size,
     reinterpret_cast<cutlass::half_t*>(A),
     reinterpret_cast<cutlass::half_t*>(B),
-    reinterpret_cast<cutlass::half_t*>(D),     // C (unused if beta=0)
-    reinterpret_cast<cutlass::half_t*>(D),     // D (FINAL, reordered + reshaped in-place)
-    (int64_t)K,                                // ldm_A (RowMajor A: ld = K)
-    (int64_t)K,                                // ldm_B (ColumnMajor B: ld = K)
-    (int64_t)N,                                // ldm_C (RowMajor C: ld = N)
-    ld_D_reshaped,                             // ldm_D (RowMajor reshaped D: ld = ReLDN*TileN)
+
+    // C is unused because beta == 0. However, pass the same packed pointer and
+    // packed leading dimension to avoid any mismatched source-layout behavior.
+    reinterpret_cast<cutlass::half_t*>(D),     // C
+    reinterpret_cast<cutlass::half_t*>(D),     // D
+
+    (int64_t)K,                                // ldm_A, RowMajor A: ld = K
+    (int64_t)K,                                // ldm_B, ColumnMajor B represented as [N,K]
+    ld_D_reshaped,                             // ldm_C, packed/reshaped
+    ld_D_reshaped,                             // ldm_D, packed/reshaped
     {
       ElementAccumulator(1.0f),
       ElementAccumulator(0.0f)
@@ -87,7 +100,7 @@ void cutlass_gemm_signal_sm90(
     MM,
     RA,
     (N / ThreadblockN),                        // kMonitoredColumn = original tile-cols
-    ReLDN,                                     // kReorderedColumn = reordered tile-cols
+    ReLDN,                                     // kReorderedColumn = packed tile-cols
     CommThr,
     Monitor
   );
@@ -128,7 +141,7 @@ bool gemm_signal_sm90_dispatch(
     bool Monitor,
     cudaStream_t stream) {
 
-  // NOTE: for now we support one known-good instance (the first line in signal_instances_sm90.inc)
+  // NOTE: for now we support one known-good instance:
   //   (128,128,32) TB, (64,64,32) Warp, (16,8,16) Inst, stages=3, swizzle=1, splitk=1
   switch (algo) {
     case 0:

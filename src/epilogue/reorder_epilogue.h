@@ -38,17 +38,17 @@ namespace cutlass {
 /// Parameters needed for reorder + signaling inside epilogue.
 struct SignalingEpilogueParams {
   int  *ptr_Monitored_Matrix;
-  int  *ptr_Reorder_Array;      // logical tile idx -> reordered tile idx
-  int   kMonitoredColumn;       // original tile-cols (N / TileN)
-  int   kReorderedColumn;       // reordered tile-cols (ReLDN)
-  int  *kCommu_Seg_Array;       // segment sizes (sum == total tiles)
+  int  *ptr_Reorder_Array;      // logical tile idx -> reordered/packed tile idx
+  int   kMonitoredColumn;       // original tile-cols = N / TileN
+  int   kReorderedColumn;       // packed tile-cols = ReLDN
+  int  *kCommu_Seg_Array;       // segment sizes in units of tiles; sum == total tiles
   bool  if_monitor;
 
   int   ThreadblockM;
   int   ThreadblockN;
 
-  void *ptr_D;                  // base ptr of FINAL output buffer (reshaped row-major)
-  int   ld_D;                   // leading dim (elements) of reshaped output:
+  void *ptr_D;                  // base ptr of FINAL output buffer
+  int   ld_D;                   // leading dim in elements of packed D:
                                 //   kReorderedColumn * ThreadblockN
 
   // Optional override/debug:
@@ -84,8 +84,41 @@ struct SignalingEpilogueParams {
 /// This wrapper matches the SM90 GemmUniversal warp-specialized epilogue interface.
 /// We forward almost everything to BaseEpilogue, but:
 ///   1) remap CTA tile coords into the reordered packed output space
-///   2) emit one segment-ready signal when the last participating epilogue subgroup
+///   2) pass a packed problem shape to the base epilogue so predicates match packed D
+///   3) emit one segment-ready signal when the last participating epilogue subgroup
 ///      for that tile reaches store_tail()
+///
+/// Packed D layout:
+///
+///   original logical GEMM output:
+///     [M, N]
+///
+///   original logical tile grid:
+///     tile_rows = ceil(M / ThreadblockM)
+///     tile_cols = ceil(N / ThreadblockN)
+///
+///   RA:
+///     RA[logical_tile] = packed_tile
+///
+///   packed tile grid:
+///     packed_tile_cols = kReorderedColumn = ReLDN
+///     packed_tile_rows = ceil(num_tiles / packed_tile_cols)
+///
+///   packed D shape:
+///     [packed_tile_rows * ThreadblockM,
+///      packed_tile_cols * ThreadblockN]
+///
+/// For fully contiguous per-tile communication, use:
+///
+///   ReLDN = 1
+///
+/// Then D is physically:
+///
+///   [num_tiles * ThreadblockM, ThreadblockN]
+///
+/// and tile p occupies:
+///
+///   D[p * ThreadblockM : (p+1) * ThreadblockM, 0 : ThreadblockN]
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <class BaseEpilogue, class ThreadblockShape>
@@ -223,60 +256,115 @@ struct ReorderSignalEpilogue {
 
   // --------------------------------------------------------------------------
   // store():
-  //   - logical tile id is flattened with kMonitoredColumn
-  //   - reordered tile id is unflattened with kReorderedColumn
-  //   - base epilogue receives a PACKED problem shape so its predicates match
-  //     the reordered packed D layout
+  //
+  // This is the actual physical pack/reorder.
+  //
+  // Incoming tile_coord is the logical GEMM tile coordinate:
+  //
+  //   cta_m, cta_n
+  //
+  // Normal CUTLASS epilogue would store tile (cta_m, cta_n) to:
+  //
+  //   D[cta_m * TileM : ..., cta_n * TileN : ...]
+  //
+  // Here we remap:
+  //
+  //   logical_tile = cta_m * original_tile_cols + cta_n
+  //   packed_tile  = RA[logical_tile]
+  //
+  // Then pass the base epilogue:
+  //
+  //   packed_cta_m = packed_tile / ReLDN
+  //   packed_cta_n = packed_tile % ReLDN
+  //
+  // and a packed problem shape:
+  //
+  //   packed_M = ceil(num_tiles / ReLDN) * TileM
+  //   packed_N = ReLDN * TileN
+  //
+  // The base epilogue then stores normally, but into packed coordinates.
   // --------------------------------------------------------------------------
- template <
-  class EpiLoadPipe, class EpiLoadState,
-  class EpiStorePipe, class EpiStoreState,
-  class ProblemShape, class TileShape, class TileCoord,
-  class AccumTensor, class TiledMma, class EpiSharedStorage
->
-CUTLASS_DEVICE
-decltype(auto) store(
-    EpiLoadPipe&&   epi_load_pipe,
-    EpiLoadState&&  epi_load_state,
-    EpiStorePipe&&  epi_store_pipe,
-    EpiStoreState&& epi_store_state,
-    ProblemShape const& problem_shape,
-    TileShape   const& tile_shape,
-    TileCoord   const& tile_coord,
-    AccumTensor const& accum,
-    TiledMma    const& tiled_mma,
-    int thread_idx,
-    EpiSharedStorage& shared_storage) {
+  template <
+    class EpiLoadPipe, class EpiLoadState,
+    class EpiStorePipe, class EpiStoreState,
+    class ProblemShape, class TileShape, class TileCoord,
+    class AccumTensor, class TiledMma, class EpiSharedStorage
+  >
+  CUTLASS_DEVICE
+  decltype(auto) store(
+      EpiLoadPipe&&   epi_load_pipe,
+      EpiLoadState&&  epi_load_state,
+      EpiStorePipe&&  epi_store_pipe,
+      EpiStoreState&& epi_store_state,
+      ProblemShape const& problem_shape,
+      TileShape   const& tile_shape,
+      TileCoord   const& tile_coord,
+      AccumTensor const& accum,
+      TiledMma    const& tiled_mma,
+      int thread_idx,
+      EpiSharedStorage& shared_storage) {
 
-  // Cache ORIGINAL logical M,N for store_tail bookkeeping
-  M_ = int(cute::get<0>(problem_shape));
-  N_ = int(cute::get<1>(problem_shape));
+    // Cache ORIGINAL logical M,N for store_tail bookkeeping.
+    M_ = int(cute::get<0>(problem_shape));
+    N_ = int(cute::get<1>(problem_shape));
 
-  // No physical reorder for bring-up:
-  // store into the original tile position
-  int cta_m = int(cute::get<0>(tile_coord));
-  int cta_n = int(cute::get<1>(tile_coord));
+    int cta_m = int(cute::get<0>(tile_coord));
+    int cta_n = int(cute::get<1>(tile_coord));
 
-  int tile_cols = params_.signal.kMonitoredColumn;
-  int logical_tile = cta_m * tile_cols + cta_n;
+    int tile_m = params_.signal.ThreadblockM;
+    int tile_n = params_.signal.ThreadblockN;
 
-  // For bring-up, use logical tile id directly for signaling/segment bookkeeping.
-  reordered_tile_ = logical_tile;
+    int original_tile_cols = params_.signal.kMonitoredColumn;
+    int packed_tile_cols   = params_.signal.kReorderedColumn;
 
-  return base_.store(
-    std::forward<EpiLoadPipe>(epi_load_pipe),
-    std::forward<EpiLoadState>(epi_load_state),
-    std::forward<EpiStorePipe>(epi_store_pipe),
-    std::forward<EpiStoreState>(epi_store_state),
-    problem_shape,
-    tile_shape,
-    tile_coord,
-    accum,
-    tiled_mma,
-    thread_idx,
-    shared_storage
-  );
-} 
+    if (packed_tile_cols <= 0) {
+      packed_tile_cols = original_tile_cols;
+    }
+
+    int logical_tile = cta_m * original_tile_cols + cta_n;
+
+    int packed_tile = logical_tile;
+    if (params_.signal.ptr_Reorder_Array != nullptr) {
+      packed_tile = params_.signal.ptr_Reorder_Array[logical_tile];
+    }
+
+    reordered_tile_ = packed_tile;
+
+    int original_tile_rows = (M_ + tile_m - 1) / tile_m;
+    int original_tile_num  = original_tile_rows * original_tile_cols;
+
+    int packed_tile_rows = (original_tile_num + packed_tile_cols - 1) / packed_tile_cols;
+
+    int packed_M = packed_tile_rows * tile_m;
+    int packed_N = packed_tile_cols * tile_n;
+
+    int packed_cta_m = packed_tile / packed_tile_cols;
+    int packed_cta_n = packed_tile - packed_cta_m * packed_tile_cols;
+
+    // Preserve the original type/rank of problem_shape and tile_coord.
+    // This is less brittle than constructing a new CuTe coord and guessing rank.
+    auto packed_problem_shape = problem_shape;
+    cute::get<0>(packed_problem_shape) = packed_M;
+    cute::get<1>(packed_problem_shape) = packed_N;
+
+    auto packed_tile_coord = tile_coord;
+    cute::get<0>(packed_tile_coord) = packed_cta_m;
+    cute::get<1>(packed_tile_coord) = packed_cta_n;
+
+    return base_.store(
+      std::forward<EpiLoadPipe>(epi_load_pipe),
+      std::forward<EpiLoadState>(epi_load_state),
+      std::forward<EpiStorePipe>(epi_store_pipe),
+      std::forward<EpiStoreState>(epi_store_state),
+      packed_problem_shape,
+      tile_shape,
+      packed_tile_coord,
+      accum,
+      tiled_mma,
+      thread_idx,
+      shared_storage
+    );
+  }
 
   // --------------------------------------------------------------------------
   // store_tail():
@@ -287,6 +375,12 @@ decltype(auto) store(
   //
   // Optional:
   //   ptr_Debug_Arrivals[tile] counts actual elected arrivals for diagnosis.
+  //
+  // Important:
+  //   tile_done[] and segment accounting are indexed by reordered/packed tile id,
+  //   not logical tile id. This is what makes communication offsets simple:
+  //
+  //     offset = packed_tile_begin * TileM * TileN
   //
   // For correctness, the "expected arrivals per tile" must match the number of
   // times cute::elect_one_sync() fires for one CTA tile on this compiled kernel.
@@ -314,12 +408,12 @@ decltype(auto) store(
 
       int tile = reordered_tile_;
 
-      // Total logical tile count
+      // Total logical tile count.
       int tile_rows = (M_ + params_.signal.ThreadblockM - 1) / params_.signal.ThreadblockM;
       int tile_cols = (N_ + params_.signal.ThreadblockN - 1) / params_.signal.ThreadblockN;
       int num_tiles = tile_rows * tile_cols;
 
-      // Number of segments
+      // Number of segments.
       int num_segments = 0;
       int sum = 0;
       while (sum < num_tiles) {
@@ -327,7 +421,7 @@ decltype(auto) store(
         ++num_segments;
       }
 
-      // Which segment contains this reordered tile?
+      // Which segment contains this reordered/packed tile?
       int idx_bound = params_.signal.kCommu_Seg_Array[0];
       int seg = 0;
       while (idx_bound <= tile) {
@@ -335,12 +429,12 @@ decltype(auto) store(
         idx_bound += params_.signal.kCommu_Seg_Array[seg];
       }
 
-      // Optional debug: count actual bookkeeping arrivals per tile
+      // Optional debug: count actual bookkeeping arrivals per tile.
       if (params_.signal.ptr_Debug_Arrivals) {
         atomicAdd(&params_.signal.ptr_Debug_Arrivals[tile], 1);
       }
 
-      // Count one arrival per warp-group, not per warp
+      // Count one arrival per warp-group, not per warp.
       int* tile_done = params_.signal.ptr_Monitored_Matrix + num_segments;
 
       int expected_arrivals =
@@ -354,9 +448,10 @@ decltype(auto) store(
 
       int old = atomicAdd(&tile_done[tile], 1);
 
-      // Last warp-group to finish this tile signals its segment exactly once
+      // Last warp-group to finish this tile signals its segment exactly once.
       if (old == (expected_arrivals - 1)) {
         __threadfence();
+
         atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);
 
         if (params_.signal.if_monitor) {
@@ -371,7 +466,7 @@ decltype(auto) store(
         }
       }
     }
-    
+
     return ret;
   }
 
