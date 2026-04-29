@@ -47,7 +47,7 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 #ifndef OOVERLAP_USE_BASE_EPILOGUE_ONLY
-#define OOVERLAP_USE_BASE_EPILOGUE_ONLY 0
+#define OOVERLAP_USE_BASE_EPILOGUE_ONLY 1
 #endif
 
 #define CUTLASS_CHECK_SM90(status)                                                               \
@@ -66,6 +66,19 @@ namespace cutlass {
 
 namespace detail {
 
+template <class T, class... Args>
+struct is_brace_constructible {
+private:
+  template <class U, class... A>
+  static auto test(int) -> decltype(U{std::declval<A>()...}, std::true_type{});
+
+  template <class, class...>
+  static auto test(...) -> std::false_type;
+
+public:
+  static constexpr bool value = decltype(test<T, Args...>(0))::value;
+};
+
 template <
   class KernelArguments,
   class ProblemShape,
@@ -80,6 +93,18 @@ KernelArguments make_kernel_arguments(
     EpilogueArguments const& epilogue_args,
     cutlass::KernelHardwareInfo const& hw_info,
     TileSchedArguments const& sched_args) {
+
+  //
+  // Different CUTLASS SM90 kernel headers expose different Arguments shapes:
+  //
+  //   WS/Pingpong variants commonly accept hw_info.
+  //   Cooperative/persistent variants often use TileSchedulerArguments instead
+  //   and do not take hw_info in the Arguments constructor.
+  //
+  // Also, some versions expose constructors while others rely on aggregate
+  // brace initialization. So each case below checks both parenthesis
+  // constructibility and brace constructibility.
+  //
 
   if constexpr (std::is_constructible<
       KernelArguments,
@@ -99,6 +124,56 @@ KernelArguments make_kernel_arguments(
       sched_args
     );
 
+  } else if constexpr (is_brace_constructible<
+      KernelArguments,
+      cutlass::gemm::GemmUniversalMode,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      cutlass::KernelHardwareInfo,
+      TileSchedArguments>::value) {
+
+    return KernelArguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info,
+      sched_args
+    };
+
+  } else if constexpr (std::is_constructible<
+      KernelArguments,
+      cutlass::gemm::GemmUniversalMode,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      TileSchedArguments>::value) {
+
+    return KernelArguments(
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      sched_args
+    );
+
+  } else if constexpr (is_brace_constructible<
+      KernelArguments,
+      cutlass::gemm::GemmUniversalMode,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      TileSchedArguments>::value) {
+
+    return KernelArguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      sched_args
+    };
+
   } else if constexpr (std::is_constructible<
       KernelArguments,
       cutlass::gemm::GemmUniversalMode,
@@ -114,6 +189,50 @@ KernelArguments make_kernel_arguments(
       epilogue_args,
       hw_info
     );
+
+  } else if constexpr (is_brace_constructible<
+      KernelArguments,
+      cutlass::gemm::GemmUniversalMode,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      cutlass::KernelHardwareInfo>::value) {
+
+    return KernelArguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info
+    };
+
+  } else if constexpr (std::is_constructible<
+      KernelArguments,
+      cutlass::gemm::GemmUniversalMode,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments>::value) {
+
+    return KernelArguments(
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args
+    );
+
+  } else if constexpr (is_brace_constructible<
+      KernelArguments,
+      cutlass::gemm::GemmUniversalMode,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments>::value) {
+
+    return KernelArguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args
+    };
 
   } else if constexpr (std::is_constructible<
       KernelArguments,
@@ -131,6 +250,50 @@ KernelArguments make_kernel_arguments(
       sched_args
     );
 
+  } else if constexpr (is_brace_constructible<
+      KernelArguments,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      cutlass::KernelHardwareInfo,
+      TileSchedArguments>::value) {
+
+    return KernelArguments{
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info,
+      sched_args
+    };
+
+  } else if constexpr (std::is_constructible<
+      KernelArguments,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      TileSchedArguments>::value) {
+
+    return KernelArguments(
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      sched_args
+    );
+
+  } else if constexpr (is_brace_constructible<
+      KernelArguments,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      TileSchedArguments>::value) {
+
+    return KernelArguments{
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      sched_args
+    };
+
   } else if constexpr (std::is_constructible<
       KernelArguments,
       ProblemShape,
@@ -145,9 +308,47 @@ KernelArguments make_kernel_arguments(
       hw_info
     );
 
+  } else if constexpr (is_brace_constructible<
+      KernelArguments,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments,
+      cutlass::KernelHardwareInfo>::value) {
+
+    return KernelArguments{
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info
+    };
+
+  } else if constexpr (std::is_constructible<
+      KernelArguments,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments>::value) {
+
+    return KernelArguments(
+      problem_shape,
+      mainloop_args,
+      epilogue_args
+    );
+
+  } else if constexpr (is_brace_constructible<
+      KernelArguments,
+      ProblemShape,
+      MainloopArguments,
+      EpilogueArguments>::value) {
+
+    return KernelArguments{
+      problem_shape,
+      mainloop_args,
+      epilogue_args
+    };
+
   } else {
     static_assert(
-      std::is_constructible<
+      is_brace_constructible<
         KernelArguments,
         cutlass::gemm::GemmUniversalMode,
         ProblemShape,
@@ -155,7 +356,7 @@ KernelArguments make_kernel_arguments(
         EpilogueArguments,
         cutlass::KernelHardwareInfo,
         TileSchedArguments>::value,
-      "Unsupported CUTLASS SM90 KernelArguments constructor for this schedule."
+      "Unsupported CUTLASS SM90 KernelArguments constructor/aggregate layout for this schedule."
     );
   }
 }

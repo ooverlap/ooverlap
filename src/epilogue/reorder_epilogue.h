@@ -69,8 +69,9 @@ struct SignalingEpilogueParams {
   int   kEpilogueArrivalsPerTile;
   int  *ptr_Debug_Arrivals;
 
-  // Faster look up
-  int num_segments;
+  // Number of segment counters at the front of ptr_Monitored_Matrix.
+  // tile_done starts at ptr_Monitored_Matrix + num_segments.
+  int   num_segments;
 
   CUTLASS_HOST_DEVICE
   SignalingEpilogueParams() :
@@ -227,11 +228,27 @@ struct ReorderSignalEpilogue {
     return base_.load_tail(static_cast<Args&&>(args)...);
   }
 
+  //
+  // NOTE:
+  //   The normal WS/pingpong SM90 kernels call epilogue.store with:
+  //
+  //     (..., tiled_mma, thread_idx, shared_storage)
+  //
+  //   The cooperative SM90 kernel calls epilogue.store with one extra trailing
+  //   scheduler/work-index argument:
+  //
+  //     (..., tiled_mma, thread_idx, shared_storage, some_int32)
+  //
+  //   Keep this store signature variadic at the end and forward those extra
+  //   args to BaseEpilogue::store. Otherwise cooperative kernels fail with
+  //   "no instance of ReorderSignalEpilogue::store matches the argument list".
+  //
   template <
     class EpiLoadPipe, class EpiLoadState,
     class EpiStorePipe, class EpiStoreState,
     class ProblemShape, class TileShape, class TileCoord,
-    class AccumTensor, class TiledMma, class EpiSharedStorage
+    class AccumTensor, class TiledMma, class EpiSharedStorage,
+    class... ExtraArgs
   >
   OOVERLAP_DEVICE_INLINE
   decltype(auto) store(
@@ -245,7 +262,8 @@ struct ReorderSignalEpilogue {
       AccumTensor const& accum,
       TiledMma    const& tiled_mma,
       int thread_idx,
-      EpiSharedStorage& shared_storage) {
+      EpiSharedStorage& shared_storage,
+      ExtraArgs&&... extra_args) {
 
     M_ = int(cute::get<0>(problem_shape));
     N_ = int(cute::get<1>(problem_shape));
@@ -307,7 +325,8 @@ struct ReorderSignalEpilogue {
       accum,
       tiled_mma,
       thread_idx,
-      shared_storage
+      shared_storage,
+      static_cast<ExtraArgs&&>(extra_args)...
     );
 
 #else
@@ -323,7 +342,8 @@ struct ReorderSignalEpilogue {
       accum,
       tiled_mma,
       thread_idx,
-      shared_storage
+      shared_storage,
+      static_cast<ExtraArgs&&>(extra_args)...
     );
 
 #endif
@@ -352,7 +372,6 @@ struct ReorderSignalEpilogue {
 
       int tile = reordered_tile_;
 
-
 #if OOVERLAP_ENABLE_EPILOGUE_DEBUG
       if (params_.signal.ptr_Debug_Arrivals) {
         atomicAdd(&params_.signal.ptr_Debug_Arrivals[tile], 1);
@@ -374,7 +393,7 @@ struct ReorderSignalEpilogue {
 
       if (old == (expected_arrivals - 1)) {
         __threadfence();
-        
+
         int idx_bound = params_.signal.kCommu_Seg_Array[0];
         int seg = 0;
 
