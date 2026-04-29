@@ -15,10 +15,12 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
-  int ThreadblockM, int ThreadblockN, int ThreadblockK,
-  int WarpM, int WarpN, int WarpK,
-  int InstructionM, int InstructionN, int InstructionK,
-  int NumStages, int SwizzleSize, int SplitK
+  int TileM,
+  int TileN,
+  int TileK,
+  typename ClusterShape,
+  typename MainloopSchedule,
+  typename EpilogueSchedule
 >
 void cutlass_gemm_signal_sm90(
   int M, int N, int K,
@@ -28,9 +30,13 @@ void cutlass_gemm_signal_sm90(
   bool Monitor,
   cudaStream_t stream = nullptr
 ) {
-  using ThreadblockShape = cutlass::gemm::GemmShape<ThreadblockM, ThreadblockN, ThreadblockK>;
-  using WarpShape        = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
-  using InstructionShape = cutlass::gemm::GemmShape<InstructionM, InstructionN, InstructionK>;
+  using ElementA           = cutlass::half_t;
+  using LayoutA            = cutlass::layout::RowMajor;
+  using ElementB           = cutlass::half_t;
+  using LayoutB            = cutlass::layout::ColumnMajor;
+  using ElementC           = cutlass::half_t;
+  using LayoutC            = cutlass::layout::RowMajor;
+  using ElementAccumulator = float;
 
   cutlass::gemm::GemmCoord problem_size(M, N, K);
 
@@ -46,20 +52,17 @@ void cutlass_gemm_signal_sm90(
 
   constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 
-  using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-    ElementC, AlignmentC, ElementAccumulator, ElementAccumulator>;
-
   using GemmSignal = cutlass::GemmSignalSm90<
     ElementA, LayoutA,
     ElementB, LayoutB,
     ElementC, LayoutC,
     ElementAccumulator,
-    EpilogueOp,
-    ThreadblockShape,
-    WarpShape,
-    InstructionShape,
-    NumStages,
-    SwizzleSize
+    TileM,
+    TileN,
+    TileK,
+    ClusterShape,
+    MainloopSchedule,
+    EpilogueSchedule
   >;
 
   // FlashOverlap-style packed output:
@@ -77,30 +80,28 @@ void cutlass_gemm_signal_sm90(
   //   [num_tiles * ThreadblockM, ThreadblockN]
   //
   // and every GEMM tile is a single contiguous slice.
-  int64_t ld_D_reshaped = int64_t(ReLDN) * int64_t(ThreadblockN);
+  int64_t ld_D_reshaped = int64_t(ReLDN) * int64_t(TileN);
 
+ 
   typename GemmSignal::Arguments arguments(
     problem_size,
     reinterpret_cast<cutlass::half_t*>(A),
     reinterpret_cast<cutlass::half_t*>(B),
-
-    // C is unused because beta == 0. However, pass the same packed pointer and
-    // packed leading dimension to avoid any mismatched source-layout behavior.
-    reinterpret_cast<cutlass::half_t*>(D),     // C
-    reinterpret_cast<cutlass::half_t*>(D),     // D
-
-    (int64_t)K,                                // ldm_A, RowMajor A: ld = K
-    (int64_t)K,                                // ldm_B, ColumnMajor B represented as [N,K]
-    ld_D_reshaped,                             // ldm_C, packed/reshaped
-    ld_D_reshaped,                             // ldm_D, packed/reshaped
-    {
-      ElementAccumulator(1.0f),
-      ElementAccumulator(0.0f)
-    },
+    reinterpret_cast<cutlass::half_t*>(D),
+    reinterpret_cast<cutlass::half_t*>(D),
+  
+    int64_t(K),
+    int64_t(K),
+    ld_D_reshaped,
+    ld_D_reshaped,
+  
+    ElementAccumulator(1.0f),
+    ElementAccumulator(0.0f),
+  
     MM,
     RA,
-    (N / ThreadblockN),                        // kMonitoredColumn = original tile-cols
-    ReLDN,                                     // kReorderedColumn = packed tile-cols
+    N / TileN,
+    ReLDN,
     CommThr,
     Monitor
   );
@@ -112,19 +113,19 @@ void cutlass_gemm_signal_sm90(
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define CUTLASS_GEMM_SIGNAL_SM90_INIT(ThreadblockM, ThreadblockN, ThreadblockK, WarpM,      \
-                                       WarpN, WarpK, InstructionM, InstructionN,           \
-                                       InstructionK, NumStages, SwizzleSize, SplitK)       \
-    template void                                                                          \
-    cutlass_gemm_signal_sm90<ThreadblockM, ThreadblockN, ThreadblockK, WarpM, WarpN,      \
-                              WarpK, InstructionM, InstructionN, InstructionK,             \
-                              NumStages, SwizzleSize, SplitK>(                             \
-        int M, int N, int K, int ReLDN, int* CommThr, half* A, half* B, half* D,          \
-        int* MM, int* RA, bool Monitor, cudaStream_t stream)
+/*#define CUTLASS_GEMM_SIGNAL_SM90_INIT(ThreadblockM, ThreadblockN, ThreadblockK, WarpM,      \*/
+                                       /*WarpN, WarpK, InstructionM, InstructionN,           \*/
+                                       /*InstructionK, NumStages, SwizzleSize, SplitK)       \*/
+    /*template void                                                                          \*/
+    /*cutlass_gemm_signal_sm90<ThreadblockM, ThreadblockN, ThreadblockK, WarpM, WarpN,      \*/
+                              /*WarpK, InstructionM, InstructionN, InstructionK,             \*/
+                              /*NumStages, SwizzleSize, SplitK>(                             \*/
+        /*int M, int N, int K, int ReLDN, int* CommThr, half* A, half* B, half* D,          \*/
+        /*int* MM, int* RA, bool Monitor, cudaStream_t stream)*/
 
-#include "../inc/signal_instances_sm90.inc"
+/*#include "../inc/signal_instances_sm90.inc"*/
 
-#undef CUTLASS_GEMM_SIGNAL_SM90_INIT
+/*#undef CUTLASS_GEMM_SIGNAL_SM90_INIT*/
 
 // -------------------------------------------------------------------------------------------------
 // Simple runtime dispatch for testing (1-GPU)
@@ -141,15 +142,21 @@ bool gemm_signal_sm90_dispatch(
     bool Monitor,
     cudaStream_t stream) {
 
-  // NOTE: for now we support one known-good instance:
-  //   (128,128,32) TB, (64,64,32) Warp, (16,8,16) Inst, stages=3, swizzle=1, splitk=1
+  using Cluster1x1x1 = cute::Shape<cute::_1, cute::_1, cute::_1>;
+  using Cluster1x2x1 = cute::Shape<cute::_1, cute::_2, cute::_1>;
+  using Cluster2x1x1 = cute::Shape<cute::_2, cute::_1, cute::_1>;
+
+  using WS = cutlass::gemm::KernelTmaWarpSpecialized;
+
+  using EpiAuto = cutlass::epilogue::collective::EpilogueScheduleAuto;
+
   switch (algo) {
     case 0:
       cutlass_gemm_signal_sm90<
           128, 128, 32,
-          64,  64,  32,
-          16,  8,   16,
-          3,   1,   1>(
+          Cluster1x1x1,
+          WS,
+          EpiAuto>(
           M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
@@ -159,9 +166,9 @@ bool gemm_signal_sm90_dispatch(
     case 1:
       cutlass_gemm_signal_sm90<
           128, 128, 64,
-          64,  64,  32,
-          16,  8,   16,
-          3,   1,   1>(
+          Cluster1x1x1,
+          WS,
+          EpiAuto>(
           M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
@@ -170,10 +177,10 @@ bool gemm_signal_sm90_dispatch(
 
     case 2:
       cutlass_gemm_signal_sm90<
-          128, 128, 64,
-          64,  64,  64,
-          16,  8,   16,
-          3,   1,   1>(
+          128, 128, 128,
+          Cluster1x1x1,
+          WS,
+          EpiAuto>(
           M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
@@ -182,10 +189,10 @@ bool gemm_signal_sm90_dispatch(
 
     case 3:
       cutlass_gemm_signal_sm90<
-          128, 256, 32,
-          64,  64,  32,
-          16,  8,   16,
-          3,   1,   1>(
+          128, 128, 64,
+          Cluster1x2x1,
+          WS,
+          EpiAuto>(
           M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
@@ -194,34 +201,10 @@ bool gemm_signal_sm90_dispatch(
 
     case 4:
       cutlass_gemm_signal_sm90<
-          128, 256, 64,
-          64,  64,  64,
-          16,  8,   16,
-          3,   1,   1>(
-          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
-          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
-          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
-          reinterpret_cast<int*>(RA), Monitor, stream);
-      return true;
-
-    case 5:
-      cutlass_gemm_signal_sm90<
-          256, 128, 32,
-          64,  64,  32,
-          16,  8,   16,
-          3,   1,   1>(
-          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
-          reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
-          reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
-          reinterpret_cast<int*>(RA), Monitor, stream);
-      return true;
-
-    case 6:
-      cutlass_gemm_signal_sm90<
-          256, 128, 64,
-          64,  64,  64,
-          16,  8,   16,
-          3,   1,   1>(
+          128, 128, 64,
+          Cluster2x1x1,
+          WS,
+          EpiAuto>(
           M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
@@ -230,7 +213,8 @@ bool gemm_signal_sm90_dispatch(
 
     default:
       return false;
-  } 
+  }
 }
 
 } // namespace ooverlap
+

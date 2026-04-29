@@ -19,6 +19,25 @@
 
 namespace py = pybind11;
 
+struct Sm90GemmAlgoInfo {
+  int tile_m;
+  int tile_n;
+};
+
+static Sm90GemmAlgoInfo get_sm90_gemm_algo_info(int64_t algo) {
+  switch (algo) {
+    case 0:
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+      return {128, 128};
+
+    default:
+      TORCH_CHECK(false, "Unsupported algo=", algo);
+  }
+}
+
 // --------------------------------------------
 // SM90 1-GPU signal GEMM wrapper (for testing)
 // --------------------------------------------
@@ -55,8 +74,9 @@ static void gemm_signal_sm90(
   TORCH_CHECK(B_packed.size(1) == K, "B_packed must be (N,K) where K matches A");
   TORCH_CHECK(ReLDN > 0, "ReLDN must be > 0");
 
-  constexpr int64_t TileM = 128;
-  constexpr int64_t TileN = 128;
+  auto info = get_sm90_gemm_algo_info(algo);
+  const int64_t TileM = info.tile_m;
+  const int64_t TileN = info.tile_n;
 
   //TORCH_CHECK(algo == 0, "Only algo=0 supported in bring-up");
   TORCH_CHECK(M % TileM == 0, "M must be multiple of 128 for algo=0");

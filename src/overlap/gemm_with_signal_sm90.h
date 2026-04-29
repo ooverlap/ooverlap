@@ -92,12 +92,12 @@ template <
   typename ElementOutput_,
   typename LayoutOutput_,
   typename ElementCompute_,
-  typename EpilogueFunctorOp_,
-  typename ThreadblockShape_,
-  typename WarpShape_,
-  typename InstructionShape_,
-  int Stages,
-  int SwizzleSize
+  int TileM_,
+  int TileN_,
+  int TileK_,
+  typename ClusterShape_,
+  typename MainloopSchedule_,
+  typename EpilogueSchedule_
 >
 class GemmSignalSm90 {
 public:
@@ -109,12 +109,21 @@ public:
   using LayoutOutput   = LayoutOutput_;
   using ElementCompute = ElementCompute_;
 
-  using ThreadblockShape = ThreadblockShape_;
-  using WarpShape        = WarpShape_;
-  using InstructionShape = InstructionShape_;
-
-  static int const kStages  = Stages;
-  static int const kSwizzle = SwizzleSize;
+  static constexpr int TileM = TileM_;
+  static constexpr int TileN = TileN_;
+  static constexpr int TileK = TileK_;
+  
+  using ThreadblockShape = cutlass::gemm::GemmShape<TileM, TileN, TileK>;
+  
+  using TileShape = cute::Shape<
+    cute::Int<TileM>,
+    cute::Int<TileN>,
+    cute::Int<TileK>
+  >;
+  
+  using ClusterShape = ClusterShape_;
+  using MainloopSchedule = MainloopSchedule_;
+  using EpilogueSchedule = EpilogueSchedule_;
 
   static_assert(cutlass::platform::is_same<LayoutOutput, cutlass::layout::RowMajor>::value,
                 "Route-A fused reorder expects RowMajor output buffer interpretation.");
@@ -134,22 +143,18 @@ public:
     ElementInputA, LayoutInputA, AlignmentA,
     ElementInputB, LayoutInputB, AlignmentB,
     ElementCompute,
-    cute::Shape<cute::Int<ThreadblockShape::kM>,
-                cute::Int<ThreadblockShape::kN>,
-                cute::Int<ThreadblockShape::kK>>,
-    cute::Shape<cute::_1, cute::_1, cute::_1>,
+    TileShape,
+    ClusterShape,
     cutlass::gemm::collective::StageCountAuto,
-    cutlass::gemm::KernelTmaWarpSpecialized
+    MainloopSchedule
   >::CollectiveOp;
 
   // Base epilogue
   using BaseCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag,
     OperatorClass,
-    cute::Shape<cute::Int<ThreadblockShape::kM>,
-                cute::Int<ThreadblockShape::kN>,
-                cute::Int<ThreadblockShape::kK>>,
-    cute::Shape<cute::_1, cute::_1, cute::_1>,
+    TileShape,
+    ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
     ElementCompute,
     ElementCompute,
@@ -159,9 +164,9 @@ public:
     ElementOutput,
     LayoutOutput,
     AlignmentD,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
+    EpilogueSchedule
   >::CollectiveOp;
-
+  
   //using CollectiveEpilogue = ReorderSignalEpilogue<BaseCollectiveEpilogue, ThreadblockShape>;
   using CollectiveEpilogue = BaseCollectiveEpilogue;
 
@@ -198,7 +203,8 @@ public:
       ElementOutput *ptr_D_,
       int64_t ldm_A_, int64_t ldm_B_,
       int64_t ldm_C_, int64_t ldm_D_,
-      typename EpilogueFunctorOp_::Params linear_scaling,
+      ElementCompute alpha_,
+      ElementCompute beta_,
       int *ptr_MM, int *ptr_RA,
       int  kMonitoredColumn,
       int  kReorderedColumn,
@@ -210,8 +216,8 @@ public:
       ptr_C(ptr_C_), ptr_D(ptr_D_),
       ldm_A(ldm_A_), ldm_B(ldm_B_),
       ldm_C(ldm_C_), ldm_D(ldm_D_),
-      alpha(linear_scaling.alpha),
-      beta(linear_scaling.beta)
+      alpha(alpha_),
+      beta(beta_)
     {
       signal_params.ptr_Monitored_Matrix = ptr_MM;
       signal_params.ptr_Reorder_Array    = ptr_RA;
