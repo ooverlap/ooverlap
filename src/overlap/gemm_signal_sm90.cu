@@ -30,14 +30,6 @@ void cutlass_gemm_signal_sm90(
   bool Monitor,
   cudaStream_t stream = nullptr
 ) {
-  using ElementA           = cutlass::half_t;
-  using LayoutA            = cutlass::layout::RowMajor;
-  using ElementB           = cutlass::half_t;
-  using LayoutB            = cutlass::layout::ColumnMajor;
-  using ElementC           = cutlass::half_t;
-  using LayoutC            = cutlass::layout::RowMajor;
-  using ElementAccumulator = float;
-
   cutlass::gemm::GemmCoord problem_size(M, N, K);
 
   using ElementA           = cutlass::half_t;
@@ -49,8 +41,6 @@ void cutlass_gemm_signal_sm90(
 
   // Use float accumulation/compute on SM90.
   using ElementAccumulator = float;
-
-  constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 
   using GemmSignal = cutlass::GemmSignalSm90<
     ElementA, LayoutA,

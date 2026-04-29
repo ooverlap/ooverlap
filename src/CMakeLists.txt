@@ -315,6 +315,14 @@ if(OOVERLAP_BUILD_LEGACY_OVERLAP)
 
     ooverlap_apply_torch(ooverlap_overlap)
 
+    target_compile_definitions(ooverlap_overlap PRIVATE
+      NDEBUG
+    )
+
+    target_compile_options(ooverlap_overlap PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    )
+
     target_link_libraries(ooverlap_overlap PUBLIC
       cutlass
       CUDA::cudart

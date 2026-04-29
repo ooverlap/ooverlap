@@ -26,11 +26,16 @@ struct Sm90GemmAlgoInfo {
 
 static Sm90GemmAlgoInfo get_sm90_gemm_algo_info(int64_t algo) {
   switch (algo) {
+    // All currently tested algos use 128x128 output tiles.
     case 0:
     case 1:
     case 2:
     case 3:
     case 4:
+    case 5:
+    case 6:
+    case 7:
+    case 8:
       return {128, 128};
 
     default:

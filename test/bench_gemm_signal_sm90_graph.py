@@ -18,14 +18,21 @@ def load_ooverlap_ext():
 
 def algo_tile_shape(algo):
     # Must match src/overlap/gemm_signal_sm90.cu dispatch.
-    if algo in (0, 1, 2):
+    #
+    # Current clean CUTLASS-3 configs:
+    #   algo 0 = 128x128x32,  WS,  cluster 1x1x1
+    #   algo 1 = 128x128x64,  WS,  cluster 1x1x1
+    #   algo 2 = 128x128x128, WS,  cluster 1x1x1
+    #   algo 3 = 128x128x64,  WS,  cluster 1x2x1
+    #   algo 4 = 128x128x64,  WS,  cluster 2x1x1
+    #   algo 5 = 128x128x64,  WSP, cluster 1x1x1
+    #   algo 6 = 128x128x128, WSP, cluster 1x1x1
+    #   algo 7 = 128x128x64,  WSC, cluster 1x1x1
+    #   algo 8 = 128x128x128, WSC, cluster 1x1x1
+    if algo in (0, 1, 2, 3, 4, 5, 6, 7, 8):
         return 128, 128
-    if algo in (3, 4):
-        return 128, 256
-    if algo in (5, 6):
-        return 256, 128
-    raise ValueError(f"Unsupported algo={algo}")
 
+    raise ValueError(f"Unsupported algo={algo}")
 
 def make_identity_ra(M, N, tile_m, tile_n, device="cuda"):
     assert M % tile_m == 0
