@@ -240,22 +240,22 @@ struct ReorderSignalEpilogue {
 
   template <class... Args>
   OOVERLAP_DEVICE_INLINE decltype(auto) load_init(Args&&... args) {
-    return base_.load_init(std::forward<Args>(args)...);
+    return base_.load_init(static_cast<Args&&>(args)...);
   }
 
   template <class... Args>
   OOVERLAP_DEVICE_INLINE decltype(auto) store_init(Args&&... args) {
-    return base_.store_init(std::forward<Args>(args)...);
+    return base_.store_init(static_cast<Args&&>(args)...);
   }
 
   template <class... Args>
   OOVERLAP_DEVICE_INLINE decltype(auto) load(Args&&... args) {
-    return base_.load(std::forward<Args>(args)...);
+    return base_.load(static_cast<Args&&>(args)...);
   }
 
   template <class... Args>
   OOVERLAP_DEVICE_INLINE decltype(auto) load_tail(Args&&... args) {
-    return base_.load_tail(std::forward<Args>(args)...);
+    return base_.load_tail(static_cast<Args&&>(args)...);
   }
 
   // --------------------------------------------------------------------------

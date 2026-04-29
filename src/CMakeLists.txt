@@ -321,7 +321,7 @@ if(OOVERLAP_BUILD_LEGACY_OVERLAP)
       CUDA::cuda_driver
     )
 
-    ooverlap_link_cudadevrt(ooverlap_overlap PUBLIC)
+    #ooverlap_link_cudadevrt(ooverlap_overlap PUBLIC)
   endif()
 endif()
 

@@ -162,7 +162,8 @@ public:
     cutlass::epilogue::collective::EpilogueScheduleAuto
   >::CollectiveOp;
 
-  using CollectiveEpilogue = ReorderSignalEpilogue<BaseCollectiveEpilogue, ThreadblockShape>;
+  //using CollectiveEpilogue = ReorderSignalEpilogue<BaseCollectiveEpilogue, ThreadblockShape>;
+  using CollectiveEpilogue = BaseCollectiveEpilogue;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     cute::Shape<int, int, int, int>,
@@ -259,15 +260,22 @@ public:
       CuteStride2D<LayoutInputB>::make(args_.ldm_B)
     };
 
-    EpilogueArguments epilogue_args;
-    epilogue_args.base = typename BaseCollectiveEpilogue::Arguments{
+    /*EpilogueArguments epilogue_args;*/
+    /*epilogue_args.base = typename BaseCollectiveEpilogue::Arguments{*/
+      /*{args_.alpha, args_.beta},*/
+      /*reinterpret_cast<ElementOutput const*>(args_.ptr_C),*/
+      /*CuteStride2D<LayoutOutput>::make(args_.ldm_C),*/
+      /*reinterpret_cast<ElementOutput*>(args_.ptr_D),*/
+      /*CuteStride2D<LayoutOutput>::make(args_.ldm_D)*/
+    /*};*/
+    /*epilogue_args.signal = args_.signal_params;*/
+    EpilogueArguments epilogue_args{
       {args_.alpha, args_.beta},
       reinterpret_cast<ElementOutput const*>(args_.ptr_C),
       CuteStride2D<LayoutOutput>::make(args_.ldm_C),
       reinterpret_cast<ElementOutput*>(args_.ptr_D),
       CuteStride2D<LayoutOutput>::make(args_.ldm_D)
     };
-    epilogue_args.signal = args_.signal_params;
 
     cutlass::KernelHardwareInfo hw_info;
     int device_id = 0;
