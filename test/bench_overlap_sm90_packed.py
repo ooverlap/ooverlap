@@ -1,8 +1,10 @@
 import argparse
 import importlib.util
+import socket
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
@@ -15,6 +17,14 @@ def load_ooverlap_ext():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def find_free_port():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 def make_column_major_reorder(M, N, tile_m=128, tile_n=128, device="cuda"):
@@ -51,10 +61,27 @@ def make_segments(num_tiles, group_tiles):
     return segs
 
 
-def time_cuda(fn, warmup, iters):
+def sync_all():
+    torch.cuda.synchronize()
+    dist.barrier()
+    torch.cuda.synchronize()
+
+
+def reduce_max_float(x, device):
+    t = torch.tensor([float(x)], device=device, dtype=torch.float32)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.item())
+
+
+def time_cuda_max(fn, warmup, iters, device):
+    # Make sure both ranks start the same timed section together.
+    sync_all()
+
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+
+    # Make sure warmup is fully complete on both ranks.
+    sync_all()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -65,143 +92,206 @@ def time_cuda(fn, warmup, iters):
     end.record()
 
     torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
+
+    local_ms = start.elapsed_time(end) / iters
+    max_ms = reduce_max_float(local_ms, device)
+
+    # Prevent the next benchmark section from starting early on one rank.
+    sync_all()
+
+    return max_ms, local_ms
 
 
-def worker(rank, world, nccl_id, M, N, K, reldn, group_tiles, warmup, iters, reorder, algo, skip_extra):
+def worker(
+    rank,
+    world,
+    dist_url,
+    nccl_id,
+    M,
+    N,
+    K,
+    reldn,
+    group_tiles,
+    warmup,
+    iters,
+    reorder,
+    algo,
+    skip_extra,
+):
     torch.cuda.set_device(rank)
-    torch.manual_seed(1234 + rank)
+    device = torch.device(f"cuda:{rank}")
 
-    ext = load_ooverlap_ext()
+    dist.init_process_group(
+        backend="nccl",
+        init_method=dist_url,
+        rank=rank,
+        world_size=world,
+    )
 
-    tile_m = 128
-    tile_n = 128
+    try:
+        torch.manual_seed(1234 + rank)
 
-    assert M % tile_m == 0
-    assert N % tile_n == 0
+        ext = load_ooverlap_ext()
 
-    tile_rows = M // tile_m
-    tile_cols = N // tile_n
-    num_tiles = tile_rows * tile_cols
+        tile_m = 128
+        tile_n = 128
 
-    packed_tile_cols = reldn
-    packed_tile_rows = (num_tiles + packed_tile_cols - 1) // packed_tile_cols
-    packed_M = packed_tile_rows * tile_m
-    packed_N = packed_tile_cols * tile_n
+        assert M % tile_m == 0
+        assert N % tile_n == 0
 
-    overlap_cseg = make_segments(num_tiles, group_tiles)
-    full_cseg = [num_tiles]
+        tile_rows = M // tile_m
+        tile_cols = N // tile_n
+        num_tiles = tile_rows * tile_cols
 
-    ov = ext.OverlapImpl()
-    ov.nccl_init(rank, world, nccl_id)
-    ov.cutlass_init()
-    ov.overlap_init()
+        packed_tile_cols = reldn
+        packed_tile_rows = (num_tiles + packed_tile_cols - 1) // packed_tile_cols
+        packed_M = packed_tile_rows * tile_m
+        packed_N = packed_tile_cols * tile_n
 
-    A = torch.randn((M, K), device="cuda", dtype=torch.float16)
-    B_ref = torch.randn((K, N), device="cuda", dtype=torch.float16)
-    B_packed = B_ref.t().contiguous()
+        overlap_cseg = make_segments(num_tiles, group_tiles)
+        full_cseg = [num_tiles]
 
-    C_packed = torch.empty((packed_M, packed_N), device="cuda", dtype=torch.float16)
-    C_packed_full = torch.empty((packed_M, packed_N), device="cuda", dtype=torch.float16)
-    C_torch = torch.empty((M, N), device="cuda", dtype=torch.float16)
-    C_nccl_only = torch.randn((packed_M, packed_N), device="cuda", dtype=torch.float16)
+        ov = ext.OverlapImpl()
+        ov.nccl_init(rank, world, nccl_id)
+        ov.cutlass_init()
+        ov.overlap_init()
 
-    if reorder == "column_major":
-        RA = make_column_major_reorder(M, N, tile_m, tile_n, device="cuda")
-    elif reorder == "identity":
-        RA = make_identity_reorder(M, N, tile_m, tile_n, device="cuda")
-    else:
-        raise ValueError(f"unknown reorder={reorder}")
+        A = torch.randn((M, K), device=device, dtype=torch.float16)
+        B_ref = torch.randn((K, N), device=device, dtype=torch.float16)
+        B_packed = B_ref.t().contiguous()
 
-    overlap_cseg_cpu = torch.tensor(overlap_cseg, dtype=torch.int32)
-    overlap_cseg_gpu = overlap_cseg_cpu.cuda(rank)
+        C_packed = torch.empty((packed_M, packed_N), device=device, dtype=torch.float16)
+        C_packed_full = torch.empty((packed_M, packed_N), device=device, dtype=torch.float16)
+        C_torch = torch.empty((M, N), device=device, dtype=torch.float16)
+        C_nccl_only = torch.randn((packed_M, packed_N), device=device, dtype=torch.float16)
 
-    full_cseg_cpu = torch.tensor(full_cseg, dtype=torch.int32)
-    full_cseg_gpu = full_cseg_cpu.cuda(rank)
+        if reorder == "column_major":
+            RA = make_column_major_reorder(M, N, tile_m, tile_n, device=device)
+        elif reorder == "identity":
+            RA = make_identity_reorder(M, N, tile_m, tile_n, device=device)
+        else:
+            raise ValueError(f"unknown reorder={reorder}")
 
-    MM_overlap = torch.empty((len(overlap_cseg) + num_tiles,), device="cuda", dtype=torch.int32)
-    MM_full = torch.empty((len(full_cseg) + num_tiles,), device="cuda", dtype=torch.int32)
+        overlap_cseg_cpu = torch.tensor(overlap_cseg, dtype=torch.int32)
+        overlap_cseg_gpu = overlap_cseg_cpu.to(device=device)
 
-    monitor = False
+        full_cseg_cpu = torch.tensor(full_cseg, dtype=torch.int32)
+        full_cseg_gpu = full_cseg_cpu.to(device=device)
 
-    def run_packed_overlap():
-        MM_overlap.zero_()
-        ov.gemm_allreduce_overlap(
-            A,
-            B_packed,
-            C_packed,
-            MM_overlap,
-            RA,
-            int(reldn),
-            overlap_cseg_cpu,
-            overlap_cseg_gpu,
-            int(algo),
-            monitor,
+        MM_overlap = torch.empty((len(overlap_cseg) + num_tiles,), device=device, dtype=torch.int32)
+        MM_full = torch.empty((len(full_cseg) + num_tiles,), device=device, dtype=torch.int32)
+
+        monitor = False
+
+        def run_packed_overlap():
+            MM_overlap.zero_()
+            ov.gemm_allreduce_overlap(
+                A,
+                B_packed,
+                C_packed,
+                MM_overlap,
+                RA,
+                int(reldn),
+                overlap_cseg_cpu,
+                overlap_cseg_gpu,
+                int(algo),
+                monitor,
+            )
+
+        def run_packed_full_segment():
+            MM_full.zero_()
+            ov.gemm_allreduce_overlap(
+                A,
+                B_packed,
+                C_packed_full,
+                MM_full,
+                RA,
+                int(reldn),
+                full_cseg_cpu,
+                full_cseg_gpu,
+                int(algo),
+                monitor,
+            )
+
+        def run_torch_matmul_plus_nccl():
+            torch.matmul(A, B_ref, out=C_torch)
+            ov.nccl_allreduce(C_torch)
+
+        def run_nccl_only_full():
+            ov.nccl_allreduce(C_nccl_only)
+
+        overlap_ms, overlap_local_ms = time_cuda_max(
+            run_packed_overlap,
+            warmup,
+            iters,
+            device,
         )
 
-    def run_packed_full_segment():
-        MM_full.zero_()
-        ov.gemm_allreduce_overlap(
-            A,
-            B_packed,
-            C_packed_full,
-            MM_full,
-            RA,
-            int(reldn),
-            full_cseg_cpu,
-            full_cseg_gpu,
-            int(algo),
-            monitor,
+        full_segment_ms, full_segment_local_ms = time_cuda_max(
+            run_packed_full_segment,
+            warmup,
+            iters,
+            device,
         )
 
-    def run_torch_matmul_plus_nccl():
-        torch.matmul(A, B_ref, out=C_torch)
-        ov.nccl_allreduce(C_torch)
+        torch_baseline_ms = None
+        torch_baseline_local_ms = None
+        nccl_only_ms = None
+        nccl_only_local_ms = None
 
-    def run_nccl_only_full():
-        ov.nccl_allreduce(C_nccl_only)
+        if not skip_extra:
+            torch_baseline_ms, torch_baseline_local_ms = time_cuda_max(
+                run_torch_matmul_plus_nccl,
+                warmup,
+                iters,
+                device,
+            )
 
-    overlap_ms = time_cuda(run_packed_overlap, warmup, iters)
-    full_segment_ms = time_cuda(run_packed_full_segment, warmup, iters)
+            nccl_only_ms, nccl_only_local_ms = time_cuda_max(
+                run_nccl_only_full,
+                warmup,
+                iters,
+                device,
+            )
 
-    torch_baseline_ms = None
-    nccl_only_ms = None
+        if rank == 0:
+            speedup_vs_full = full_segment_ms / overlap_ms if overlap_ms > 0 else float("nan")
 
-    if not skip_extra:
-        torch_baseline_ms = time_cuda(run_torch_matmul_plus_nccl, warmup, iters)
-        nccl_only_ms = time_cuda(run_nccl_only_full, warmup, iters)
+            print("========================================")
+            print(f"M={M} N={N} K={K}")
+            print(f"tile_rows={tile_rows} tile_cols={tile_cols} num_tiles={num_tiles}")
+            print(f"reldn={reldn} packed_shape=({packed_M}, {packed_N})")
+            print(f"reorder={reorder}")
+            print(f"algo={algo}")
+            print("")
+            print(f"overlap group_tiles={group_tiles}")
+            print(f"overlap num_segments={len(overlap_cseg)}")
+            print(f"overlap segments={overlap_cseg[:16]}{' ...' if len(overlap_cseg) > 16 else ''}")
+            print("")
+            print("All reported latencies below are MAX across ranks.")
+            print(f"packed overlap latency:        {overlap_ms:.4f} ms")
+            print(f"packed full-segment latency:   {full_segment_ms:.4f} ms")
 
-    packed_gemm_only_ms = None
-    if world == 1:
-        packed_gemm_only_ms = full_segment_ms
+            if torch_baseline_ms is not None:
+                print(f"torch matmul + NCCL latency:   {torch_baseline_ms:.4f} ms")
+            if nccl_only_ms is not None:
+                print(f"NCCL-only full-buffer latency: {nccl_only_ms:.4f} ms")
 
-    if rank == 0:
-        speedup_vs_full = full_segment_ms / overlap_ms if overlap_ms > 0 else float("nan")
+            print("")
+            print(f"rank0 packed overlap local:    {overlap_local_ms:.4f} ms")
+            print(f"rank0 full-segment local:      {full_segment_local_ms:.4f} ms")
+            if torch_baseline_local_ms is not None:
+                print(f"rank0 torch+NCCL local:        {torch_baseline_local_ms:.4f} ms")
+            if nccl_only_local_ms is not None:
+                print(f"rank0 NCCL-only local:         {nccl_only_local_ms:.4f} ms")
 
-        print("========================================")
-        print(f"M={M} N={N} K={K}")
-        print(f"tile_rows={tile_rows} tile_cols={tile_cols} num_tiles={num_tiles}")
-        print(f"reldn={reldn} packed_shape=({packed_M}, {packed_N})")
-        print(f"reorder={reorder}")
-        print(f"algo={algo}")
-        print("")
-        print(f"overlap group_tiles={group_tiles}")
-        print(f"overlap num_segments={len(overlap_cseg)}")
-        print(f"overlap segments={overlap_cseg[:16]}{' ...' if len(overlap_cseg) > 16 else ''}")
-        print("")
-        print(f"packed overlap latency:        {overlap_ms:.4f} ms")
-        print(f"packed full-segment latency:   {full_segment_ms:.4f} ms")
+            print("")
+            print(f"speedup vs packed full-seg:    {speedup_vs_full:.4f}x")
+            print("========================================")
 
-        if torch_baseline_ms is not None:
-            print(f"torch matmul + NCCL latency:   {torch_baseline_ms:.4f} ms")
-        if nccl_only_ms is not None:
-            print(f"NCCL-only full-buffer latency: {nccl_only_ms:.4f} ms")
-        if packed_gemm_only_ms is not None:
-            print(f"packed GEMM-only approx:       {packed_gemm_only_ms:.4f} ms")
-
-        print("")
-        print(f"speedup vs packed full-seg:    {speedup_vs_full:.4f}x")
-        print("========================================")
+    finally:
+        sync_all()
+        dist.destroy_process_group()
 
 
 def main():
@@ -226,10 +316,14 @@ def main():
     ext = load_ooverlap_ext()
     nccl_id = ext.generate_nccl_id()
 
+    port = find_free_port()
+    dist_url = f"tcp://127.0.0.1:{port}"
+
     mp.spawn(
         worker,
         args=(
             args.gpus,
+            dist_url,
             nccl_id,
             args.m,
             args.n,

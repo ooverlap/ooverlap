@@ -14,6 +14,7 @@ bool gemm_signal_sm90_dispatch(
     int algo,
     int M, int N, int K,
     int ReLDN,
+    int num_segments,
     int32_t* CommThr,
     void* A, void* B, void* D,
     int32_t* MM, int32_t* RA,

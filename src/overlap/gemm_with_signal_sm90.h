@@ -206,6 +206,7 @@ public:
       int  kMonitoredColumn,
       int  kReorderedColumn,
       int *kCommuSegArray,
+      int  numSegments,
       bool Monitor
     ) :
       problem_size(problem_size_),
@@ -232,6 +233,7 @@ public:
       signal_params.ld_D                 = int(ldm_D_);
       signal_params.kEpilogueArrivalsPerTile = 0;
       signal_params.ptr_Debug_Arrivals = nullptr;
+      signal_params.num_segments = numSegments;
     }
   };
 

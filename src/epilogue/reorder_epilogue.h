@@ -69,6 +69,9 @@ struct SignalingEpilogueParams {
   int   kEpilogueArrivalsPerTile;
   int  *ptr_Debug_Arrivals;
 
+  // Faster look up
+  int num_segments;
+
   CUTLASS_HOST_DEVICE
   SignalingEpilogueParams() :
     ptr_Monitored_Matrix(nullptr),
@@ -82,7 +85,8 @@ struct SignalingEpilogueParams {
     ptr_D(nullptr),
     ld_D(0),
     kEpilogueArrivalsPerTile(0),
-    ptr_Debug_Arrivals(nullptr)
+    ptr_Debug_Arrivals(nullptr),
+    num_segments(0)
   {}
 };
 
@@ -352,29 +356,13 @@ struct ReorderSignalEpilogue {
       int tile_cols = (N_ + params_.signal.ThreadblockN - 1) / params_.signal.ThreadblockN;
       int num_tiles = tile_rows * tile_cols;
 
-      int num_segments = 0;
-      int sum = 0;
-
-      while (sum < num_tiles) {
-        sum += params_.signal.kCommu_Seg_Array[num_segments];
-        ++num_segments;
-      }
-
-      int idx_bound = params_.signal.kCommu_Seg_Array[0];
-      int seg = 0;
-
-      while (idx_bound <= tile) {
-        ++seg;
-        idx_bound += params_.signal.kCommu_Seg_Array[seg];
-      }
-
 #if OOVERLAP_ENABLE_EPILOGUE_DEBUG
       if (params_.signal.ptr_Debug_Arrivals) {
         atomicAdd(&params_.signal.ptr_Debug_Arrivals[tile], 1);
       }
 #endif
 
-      int* tile_done = params_.signal.ptr_Monitored_Matrix + num_segments;
+      int* tile_done = params_.signal.ptr_Monitored_Matrix + params_.signal.num_segments;
 
       int expected_arrivals =
           (params_.signal.kEpilogueArrivalsPerTile > 0)
@@ -389,6 +377,14 @@ struct ReorderSignalEpilogue {
 
       if (old == (expected_arrivals - 1)) {
         __threadfence();
+        
+        int idx_bound = params_.signal.kCommu_Seg_Array[0];
+        int seg = 0;
+
+        while (idx_bound <= tile) {
+          ++seg;
+          idx_bound += params_.signal.kCommu_Seg_Array[seg];
+        }
 
         atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);
 

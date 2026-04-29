@@ -104,6 +104,11 @@ static void gemm_signal_sm90(
   TORCH_CHECK(err == cudaSuccess, "cudaSetDevice failed: ", cudaGetErrorString(err));
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  const int64_t num_segments = CommThr.numel();
+
+  TORCH_CHECK(num_segments > 0, "CommThr must have at least one segment");
+  TORCH_CHECK(MM.numel() >= num_segments + num_tiles,
+            "MM must have at least num_segments + num_tiles elements");
 
   bool ok = ooverlap::gemm_signal_sm90_dispatch(
       static_cast<int>(algo),
@@ -111,6 +116,7 @@ static void gemm_signal_sm90(
       static_cast<int>(N),
       static_cast<int>(K),
       static_cast<int>(ReLDN),
+      static_cast<int>(num_segments),
       reinterpret_cast<int32_t*>(CommThr.data_ptr<int32_t>()),
       static_cast<void*>(A.data_ptr<at::Half>()),
       static_cast<void*>(B_packed.data_ptr<at::Half>()),

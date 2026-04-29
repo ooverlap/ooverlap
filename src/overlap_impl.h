@@ -46,6 +46,7 @@ public:
 
 private:
     cudaStream_t gemm_stream_;
+    cudaEvent_t mm_ready_;
     cudaStream_t comm_stream_;
     cudaEvent_t gemm_finished_;
 

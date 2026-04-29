@@ -10,6 +10,7 @@
  *   only run the initialized GEMM.
  **************************************************************************************************/
 
+#include <ATen/core/interned_strings.h>
 #include <cuda_fp16.h>
 
 #include <cstdint>
@@ -87,7 +88,9 @@ template <
 >
 void cutlass_gemm_signal_sm90(
   int M, int N, int K,
-  int ReLDN, int* CommThr,
+  int ReLDN,
+  int num_segments,
+  int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
   bool Monitor,
@@ -161,6 +164,7 @@ void cutlass_gemm_signal_sm90(
     N / TileN,
     ReLDN,
     CommThr,
+    num_segments,
     Monitor
   );
 
@@ -180,12 +184,13 @@ bool gemm_signal_sm90_dispatch(
     int algo,
     int M, int N, int K,
     int ReLDN,
+    int num_segments,
     int32_t* CommThr,
     void* A, void* B, void* D,
     int32_t* MM, int32_t* RA,
     bool Monitor,
     cudaStream_t stream) {
-
+    
   using Cluster1x1x1 = cute::Shape<cute::_1, cute::_1, cute::_1>;
   using Cluster1x2x1 = cute::Shape<cute::_1, cute::_2, cute::_1>;
   using Cluster2x1x1 = cute::Shape<cute::_2, cute::_1, cute::_1>;
@@ -200,7 +205,7 @@ bool gemm_signal_sm90_dispatch(
           Cluster1x1x1,
           WS,
           EpiAuto>(
-          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
           reinterpret_cast<int*>(RA), Monitor, stream);
@@ -212,7 +217,7 @@ bool gemm_signal_sm90_dispatch(
           Cluster1x1x1,
           WS,
           EpiAuto>(
-          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
           reinterpret_cast<int*>(RA), Monitor, stream);
@@ -224,7 +229,7 @@ bool gemm_signal_sm90_dispatch(
           Cluster1x1x1,
           WS,
           EpiAuto>(
-          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
           reinterpret_cast<int*>(RA), Monitor, stream);
@@ -236,7 +241,7 @@ bool gemm_signal_sm90_dispatch(
           Cluster1x2x1,
           WS,
           EpiAuto>(
-          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
           reinterpret_cast<int*>(RA), Monitor, stream);
@@ -248,7 +253,7 @@ bool gemm_signal_sm90_dispatch(
           Cluster2x1x1,
           WS,
           EpiAuto>(
-          M, N, K, ReLDN, reinterpret_cast<int*>(CommThr),
+          M, N, K, ReLDN, num_segments, reinterpret_cast<int*>(CommThr),
           reinterpret_cast<half*>(A), reinterpret_cast<half*>(B),
           reinterpret_cast<half*>(D), reinterpret_cast<int*>(MM),
           reinterpret_cast<int*>(RA), Monitor, stream);

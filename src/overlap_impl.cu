@@ -22,6 +22,7 @@ OverlapImpl::OverlapImpl()
     : gemm_stream_(nullptr),
       comm_stream_(nullptr),
       gemm_finished_(nullptr),
+      mm_ready_(nullptr),
       comm_(nullptr),
       my_rank_(0),
       my_size_(1),
@@ -39,6 +40,10 @@ OverlapImpl::~OverlapImpl() {
     if (comm_ != nullptr) {
         ncclCommDestroy(comm_);
         comm_ = nullptr;
+    }
+    if (mm_ready_ != nullptr) {
+        cudaEventDestroy(mm_ready_);
+        mm_ready_ = nullptr;
     }
 }
 
@@ -76,6 +81,11 @@ void OverlapImpl::OverlapInit() {
         err = cudaEventCreateWithFlags(&gemm_finished_, cudaEventDisableTiming);
         TORCH_CHECK(err == cudaSuccess,
                     "cudaEventCreateWithFlags failed: ", cudaGetErrorString(err));
+
+        err = cudaEventCreateWithFlags(&mm_ready_, cudaEventDisableTiming);
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaEventCreateWithFlags mm_ready_ failed: ",
+                    cudaGetErrorString(err));
 
         overlap_init_done_ = true;
     }
@@ -199,10 +209,21 @@ void OverlapImpl::GemmAllReduceOverlap(
     auto* cseg_cpu_ptr = cSEG_CPU.data_ptr<int>();
     auto* cseg_gpu_ptr = cSEG_GPU.data_ptr<int>();
 
+    cudaError_t err = cudaEventRecord(mm_ready_, gemm_stream_);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaEventRecord mm_ready_ failed: ",
+                cudaGetErrorString(err));
+    
+    err = cudaStreamWaitEvent(comm_stream_, mm_ready_, 0);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaStreamWaitEvent mm_ready_ failed: ",
+            cudaGetErrorString(err));
+
     bool ok = ooverlap::gemm_signal_sm90_dispatch(
         static_cast<int>(Algo),
         M, N, K,
         static_cast<int>(rLDN),
+        seg_size,
         reinterpret_cast<int32_t*>(cseg_gpu_ptr),
         reinterpret_cast<void*>(a_ptr),
         reinterpret_cast<void*>(b_ptr),
