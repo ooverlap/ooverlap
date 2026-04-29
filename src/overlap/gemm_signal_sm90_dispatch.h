@@ -1,4 +1,5 @@
 #pragma once
+
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -11,24 +12,17 @@ struct GemmSignalSm90AlgoMeta {
   int cluster_m;
   int cluster_n;
   int cluster_k;
-  const char* mainloop;
-  const char* epilogue;
+  int stages;              // -1 means StageCountAuto
+  const char* mainloop;    // ws | pingpong | cooperative
+  const char* epilogue;    // auto
 };
 
-// Returns number of generated SM90 signal GEMM algos.
 int gemm_signal_sm90_algo_count();
 
-// Returns false if algo is out of range.
 bool gemm_signal_sm90_get_algo_meta(
     int algo,
     GemmSignalSm90AlgoMeta* meta);
 
-// Minimal dispatch for tests.
-// Pointers are device pointers.
-// - A, B, D: fp16 device buffers
-// - MM, RA, CommThr: int32 device buffers
-//
-// Returns true if algo is supported, false otherwise.
 bool gemm_signal_sm90_dispatch(
     int algo,
     int M, int N, int K,

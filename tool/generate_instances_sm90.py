@@ -2,36 +2,29 @@
 """
 Generate SM90 CUTLASS-3 GEMM-with-signal instances for ooverlap.
 
-This is the SM90/H100 analogue of FlashOverlap's tool/generate_instances.py.
+This version supports exact stage-count keys:
 
-FlashOverlap generated CUTLASS-2/SM80-style configs:
-  ThreadblockM/N/K, WarpM/N/K, InstructionM/N/K, NumStages, SwizzleSize, SplitK
+  TileM, TileN, TileK,
+  ClusterM, ClusterN, ClusterK,
+  Stages,
+  Mainloop,
+  Epilogue
 
-For our CUTLASS-3/SM90 path, the relevant parameters are:
-  TileM, TileN, TileK
-  ClusterM, ClusterN, ClusterK
-  MainloopSchedule
-  EpilogueSchedule
+Recommended workflow after a profiling miss:
 
-Generated files:
-  configs/AlgoDictSm90.pt
-  configs/AlgoDictSm90.json
-  src/inc/signal_instances_sm90.inc
-  src/tiling/signal_tiling_sm90.cuh
+  python tool/generate_instances_sm90.py \
+    --from-missing-json configs/m4096n2048k1024_nvidia_h100_nvl_normal_sm90_missing.json \
+    --top-missing 20 \
+    --keep-base-ws
 
-Integration target:
-  src/overlap/gemm_signal_sm90.cu
+  cd build && make -j
 
-Important:
-  By default this script only emits KernelTmaWarpSpecialized ("ws") kernels.
+Then rerun gen_config_sm90.py with:
 
-  Pingpong/cooperative are supported by this generator, but should not be enabled
-  until GemmSignalSm90::initialize() supports their schedule-specific
-  GemmKernel::Arguments constructor shapes.
+  --match-stages exact
 """
 
 import argparse
-import itertools
 import json
 from pathlib import Path
 
@@ -52,192 +45,219 @@ EPILOGUE_TYPES = {
 }
 
 
+def root_from_script() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
 def cluster_cpp(cluster):
     cm, cn, ck = cluster
     return f"cute::Shape<cute::_{cm}, cute::_{cn}, cute::_{ck}>"
 
 
+def stage_cpp(stages):
+    if stages is None or str(stages).lower() == "auto" or int(stages) < 0:
+        return "cutlass::gemm::collective::StageCountAuto"
+    return f"cutlass::gemm::collective::StageCount<{int(stages)}>"
+
+
 def combo_key(combo):
-    """
-    Stable Python/JSON key representation.
-
-    Tuple layout:
-      TileM, TileN, TileK,
-      ClusterM, ClusterN, ClusterK,
-      MainloopName,
-      EpilogueName
-    """
     return (
-        combo["tile_m"],
-        combo["tile_n"],
-        combo["tile_k"],
-        combo["cluster"][0],
-        combo["cluster"][1],
-        combo["cluster"][2],
-        combo["mainloop"],
-        combo["epilogue"],
+        int(combo["tile_m"]),
+        int(combo["tile_n"]),
+        int(combo["tile_k"]),
+        int(combo["cluster"][0]),
+        int(combo["cluster"][1]),
+        int(combo["cluster"][2]),
+        int(combo["stages"]) if combo.get("stages") and combo["stages"] != "auto" is not None else "auto",
+        str(combo["mainloop"]),
+        str(combo["epilogue"]),
     )
-
-def sm90_two_stage_smem_ok(combo):
-    tm = combo["tile_m"]
-    tn = combo["tile_n"]
-    tk = combo["tile_k"]
-
-    # Conservative fp16 A/B mainloop smem estimate.
-    # One stage stores one A tile and one B tile.
-    bytes_per_element = 2
-    bytes_per_stage = (tm * tk + tn * tk) * bytes_per_element
-
-    # SM90 TMA warp-specialized kernels require at least 2 stages.
-    # Use a conservative budget because CUTLASS also needs barriers,
-    # descriptors, epilogue/pipeline storage, alignment, etc.
-    min_required = 2 * bytes_per_stage
-    conservative_budget = 220 * 1024
-
-    return min_required <= conservative_budget
 
 
 def combo_dict_from_key(key):
     return {
-        "tile_m": key[0],
-        "tile_n": key[1],
-        "tile_k": key[2],
-        "cluster": [key[3], key[4], key[5]],
-        "mainloop": key[6],
-        "epilogue": key[7],
+        "tile_m": int(key[0]),
+        "tile_n": int(key[1]),
+        "tile_k": int(key[2]),
+        "cluster": [int(key[3]), int(key[4]), int(key[5])],
+        "stages": key[6],
+        "mainloop": str(key[7]),
+        "epilogue": str(key[8]),
     }
 
 
-def is_reasonable_combo(combo, preset):
-    tm = combo["tile_m"]
-    tn = combo["tile_n"]
-    tk = combo["tile_k"]
-    cm, cn, ck = combo["cluster"]
-    mainloop = combo["mainloop"]
+def canonical_combo(x):
+    return {
+        "tile_m": int(x["tile_m"]),
+        "tile_n": int(x["tile_n"]),
+        "tile_k": int(x["tile_k"]),
+        "cluster": [int(x["cluster"][0]), int(x["cluster"][1]), int(x["cluster"][2])],
+        "stages": int(x["stages"]) if x.get("stages") not in (None, "auto") else "auto",
+        "mainloop": str(x["mainloop"]),
+        "epilogue": str(x.get("epilogue", "auto")),
+    }
 
-    # Basic sanity.
-    if ck != 1:
-        return False
 
-    # We use WGMMA/TMA kernels. Very tiny CTA tiles are usually not useful here.
-    if tm == 64 and tn == 64:
-        return False
+def default_base_ws_combos():
+    """
+    Compact fallback set. These are not meant to beat the profiler; they keep
+    old algo coverage available while you add exact profiler misses.
+    """
+    combos = []
+    for tm in [64, 128, 256]:
+        for tn in [64, 128, 256]:
+            if tm == 64 and tn == 64:
+                continue
+            if tm == 256 and tn == 256:
+                continue
+            for tk in [32, 64, 128]:
+                # StageCountAuto is useful as a fallback but exact profiling should
+                # use concrete stages from missing JSON.
+                for cluster in [(1, 1, 1), (1, 2, 1), (2, 1, 1)]:
+                    combos.append({
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "cluster": list(cluster),
+                        "stages": "auto",
+                        "mainloop": "ws",
+                        "epilogue": "auto",
+                    })
+    return combos
 
-    if (tm, tn) in [
-        (256, 256),
-        (256, 128),
-        (128, 256),
+
+def curated_sm90_combos(include_pingpong: bool, include_cooperative: bool):
+    """
+    Small H100-focused set based on the top profiler patterns we have seen:
+      - ws:          64x256/128x128/128x256/256x128
+      - pingpong:    64x256 stage 5, 128x128 stage 6
+      - cooperative: 128x128 stage 6, 128x256/256x128 stage 4
+    """
+    combos = []
+
+    # WS exact-ish stage candidates.
+    for tm, tn, tk, stages in [
+        (64, 256, 64, 5),
+        (128, 128, 64, 7),
+        (128, 256, 64, 4),
+        (256, 128, 64, 4),
     ]:
-        return False
+        for cluster in [(1, 1, 1), (1, 2, 1), (2, 1, 1)]:
+            combos.append({
+                "tile_m": tm, "tile_n": tn, "tile_k": tk,
+                "cluster": list(cluster),
+                "stages": stages,
+                "mainloop": "ws",
+                "epilogue": "auto",
+            })
 
-    # Keep 256x256 out of the safe/default set. It can be useful for pure GEMM,
-    # but for FlashOverlap-style overlap it gives fewer output tiles/signals.
-    if preset == "safe" and tm == 256 and tn == 256:
-        return False
+    if include_pingpong:
+        for tm, tn, tk, stages in [
+            (64, 256, 64, 5),
+            (128, 128, 64, 6),
+        ]:
+            for cluster in [(1, 2, 1), (2, 1, 1)]:
+                combos.append({
+                    "tile_m": tm, "tile_n": tn, "tile_k": tk,
+                    "cluster": list(cluster),
+                    "stages": stages,
+                    "mainloop": "pingpong",
+                    "epilogue": "auto",
+                })
 
-    # For small tile dimensions, clustered launch is usually not our first choice.
-    if preset == "safe" and (tm < 128 or tn < 128) and (cm != 1 or cn != 1):
-        return False
+    if include_cooperative:
+        for tm, tn, tk, stages in [
+            (128, 128, 64, 6),
+            (128, 256, 64, 4),
+            (256, 128, 64, 4),
+        ]:
+            for cluster in [(1, 2, 1), (2, 1, 1)]:
+                combos.append({
+                    "tile_m": tm, "tile_n": tn, "tile_k": tk,
+                    "cluster": list(cluster),
+                    "stages": stages,
+                    "mainloop": "cooperative",
+                    "epilogue": "auto",
+                })
 
-    # Keep the safe preset compact.
-    if preset == "safe":
-        if cm * cn > 2:
-            return False
-
-    # Pingpong/cooperative are experimental for our wrapper right now.
-    # Keep their cluster space conservative.
-    if mainloop in ("pingpong", "cooperative"):
-        if (cm, cn, ck) != (1, 1, 1):
-            return False
-
-    # Avoid too many huge experimental kernels unless explicitly requested.
-    if preset != "extended":
-        if tm == 256 and tn == 256:
-            return False
-
-    if not sm90_two_stage_smem_ok(combo):
-        return False
-
-    return True
+    return combos
 
 
-def build_candidates(args):
-    if args.preset == "minimal":
-        tile_m = [128]
-        tile_n = [128]
-        tile_k = [32, 64, 128]
-        clusters = [(1, 1, 1)]
-    elif args.preset == "safe":
-        tile_m = [64, 128, 256]
-        tile_n = [64, 128, 256]
-        tile_k = [32, 64, 128]
-        clusters = [
-            (1, 1, 1),
-            (1, 2, 1),
-            (2, 1, 1),
-        ]
-    elif args.preset == "extended":
-        tile_m = [64, 128, 256]
-        tile_n = [64, 128, 256]
-        tile_k = [32, 64, 128]
-        clusters = [
-            (1, 1, 1),
-            (1, 2, 1),
-            (2, 1, 1),
-            (2, 2, 1),
-        ]
-    else:
-        raise ValueError(f"unknown preset={args.preset}")
+def load_missing_json(path: Path, top_miss: int, allow_slow: bool):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    mainloops = ["ws"]
+    rows = data.get("missing", data)
+    if isinstance(rows, dict):
+        rows = rows.get("missing", [])
 
-    if args.include_pingpong:
-        mainloops.append("pingpong")
+    out = []
+    for r in rows:
+        if "tile_m" not in r:
+            continue
 
-    if args.include_cooperative:
-        mainloops.append("cooperative")
+        # Skip obvious f32-output rows unless requested. Our wrapper is D=f16.
+        op = str(r.get("operation", ""))
+        if (not allow_slow) and "_f32_f32_" in op:
+            continue
 
-    epilogues = ["auto"]
+        mainloop = str(r.get("mainloop", "ws"))
+        if mainloop not in MAINLOOP_TYPES:
+            continue
 
-    candidates = []
-    for tm, tn, tk, cluster, mainloop, epilogue in itertools.product(
-        tile_m,
-        tile_n,
-        tile_k,
-        clusters,
-        mainloops,
-        epilogues,
-    ):
-        combo = {
-            "tile_m": tm,
-            "tile_n": tn,
-            "tile_k": tk,
-            "cluster": cluster,
+        stages = r.get("stages", None)
+        if stages is None:
+            continue
+
+        out.append(canonical_combo({
+            "tile_m": r["tile_m"],
+            "tile_n": r["tile_n"],
+            "tile_k": r["tile_k"],
+            "cluster": r["cluster"],
+            "stages": stages,
             "mainloop": mainloop,
-            "epilogue": epilogue,
-        }
+            "epilogue": r.get("epilogue", "auto"),
+        }))
 
-        if is_reasonable_combo(combo, args.preset):
-            candidates.append(combo)
+        if len(out) >= top_miss:
+            break
 
-    candidates.sort(key=lambda c: (
-        c["mainloop"],
-        c["tile_m"],
-        c["tile_n"],
-        c["tile_k"],
-        c["cluster"][0],
-        c["cluster"][1],
-        c["cluster"][2],
-        c["epilogue"],
+    return out
+
+
+def dedupe(combos):
+    by_key = {}
+    for c in combos:
+        key = combo_key(c)
+        by_key[key] = canonical_combo(c)
+
+    out = list(by_key.values())
+    out.sort(key=lambda c: (
+        str(c["mainloop"]),
+        int(c["tile_m"]),
+        int(c["tile_n"]),
+        int(c["tile_k"]),
+        int(c["cluster"][0]),
+        int(c["cluster"][1]),
+        int(c["cluster"][2]),
+        str(c["stages"]),
+        str(c["epilogue"]),
     ))
-
-    if args.max_count is not None:
-        candidates = candidates[: args.max_count]
-
-    return candidates
+    return out
 
 
-def write_algo_dicts(root, candidates):
+def cpp_template_args(combo):
+    tm = int(combo["tile_m"])
+    tn = int(combo["tile_n"])
+    tk = int(combo["tile_k"])
+    stage = stage_cpp(combo["stages"])
+    cluster = cluster_cpp(combo["cluster"])
+    mainloop = MAINLOOP_TYPES[combo["mainloop"]]
+    epilogue = EPILOGUE_TYPES[combo["epilogue"]]
+    return f"{tm}, {tn}, {tk}, {stage}, {cluster}, {mainloop}, {epilogue}"
+
+
+def write_algo_dicts(root: Path, candidates):
     config_dir = root / "configs"
     config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -270,6 +290,7 @@ def write_algo_dicts(root, candidates):
                     "ClusterM",
                     "ClusterN",
                     "ClusterK",
+                    "Stages",
                     "Mainloop",
                     "Epilogue",
                 ],
@@ -280,19 +301,7 @@ def write_algo_dicts(root, candidates):
         )
 
 
-def cpp_template_args(combo):
-    tm = combo["tile_m"]
-    tn = combo["tile_n"]
-    tk = combo["tile_k"]
-
-    cluster = cluster_cpp(combo["cluster"])
-    mainloop = MAINLOOP_TYPES[combo["mainloop"]]
-    epilogue = EPILOGUE_TYPES[combo["epilogue"]]
-
-    return f"{tm}, {tn}, {tk}, {cluster}, {mainloop}, {epilogue}"
-
-
-def write_signal_instances(root, candidates):
+def write_signal_instances(root: Path, candidates):
     inc_dir = root / "src" / "inc"
     tiling_dir = root / "src" / "tiling"
 
@@ -352,6 +361,7 @@ def write_signal_instances(root, candidates):
         f.write("  int cluster_m;\n")
         f.write("  int cluster_n;\n")
         f.write("  int cluster_k;\n")
+        f.write("  int stages;\n")
         f.write("  const char* mainloop;\n")
         f.write("  const char* epilogue;\n")
         f.write("};\n\n")
@@ -362,18 +372,19 @@ def write_signal_instances(root, candidates):
             f.write(f"  &::cutlass_gemm_signal_sm90<{args}>,\n")
         f.write("};\n\n")
 
-        f.write("static constexpr int signal_sm90_func_count = ")
-        f.write(f"{len(candidates)};\n\n")
+        f.write(f"static constexpr int signal_sm90_func_count = {len(candidates)};\n\n")
 
         f.write("static SignalSm90AlgoMeta signal_sm90_algo_meta[] = {\n")
         for combo in candidates:
             cm, cn, ck = combo["cluster"]
+            stages = -1 if str(combo["stages"]).lower() == "auto" else int(combo["stages"])
             f.write(
                 "  {"
-                f"{combo['tile_m']}, "
-                f"{combo['tile_n']}, "
-                f"{combo['tile_k']}, "
-                f"{cm}, {cn}, {ck}, "
+                f"{int(combo['tile_m'])}, "
+                f"{int(combo['tile_n'])}, "
+                f"{int(combo['tile_k'])}, "
+                f"{int(cm)}, {int(cn)}, {int(ck)}, "
+                f"{stages}, "
                 f"\"{combo['mainloop']}\", "
                 f"\"{combo['epilogue']}\""
                 "},\n"
@@ -393,6 +404,7 @@ def print_summary(candidates):
             f"  algo={idx:03d} "
             f"tile={combo['tile_m']}x{combo['tile_n']}x{combo['tile_k']} "
             f"cluster={cm}x{cn}x{ck} "
+            f"stages={combo['stages']} "
             f"mainloop={combo['mainloop']} "
             f"epilogue={combo['epilogue']}"
         )
@@ -401,65 +413,52 @@ def print_summary(candidates):
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument(
-        "--root",
-        type=str,
-        default=None,
-        help=(
-            "Repository root. Default: parent of this script's parent, "
-            "assuming script is in tool/."
-        ),
-    )
+    ap.add_argument("--root", type=str, default=None)
 
     ap.add_argument(
         "--preset",
-        choices=["minimal", "safe", "extended"],
-        default="safe",
-        help=(
-            "minimal: current 128x128 family only. "
-            "safe: compact H100 search space. "
-            "extended: larger experimental search space."
-        ),
+        choices=["curated", "base-ws-only"],
+        default="curated",
     )
 
-    ap.add_argument(
-        "--include-pingpong",
-        action="store_true",
-        help=(
-            "Also generate KernelTmaWarpSpecializedPingpong entries. "
-            "Do not enable until GemmSignalSm90 supports pingpong "
-            "KernelArguments construction."
-        ),
-    )
+    ap.add_argument("--include-pingpong", action="store_true", default=True)
+    ap.add_argument("--no-include-pingpong", dest="include_pingpong", action="store_false")
 
-    ap.add_argument(
-        "--include-cooperative",
-        action="store_true",
-        help=(
-            "Also generate KernelTmaWarpSpecializedCooperative entries. "
-            "Do not enable until GemmSignalSm90 supports cooperative "
-            "KernelArguments construction if needed."
-        ),
-    )
+    ap.add_argument("--include-cooperative", action="store_true", default=True)
+    ap.add_argument("--no-include-cooperative", dest="include_cooperative", action="store_false")
 
-    ap.add_argument(
-        "--max-count",
-        type=int,
-        default=None,
-        help="Optional cap on number of generated algorithms.",
-    )
+    ap.add_argument("--from-missing-json", type=str, default=None)
+    ap.add_argument("--top-missing", type=int, default=20)
+    ap.add_argument("--keep-base-ws", action="store_true")
+    ap.add_argument("--allow-slow-or-f32-output-rows", action="store_true")
 
     args = ap.parse_args()
 
-    if args.root is None:
-        root = Path(__file__).resolve().parents[1]
+    root = Path(args.root).resolve() if args.root is not None else root_from_script()
+
+    candidates = []
+
+    if args.from_missing_json is not None:
+        candidates.extend(load_missing_json(
+            Path(args.from_missing_json).expanduser().resolve(),
+            args.top_missing,
+            args.allow_slow_or_f32_output_rows,
+        ))
+        if args.keep_base_ws:
+            candidates.extend(default_base_ws_combos())
     else:
-        root = Path(args.root).resolve()
+        if args.preset == "base-ws-only":
+            candidates.extend(default_base_ws_combos())
+        else:
+            candidates.extend(curated_sm90_combos(
+                include_pingpong=args.include_pingpong,
+                include_cooperative=args.include_cooperative,
+            ))
 
-    candidates = build_candidates(args)
+    candidates = dedupe(candidates)
 
-    if len(candidates) == 0:
-        raise RuntimeError("No SM90 candidates generated. Check filters/options.")
+    if not candidates:
+        raise RuntimeError("No SM90 candidates generated.")
 
     write_algo_dicts(root, candidates)
     write_signal_instances(root, candidates)
@@ -471,13 +470,6 @@ def main():
     print(f"  {root / 'configs' / 'AlgoDictSm90.json'}")
     print(f"  {root / 'src' / 'inc' / 'signal_instances_sm90.inc'}")
     print(f"  {root / 'src' / 'tiling' / 'signal_tiling_sm90.cuh'}")
-
-    if args.include_pingpong or args.include_cooperative:
-        print("")
-        print("[WARN] You enabled experimental schedules.")
-        print("       The generated table may not compile until")
-        print("       GemmSignalSm90::initialize() has schedule-specific")
-        print("       KernelArguments construction.")
 
 
 if __name__ == "__main__":

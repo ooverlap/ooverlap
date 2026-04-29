@@ -1,15 +1,18 @@
 /***************************************************************************************************
  * SM90 CUTLASS 3.x GEMM wrapper.
  *
- * Important:
- *   initialize(args, stream) now does the expensive CUTLASS setup once:
- *     - cudaGetDeviceProperties
- *     - can_implement
- *     - GemmUniversalAdapter::initialize
+ * This version makes StageCount an explicit template parameter so generated algos can
+ * exactly match CUTLASS profiler rows:
  *
- *   run(stream) only launches the already-initialized GEMM.
+ *   TileM, TileN, TileK,
+ *   StageCount,
+ *   ClusterM, ClusterN, ClusterK,
+ *   MainloopSchedule,
+ *   EpilogueSchedule
  *
- * The outer dispatch in gemm_signal_sm90.cu caches one GemmSignalSm90 instance per template algo.
+ * OOVERLAP_USE_BASE_EPILOGUE_ONLY:
+ *   0: use ReorderSignalEpilogue
+ *   1: use CUTLASS base epilogue only
  **************************************************************************************************/
 #pragma once
 
@@ -18,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <type_traits>
 #include <utility>
 
 #include "cutlass/cutlass.h"
@@ -42,6 +46,10 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+#ifndef OOVERLAP_USE_BASE_EPILOGUE_ONLY
+#define OOVERLAP_USE_BASE_EPILOGUE_ONLY 0
+#endif
+
 #define CUTLASS_CHECK_SM90(status)                                                               \
   {                                                                                              \
     cutlass::Status error = status;                                                              \
@@ -53,8 +61,6 @@
   }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define OOVERLAP_USE_BASE_EPILOGUE_ONLY 1
 
 namespace cutlass {
 
@@ -156,8 +162,6 @@ KernelArguments make_kernel_arguments(
 
 } // namespace detail
 
-
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename LayoutTag>
@@ -175,7 +179,7 @@ template <>
 struct CuteStride2D<cutlass::layout::ColumnMajor> {
   CUTLASS_HOST_DEVICE
   static auto make(int64_t ld) {
-    // In this repo B is passed physically as [N, K] contiguous and interpreted by CUTLASS.
+    // In this repo B is physically [N, K] contiguous and interpreted by CUTLASS as B^T.
     return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
   }
 };
@@ -193,6 +197,7 @@ template <
   int TileM_,
   int TileN_,
   int TileK_,
+  typename StageCountType_,
   typename ClusterShape_,
   typename MainloopSchedule_,
   typename EpilogueSchedule_
@@ -219,7 +224,8 @@ public:
     cute::Int<TileK>
   >;
 
-  using ClusterShape     = ClusterShape_;
+  using StageCountType  = StageCountType_;
+  using ClusterShape    = ClusterShape_;
   using MainloopSchedule = MainloopSchedule_;
   using EpilogueSchedule = EpilogueSchedule_;
 
@@ -242,7 +248,7 @@ public:
     ElementCompute,
     TileShape,
     ClusterShape,
-    cutlass::gemm::collective::StageCountAuto,
+    StageCountType,
     MainloopSchedule
   >::CollectiveOp;
 
@@ -331,11 +337,11 @@ public:
       signal_params.if_monitor           = Monitor;
       signal_params.ThreadblockM         = ThreadblockShape::kM;
       signal_params.ThreadblockN         = ThreadblockShape::kN;
-      signal_params.ptr_D                = (void*)ptr_D_;
+      signal_params.ptr_D                = static_cast<void*>(ptr_D_);
       signal_params.ld_D                 = int(ldm_D_);
       signal_params.kEpilogueArrivalsPerTile = 0;
-      signal_params.ptr_Debug_Arrivals = nullptr;
-      signal_params.num_segments = numSegments;
+      signal_params.ptr_Debug_Arrivals   = nullptr;
+      signal_params.num_segments         = numSegments;
     }
   };
 

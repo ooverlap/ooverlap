@@ -1,13 +1,7 @@
 /***************************************************************************************************
  * SM90 CUTLASS 3.x GEMM dispatch for packed/reordered output experiments.
  *
- * This file caches the CUTLASS GEMM object per template instantiation.
- *
- * First call for a unique key:
- *   pays CUTLASS setup.
- *
- * Later calls with same key:
- *   only run the initialized GEMM.
+ * The generated algo table now includes explicit StageCountType and schedule.
  **************************************************************************************************/
 
 #include <ATen/core/interned_strings.h>
@@ -85,6 +79,7 @@ template <
   int TileM,
   int TileN,
   int TileK,
+  typename StageCountType,
   typename ClusterShape,
   typename MainloopSchedule,
   typename EpilogueSchedule
@@ -115,6 +110,7 @@ void cutlass_gemm_signal_sm90(
     TileM,
     TileN,
     TileK,
+    StageCountType,
     ClusterShape,
     MainloopSchedule,
     EpilogueSchedule
@@ -213,6 +209,7 @@ bool gemm_signal_sm90_get_algo_meta(
   out->cluster_m = src.cluster_m;
   out->cluster_n = src.cluster_n;
   out->cluster_k = src.cluster_k;
+  out->stages = src.stages;
   out->mainloop = src.mainloop;
   out->epilogue = src.epilogue;
 

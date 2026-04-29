@@ -7,78 +7,70 @@
     "ClusterM",
     "ClusterN",
     "ClusterK",
+    "Stages",
     "Mainloop",
     "Epilogue"
   ],
   "algorithms": [
     {
       "algo": 0,
-      "tile_m": 64,
+      "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 32,
+      "tile_k": 64,
       "cluster": [
         1,
-        1,
+        2,
         1
       ],
-      "mainloop": "ws",
+      "stages": 6,
+      "mainloop": "cooperative",
       "epilogue": "auto"
     },
     {
       "algo": 1,
-      "tile_m": 64,
+      "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 32,
+      "tile_k": 64,
       "cluster": [
-        1,
         2,
+        1,
         1
       ],
-      "mainloop": "ws",
+      "stages": 6,
+      "mainloop": "cooperative",
       "epilogue": "auto"
     },
     {
       "algo": 2,
-      "tile_m": 64,
-      "tile_n": 128,
-      "tile_k": 32,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
       "cluster": [
-        2,
         1,
+        2,
         1
       ],
-      "mainloop": "ws",
+      "stages": 4,
+      "mainloop": "cooperative",
       "epilogue": "auto"
     },
     {
       "algo": 3,
-      "tile_m": 64,
-      "tile_n": 128,
-      "tile_k": 32,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
       "cluster": [
         2,
-        2,
+        1,
         1
       ],
-      "mainloop": "ws",
+      "stages": 4,
+      "mainloop": "cooperative",
       "epilogue": "auto"
     },
     {
       "algo": 4,
-      "tile_m": 64,
-      "tile_n": 128,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 5,
-      "tile_m": 64,
+      "tile_m": 256,
       "tile_n": 128,
       "tile_k": 64,
       "cluster": [
@@ -86,201 +78,231 @@
         2,
         1
       ],
-      "mainloop": "ws",
+      "stages": 4,
+      "mainloop": "cooperative",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 5,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "cooperative",
       "epilogue": "auto"
     },
     {
       "algo": 6,
       "tile_m": 64,
-      "tile_n": 128,
+      "tile_n": 256,
       "tile_k": 64,
       "cluster": [
-        2,
         1,
+        2,
         1
       ],
-      "mainloop": "ws",
+      "stages": 5,
+      "mainloop": "pingpong",
       "epilogue": "auto"
     },
     {
       "algo": 7,
       "tile_m": 64,
-      "tile_n": 128,
+      "tile_n": 256,
       "tile_k": 64,
       "cluster": [
         2,
-        2,
+        1,
         1
       ],
-      "mainloop": "ws",
+      "stages": 5,
+      "mainloop": "pingpong",
       "epilogue": "auto"
     },
     {
       "algo": 8,
-      "tile_m": 64,
+      "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 64,
       "cluster": [
         1,
-        1,
+        2,
         1
       ],
-      "mainloop": "ws",
+      "stages": 6,
+      "mainloop": "pingpong",
       "epilogue": "auto"
     },
     {
       "algo": 9,
-      "tile_m": 64,
+      "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 64,
       "cluster": [
         1,
         2,
         1
       ],
-      "mainloop": "ws",
+      "stages": 7,
+      "mainloop": "pingpong",
       "epilogue": "auto"
     },
     {
       "algo": 10,
-      "tile_m": 64,
+      "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 64,
       "cluster": [
         2,
         1,
         1
       ],
-      "mainloop": "ws",
+      "stages": 6,
+      "mainloop": "pingpong",
       "epilogue": "auto"
     },
     {
       "algo": 11,
-      "tile_m": 64,
+      "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 64,
       "cluster": [
         2,
-        2,
+        1,
         1
       ],
-      "mainloop": "ws",
+      "stages": 7,
+      "mainloop": "pingpong",
       "epilogue": "auto"
     },
     {
       "algo": 12,
       "tile_m": 64,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 32,
       "cluster": [
         1,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 13,
       "tile_m": 64,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 32,
       "cluster": [
         1,
         2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 14,
       "tile_m": 64,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 32,
       "cluster": [
         2,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 15,
       "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 32,
+      "tile_n": 128,
+      "tile_k": 64,
       "cluster": [
-        2,
-        2,
+        1,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 16,
       "tile_m": 64,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 64,
       "cluster": [
         1,
-        1,
+        2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 17,
       "tile_m": 64,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 64,
       "cluster": [
-        1,
         2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 18,
       "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 64,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 19,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 64,
-      "cluster": [
-        2,
-        2,
-        1
-      ],
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 20,
-      "tile_m": 64,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 128,
       "cluster": [
         1,
         1,
         1
       ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 19,
+      "tile_m": 64,
+      "tile_n": 128,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 20,
+      "tile_m": 64,
+      "tile_n": 128,
+      "tile_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -288,12 +310,13 @@
       "algo": 21,
       "tile_m": 64,
       "tile_n": 256,
-      "tile_k": 128,
+      "tile_k": 32,
       "cluster": [
         1,
-        2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -301,12 +324,13 @@
       "algo": 22,
       "tile_m": 64,
       "tile_n": 256,
-      "tile_k": 128,
+      "tile_k": 32,
       "cluster": [
-        2,
         1,
+        2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -314,116 +338,125 @@
       "algo": 23,
       "tile_m": 64,
       "tile_n": 256,
-      "tile_k": 128,
+      "tile_k": 32,
       "cluster": [
         2,
-        2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 24,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 32,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
       "cluster": [
         1,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 25,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 32,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
       "cluster": [
         1,
         2,
         1
       ],
+      "stages": 5,
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 26,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 32,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
       "cluster": [
-        2,
         1,
+        2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 27,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 32,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
       "cluster": [
         2,
-        2,
+        1,
         1
       ],
+      "stages": 5,
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 28,
-      "tile_m": 128,
-      "tile_n": 64,
+      "tile_m": 64,
+      "tile_n": 256,
       "tile_k": 64,
       "cluster": [
-        1,
+        2,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 29,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 64,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 128,
       "cluster": [
         1,
-        2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 30,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 64,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 128,
       "cluster": [
-        2,
         1,
+        2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 31,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 64,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 128,
       "cluster": [
         2,
-        2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -431,12 +464,13 @@
       "algo": 32,
       "tile_m": 128,
       "tile_n": 64,
-      "tile_k": 128,
+      "tile_k": 32,
       "cluster": [
         1,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -444,12 +478,13 @@
       "algo": 33,
       "tile_m": 128,
       "tile_n": 64,
-      "tile_k": 128,
+      "tile_k": 32,
       "cluster": [
         1,
         2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -457,12 +492,13 @@
       "algo": 34,
       "tile_m": 128,
       "tile_n": 64,
-      "tile_k": 128,
+      "tile_k": 32,
       "cluster": [
         2,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -470,77 +506,83 @@
       "algo": 35,
       "tile_m": 128,
       "tile_n": 64,
-      "tile_k": 128,
-      "cluster": [
-        2,
-        2,
-        1
-      ],
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 36,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 37,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 38,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 39,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        2,
-        2,
-        1
-      ],
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 40,
-      "tile_m": 128,
-      "tile_n": 128,
       "tile_k": 64,
       "cluster": [
         1,
         1,
         1
       ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 36,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 37,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 38,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 39,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 40,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -548,12 +590,13 @@
       "algo": 41,
       "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 64,
+      "tile_k": 32,
       "cluster": [
         1,
-        2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -561,12 +604,13 @@
       "algo": 42,
       "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 64,
+      "tile_k": 32,
       "cluster": [
-        2,
         1,
+        2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -574,12 +618,13 @@
       "algo": 43,
       "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 64,
+      "tile_k": 32,
       "cluster": [
         2,
-        2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -587,12 +632,13 @@
       "algo": 44,
       "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 64,
       "cluster": [
         1,
         1,
         1
       ],
+      "stages": 7,
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -600,12 +646,13 @@
       "algo": 45,
       "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 64,
       "cluster": [
         1,
-        2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -613,12 +660,13 @@
       "algo": 46,
       "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 64,
       "cluster": [
-        2,
         1,
+        2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
@@ -626,147 +674,298 @@
       "algo": 47,
       "tile_m": 128,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 64,
       "cluster": [
         2,
-        2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 48,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 32,
+      "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 128,
       "cluster": [
         1,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 49,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 32,
+      "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 128,
       "cluster": [
         1,
         2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 50,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 32,
+      "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 128,
       "cluster": [
         2,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 51,
-      "tile_m": 256,
-      "tile_n": 64,
+      "tile_m": 128,
+      "tile_n": 256,
       "tile_k": 32,
       "cluster": [
-        2,
-        2,
+        1,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 52,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 64,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 32,
       "cluster": [
         1,
-        1,
+        2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 53,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 64,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 32,
       "cluster": [
-        1,
         2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 54,
-      "tile_m": 256,
-      "tile_n": 64,
+      "tile_m": 128,
+      "tile_n": 256,
       "tile_k": 64,
       "cluster": [
-        2,
+        1,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 55,
-      "tile_m": 256,
-      "tile_n": 64,
+      "tile_m": 128,
+      "tile_n": 256,
       "tile_k": 64,
       "cluster": [
-        2,
+        1,
         2,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 56,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 128,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
       "cluster": [
-        1,
+        2,
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 57,
-      "tile_m": 256,
-      "tile_n": 64,
+      "tile_m": 128,
+      "tile_n": 256,
       "tile_k": 128,
       "cluster": [
         1,
-        2,
+        1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
       "algo": 58,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 59,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 60,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 61,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 62,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 32,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 63,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 64,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 65,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 66,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 67,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 68,
       "tile_m": 256,
       "tile_n": 64,
       "tile_k": 128,
@@ -775,19 +974,133 @@
         1,
         1
       ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     },
     {
-      "algo": 59,
+      "algo": 69,
       "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 128,
+      "tile_n": 128,
+      "tile_k": 32,
       "cluster": [
-        2,
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 70,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 32,
+      "cluster": [
+        1,
         2,
         1
       ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 71,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 32,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 72,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 73,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 74,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 75,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 76,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto"
+    },
+    {
+      "algo": 77,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
       "mainloop": "ws",
       "epilogue": "auto"
     }
