@@ -9,7 +9,8 @@
     "ClusterK",
     "Stages",
     "Mainloop",
-    "Epilogue"
+    "Epilogue",
+    "Scheduler"
   ],
   "algorithms": [
     {
@@ -24,7 +25,8 @@
       ],
       "stages": 6,
       "mainloop": "cooperative",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 1,
@@ -38,7 +40,8 @@
       ],
       "stages": 6,
       "mainloop": "cooperative",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 2,
@@ -52,7 +55,8 @@
       ],
       "stages": 4,
       "mainloop": "cooperative",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 3,
@@ -66,7 +70,8 @@
       ],
       "stages": 4,
       "mainloop": "cooperative",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 4,
@@ -80,7 +85,8 @@
       ],
       "stages": 4,
       "mainloop": "cooperative",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 5,
@@ -94,53 +100,147 @@
       ],
       "stages": 4,
       "mainloop": "cooperative",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 6,
-      "tile_m": 64,
-      "tile_n": 256,
+      "tile_m": 128,
+      "tile_n": 128,
       "tile_k": 64,
       "cluster": [
         1,
         2,
         1
       ],
-      "stages": 5,
-      "mainloop": "pingpong",
-      "epilogue": "auto"
+      "stages": 6,
+      "mainloop": "cooperative",
+      "epilogue": "auto",
+      "scheduler": "stream_k"
     },
     {
       "algo": 7,
-      "tile_m": 64,
-      "tile_n": 256,
+      "tile_m": 128,
+      "tile_n": 128,
       "tile_k": 64,
       "cluster": [
         2,
         1,
         1
       ],
-      "stages": 5,
-      "mainloop": "pingpong",
-      "epilogue": "auto"
+      "stages": 6,
+      "mainloop": "cooperative",
+      "epilogue": "auto",
+      "scheduler": "stream_k"
     },
     {
       "algo": 8,
       "tile_m": 128,
-      "tile_n": 128,
+      "tile_n": 256,
       "tile_k": 64,
       "cluster": [
         1,
         2,
         1
       ],
-      "stages": 6,
-      "mainloop": "pingpong",
-      "epilogue": "auto"
+      "stages": 4,
+      "mainloop": "cooperative",
+      "epilogue": "auto",
+      "scheduler": "stream_k"
     },
     {
       "algo": 9,
       "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "cooperative",
+      "epilogue": "auto",
+      "scheduler": "stream_k"
+    },
+    {
+      "algo": 10,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "cooperative",
+      "epilogue": "auto",
+      "scheduler": "stream_k"
+    },
+    {
+      "algo": 11,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "cooperative",
+      "epilogue": "auto",
+      "scheduler": "stream_k"
+    },
+    {
+      "algo": 12,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": 5,
+      "mainloop": "pingpong",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 13,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": 5,
+      "mainloop": "pingpong",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 14,
+      "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": 6,
+      "mainloop": "pingpong",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 15,
+      "tile_m": 128,
       "tile_n": 128,
       "tile_k": 64,
       "cluster": [
@@ -150,10 +250,11 @@
       ],
       "stages": 7,
       "mainloop": "pingpong",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 10,
+      "algo": 16,
       "tile_m": 128,
       "tile_n": 128,
       "tile_k": 64,
@@ -164,10 +265,11 @@
       ],
       "stages": 6,
       "mainloop": "pingpong",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 11,
+      "algo": 17,
       "tile_m": 128,
       "tile_n": 128,
       "tile_k": 64,
@@ -178,97 +280,14 @@
       ],
       "stages": 7,
       "mainloop": "pingpong",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 12,
-      "tile_m": 64,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 13,
-      "tile_m": 64,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 14,
-      "tile_m": 64,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 15,
-      "tile_m": 64,
-      "tile_n": 128,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 16,
-      "tile_m": 64,
-      "tile_n": 128,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 17,
-      "tile_m": 64,
-      "tile_n": 128,
-      "tile_k": 64,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 18,
       "tile_m": 64,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 32,
       "cluster": [
         1,
         1,
@@ -276,13 +295,14 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 19,
       "tile_m": 64,
       "tile_n": 128,
-      "tile_k": 128,
+      "tile_k": 32,
       "cluster": [
         1,
         2,
@@ -290,12 +310,103 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 20,
       "tile_m": 64,
       "tile_n": 128,
+      "tile_k": 32,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 21,
+      "tile_m": 64,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 22,
+      "tile_m": 64,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 23,
+      "tile_m": 64,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 24,
+      "tile_m": 64,
+      "tile_n": 128,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 25,
+      "tile_m": 64,
+      "tile_n": 128,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 26,
+      "tile_m": 64,
+      "tile_n": 128,
       "tile_k": 128,
       "cluster": [
         2,
@@ -304,96 +415,118 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 21,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 22,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 23,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 32,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 24,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 25,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": 5,
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 26,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 27,
       "tile_m": 64,
       "tile_n": 256,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 28,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 29,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 32,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 30,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": 5,
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 31,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 32,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": 5,
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 33,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 34,
+      "tile_m": 64,
+      "tile_n": 256,
       "tile_k": 64,
       "cluster": [
         2,
@@ -402,152 +535,28 @@
       ],
       "stages": 5,
       "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 28,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 64,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 29,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 128,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 30,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 128,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 31,
-      "tile_m": 64,
-      "tile_n": 256,
-      "tile_k": 128,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 32,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 33,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 34,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 32,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 35,
-      "tile_m": 128,
-      "tile_n": 64,
+      "tile_m": 64,
+      "tile_n": 256,
       "tile_k": 64,
       "cluster": [
-        1,
+        2,
         1,
         1
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 36,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 37,
-      "tile_m": 128,
-      "tile_n": 64,
-      "tile_k": 64,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 38,
-      "tile_m": 128,
-      "tile_n": 64,
+      "tile_m": 64,
+      "tile_n": 256,
       "tile_k": 128,
       "cluster": [
         1,
@@ -556,12 +565,148 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 37,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 38,
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 39,
       "tile_m": 128,
       "tile_n": 64,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 40,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 41,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 32,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 42,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 43,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 44,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 45,
+      "tile_m": 128,
+      "tile_n": 64,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 46,
+      "tile_m": 128,
+      "tile_n": 64,
       "tile_k": 128,
       "cluster": [
         1,
@@ -570,10 +715,11 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 40,
+      "algo": 47,
       "tile_m": 128,
       "tile_n": 64,
       "tile_k": 128,
@@ -584,10 +730,11 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 41,
+      "algo": 48,
       "tile_m": 128,
       "tile_n": 128,
       "tile_k": 32,
@@ -598,10 +745,11 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 42,
+      "algo": 49,
       "tile_m": 128,
       "tile_n": 128,
       "tile_k": 32,
@@ -612,10 +760,11 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 43,
+      "algo": 50,
       "tile_m": 128,
       "tile_n": 128,
       "tile_k": 32,
@@ -626,10 +775,11 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 44,
+      "algo": 51,
       "tile_m": 128,
       "tile_n": 128,
       "tile_k": 64,
@@ -640,166 +790,73 @@
       ],
       "stages": 7,
       "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 45,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 46,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 47,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 64,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 48,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 128,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 49,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 128,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 50,
-      "tile_m": 128,
-      "tile_n": 128,
-      "tile_k": 128,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 51,
-      "tile_m": 128,
-      "tile_n": 256,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 52,
       "tile_m": 128,
-      "tile_n": 256,
-      "tile_k": 32,
+      "tile_n": 128,
+      "tile_k": 64,
       "cluster": [
         1,
-        2,
+        1,
         1
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 53,
       "tile_m": 128,
-      "tile_n": 256,
-      "tile_k": 32,
+      "tile_n": 128,
+      "tile_k": 64,
       "cluster": [
-        2,
         1,
+        2,
         1
       ],
-      "stages": "auto",
+      "stages": 7,
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 54,
       "tile_m": 128,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 64,
       "cluster": [
         1,
-        1,
+        2,
         1
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 55,
       "tile_m": 128,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 64,
       "cluster": [
-        1,
         2,
+        1,
         1
       ],
-      "stages": "auto",
+      "stages": 7,
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 56,
       "tile_m": 128,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 64,
       "cluster": [
         2,
@@ -808,12 +865,13 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 57,
       "tile_m": 128,
-      "tile_n": 256,
+      "tile_n": 128,
       "tile_k": 128,
       "cluster": [
         1,
@@ -822,11 +880,192 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 58,
       "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 59,
+      "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 60,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 61,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 62,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 32,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 63,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 64,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 65,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 66,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 67,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 68,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 69,
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 70,
+      "tile_m": 128,
       "tile_n": 256,
       "tile_k": 128,
       "cluster": [
@@ -836,10 +1075,11 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 59,
+      "algo": 71,
       "tile_m": 128,
       "tile_n": 256,
       "tile_k": 128,
@@ -850,181 +1090,14 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 60,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 61,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 62,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 32,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 63,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 64,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 64,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 65,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 64,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 66,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 128,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 67,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 128,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 68,
-      "tile_m": 256,
-      "tile_n": 64,
-      "tile_k": 128,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 69,
-      "tile_m": 256,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 70,
-      "tile_m": 256,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        1,
-        2,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
-    },
-    {
-      "algo": 71,
-      "tile_m": 256,
-      "tile_n": 128,
-      "tile_k": 32,
-      "cluster": [
-        2,
-        1,
-        1
-      ],
-      "stages": "auto",
-      "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 72,
       "tile_m": 256,
-      "tile_n": 128,
-      "tile_k": 64,
+      "tile_n": 64,
+      "tile_k": 32,
       "cluster": [
         1,
         1,
@@ -1032,13 +1105,14 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 73,
       "tile_m": 256,
-      "tile_n": 128,
-      "tile_k": 64,
+      "tile_n": 64,
+      "tile_k": 32,
       "cluster": [
         1,
         2,
@@ -1046,11 +1120,237 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
       "algo": 74,
       "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 32,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 75,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 76,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 77,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 78,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 79,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 128,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 80,
+      "tile_m": 256,
+      "tile_n": 64,
+      "tile_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 81,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 82,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 32,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 83,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 32,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 84,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 85,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 86,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 87,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        1,
+        2,
+        1
+      ],
+      "stages": "auto",
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 88,
+      "tile_m": 256,
+      "tile_n": 128,
+      "tile_k": 64,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "stages": 4,
+      "mainloop": "ws",
+      "epilogue": "auto",
+      "scheduler": "normal"
+    },
+    {
+      "algo": 89,
+      "tile_m": 256,
       "tile_n": 128,
       "tile_k": 64,
       "cluster": [
@@ -1060,10 +1360,11 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 75,
+      "algo": 90,
       "tile_m": 256,
       "tile_n": 128,
       "tile_k": 128,
@@ -1074,10 +1375,11 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 76,
+      "algo": 91,
       "tile_m": 256,
       "tile_n": 128,
       "tile_k": 128,
@@ -1088,10 +1390,11 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     },
     {
-      "algo": 77,
+      "algo": 92,
       "tile_m": 256,
       "tile_n": 128,
       "tile_k": 128,
@@ -1102,7 +1405,8 @@
       ],
       "stages": "auto",
       "mainloop": "ws",
-      "epilogue": "auto"
+      "epilogue": "auto",
+      "scheduler": "normal"
     }
   ]
 }

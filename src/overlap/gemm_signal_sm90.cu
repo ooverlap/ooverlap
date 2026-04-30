@@ -1,7 +1,7 @@
 /***************************************************************************************************
  * SM90 CUTLASS 3.x GEMM dispatch for packed/reordered output experiments.
  *
- * The generated algo table now includes explicit StageCountType and schedule.
+ * The generated algo table includes explicit StageCountType, schedule, and tile scheduler.
  **************************************************************************************************/
 
 #include <ATen/core/interned_strings.h>
@@ -82,7 +82,8 @@ template <
   typename StageCountType,
   typename ClusterShape,
   typename MainloopSchedule,
-  typename EpilogueSchedule
+  typename EpilogueSchedule,
+  typename TileScheduler
 >
 void cutlass_gemm_signal_sm90(
   int M, int N, int K,
@@ -99,7 +100,6 @@ void cutlass_gemm_signal_sm90(
   using ElementB           = cutlass::half_t;
   using LayoutB            = cutlass::layout::ColumnMajor;
   using ElementC           = cutlass::half_t;
-  //using LayoutC            = cutlass::layout::RowMajor;
   using LayoutC            = cutlass::layout::ColumnMajor;
   using ElementAccumulator = float;
 
@@ -114,7 +114,8 @@ void cutlass_gemm_signal_sm90(
     StageCountType,
     ClusterShape,
     MainloopSchedule,
-    EpilogueSchedule
+    EpilogueSchedule,
+    TileScheduler
   >;
 
   static GemmSignal gemm_op;
@@ -141,7 +142,16 @@ void cutlass_gemm_signal_sm90(
 
   cutlass::gemm::GemmCoord problem_size(M, N, K);
 
-  int64_t ld_D_reshaped = int64_t(ReLDN) * int64_t(TileN);
+  // D is interpreted as ColumnMajor in the temporary GEMM-only experiment.
+  // The physical D tensor is shaped as:
+  //   normal: (M, N), with ReLDN = N / TileN
+  //   packed: (ceil(TileNum / ReLDN) * TileM, ReLDN * TileN)
+  // Therefore the ColumnMajor leading dimension is the physical row count.
+  int64_t tile_rows = (int64_t(M) + TileM - 1) / TileM;
+  int64_t tile_cols = (int64_t(N) + TileN - 1) / TileN;
+  int64_t tile_num = tile_rows * tile_cols;
+  int64_t packed_tile_rows = (tile_num + int64_t(ReLDN) - 1) / int64_t(ReLDN);
+  int64_t ld_D_reshaped = packed_tile_rows * int64_t(TileM);
 
   typename GemmSignal::Arguments arguments(
     problem_size,
@@ -213,6 +223,7 @@ bool gemm_signal_sm90_get_algo_meta(
   out->stages = src.stages;
   out->mainloop = src.mainloop;
   out->epilogue = src.epilogue;
+  out->scheduler = src.scheduler;
 
   return true;
 }

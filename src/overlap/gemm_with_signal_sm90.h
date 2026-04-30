@@ -1,14 +1,15 @@
 /***************************************************************************************************
  * SM90 CUTLASS 3.x GEMM wrapper.
  *
- * This version makes StageCount an explicit template parameter so generated algos can
- * exactly match CUTLASS profiler rows:
+ * This version adds TileScheduler as an explicit template parameter so generated algos can
+ * instantiate both normal CUTLASS scheduling and Stream-K scheduling:
  *
  *   TileM, TileN, TileK,
  *   StageCount,
  *   ClusterM, ClusterN, ClusterK,
  *   MainloopSchedule,
- *   EpilogueSchedule
+ *   EpilogueSchedule,
+ *   TileScheduler
  *
  * OOVERLAP_USE_BASE_EPILOGUE_ONLY:
  *   0: use ReorderSignalEpilogue
@@ -35,6 +36,7 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -93,18 +95,6 @@ KernelArguments make_kernel_arguments(
     EpilogueArguments const& epilogue_args,
     cutlass::KernelHardwareInfo const& hw_info,
     TileSchedArguments const& sched_args) {
-
-  //
-  // Different CUTLASS SM90 kernel headers expose different Arguments shapes:
-  //
-  //   WS/Pingpong variants commonly accept hw_info.
-  //   Cooperative/persistent variants often use TileSchedulerArguments instead
-  //   and do not take hw_info in the Arguments constructor.
-  //
-  // Also, some versions expose constructors while others rely on aggregate
-  // brace initialization. So each case below checks both parenthesis
-  // constructibility and brace constructibility.
-  //
 
   if constexpr (std::is_constructible<
       KernelArguments,
@@ -365,11 +355,16 @@ KernelArguments make_kernel_arguments(
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Mainloop stride helper.
+// For this repo, B is physically [N, K] contiguous and is passed as logical B^T.
+// Your CUTLASS rev expects the mainloop stride type for LayoutB=ColumnMajor to be
+// cute::tuple<int64_t, C<1>, int64_t>, so ColumnMajor intentionally uses the same
+// physical row-major stride here.
 template <typename LayoutTag>
-struct CuteEpilogue;
+struct CuteMainloopStride2D;
 
 template <>
-struct CuteEpilogue<cutlass::layout::RowMajor> {
+struct CuteMainloopStride2D<cutlass::layout::RowMajor> {
   CUTLASS_HOST_DEVICE
   static auto make(int64_t ld) {
     return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
@@ -377,14 +372,14 @@ struct CuteEpilogue<cutlass::layout::RowMajor> {
 };
 
 template <>
-struct CuteEpilogue<cutlass::layout::ColumnMajor> {
+struct CuteMainloopStride2D<cutlass::layout::ColumnMajor> {
   CUTLASS_HOST_DEVICE
   static auto make(int64_t ld) {
-    // In this repo B is physically [N, K] contiguous and interpreted by CUTLASS as B^T.
     return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
   }
 };
 
+// Epilogue stride helper. This one uses true output layout semantics.
 template <typename LayoutTag>
 struct CuteEpilogueStride2D;
 
@@ -420,7 +415,8 @@ template <
   typename StageCountType_,
   typename ClusterShape_,
   typename MainloopSchedule_,
-  typename EpilogueSchedule_
+  typename EpilogueSchedule_,
+  typename TileScheduler_ = void
 >
 class GemmSignalSm90 {
 public:
@@ -444,17 +440,16 @@ public:
     cute::Int<TileK>
   >;
 
-  using StageCountType  = StageCountType_;
-  using ClusterShape    = ClusterShape_;
+  using StageCountType   = StageCountType_;
+  using ClusterShape     = ClusterShape_;
   using MainloopSchedule = MainloopSchedule_;
   using EpilogueSchedule = EpilogueSchedule_;
+  using TileScheduler    = TileScheduler_;
 
-  //static_assert(cutlass::platform::is_same<LayoutOutput, cutlass::layout::RowMajor>::value,
-                //"Route-A fused reorder expects RowMajor output buffer interpretation.");
-static_assert(
+  static_assert(
     cutlass::platform::is_same<LayoutOutput, cutlass::layout::ColumnMajor>::value,
     "Temporary GEMM-only test expects ColumnMajor output."
-);
+  );
 
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   using ArchTag       = cutlass::arch::Sm90;
@@ -502,7 +497,8 @@ static_assert(
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     cute::Shape<int, int, int, int>,
     CollectiveMainloop,
-    CollectiveEpilogue
+    CollectiveEpilogue,
+    TileScheduler
   >;
 
   using GemmDevice = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
@@ -595,9 +591,9 @@ public:
 
     MainloopArguments mainloop_args{
       reinterpret_cast<ElementInputA const*>(args_.ptr_A),
-      CuteEpilogueStride2D<LayoutInputA>::make(args_.ldm_A),
+      CuteMainloopStride2D<LayoutInputA>::make(args_.ldm_A),
       reinterpret_cast<ElementInputB const*>(args_.ptr_B),
-      CuteEpilogueStride2D<LayoutInputB>::make(args_.ldm_B)
+      CuteMainloopStride2D<LayoutInputB>::make(args_.ldm_B)
     };
 
 #if defined(OOVERLAP_USE_BASE_EPILOGUE_ONLY) && OOVERLAP_USE_BASE_EPILOGUE_ONLY
@@ -664,8 +660,6 @@ public:
 
   Status run(cudaStream_t stream) {
     if (!initialized_) {
-
-      std::cout << "heloooooooooooo" << std::endl;
       Status status = initialize(args_, stream);
       if (status != Status::kSuccess) {
         return status;

@@ -2,30 +2,45 @@
 """
 Generate SM90 CUTLASS-3 GEMM-with-signal instances for ooverlap.
 
-This version supports exact stage-count keys:
+This version supports exact stage-count keys and explicit tile schedulers:
 
   TileM, TileN, TileK,
   ClusterM, ClusterN, ClusterK,
   Stages,
   Mainloop,
-  Epilogue
+  Epilogue,
+  Scheduler
 
-Recommended workflow after a profiling miss:
+Schedulers:
+  normal   -> default CUTLASS GemmUniversal scheduler, encoded as C++ type void
+  stream_k -> cutlass::gemm::StreamKScheduler
 
+Useful Stream-K workflow:
+
+  # First run gen_config_sm90.py once so *_failed.json contains unsupported_stream_k rows.
+  python tool/gen_config_sm90.py \
+    --m 16384 --n 8192 --k 8192 \
+    --csv ~/csv_out_h100/m16384n8192k8192.gemm.csv \
+    --layout packed \
+    --top-csv 10 \
+    --match-stages exact \
+    --timing-mode eager \
+    --csv-c-layout any --csv-d-layout any
+
+  # Then generate Stream-K instances from that failed file.
   python tool/generate_instances_sm90.py \
-    --from-missing-json configs/m4096n2048k1024_nvidia_h100_nvl_normal_sm90_missing.json \
-    --top-missing 20 \
-    --keep-base-ws
+    --from-failed-json configs/m16384n8192k8192_nvidia_h100_nvl_packed_sm90_failed.json \
+    --top-failed 20 \
+    --keep-curated
 
   cd build && make -j
 
-Then rerun gen_config_sm90.py with:
-
-  --match-stages exact
+Then test direct algo ids, or rerun gen_config_sm90.py with --allow-stream-k.
 """
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 try:
@@ -44,13 +59,18 @@ EPILOGUE_TYPES = {
     "auto": "cutlass::epilogue::collective::EpilogueScheduleAuto",
 }
 
+SCHEDULER_TYPES = {
+    "normal": "void",
+    "stream_k": "cutlass::gemm::StreamKScheduler",
+}
+
 
 def root_from_script() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
 def cluster_cpp(cluster):
-    cm, cn, ck = cluster
+    cm, cn, ck = [int(x) for x in cluster]
     return f"cute::Shape<cute::_{cm}, cute::_{cn}, cute::_{ck}>"
 
 
@@ -60,7 +80,36 @@ def stage_cpp(stages):
     return f"cutlass::gemm::collective::StageCount<{int(stages)}>"
 
 
+def normalize_scheduler(x):
+    if x is None:
+        return "normal"
+    s = str(x).strip().lower().replace("-", "_")
+    if s in ("streamk", "stream_k"):
+        return "stream_k"
+    return "normal"
+
+
+def infer_scheduler_from_row(row):
+    if "scheduler" in row:
+        return normalize_scheduler(row.get("scheduler"))
+    if "csv_scheduler" in row:
+        return normalize_scheduler(row.get("csv_scheduler"))
+    if bool(row.get("is_stream_k", False)):
+        return "stream_k"
+    op = str(row.get("operation", "")).lower().replace("-", "_")
+    err = str(row.get("error", "")).lower().replace("-", "_")
+    if re.search(r"stream_?k", op) or re.search(r"stream_?k", err):
+        return "stream_k"
+    return "normal"
+
+
 def combo_key(combo):
+    stages = combo.get("stages", "auto")
+    if stages is None or str(stages).lower() == "auto" or int(stages) < 0:
+        stages_key = "auto"
+    else:
+        stages_key = int(stages)
+
     return (
         int(combo["tile_m"]),
         int(combo["tile_n"]),
@@ -68,9 +117,10 @@ def combo_key(combo):
         int(combo["cluster"][0]),
         int(combo["cluster"][1]),
         int(combo["cluster"][2]),
-        int(combo["stages"]) if combo.get("stages") and combo["stages"] != "auto" is not None else "auto",
+        stages_key,
         str(combo["mainloop"]),
-        str(combo["epilogue"]),
+        str(combo.get("epilogue", "auto")),
+        normalize_scheduler(combo.get("scheduler", "normal")),
     )
 
 
@@ -83,26 +133,39 @@ def combo_dict_from_key(key):
         "stages": key[6],
         "mainloop": str(key[7]),
         "epilogue": str(key[8]),
+        "scheduler": str(key[9]),
     }
 
 
 def canonical_combo(x):
+    scheduler = normalize_scheduler(x.get("scheduler", "normal"))
+    if scheduler not in SCHEDULER_TYPES:
+        raise ValueError(f"Unsupported scheduler={scheduler}")
+
+    mainloop = str(x["mainloop"])
+    if mainloop not in MAINLOOP_TYPES:
+        raise ValueError(f"Unsupported mainloop={mainloop}")
+
+    epilogue = str(x.get("epilogue", "auto"))
+    if epilogue not in EPILOGUE_TYPES:
+        raise ValueError(f"Unsupported epilogue={epilogue}")
+
+    stages = x.get("stages", "auto")
+    stages_out = "auto" if stages is None or str(stages).lower() == "auto" or int(stages) < 0 else int(stages)
+
     return {
         "tile_m": int(x["tile_m"]),
         "tile_n": int(x["tile_n"]),
         "tile_k": int(x["tile_k"]),
         "cluster": [int(x["cluster"][0]), int(x["cluster"][1]), int(x["cluster"][2])],
-        "stages": int(x["stages"]) if x.get("stages") not in (None, "auto") else "auto",
-        "mainloop": str(x["mainloop"]),
-        "epilogue": str(x.get("epilogue", "auto")),
+        "stages": stages_out,
+        "mainloop": mainloop,
+        "epilogue": epilogue,
+        "scheduler": scheduler,
     }
 
 
 def default_base_ws_combos():
-    """
-    Compact fallback set. These are not meant to beat the profiler; they keep
-    old algo coverage available while you add exact profiler misses.
-    """
     combos = []
     for tm in [64, 128, 256]:
         for tn in [64, 128, 256]:
@@ -111,8 +174,6 @@ def default_base_ws_combos():
             if tm == 256 and tn == 256:
                 continue
             for tk in [32, 64, 128]:
-                # StageCountAuto is useful as a fallback but exact profiling should
-                # use concrete stages from missing JSON.
                 for cluster in [(1, 1, 1), (1, 2, 1), (2, 1, 1)]:
                     combos.append({
                         "tile_m": tm,
@@ -122,20 +183,14 @@ def default_base_ws_combos():
                         "stages": "auto",
                         "mainloop": "ws",
                         "epilogue": "auto",
+                        "scheduler": "normal",
                     })
     return combos
 
 
-def curated_sm90_combos(include_pingpong: bool, include_cooperative: bool):
-    """
-    Small H100-focused set based on the top profiler patterns we have seen:
-      - ws:          64x256/128x128/128x256/256x128
-      - pingpong:    64x256 stage 5, 128x128 stage 6
-      - cooperative: 128x128 stage 6, 128x256/256x128 stage 4
-    """
+def curated_sm90_combos(include_pingpong: bool, include_cooperative: bool, include_stream_k: bool):
     combos = []
 
-    # WS exact-ish stage candidates.
     for tm, tn, tk, stages in [
         (64, 256, 64, 5),
         (128, 128, 64, 7),
@@ -149,12 +204,14 @@ def curated_sm90_combos(include_pingpong: bool, include_cooperative: bool):
                 "stages": stages,
                 "mainloop": "ws",
                 "epilogue": "auto",
+                "scheduler": "normal",
             })
 
     if include_pingpong:
         for tm, tn, tk, stages in [
             (64, 256, 64, 5),
             (128, 128, 64, 6),
+            (128, 128, 64, 7),
         ]:
             for cluster in [(1, 2, 1), (2, 1, 1)]:
                 combos.append({
@@ -163,14 +220,16 @@ def curated_sm90_combos(include_pingpong: bool, include_cooperative: bool):
                     "stages": stages,
                     "mainloop": "pingpong",
                     "epilogue": "auto",
+                    "scheduler": "normal",
                 })
 
     if include_cooperative:
-        for tm, tn, tk, stages in [
+        coop_shapes = [
             (128, 128, 64, 6),
             (128, 256, 64, 4),
             (256, 128, 64, 4),
-        ]:
+        ]
+        for tm, tn, tk, stages in coop_shapes:
             for cluster in [(1, 2, 1), (2, 1, 1)]:
                 combos.append({
                     "tile_m": tm, "tile_n": tn, "tile_k": tk,
@@ -178,25 +237,45 @@ def curated_sm90_combos(include_pingpong: bool, include_cooperative: bool):
                     "stages": stages,
                     "mainloop": "cooperative",
                     "epilogue": "auto",
+                    "scheduler": "normal",
                 })
+
+                if include_stream_k:
+                    combos.append({
+                        "tile_m": tm, "tile_n": tn, "tile_k": tk,
+                        "cluster": list(cluster),
+                        "stages": stages,
+                        "mainloop": "cooperative",
+                        "epilogue": "auto",
+                        "scheduler": "stream_k",
+                    })
 
     return combos
 
 
-def load_missing_json(path: Path, top_miss: int, allow_slow: bool):
+def _rows_from_json_obj(data, preferred_key):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        if preferred_key in data:
+            return data.get(preferred_key, [])
+        if "failed" in data:
+            return data.get("failed", [])
+        if "missing" in data:
+            return data.get("missing", [])
+    return []
+
+
+def load_rows_json(path: Path, top_n: int, allow_slow: bool, preferred_key: str):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    rows = data.get("missing", data)
-    if isinstance(rows, dict):
-        rows = rows.get("missing", [])
-
+    rows = _rows_from_json_obj(data, preferred_key)
     out = []
     for r in rows:
         if "tile_m" not in r:
             continue
 
-        # Skip obvious f32-output rows unless requested. Our wrapper is D=f16.
         op = str(r.get("operation", ""))
         if (not allow_slow) and "_f32_f32_" in op:
             continue
@@ -217,9 +296,10 @@ def load_missing_json(path: Path, top_miss: int, allow_slow: bool):
             "stages": stages,
             "mainloop": mainloop,
             "epilogue": r.get("epilogue", "auto"),
+            "scheduler": infer_scheduler_from_row(r),
         }))
 
-        if len(out) >= top_miss:
+        if len(out) >= top_n:
             break
 
     return out
@@ -228,12 +308,13 @@ def load_missing_json(path: Path, top_miss: int, allow_slow: bool):
 def dedupe(combos):
     by_key = {}
     for c in combos:
-        key = combo_key(c)
-        by_key[key] = canonical_combo(c)
+        cc = canonical_combo(c)
+        by_key[combo_key(cc)] = cc
 
     out = list(by_key.values())
     out.sort(key=lambda c: (
         str(c["mainloop"]),
+        str(c.get("scheduler", "normal")),
         int(c["tile_m"]),
         int(c["tile_n"]),
         int(c["tile_k"]),
@@ -254,7 +335,8 @@ def cpp_template_args(combo):
     cluster = cluster_cpp(combo["cluster"])
     mainloop = MAINLOOP_TYPES[combo["mainloop"]]
     epilogue = EPILOGUE_TYPES[combo["epilogue"]]
-    return f"{tm}, {tn}, {tk}, {stage}, {cluster}, {mainloop}, {epilogue}"
+    scheduler = SCHEDULER_TYPES[normalize_scheduler(combo.get("scheduler", "normal"))]
+    return f"{tm}, {tn}, {tk}, {stage}, {cluster}, {mainloop}, {epilogue}, {scheduler}"
 
 
 def write_algo_dicts(root: Path, candidates):
@@ -293,6 +375,7 @@ def write_algo_dicts(root: Path, candidates):
                     "Stages",
                     "Mainloop",
                     "Epilogue",
+                    "Scheduler",
                 ],
                 "algorithms": json_items,
             },
@@ -364,6 +447,7 @@ def write_signal_instances(root: Path, candidates):
         f.write("  int stages;\n")
         f.write("  const char* mainloop;\n")
         f.write("  const char* epilogue;\n")
+        f.write("  const char* scheduler;\n")
         f.write("};\n\n")
 
         f.write("static SignalSm90FuncPtr signal_sm90_func_table[] = {\n")
@@ -378,6 +462,7 @@ def write_signal_instances(root: Path, candidates):
         for combo in candidates:
             cm, cn, ck = combo["cluster"]
             stages = -1 if str(combo["stages"]).lower() == "auto" else int(combo["stages"])
+            scheduler = normalize_scheduler(combo.get("scheduler", "normal"))
             f.write(
                 "  {"
                 f"{int(combo['tile_m'])}, "
@@ -386,7 +471,8 @@ def write_signal_instances(root: Path, candidates):
                 f"{int(cm)}, {int(cn)}, {int(ck)}, "
                 f"{stages}, "
                 f"\"{combo['mainloop']}\", "
-                f"\"{combo['epilogue']}\""
+                f"\"{combo['epilogue']}\", "
+                f"\"{scheduler}\""
                 "},\n"
             )
         f.write("};\n\n")
@@ -406,7 +492,8 @@ def print_summary(candidates):
             f"cluster={cm}x{cn}x{ck} "
             f"stages={combo['stages']} "
             f"mainloop={combo['mainloop']} "
-            f"epilogue={combo['epilogue']}"
+            f"epilogue={combo['epilogue']} "
+            f"scheduler={normalize_scheduler(combo.get('scheduler', 'normal'))}"
         )
 
 
@@ -427,9 +514,17 @@ def main():
     ap.add_argument("--include-cooperative", action="store_true", default=True)
     ap.add_argument("--no-include-cooperative", dest="include_cooperative", action="store_false")
 
+    ap.add_argument("--include-stream-k", action="store_true")
+    ap.add_argument("--stream-k-only", action="store_true")
+
     ap.add_argument("--from-missing-json", type=str, default=None)
     ap.add_argument("--top-missing", type=int, default=20)
+
+    ap.add_argument("--from-failed-json", type=str, default=None)
+    ap.add_argument("--top-failed", type=int, default=20)
+
     ap.add_argument("--keep-base-ws", action="store_true")
+    ap.add_argument("--keep-curated", action="store_true")
     ap.add_argument("--allow-slow-or-f32-output-rows", action="store_true")
 
     args = ap.parse_args()
@@ -439,21 +534,36 @@ def main():
     candidates = []
 
     if args.from_missing_json is not None:
-        candidates.extend(load_missing_json(
+        candidates.extend(load_rows_json(
             Path(args.from_missing_json).expanduser().resolve(),
             args.top_missing,
             args.allow_slow_or_f32_output_rows,
+            preferred_key="missing",
         ))
-        if args.keep_base_ws:
-            candidates.extend(default_base_ws_combos())
-    else:
+
+    if args.from_failed_json is not None:
+        candidates.extend(load_rows_json(
+            Path(args.from_failed_json).expanduser().resolve(),
+            args.top_failed,
+            args.allow_slow_or_f32_output_rows,
+            preferred_key="failed",
+        ))
+
+    if args.keep_base_ws:
+        candidates.extend(default_base_ws_combos())
+
+    if args.keep_curated or (args.from_missing_json is None and args.from_failed_json is None):
         if args.preset == "base-ws-only":
             candidates.extend(default_base_ws_combos())
         else:
             candidates.extend(curated_sm90_combos(
                 include_pingpong=args.include_pingpong,
                 include_cooperative=args.include_cooperative,
+                include_stream_k=args.include_stream_k,
             ))
+
+    if args.stream_k_only:
+        candidates = [c for c in candidates if normalize_scheduler(c.get("scheduler", "normal")) == "stream_k"]
 
     candidates = dedupe(candidates)
 

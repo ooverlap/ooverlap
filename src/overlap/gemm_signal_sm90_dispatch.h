@@ -15,6 +15,7 @@ struct GemmSignalSm90AlgoMeta {
   int stages;              // -1 means StageCountAuto
   const char* mainloop;    // ws | pingpong | cooperative
   const char* epilogue;    // auto
+  const char* scheduler;   // normal | stream_k
 };
 
 int gemm_signal_sm90_algo_count();
