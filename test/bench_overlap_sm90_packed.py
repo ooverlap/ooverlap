@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import json
 import socket
 from pathlib import Path
 
@@ -8,15 +9,41 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
+def repo_root():
+    return Path(__file__).resolve().parents[1]
+
+
 def load_ooverlap_ext():
-    root = Path(__file__).resolve().parents[1]
+    root = repo_root()
     so = root / "build" / "lib" / "ooverlap_ext.so"
     if not so.exists():
         raise FileNotFoundError(f"Could not find {so}. Build first.")
+
     spec = importlib.util.spec_from_file_location("ooverlap_ext", str(so))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def load_algo_meta(algo, algo_dict_path=None):
+    root = repo_root()
+
+    if algo_dict_path is None:
+        algo_dict_path = root / "configs" / "AlgoDictSm90.json"
+    else:
+        algo_dict_path = Path(algo_dict_path).expanduser().resolve()
+
+    if not algo_dict_path.exists():
+        raise FileNotFoundError(f"Could not find algo dict: {algo_dict_path}")
+
+    with open(algo_dict_path, "r") as f:
+        data = json.load(f)
+
+    for item in data.get("algorithms", []):
+        if int(item["algo"]) == int(algo):
+            return item, algo_dict_path
+
+    raise ValueError(f"algo={algo} not found in {algo_dict_path}")
 
 
 def find_free_port():
@@ -27,7 +54,10 @@ def find_free_port():
     return port
 
 
-def make_column_major_reorder(M, N, tile_m=128, tile_n=128, device="cuda"):
+def make_column_major_reorder(M, N, tile_m, tile_n, device="cuda"):
+    assert M % tile_m == 0
+    assert N % tile_n == 0
+
     tile_rows = M // tile_m
     tile_cols = N // tile_n
     num_tiles = tile_rows * tile_cols
@@ -44,26 +74,42 @@ def make_column_major_reorder(M, N, tile_m=128, tile_n=128, device="cuda"):
     return ra
 
 
-def make_identity_reorder(M, N, tile_m=128, tile_n=128, device="cuda"):
+def make_identity_reorder(M, N, tile_m, tile_n, device="cuda"):
+    assert M % tile_m == 0
+    assert N % tile_n == 0
+
     tile_rows = M // tile_m
     tile_cols = N // tile_n
     num_tiles = tile_rows * tile_cols
+
     return torch.arange(num_tiles, device=device, dtype=torch.int32)
 
 
 def make_segments(num_tiles, group_tiles):
+    # group_tiles=0 means no segmentation / one full segment.
+    if group_tiles <= 0 or group_tiles >= num_tiles:
+        return [num_tiles]
+
     segs = []
     remaining = num_tiles
     while remaining > 0:
         x = min(group_tiles, remaining)
         segs.append(x)
         remaining -= x
+
     return segs
 
 
-def sync_all():
+def sync_all(device_index=None):
     torch.cuda.synchronize()
-    dist.barrier()
+
+    if dist.is_initialized():
+        if device_index is None:
+            dist.barrier()
+        else:
+            # Avoid ProcessGroupNCCL "devices used by this process are unknown" warning.
+            dist.barrier(device_ids=[int(device_index)])
+
     torch.cuda.synchronize()
 
 
@@ -73,15 +119,15 @@ def reduce_max_float(x, device):
     return float(t.item())
 
 
-def time_cuda_max(fn, warmup, iters, device):
-    # Make sure both ranks start the same timed section together.
-    sync_all()
+def time_cuda_max(fn, warmup, iters, device, device_index):
+    # Make sure both ranks enter this benchmark section together.
+    sync_all(device_index)
 
     for _ in range(warmup):
         fn()
 
-    # Make sure warmup is fully complete on both ranks.
-    sync_all()
+    # Make sure warmup is fully done on both ranks.
+    sync_all(device_index)
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -96,8 +142,8 @@ def time_cuda_max(fn, warmup, iters, device):
     local_ms = start.elapsed_time(end) / iters
     max_ms = reduce_max_float(local_ms, device)
 
-    # Prevent the next benchmark section from starting early on one rank.
-    sync_all()
+    # Do not let one rank start the next section early.
+    sync_all(device_index)
 
     return max_ms, local_ms
 
@@ -117,6 +163,7 @@ def worker(
     reorder,
     algo,
     skip_extra,
+    algo_dict_path,
 ):
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
@@ -132,18 +179,29 @@ def worker(
         torch.manual_seed(1234 + rank)
 
         ext = load_ooverlap_ext()
+        algo_meta, algo_dict_path_resolved = load_algo_meta(algo, algo_dict_path)
 
-        tile_m = 128
-        tile_n = 128
+        tile_m = int(algo_meta["tile_m"])
+        tile_n = int(algo_meta["tile_n"])
+        tile_k = int(algo_meta["tile_k"])
+        cluster = algo_meta.get("cluster", None)
+        stages = algo_meta.get("stages", None)
+        mainloop = algo_meta.get("mainloop", None)
+        epilogue = algo_meta.get("epilogue", None)
 
-        assert M % tile_m == 0
-        assert N % tile_n == 0
+        assert M % tile_m == 0, (
+            f"M={M} must be divisible by tile_m={tile_m} for algo={algo}"
+        )
+        assert N % tile_n == 0, (
+            f"N={N} must be divisible by tile_n={tile_n} for algo={algo}"
+        )
+        assert reldn > 0, f"reldn must be positive, got {reldn}"
 
         tile_rows = M // tile_m
         tile_cols = N // tile_n
         num_tiles = tile_rows * tile_cols
 
-        packed_tile_cols = reldn
+        packed_tile_cols = int(reldn)
         packed_tile_rows = (num_tiles + packed_tile_cols - 1) // packed_tile_cols
         packed_M = packed_tile_rows * tile_m
         packed_N = packed_tile_cols * tile_n
@@ -157,11 +215,16 @@ def worker(
         ov.overlap_init()
 
         A = torch.randn((M, K), device=device, dtype=torch.float16)
+
+        # Torch baseline uses B_ref as [K, N].
         B_ref = torch.randn((K, N), device=device, dtype=torch.float16)
+
+        # Our wrapper expects packed/column-major style B as [N, K].
         B_packed = B_ref.t().contiguous()
 
         C_packed = torch.empty((packed_M, packed_N), device=device, dtype=torch.float16)
         C_packed_full = torch.empty((packed_M, packed_N), device=device, dtype=torch.float16)
+
         C_torch = torch.empty((M, N), device=device, dtype=torch.float16)
         C_nccl_only = torch.randn((packed_M, packed_N), device=device, dtype=torch.float16)
 
@@ -178,8 +241,19 @@ def worker(
         full_cseg_cpu = torch.tensor(full_cseg, dtype=torch.int32)
         full_cseg_gpu = full_cseg_cpu.to(device=device)
 
-        MM_overlap = torch.empty((len(overlap_cseg) + num_tiles,), device=device, dtype=torch.int32)
-        MM_full = torch.empty((len(full_cseg) + num_tiles,), device=device, dtype=torch.int32)
+        # Layout:
+        #   MM[0:num_segments]               = segment counters
+        #   MM[num_segments:num_segments+T]  = per-tile arrival counters
+        MM_overlap = torch.empty(
+            (len(overlap_cseg) + num_tiles,),
+            device=device,
+            dtype=torch.int32,
+        )
+        MM_full = torch.empty(
+            (len(full_cseg) + num_tiles,),
+            device=device,
+            dtype=torch.int32,
+        )
 
         monitor = False
 
@@ -225,6 +299,7 @@ def worker(
             warmup,
             iters,
             device,
+            rank,
         )
 
         full_segment_ms, full_segment_local_ms = time_cuda_max(
@@ -232,6 +307,7 @@ def worker(
             warmup,
             iters,
             device,
+            rank,
         )
 
         torch_baseline_ms = None
@@ -245,6 +321,7 @@ def worker(
                 warmup,
                 iters,
                 device,
+                rank,
             )
 
             nccl_only_ms, nccl_only_local_ms = time_cuda_max(
@@ -252,21 +329,32 @@ def worker(
                 warmup,
                 iters,
                 device,
+                rank,
             )
 
         if rank == 0:
-            speedup_vs_full = full_segment_ms / overlap_ms if overlap_ms > 0 else float("nan")
+            speedup_vs_full = (
+                full_segment_ms / overlap_ms if overlap_ms > 0 else float("nan")
+            )
 
             print("========================================")
             print(f"M={M} N={N} K={K}")
             print(f"tile_rows={tile_rows} tile_cols={tile_cols} num_tiles={num_tiles}")
             print(f"reldn={reldn} packed_shape=({packed_M}, {packed_N})")
             print(f"reorder={reorder}")
-            print(f"algo={algo}")
+            print(
+                f"algo={algo} tile={tile_m}x{tile_n}x{tile_k} "
+                f"cluster={cluster} stages={stages} "
+                f"mainloop={mainloop} epilogue={epilogue}"
+            )
+            print(f"algo_dict={algo_dict_path_resolved}")
             print("")
             print(f"overlap group_tiles={group_tiles}")
             print(f"overlap num_segments={len(overlap_cseg)}")
-            print(f"overlap segments={overlap_cseg[:16]}{' ...' if len(overlap_cseg) > 16 else ''}")
+            print(
+                f"overlap segments={overlap_cseg[:16]}"
+                f"{' ...' if len(overlap_cseg) > 16 else ''}"
+            )
             print("")
             print("All reported latencies below are MAX across ranks.")
             print(f"packed overlap latency:        {overlap_ms:.4f} ms")
@@ -280,6 +368,7 @@ def worker(
             print("")
             print(f"rank0 packed overlap local:    {overlap_local_ms:.4f} ms")
             print(f"rank0 full-segment local:      {full_segment_local_ms:.4f} ms")
+
             if torch_baseline_local_ms is not None:
                 print(f"rank0 torch+NCCL local:        {torch_baseline_local_ms:.4f} ms")
             if nccl_only_local_ms is not None:
@@ -290,23 +379,59 @@ def worker(
             print("========================================")
 
     finally:
-        sync_all()
-        dist.destroy_process_group()
+        try:
+            sync_all(rank)
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
 
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--gpus", type=int, default=2)
     ap.add_argument("--m", type=int, default=1024)
     ap.add_argument("--n", type=int, default=1024)
     ap.add_argument("--k", type=int, default=4096)
-    ap.add_argument("--reldn", type=int, default=1)
-    ap.add_argument("--group-tiles", type=int, default=8)
+
+    ap.add_argument(
+        "--reldn",
+        type=int,
+        default=1,
+        help="Packed tile columns. reldn=1 gives shape (num_tiles * tile_m, tile_n).",
+    )
+
+    ap.add_argument(
+        "--group-tiles",
+        type=int,
+        default=8,
+        help="Tiles per communication segment. Use 0 for one full segment.",
+    )
+
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--iters", type=int, default=200)
-    ap.add_argument("--reorder", choices=["column_major", "identity"], default="column_major")
-    ap.add_argument("--algo", type=int, default=1)
-    ap.add_argument("--skip-extra", action="store_true")
+
+    ap.add_argument(
+        "--reorder",
+        choices=["column_major", "identity"],
+        default="column_major",
+    )
+
+    ap.add_argument("--algo", type=int, default=8)
+
+    ap.add_argument(
+        "--algo-dict",
+        type=str,
+        default=None,
+        help="Path to AlgoDictSm90.json. Defaults to configs/AlgoDictSm90.json.",
+    )
+
+    ap.add_argument(
+        "--skip-extra",
+        action="store_true",
+        help="Skip torch+NCCL and NCCL-only baselines.",
+    )
+
     args = ap.parse_args()
 
     assert torch.cuda.is_available()
@@ -335,6 +460,7 @@ def main():
             args.reorder,
             args.algo,
             args.skip_extra,
+            args.algo_dict,
         ),
         nprocs=args.gpus,
         join=True,

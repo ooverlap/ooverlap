@@ -162,62 +162,166 @@ void OverlapImpl::GemmAllReduceOverlap(
     TORCH_CHECK(C.is_cuda(), "C must be CUDA");
     TORCH_CHECK(C.scalar_type() == torch::kFloat16, "C must be float16");
     TORCH_CHECK(C.is_contiguous(), "C must be contiguous");
+
     TORCH_CHECK(MM.is_cuda() && RA.is_cuda() && cSEG_GPU.is_cuda(),
                 "MM/RA/cSEG_GPU must be CUDA");
     TORCH_CHECK(cSEG_CPU.device().is_cpu(), "cSEG_CPU must be CPU");
+
     TORCH_CHECK(MM.scalar_type() == torch::kInt32, "MM must be int32");
     TORCH_CHECK(RA.scalar_type() == torch::kInt32, "RA must be int32");
     TORCH_CHECK(cSEG_CPU.scalar_type() == torch::kInt32 &&
                 cSEG_GPU.scalar_type() == torch::kInt32,
                 "cSEG tensors must be int32");
-    TORCH_CHECK(rLDN > 0, "rLDN must be > 0");
-    TORCH_CHECK(Algo >= 0 && Algo <= 4, "Unsupported algo=", Algo);
 
-    ooverlap::torch_utils::ensure_streams_ready(gemm_stream_, comm_stream_, overlap_init_done_);
+    TORCH_CHECK(rLDN > 0, "rLDN must be > 0");
+
+    ooverlap::GemmSignalSm90AlgoMeta meta{};
+    bool meta_ok = ooverlap::gemm_signal_sm90_get_algo_meta(
+        static_cast<int>(Algo),
+        &meta);
+
+    TORCH_CHECK(
+        meta_ok,
+        "Unsupported algo=", Algo,
+        ". Generated SM90 algo count=",
+        ooverlap::gemm_signal_sm90_algo_count()
+    );
+
+    const int tile_m = meta.tile_m;
+    const int tile_n = meta.tile_n;
+
+    TORCH_CHECK(tile_m > 0 && tile_n > 0,
+                "Invalid algo metadata for algo=", Algo,
+                ": tile_m=", tile_m,
+                " tile_n=", tile_n);
+
+    ooverlap::torch_utils::ensure_streams_ready(
+        gemm_stream_,
+        comm_stream_,
+        overlap_init_done_);
 
     if (gemm_finished_ == nullptr) {
-        cudaError_t err = cudaEventCreateWithFlags(&gemm_finished_, cudaEventDisableTiming);
+        cudaError_t err = cudaEventCreateWithFlags(
+            &gemm_finished_,
+            cudaEventDisableTiming);
         TORCH_CHECK(err == cudaSuccess,
-                    "cudaEventCreateWithFlags failed: ", cudaGetErrorString(err));
+                    "cudaEventCreateWithFlags failed: ",
+                    cudaGetErrorString(err));
+    }
+
+    if (mm_ready_ == nullptr) {
+        cudaError_t err = cudaEventCreateWithFlags(
+            &mm_ready_,
+            cudaEventDisableTiming);
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaEventCreateWithFlags mm_ready_ failed: ",
+                    cudaGetErrorString(err));
     }
 
     const int M = static_cast<int>(A.size(0));
     const int K = static_cast<int>(A.size(1));
     const int N = static_cast<int>(B.size(0));
 
-    TORCH_CHECK(static_cast<int>(B.size(1)) == K, "B must have shape [N, K]");
-    TORCH_CHECK(M % kTileM == 0 && N % kTileN == 0, "M/N must be multiples of 128");
+    TORCH_CHECK(static_cast<int>(B.size(1)) == K,
+                "B must have shape [N, K]");
 
-    const int tile_rows = M / kTileM;
-    const int tile_cols = N / kTileN;
+    TORCH_CHECK(M % tile_m == 0,
+                "M=", M,
+                " must be multiple of tile_m=", tile_m,
+                " for algo=", Algo);
+
+    TORCH_CHECK(N % tile_n == 0,
+                "N=", N,
+                " must be multiple of tile_n=", tile_n,
+                " for algo=", Algo);
+
+    const int tile_rows = M / tile_m;
+    const int tile_cols = N / tile_n;
     const int tile_num  = tile_rows * tile_cols;
 
     TORCH_CHECK(static_cast<int>(RA.numel()) == tile_num,
-                "RA.numel() must equal tile count");
-    TORCH_CHECK(C.numel() >= static_cast<int64_t>(M) * N,
-                "C must hold at least M*N elements");
+                "RA.numel() must equal tile count. RA.numel()=",
+                RA.numel(),
+                " tile_num=", tile_num,
+                " tile_m=", tile_m,
+                " tile_n=", tile_n,
+                " tile_rows=", tile_rows,
+                " tile_cols=", tile_cols,
+                " algo=", Algo);
 
     const int seg_size = static_cast<int>(cSEG_GPU.numel());
+
+    TORCH_CHECK(seg_size > 0,
+                "cSEG must contain at least one segment");
+
     TORCH_CHECK(seg_size == static_cast<int>(cSEG_CPU.numel()),
                 "cSEG_CPU/GPU size mismatch");
+
+    TORCH_CHECK(MM.numel() >= static_cast<int64_t>(seg_size) + tile_num,
+                "MM must have at least num_segments + num_tiles elements. MM.numel()=",
+                MM.numel(),
+                " num_segments=", seg_size,
+                " num_tiles=", tile_num);
+
+    auto* cseg_cpu_ptr = cSEG_CPU.data_ptr<int>();
+
+    int64_t total_segment_tiles = 0;
+    for (int i = 0; i < seg_size; ++i) {
+        const int this_seg = cseg_cpu_ptr[i];
+
+        TORCH_CHECK(this_seg > 0,
+                    "cSEG[", i, "] must be > 0, got ", this_seg);
+
+        total_segment_tiles += static_cast<int64_t>(this_seg);
+
+        TORCH_CHECK(total_segment_tiles <= tile_num,
+                    "Sum of cSEG exceeds tile_num. partial_sum=",
+                    total_segment_tiles,
+                    " tile_num=", tile_num);
+    }
+
+    TORCH_CHECK(total_segment_tiles == tile_num,
+                "Sum of cSEG must equal tile_num. sum=",
+                total_segment_tiles,
+                " tile_num=", tile_num);
+
+    const int64_t packed_tile_cols = rLDN;
+    const int64_t packed_tile_rows =
+        (static_cast<int64_t>(tile_num) + packed_tile_cols - 1) /
+        packed_tile_cols;
+
+    const int64_t required_c_elems =
+        packed_tile_rows *
+        static_cast<int64_t>(tile_m) *
+        packed_tile_cols *
+        static_cast<int64_t>(tile_n);
+
+    TORCH_CHECK(C.numel() >= required_c_elems,
+                "C is too small for packed output. C.numel()=",
+                C.numel(),
+                " required=", required_c_elems,
+                " packed_tile_rows=", packed_tile_rows,
+                " packed_tile_cols=", packed_tile_cols,
+                " tile_m=", tile_m,
+                " tile_n=", tile_n,
+                " algo=", Algo);
 
     auto* a_ptr = reinterpret_cast<half*>(A.data_ptr<at::Half>());
     auto* b_ptr = reinterpret_cast<half*>(B.data_ptr<at::Half>());
     auto* c_ptr = reinterpret_cast<half*>(C.data_ptr<at::Half>());
     auto* mm_ptr = MM.data_ptr<int>();
     auto* ra_ptr = RA.data_ptr<int>();
-    auto* cseg_cpu_ptr = cSEG_CPU.data_ptr<int>();
     auto* cseg_gpu_ptr = cSEG_GPU.data_ptr<int>();
 
     cudaError_t err = cudaEventRecord(mm_ready_, gemm_stream_);
     TORCH_CHECK(err == cudaSuccess,
                 "cudaEventRecord mm_ready_ failed: ",
                 cudaGetErrorString(err));
-    
+
     err = cudaStreamWaitEvent(comm_stream_, mm_ready_, 0);
     TORCH_CHECK(err == cudaSuccess,
                 "cudaStreamWaitEvent mm_ready_ failed: ",
-            cudaGetErrorString(err));
+                cudaGetErrorString(err));
 
     bool ok = ooverlap::gemm_signal_sm90_dispatch(
         static_cast<int>(Algo),
@@ -239,27 +343,46 @@ void OverlapImpl::GemmAllReduceOverlap(
         return;
     }
 
-    int acc_addr = 0;
+    const int64_t elems_per_tile =
+        static_cast<int64_t>(tile_m) * static_cast<int64_t>(tile_n);
+
+    int64_t acc_addr = 0;
+
     for (int iter = 0; iter < seg_size; ++iter) {
         const int this_seg = cseg_cpu_ptr[iter];
-        const int comm_size = (M * N / tile_num) * this_seg;
+        const int64_t comm_elems =
+            elems_per_tile * static_cast<int64_t>(this_seg);
 
-        kernel_wait_flag<<<1, 1, 0, comm_stream_>>>(this_seg, (mm_ptr + iter));
+        kernel_wait_flag<<<1, 1, 0, comm_stream_>>>(
+            this_seg,
+            mm_ptr + iter);
+
+        err = cudaGetLastError();
+        TORCH_CHECK(err == cudaSuccess,
+                    "kernel_wait_flag launch failed: ",
+                    cudaGetErrorString(err));
 
         NCCL_CHECK(ncclAllReduce(
-            (void*)(c_ptr + acc_addr),
-            (void*)(c_ptr + acc_addr),
-            static_cast<size_t>(comm_size),
+            static_cast<void*>(c_ptr + acc_addr),
+            static_cast<void*>(c_ptr + acc_addr),
+            static_cast<size_t>(comm_elems),
             ncclFloat16,
             ncclSum,
             comm_,
             comm_stream_));
 
-        acc_addr += comm_size;
+        acc_addr += comm_elems;
     }
 
-    cudaEventRecord(gemm_finished_, comm_stream_);
-    cudaStreamWaitEvent(gemm_stream_, gemm_finished_, 0);
+    err = cudaEventRecord(gemm_finished_, comm_stream_);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaEventRecord gemm_finished_ failed: ",
+                cudaGetErrorString(err));
+
+    err = cudaStreamWaitEvent(gemm_stream_, gemm_finished_, 0);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaStreamWaitEvent gemm_finished_ failed: ",
+                cudaGetErrorString(err));
 }
 
 void OverlapImpl::GemmReduceScatterOverlap(
