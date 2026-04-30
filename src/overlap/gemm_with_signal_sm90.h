@@ -366,10 +366,10 @@ KernelArguments make_kernel_arguments(
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename LayoutTag>
-struct CuteStride2D;
+struct CuteEpilogue;
 
 template <>
-struct CuteStride2D<cutlass::layout::RowMajor> {
+struct CuteEpilogue<cutlass::layout::RowMajor> {
   CUTLASS_HOST_DEVICE
   static auto make(int64_t ld) {
     return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
@@ -377,11 +377,30 @@ struct CuteStride2D<cutlass::layout::RowMajor> {
 };
 
 template <>
-struct CuteStride2D<cutlass::layout::ColumnMajor> {
+struct CuteEpilogue<cutlass::layout::ColumnMajor> {
   CUTLASS_HOST_DEVICE
   static auto make(int64_t ld) {
     // In this repo B is physically [N, K] contiguous and interpreted by CUTLASS as B^T.
     return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
+  }
+};
+
+template <typename LayoutTag>
+struct CuteEpilogueStride2D;
+
+template <>
+struct CuteEpilogueStride2D<cutlass::layout::RowMajor> {
+  CUTLASS_HOST_DEVICE
+  static auto make(int64_t ld) {
+    return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
+  }
+};
+
+template <>
+struct CuteEpilogueStride2D<cutlass::layout::ColumnMajor> {
+  CUTLASS_HOST_DEVICE
+  static auto make(int64_t ld) {
+    return cute::make_stride(cute::Int<1>{}, ld, int64_t{0});
   }
 };
 
@@ -576,9 +595,9 @@ public:
 
     MainloopArguments mainloop_args{
       reinterpret_cast<ElementInputA const*>(args_.ptr_A),
-      CuteStride2D<LayoutInputA>::make(args_.ldm_A),
+      CuteEpilogueStride2D<LayoutInputA>::make(args_.ldm_A),
       reinterpret_cast<ElementInputB const*>(args_.ptr_B),
-      CuteStride2D<LayoutInputB>::make(args_.ldm_B)
+      CuteEpilogueStride2D<LayoutInputB>::make(args_.ldm_B)
     };
 
 #if defined(OOVERLAP_USE_BASE_EPILOGUE_ONLY) && OOVERLAP_USE_BASE_EPILOGUE_ONLY
@@ -586,9 +605,9 @@ public:
     EpilogueArguments epilogue_args{
       {args_.alpha, args_.beta},
       reinterpret_cast<ElementOutput const*>(args_.ptr_C),
-      CuteStride2D<LayoutOutput>::make(args_.ldm_C),
+      CuteEpilogueStride2D<LayoutOutput>::make(args_.ldm_C),
       reinterpret_cast<ElementOutput*>(args_.ptr_D),
-      CuteStride2D<LayoutOutput>::make(args_.ldm_D)
+      CuteEpilogueStride2D<LayoutOutput>::make(args_.ldm_D)
     };
 
 #else
@@ -597,9 +616,9 @@ public:
     epilogue_args.base = typename BaseCollectiveEpilogue::Arguments{
       {args_.alpha, args_.beta},
       reinterpret_cast<ElementOutput const*>(args_.ptr_C),
-      CuteStride2D<LayoutOutput>::make(args_.ldm_C),
+      CuteEpilogueStride2D<LayoutOutput>::make(args_.ldm_C),
       reinterpret_cast<ElementOutput*>(args_.ptr_D),
-      CuteStride2D<LayoutOutput>::make(args_.ldm_D)
+      CuteEpilogueStride2D<LayoutOutput>::make(args_.ldm_D)
     };
     epilogue_args.signal = args_.signal_params;
 
