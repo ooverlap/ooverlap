@@ -1,6 +1,8 @@
 import argparse
 import importlib.util
+import math
 from pathlib import Path
+from time import sleep
 
 import torch
 import torch.multiprocessing as mp
@@ -22,7 +24,32 @@ def load_ooverlap_ext():
     return mod
 
 
-def perf_comm_process(rank, world_size, nccl_id, M, N, comm_op, result_dict):
+def make_sizes():
+    # Same style as FlashOverlap: element counts, not bytes.
+    return [(int(2 ** (20 + 0.25 * i)) // 1024 * 1024) for i in range(36)]
+
+
+def p90_from_tensor(x):
+    # Nearest-rank p90: sort samples and keep the 90th-percentile latency.
+    # This is intentionally simple and deterministic.
+    x_sorted = torch.sort(x.flatten()).values
+    n = int(x_sorted.numel())
+    idx = int(math.ceil(0.90 * n)) - 1
+    idx = max(0, min(idx, n - 1))
+    return float(x_sorted[idx].item())
+
+
+def perf_comm_process(
+    rank,
+    world_size,
+    nccl_id,
+    comm_op,
+    sizes,
+    warmup,
+    iters,
+    barrier,
+    result_dict,
+):
     torch.cuda.set_device(rank)
 
     ext = load_ooverlap_ext()
@@ -31,130 +58,204 @@ def perf_comm_process(rank, world_size, nccl_id, M, N, comm_op, result_dict):
     comm_class.nccl_init(rank, world_size, nccl_id)
     comm_class.cutlass_init()
 
-    C = torch.empty((M, N), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
+    rank_results = []
+    print(sizes)
 
-    if comm_op == "all_reduce":
-        for _ in range(20):
-            comm_class.nccl_allreduce(C)
+    for size in sizes:
+        M = 1024
+        N = size // 1024
 
-        start_event = [torch.cuda.Event(enable_timing=True) for _ in range(200)]
-        end_event = [torch.cuda.Event(enable_timing=True) for _ in range(200)]
-
-        for i in range(200):
-            start_event[i].record()
-            comm_class.nccl_allreduce(C)
-            end_event[i].record()
-
-        torch.cuda.synchronize()
-        dur = torch.tensor(
-            [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
-            dtype=torch.float,
+        C = torch.empty((M, N), dtype=torch.float16, device="cuda").normal_(
+            mean=0.0,
+            std=0.5,
         )
 
-    elif comm_op == "reduce_scatter":
-        for _ in range(20):
-            comm_class.nccl_reducescatter(C)
+        # sleep to let the link rest?!
+        sleep(5)
+        torch.cuda.synchronize()
+        barrier.wait()
 
-        start_event = [torch.cuda.Event(enable_timing=True) for _ in range(200)]
-        end_event = [torch.cuda.Event(enable_timing=True) for _ in range(200)]
+        if comm_op == "all_reduce":
+            for _ in range(warmup):
+                comm_class.nccl_allreduce(C)
 
-        for i in range(200):
-            start_event[i].record()
-            comm_class.nccl_reducescatter(C)
-            end_event[i].record()
+            torch.cuda.synchronize()
+            barrier.wait()
+
+            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+
+            for i in range(iters):
+                start_event[i].record()
+                comm_class.nccl_allreduce(C)
+                end_event[i].record()
+
+        elif comm_op == "reduce_scatter":
+            for _ in range(warmup):
+                comm_class.nccl_reducescatter(C)
+
+            torch.cuda.synchronize()
+            barrier.wait()
+
+            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+
+            for i in range(iters):
+                start_event[i].record()
+                comm_class.nccl_reducescatter(C)
+                end_event[i].record()
+
+        else:
+            raise ValueError(f"Unsupported comm_op={comm_op}")
 
         torch.cuda.synchronize()
-        dur = torch.tensor(
+        barrier.wait()
+
+        dur_ms = torch.tensor(
             [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
-            dtype=torch.float,
+            dtype=torch.float32,
         )
 
-    else:
-        raise ValueError(f"Unsupported communication operation: {comm_op}")
+        s = (f"====================size is {size}============================"
+                f"{dur_ms}\n"
+        "---------------------------------------------------------------")
+        print(s)
 
-    result_dict[rank] = torch.mean(dur).item()
+        rank_results.append(
+            {
+                "size": int(size),
+                "bytes": int(size * 2),
+                "mean_ms": float(torch.mean(dur_ms).item()),
+                "median_ms": float(torch.median(dur_ms).item()),
+                "p90_ms": p90_from_tensor(dur_ms),
+                "min_ms": float(torch.min(dur_ms).item()),
+                "max_ms": float(torch.max(dur_ms).item()),
+            }
+        )
+
+        del C
+        torch.cuda.synchronize()
+        barrier.wait()
+
+    result_dict[rank] = rank_results
 
 
-def perf_comm(M: int, N: int, comm_op: str):
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--comm_op", type=str, default="all_reduce",
+                        choices=["all_reduce", "reduce_scatter"])
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--iters", type=int, default=200)
+    parser.add_argument("--use-median", action="store_true")
+    parser.add_argument("--use-p90", action="store_true")
+    args = parser.parse_args()
+
     world_size = torch.cuda.device_count()
     if world_size < 2:
-        raise RuntimeError("At least 2 GPUs are required!")
+        raise RuntimeError("At least 2 GPUs are required.")
+
+    sizes = make_sizes()
 
     ext = load_ooverlap_ext()
     nccl_id = ext.generate_nccl_id()
 
-    torch.cuda.synchronize()
-
     manager = mp.Manager()
     result_dict = manager.dict()
+    barrier = manager.Barrier(world_size)
 
     mp.spawn(
         perf_comm_process,
-        args=(world_size, nccl_id, M, N, comm_op, result_dict),
+        args=(
+            world_size,
+            nccl_id,
+            args.comm_op,
+            sizes,
+            args.warmup,
+            args.iters,
+            barrier,
+            result_dict,
+        ),
         nprocs=world_size,
+        join=True,
     )
 
-    return result_dict[0]
-
-
-def main():
-    world_size = torch.cuda.device_count()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--comm_op", type=str, default="all_reduce")
-    args = parser.parse_args()
-
-    data_sizes = [(int(2 ** (20 + 0.25 * i)) // 1024 * 1024) for i in range(36)]
-
     bandwidths = []
-    size_len = len(data_sizes)
-    comm_array = torch.zeros((size_len, 2))
+    comm_array = torch.zeros((len(sizes), 2), dtype=torch.float32)
 
-    for i, size in enumerate(data_sizes):
-        input_data = torch.randn(size, dtype=torch.float16, device="cuda")
+    print("========================================")
+    print("bandwidth.py")
+    print(f"comm_op:    {args.comm_op}")
+    print(f"gpus:       {world_size}")
+    print("dtype:      fp16")
+    print(f"warmup:     {args.warmup}")
+    print(f"iters:      {args.iters}")
+    print(f"use_median: {args.use_median}")
+    print(f"use_p90:    {args.use_p90}")
+    print("========================================")
 
-        avg_time_ms = perf_comm(1024, size // 1024, args.comm_op)
+    for i, size in enumerate(sizes):
+        per_rank = [result_dict[r][i] for r in range(world_size)]
 
-        data_size_bytes = input_data.numel() * input_data.element_size()
+        mean_ms = max(x["mean_ms"] for x in per_rank)
+        median_ms = max(x["median_ms"] for x in per_rank)
+        p90_ms = max(x["p90_ms"] for x in per_rank)
+        min_ms = max(x["min_ms"] for x in per_rank)
+        max_ms = max(x["max_ms"] for x in per_rank)
+
+        if args.use_p90:
+            latency_ms = p90_ms
+        elif args.use_median:
+            latency_ms = median_ms
+        else:
+            latency_ms = mean_ms
+
+        latency_s = latency_ms * 1.0e-3
+
+        data_size_bytes = size * 2  # fp16
 
         if args.comm_op == "all_reduce":
             total_data_transferred = data_size_bytes * 2 * (world_size - 1)
         elif args.comm_op == "reduce_scatter":
             total_data_transferred = data_size_bytes * (world_size - 1)
         else:
-            raise ValueError("Unsupported communication operation")
+            raise ValueError(f"Unsupported comm_op={args.comm_op}")
 
-        # CUDA event elapsed_time is milliseconds.
-        # FlashOverlap code forgot this conversion. Without 1e-3, bandwidth is 1000x too small.
-        bandwidth = (total_data_transferred / avg_time_ms) / (1024 ** 3)
+        flash_bw = total_data_transferred / latency_s / (1024 ** 3)
+        alg_bw = data_size_bytes / latency_s / (1024 ** 3)
 
-        bandwidths.append(bandwidth)
-
-        comm_array[i, 0] = size
-        comm_array[i, 1] = bandwidth
+        bandwidths.append(flash_bw)
+        comm_array[i, 0] = float(size)
+        comm_array[i, 1] = float(flash_bw)
 
         print(
             f"size={size:12d} elems "
             f"bytes={data_size_bytes:12d} "
-            f"time={avg_time_ms:9.5f} ms "
-            f"bandwidth={bandwidth:9.2f} GB/s"
+            f"mean={mean_ms:9.5f} ms "
+            f"median={median_ms:9.5f} ms "
+            f"p90={p90_ms:9.5f} ms "
+            f"min={min_ms:9.5f} ms "
+            f"max={max_ms:9.5f} ms "
+            f"flash_bw={flash_bw:9.2f} GB/s "
+            f"alg_bw={alg_bw:9.2f} GB/s"
         )
-
-    plt.plot(data_sizes, bandwidths, marker="o")
-    plt.xlabel("Data Size (elements)")
-    plt.ylabel("Bandwidth (GB/s)")
-    plt.title("Bandwidth vs Data Size")
-    plt.grid(True)
-    plt.savefig("bandwidth.png", dpi=300, bbox_inches="tight")
-    plt.show()
 
     out_dir = repo_root() / "configs"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_path = out_dir / f"bandwidth_{args.comm_op}_tp{world_size}.pt"
-    torch.save(comm_array, out_path)
+    out_pt = out_dir / f"bandwidth_{args.comm_op}_tp{world_size}.pt"
+    torch.save(comm_array, out_pt)
 
-    print(f"Saved: {out_path}")
+    plt.plot(sizes, bandwidths, marker="o")
+    plt.xlabel("Data Size (elements)")
+    plt.ylabel("Bandwidth (GB/s)")
+    plt.title(f"Bandwidth vs Data Size ({args.comm_op}, tp={world_size})")
+    plt.grid(True)
+    plt.savefig("bandwidth.png", dpi=300, bbox_inches="tight")
+
+    print("========================================")
+    print(f"saved: {out_pt}")
+    print("saved: bandwidth.png")
+    print("========================================")
 
 
 if __name__ == "__main__":
