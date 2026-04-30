@@ -92,21 +92,15 @@ void OverlapImpl::OverlapInit() {
 }
 
 void OverlapImpl::NcclAllReduce(at::Tensor C) {
-    TORCH_CHECK(C.is_cuda(), "C must be CUDA");
-    TORCH_CHECK(C.scalar_type() == torch::kFloat16, "C must be float16");
-    TORCH_CHECK(C.is_contiguous(), "C must be contiguous");
 
-    ooverlap::torch_utils::refresh_gemm_stream(gemm_stream_);
-
-    if (my_size_ == 1 || comm_ == nullptr) {
-        return;
-    }
+    int M = C.size(0);
+    int N = C.size(1);
 
     half* c_ptr = reinterpret_cast<half*>(C.data_ptr<at::Half>());
     NCCL_CHECK(ncclAllReduce(
         (void*)c_ptr,
         (void*)c_ptr,
-        static_cast<size_t>(C.numel()),
+        M * N,
         ncclFloat16,
         ncclSum,
         comm_,
@@ -114,32 +108,16 @@ void OverlapImpl::NcclAllReduce(at::Tensor C) {
 }
 
 void OverlapImpl::NcclReduceScatter(at::Tensor C, at::Tensor D) {
-    TORCH_CHECK(C.is_cuda() && D.is_cuda(), "C/D must be CUDA");
-    TORCH_CHECK(C.scalar_type() == torch::kFloat16 && D.scalar_type() == torch::kFloat16,
-                "C/D must be float16");
-    TORCH_CHECK(C.is_contiguous() && D.is_contiguous(), "C/D must be contiguous");
 
-    ooverlap::torch_utils::refresh_gemm_stream(gemm_stream_);
+    int M = C.size(0);
+    int N = C.size(1);
 
     half* c_ptr = reinterpret_cast<half*>(C.data_ptr<at::Half>());
-    half* d_ptr = reinterpret_cast<half*>(D.data_ptr<at::Half>());
-
-    if (my_size_ == 1 || comm_ == nullptr) {
-        cudaError_t err = cudaMemcpyAsync(
-            d_ptr, c_ptr, ooverlap::torch_utils::tensor_nbytes(D),
-            cudaMemcpyDeviceToDevice, gemm_stream_);
-        TORCH_CHECK(err == cudaSuccess, "cudaMemcpyAsync failed: ", cudaGetErrorString(err));
-        return;
-    }
-
-    TORCH_CHECK(C.numel() % my_size_ == 0, "C.numel() must be divisible by world size");
-    TORCH_CHECK(D.numel() == C.numel() / my_size_,
-                "D.numel() must equal C.numel()/world_size");
 
     NCCL_CHECK(ncclReduceScatter(
         (void*)c_ptr,
-        (void*)d_ptr,
-        static_cast<size_t>(D.numel()),
+        (void*)c_ptr,
+        M * N,
         ncclFloat16,
         ncclSum,
         comm_,
