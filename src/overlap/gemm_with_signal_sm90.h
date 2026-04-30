@@ -569,9 +569,22 @@ private:
   Arguments  args_;
   GemmDevice gemm_device_;
   bool       initialized_;
+  void*      workspace_;
+  size_t     workspace_size_;
 
 public:
-  GemmSignalSm90() : initialized_(false) {}
+  GemmSignalSm90() : 
+      initialized_(false),
+      workspace_(nullptr),
+      workspace_size_(0) {}
+
+  ~GemmSignalSm90() {
+    if (workspace_ != nullptr) {
+      cudaFree(workspace_);
+      workspace_ = nullptr;
+      workspace_size_ = 0;
+    }
+  }
 
   Status initialize(Arguments const &args, cudaStream_t stream = nullptr) {
     args_ = args;
@@ -648,7 +661,27 @@ public:
       return status;
     }
 
-    status = gemm_device_.initialize(gemm_args, nullptr, stream);
+    size_t needed_workspace = GemmDevice::get_workspace_size(gemm_args);
+
+    if (needed_workspace > workspace_size_) {
+      if (workspace_ != nullptr) {
+        cudaFree(workspace_);
+        workspace_ = nullptr;
+        workspace_size_ = 0;
+      }
+    
+      if (needed_workspace > 0) {
+        cudaError_t err = cudaMalloc(&workspace_, needed_workspace);
+        if (err != cudaSuccess) {
+          initialized_ = false;
+          return cutlass::Status::kErrorWorkspaceNull;
+        }
+        workspace_size_ = needed_workspace;
+      }
+    }
+    
+    status = gemm_device_.initialize(gemm_args, workspace_, stream);
+
     if (status != Status::kSuccess) {
       initialized_ = false;
       return status;
