@@ -47,7 +47,7 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 #ifndef OOVERLAP_USE_BASE_EPILOGUE_ONLY
-#define OOVERLAP_USE_BASE_EPILOGUE_ONLY 0
+#define OOVERLAP_USE_BASE_EPILOGUE_ONLY 1
 #endif
 
 #define CUTLASS_CHECK_SM90(status)                                                               \
@@ -430,8 +430,12 @@ public:
   using MainloopSchedule = MainloopSchedule_;
   using EpilogueSchedule = EpilogueSchedule_;
 
-  static_assert(cutlass::platform::is_same<LayoutOutput, cutlass::layout::RowMajor>::value,
-                "Route-A fused reorder expects RowMajor output buffer interpretation.");
+  //static_assert(cutlass::platform::is_same<LayoutOutput, cutlass::layout::RowMajor>::value,
+                //"Route-A fused reorder expects RowMajor output buffer interpretation.");
+static_assert(
+    cutlass::platform::is_same<LayoutOutput, cutlass::layout::ColumnMajor>::value,
+    "Temporary GEMM-only test expects ColumnMajor output."
+);
 
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   using ArchTag       = cutlass::arch::Sm90;
@@ -641,6 +645,8 @@ public:
 
   Status run(cudaStream_t stream) {
     if (!initialized_) {
+
+      std::cout << "heloooooooooooo" << std::endl;
       Status status = initialize(args_, stream);
       if (status != Status::kSuccess) {
         return status;

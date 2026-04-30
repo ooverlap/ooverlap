@@ -2,9 +2,9 @@
 """
 Profile ooverlap SM90 GEMM candidates against a CUTLASS profiler CSV.
 
-Important details in this version:
+Important details:
 
-1. The default CSV filter is now apples-to-apples with the current ooverlap
+1. The CSV filter is meant to be apples-to-apples with the current ooverlap
    wrapper:
 
      A = f16 row-major
@@ -12,24 +12,32 @@ Important details in this version:
      Accumulator = f32
      C = f16
      D = f16
-
-   The previous script allowed C=void rows from CUTLASS profiler. Those rows are
-   often the fastest, but they are NOT the same epilogue as the current wrapper,
-   which passes a half C pointer to CUTLASS even though beta=0.
+     C/D layout = row-major by default
 
    If you later change the C++ wrapper to ElementC=void, run this script with:
 
      --csv-c-dtype void
 
-2. The default timing mode is now an unrolled CUDA Graph:
+   If you intentionally want to allow unknown or different C/D layouts, use:
+
+     --csv-c-layout any --csv-d-layout any
+
+2. Stream-K CUTLASS profiler rows are NOT treated as normal cooperative/ws rows.
+   AlgoDictSm90 currently does not encode a Stream-K scheduler, so by default
+   Stream-K rows from the considered top CSV candidates are written into the
+   *_failed.json file with an explicit unsupported_stream_k error.
+
+   To override this and benchmark them anyway, pass:
+
+     --allow-stream-k
+
+3. The default timing mode is an unrolled CUDA Graph:
 
      capture graph_repeats GEMM launches in one CUDA graph
      time graph replay
      report per-GEMM latency = replay_time / graph_repeats
 
-   This removes Python enqueue gaps from candidate ranking.
-
-3. The AlgoDictSm90 key is expected to be:
+4. The AlgoDictSm90 key is expected to be:
 
      TileM, TileN, TileK,
      ClusterM, ClusterN, ClusterK,
@@ -179,6 +187,11 @@ def parse_op_dtypes(op: str) -> Dict[str, Optional[str]]:
     }
 
 
+def op_uses_stream_k(op: Any) -> bool:
+    s = str(op).lower().replace("-", "_")
+    return re.search(r"stream_?k", s) is not None
+
+
 def map_mainloop(op: str, default: str) -> str:
     s = str(op).lower().replace("-", "_")
     if "pingpong" in s or "ping_pong" in s:
@@ -271,6 +284,22 @@ def load_algo_dict(path: Path):
     return by8, by9, inverse
 
 
+def add_algo_meta(rr: Dict[str, Any], algo: Optional[int], inverse: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    if algo is None or algo not in inverse:
+        return rr
+
+    rr.update({
+        "algo_tile_m": inverse[algo]["tile_m"],
+        "algo_tile_n": inverse[algo]["tile_n"],
+        "algo_tile_k": inverse[algo]["tile_k"],
+        "algo_cluster": inverse[algo]["cluster"],
+        "algo_stages": inverse[algo].get("stages"),
+        "algo_mainloop": inverse[algo]["mainloop"],
+        "algo_epilogue": inverse[algo].get("epilogue", "auto"),
+    })
+    return rr
+
+
 # ----------------------------- CSV parsing -----------------------------
 
 
@@ -312,6 +341,7 @@ def parse_csv(args, csv_path: Path):
         "shape": 0,
         "layout_or_dtype": 0,
         "tile_parse": 0,
+        "stream_k_rows_seen": 0,
         "kept": 0,
     }
 
@@ -351,9 +381,14 @@ def parse_csv(args, csv_path: Path):
 
         op = str(r[c_op]) if c_op is not None else ""
         op_dt = parse_op_dtypes(op)
+        is_stream_k = op_uses_stream_k(op)
+        if is_stream_k:
+            counts["stream_k_rows_seen"] += 1
 
         a_layout = norm_layout(r[c_a]) if c_a is not None else None
         b_layout = norm_layout(r[c_b]) if c_b is not None else None
+        c_layout = norm_layout(r[c_c]) if c_c is not None else None
+        d_layout = norm_layout(r[c_d]) if c_d is not None else None
 
         a_dtype = norm_dtype(r[c_a]) if c_a is not None else op_dt["a"]
         b_dtype = norm_dtype(r[c_b]) if c_b is not None else op_dt["b"]
@@ -369,6 +404,13 @@ def parse_csv(args, csv_path: Path):
             if b_layout is not None and b_layout != args.csv_b_layout:
                 ok = False
 
+            # Critical: current ooverlap wrapper writes RowMajor C/D semantics.
+            # If the CSV tells us C/D are column-major, do not compare against it.
+            if args.csv_c_layout != "any" and c_layout is not None and c_layout != args.csv_c_layout:
+                ok = False
+            if args.csv_d_layout != "any" and d_layout is not None and d_layout != args.csv_d_layout:
+                ok = False
+
         if a_dtype is not None and a_dtype != args.csv_a_dtype:
             ok = False
         if b_dtype is not None and b_dtype != args.csv_b_dtype:
@@ -376,7 +418,7 @@ def parse_csv(args, csv_path: Path):
         if accum is not None and accum != args.csv_accum_dtype:
             ok = False
 
-        # Critical default: current wrapper is ElementC=half and ElementD=half.
+        # Current wrapper is ElementC=half and ElementD=half.
         # Do not compare against C=void rows unless explicitly requested.
         if args.csv_c_dtype != "any":
             if c_dtype is None or c_dtype != args.csv_c_dtype:
@@ -407,6 +449,8 @@ def parse_csv(args, csv_path: Path):
             "stages": int(stages),
             "mainloop": mainloop,
             "epilogue": epilogue,
+            "is_stream_k": bool(is_stream_k),
+            "csv_scheduler": "stream_k" if is_stream_k else "normal",
             "a": str(r[c_a]) if c_a is not None else None,
             "b": str(r[c_b]) if c_b is not None else None,
             "c": str(r[c_c]) if c_c is not None else op_dt["c"],
@@ -415,6 +459,10 @@ def parse_csv(args, csv_path: Path):
             "b_dtype": b_dtype,
             "c_dtype": c_dtype,
             "d_dtype": d_dtype,
+            "a_layout": a_layout,
+            "b_layout": b_layout,
+            "c_layout": c_layout,
+            "d_layout": d_layout,
             "accum": str(r[c_accum]) if c_accum is not None else op_dt["accum"],
             "accum_dtype": accum,
             "operation": op,
@@ -621,7 +669,8 @@ def main() -> None:
     ap.add_argument("--graph-repeats", type=int, default=100)
 
     # CSV compatibility filters. Defaults match the current C++ wrapper:
-    # ElementA=f16, ElementB=f16, ElementAccumulator=f32, ElementC=f16, ElementD=f16.
+    # ElementA=f16 row, ElementB=f16 column, ElementAccumulator=f32,
+    # ElementC=f16 row, ElementD=f16 row.
     ap.add_argument("--csv-a-dtype", choices=["f16"], default="f16")
     ap.add_argument("--csv-b-dtype", choices=["f16"], default="f16")
     ap.add_argument("--csv-accum-dtype", choices=["f32"], default="f32")
@@ -629,8 +678,19 @@ def main() -> None:
     ap.add_argument("--csv-d-dtype", choices=["f16", "f32", "any"], default="f16")
     ap.add_argument("--csv-a-layout", choices=["row", "column"], default="row")
     ap.add_argument("--csv-b-layout", choices=["row", "column"], default="column")
+    ap.add_argument("--csv-c-layout", choices=["row", "column", "any"], default="row")
+    ap.add_argument("--csv-d-layout", choices=["row", "column", "any"], default="row")
     ap.add_argument("--no-filter-layouts", dest="filter_layouts", action="store_false")
     ap.add_argument("--allow-split-k", action="store_true")
+    ap.add_argument(
+        "--allow-stream-k",
+        action="store_true",
+        help=(
+            "Allow CUTLASS CSV rows whose operation name contains stream_k. "
+            "By default these rows are written to *_failed.json as unsupported "
+            "because AlgoDictSm90 does not encode a Stream-K scheduler."
+        ),
+    )
 
     args = ap.parse_args()
 
@@ -659,9 +719,26 @@ def main() -> None:
     considered = records[: args.top_csv]
     matched: List[Dict[str, Any]] = []
     missing: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    stream_k_unsupported = 0
 
     for r in considered:
         algo, how = match_algo(r, by8, by9, args.match_stages)
+
+        if r.get("is_stream_k", False) and not args.allow_stream_k:
+            rr = dict(r)
+            rr["algo"] = int(algo) if algo is not None else None
+            rr["match"] = how
+            rr = add_algo_meta(rr, int(algo) if algo is not None else None, inverse)
+            rr["error"] = (
+                "unsupported_stream_k_csv_row: CUTLASS row uses a Stream-K scheduler "
+                "but ooverlap AlgoDictSm90 does not encode/instantiate Stream-K as a "
+                "separate scheduler. Not benchmarking this row as a normal cooperative/ws kernel."
+            )
+            failed.append(rr)
+            stream_k_unsupported += 1
+            continue
+
         if algo is None:
             rr = dict(r)
             rr["match"] = how
@@ -671,15 +748,7 @@ def main() -> None:
         rr = dict(r)
         rr["algo"] = int(algo)
         rr["match"] = how
-        rr.update({
-            "algo_tile_m": inverse[algo]["tile_m"],
-            "algo_tile_n": inverse[algo]["tile_n"],
-            "algo_tile_k": inverse[algo]["tile_k"],
-            "algo_cluster": inverse[algo]["cluster"],
-            "algo_stages": inverse[algo].get("stages"),
-            "algo_mainloop": inverse[algo]["mainloop"],
-            "algo_epilogue": inverse[algo].get("epilogue", "auto"),
-        })
+        rr = add_algo_meta(rr, int(algo), inverse)
         matched.append(rr)
 
     matched = dedupe_matched(matched)
@@ -687,7 +756,6 @@ def main() -> None:
     ext = load_ext(root)
 
     ok: List[Dict[str, Any]] = []
-    failed: List[Dict[str, Any]] = []
 
     print("========================================")
     print("gen_config_sm90")
@@ -700,11 +768,19 @@ def main() -> None:
     print(f"top_csv:        {args.top_csv}")
     print(f"matched unique: {len(matched)}")
     print(f"missing rows:   {len(missing)}")
+    print(f"stream_k fail:  {stream_k_unsupported}")
     print(f"match_stages:   {args.match_stages}")
     print(f"timing_mode:    {args.timing_mode}")
     print(f"graph_repeats:  {args.graph_repeats}")
-    print(f"csv A/B/C/D:    {args.csv_a_dtype}:{args.csv_a_layout} / {args.csv_b_dtype}:{args.csv_b_layout} / {args.csv_c_dtype} / {args.csv_d_dtype}")
+    print(
+        "csv A/B/C/D:    "
+        f"{args.csv_a_dtype}:{args.csv_a_layout} / "
+        f"{args.csv_b_dtype}:{args.csv_b_layout} / "
+        f"{args.csv_c_dtype}:{args.csv_c_layout} / "
+        f"{args.csv_d_dtype}:{args.csv_d_layout}"
+    )
     print(f"csv accum:      {args.csv_accum_dtype}")
+    print(f"allow_stream_k: {args.allow_stream_k}")
     print("")
     print("CSV filter counts:")
     for k, v in counts.items():
@@ -717,7 +793,9 @@ def main() -> None:
             f"algo={r['algo']} tile={r['tile_m']}x{r['tile_n']}x{r['tile_k']} "
             f"cluster={r['cluster']} stages={r['stages']} "
             f"mainloop={r['mainloop']} cutlass={r['cutlass_runtime']:.6f} "
-            f"C={r.get('c_dtype')} D={r.get('d_dtype')} "
+            f"C={r.get('c_dtype')}:{r.get('c_layout')} "
+            f"D={r.get('d_dtype')}:{r.get('d_layout')} "
+            f"scheduler={r.get('csv_scheduler')} "
             f"match={r['match']}"
         )
         try:
@@ -761,6 +839,8 @@ def main() -> None:
         "match_stages": args.match_stages,
         "timing_mode": args.timing_mode,
         "graph_repeats": args.graph_repeats,
+        "allow_stream_k": args.allow_stream_k,
+        "stream_k_unsupported": stream_k_unsupported,
         "csv_filter": {
             "a_dtype": args.csv_a_dtype,
             "b_dtype": args.csv_b_dtype,
@@ -769,6 +849,8 @@ def main() -> None:
             "d_dtype": args.csv_d_dtype,
             "a_layout": args.csv_a_layout,
             "b_layout": args.csv_b_layout,
+            "c_layout": args.csv_c_layout,
+            "d_layout": args.csv_d_layout,
             "filter_layouts": args.filter_layouts,
         },
         "BM": [int(x["tile_m"]) for x in selected],
@@ -787,20 +869,27 @@ def main() -> None:
         "missing": missing,
     }
 
+    failed_obj = {
+        "description": "Rows that matched/parsed but were not benchmarked successfully, including unsupported Stream-K rows",
+        "stream_k_unsupported": stream_k_unsupported,
+        "failed": failed,
+    }
+
     write_json(base.with_suffix(".json"), result)
     write_json(Path(str(base) + "_missing.json"), missing_obj)
-    write_json(Path(str(base) + "_failed.json"), {"failed": failed})
+    write_json(Path(str(base) + "_failed.json"), failed_obj)
 
     print("")
     print("========================================")
     print("DONE")
-    print(f"profiled ok: {len(ok)}")
-    print(f"failed:      {len(failed)}")
-    print(f"missing:     {len(missing)}")
+    print(f"profiled ok:       {len(ok)}")
+    print(f"failed:            {len(failed)}")
+    print(f"  stream_k failed: {stream_k_unsupported}")
+    print(f"missing:           {len(missing)}")
     print("")
-    print(f"wrote:       {base.with_suffix('.json')}")
-    print(f"wrote:       {Path(str(base) + '_missing.json')}")
-    print(f"wrote:       {Path(str(base) + '_failed.json')}")
+    print(f"wrote:             {base.with_suffix('.json')}")
+    print(f"wrote:             {Path(str(base) + '_missing.json')}")
+    print(f"wrote:             {Path(str(base) + '_failed.json')}")
 
     if selected:
         print("")
@@ -809,7 +898,9 @@ def main() -> None:
             print(
                 f"  #{i}: algo={r['algo']} tile={r['tile_m']}x{r['tile_n']}x{r['tile_k']} "
                 f"cluster={r['cluster']} stages={r['stages']} mainloop={r['mainloop']} "
-                f"C={r.get('c_dtype')} D={r.get('d_dtype')} "
+                f"C={r.get('c_dtype')}:{r.get('c_layout')} "
+                f"D={r.get('d_dtype')}:{r.get('d_layout')} "
+                f"scheduler={r.get('csv_scheduler')} "
                 f"{args.layout}_gemm_ms={r['measured_ms']:.6f} "
                 f"cutlass_runtime={r['cutlass_runtime']:.6f} "
                 f"timing={r.get('timing_used')} match={r['match']}"
@@ -820,7 +911,7 @@ def main() -> None:
 
     print("========================================")
 
-    if not matched:
+    if not matched and not failed:
         raise RuntimeError(
             f"No CSV candidates matched AlgoDictSm90. Wrote diagnostics to {Path(str(base) + '_missing.json')}"
         )

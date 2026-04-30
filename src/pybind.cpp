@@ -306,6 +306,16 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev1") = 1,
         "Benchmark public oo_allreduce_tuned API vs NCCL in one process.");
 
+  py::class_<BaselineImpl>(m, "BaselineImpl")
+      .def(py::init<>())
+      .def("nccl_init", &BaselineImpl::NcclInit)
+      .def("cublas_init", &BaselineImpl::CublasInit)
+      .def("gemm", &BaselineImpl::Gemm)
+      .def("gemm_allreduce", &BaselineImpl::GemmAllReduce)
+      .def("gemm_reducescatter", &BaselineImpl::GemmReduceScatter)
+      .def("nccl_allreduce", &BaselineImpl::NcclAllReduce)
+      .def("nccl_reducescatter", &BaselineImpl::NcclReduceScatter);
+
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
       .def("cutlass_init", &OverlapImpl::CutlassInit)

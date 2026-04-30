@@ -2,9 +2,19 @@
 """
 Custom SM90 GEMM-with-signal profiler for ooverlap.
 
-This intentionally does NOT use CUTLASS profiler CSV files.  It profiles the
+This intentionally does NOT use CUTLASS profiler CSV files. It profiles the
 algorithms that are actually compiled into ooverlap_ext, using the same Python
 call path that the rest of ooverlap uses.
+
+Important layout convention:
+  A    is [M, K]
+  B_nk is [N, K]
+  C    is [M, N]
+
+So the GEMM is:
+  C = A @ B_nk.T
+
+This matches FlashOverlap and BaselineImpl.
 
 Recommended first run:
 
@@ -15,7 +25,7 @@ Recommended first run:
     --timing-mode eager \
     --rank-metric median \
     --check top1 \
-    --include-torch
+    --include-baseline
 
 For packed reorder+signal:
 
@@ -38,7 +48,7 @@ import random
 import statistics
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -59,8 +69,6 @@ def load_ooverlap_ext(root: Optional[Path] = None):
     if not so.exists():
         raise FileNotFoundError(f"Could not find {so}. Build first.")
 
-    # Reuse a stable module name so repeated imports in one process do not
-    # produce multiple copies of static CUDA state.
     module_name = "ooverlap_ext"
     if module_name in sys.modules:
         return sys.modules[module_name]
@@ -73,6 +81,38 @@ def load_ooverlap_ext(root: Optional[Path] = None):
     sys.modules[module_name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def make_baseline_impl(ext: Any):
+    """
+    Create BaselineImpl from either pybind11 or TORCH_LIBRARY registration.
+
+    Preferred:
+      ext.BaselineImpl()
+
+    Fallback:
+      torch.classes.ooverlap_class.BaselineImpl()
+
+    The fallback requires OOVERLAP_ENABLE_TORCH_LIBRARY=1 at build time.
+    """
+    if hasattr(ext, "BaselineImpl"):
+        baseline = ext.BaselineImpl()
+        baseline.cublas_init()
+        return baseline
+
+    try:
+        baseline = torch.classes.ooverlap_class.BaselineImpl()
+        baseline.cublas_init()
+        return baseline
+    except Exception as e:
+        raise RuntimeError(
+            "Could not construct BaselineImpl. Expose it in pybind.cpp with:\n"
+            "  py::class_<BaselineImpl>(m, \"BaselineImpl\")\n"
+            "    .def(py::init<>())\n"
+            "    .def(\"cublas_init\", &BaselineImpl::CublasInit)\n"
+            "    .def(\"gemm\", &BaselineImpl::Gemm);\n"
+            "or build with OOVERLAP_ENABLE_TORCH_LIBRARY=1."
+        ) from e
 
 
 def load_algo_dict(path: Optional[str] = None) -> Tuple[Dict[int, Dict[str, Any]], Path]:
@@ -127,7 +167,6 @@ def make_column_major_ra(M: int, N: int, tile_m: int, tile_n: int, device: str) 
     tile_cols = N // tile_n
     num_tiles = tile_rows * tile_cols
 
-    # CPU construction is fine; this is outside timing and avoids many tiny GPU ops.
     host = [0] * num_tiles
     packed = 0
     for tc in range(tile_cols):
@@ -430,6 +469,8 @@ class GemmSignalBench:
         monitor: bool,
     ) -> None:
         self.ext = ext
+        self.baseline = make_baseline_impl(ext)
+
         self.M = M
         self.N = N
         self.K = K
@@ -445,11 +486,13 @@ class GemmSignalBench:
         torch.manual_seed(seed)
 
         self.A = torch.randn((M, K), device=device, dtype=torch.float16)
-        self.B_ref = torch.randn((K, N), device=device, dtype=torch.float16)
-        self.B_packed = self.B_ref.t().contiguous()
-        self.C_torch = torch.empty((M, N), device=device, dtype=torch.float16)
 
-        # Reused per candidate.  Reallocated because tile/reldn affect shape.
+        # FlashOverlap / ooverlap convention:
+        # B is [N, K], and GEMM computes A @ B.T.
+        self.B_nk = torch.randn((N, K), device=device, dtype=torch.float16)
+
+        self.C_baseline = torch.empty((M, N), device=device, dtype=torch.float16)
+
         self.C_ours: Optional[torch.Tensor] = None
         self.MM: Optional[torch.Tensor] = None
         self.RA: Optional[torch.Tensor] = None
@@ -503,13 +546,12 @@ class GemmSignalBench:
         self.num_segments = int(self.CommThr.numel())
         self.MM = torch.empty((self.num_segments + self.num_tiles,), device=self.device, dtype=torch.int32)
 
-        # First touch allocations outside timing.
         self.C_ours.zero_()
         self.MM.zero_()
         cuda_sync()
 
-    def torch_fn(self) -> None:
-        torch.matmul(self.A, self.B_ref, out=self.C_torch)
+    def baseline_fn(self) -> None:
+        self.baseline.gemm(self.A, self.B_nk, self.C_baseline)
 
     def ours_fn(self, algo: int, mm_mode: str) -> None:
         assert self.C_ours is not None
@@ -521,13 +563,11 @@ class GemmSignalBench:
             self.MM.zero_()
 
         if self.fill_output:
-            # Optional debugging knob: rules out stale-output artifacts, but it is
-            # intentionally not part of normal performance tuning.
             self.C_ours.zero_()
 
         self.ext.gemm_signal_sm90(
             self.A,
-            self.B_packed,
+            self.B_nk,
             self.C_ours,
             self.MM,
             self.RA,
@@ -551,7 +591,7 @@ class GemmSignalBench:
         tile_n = int(meta["tile_n"])
 
         self.reset_mm_once()
-        self.torch_fn()
+        self.baseline_fn()
         self.ours_fn(algo, mm_mode="never")
         cuda_sync()
 
@@ -568,7 +608,7 @@ class GemmSignalBench:
                 self.reldn,
             )
 
-        err = float((C_ours_normal - self.C_torch).abs().max().item())
+        err = float((C_ours_normal - self.C_baseline).abs().max().item())
         if err > atol:
             raise RuntimeError(f"max_abs_err too large: {err} > {atol}")
         return err
@@ -600,7 +640,7 @@ def benchmark_one(
     raise ValueError(f"unknown timing_mode={timing_mode}")
 
 
-def benchmark_torch(
+def benchmark_baseline(
     bench: GemmSignalBench,
     timing_mode: str,
     warmup: int,
@@ -608,10 +648,10 @@ def benchmark_torch(
     graph_repeats: int,
 ) -> float:
     if timing_mode == "eager":
-        return event_time_loop(bench.torch_fn, warmup=warmup, iters=iters)
+        return event_time_loop(bench.baseline_fn, warmup=warmup, iters=iters)
 
     if timing_mode == "graph":
-        return event_time_graph(bench.torch_fn, warmup=warmup, iters=iters, graph_repeats=graph_repeats)
+        return event_time_graph(bench.baseline_fn, warmup=warmup, iters=iters, graph_repeats=graph_repeats)
 
     raise ValueError(f"unknown timing_mode={timing_mode}")
 
@@ -745,11 +785,20 @@ def main() -> None:
     )
     ap.add_argument("--check-atol", type=float, default=0.75)
 
-    ap.add_argument("--include-torch", action="store_true")
+    ap.add_argument("--include-baseline", action="store_true")
+    ap.add_argument(
+        "--include-torch",
+        action="store_true",
+        help="Deprecated alias for --include-baseline. This script now uses BaselineImpl, not torch.matmul.",
+    )
+
     ap.add_argument("--suffix", type=str, default="")
     ap.add_argument("--dry-run", action="store_true")
 
     args = ap.parse_args()
+
+    if args.include_torch:
+        args.include_baseline = True
 
     if args.rounds <= 0:
         raise ValueError("--rounds must be > 0")
@@ -806,6 +855,7 @@ def main() -> None:
     print(f"iters:          {args.iters}")
     print(f"mm_mode:        {args.mm_mode}")
     print(f"rank_metric:    {args.rank_metric}")
+    print(f"baseline:       {'enabled' if args.include_baseline else 'disabled'}")
     print("========================================")
 
     if not candidates:
@@ -836,20 +886,19 @@ def main() -> None:
         monitor=args.monitor,
     )
 
-    # Optional torch baseline.  This is intentionally separate from candidate timing.
-    torch_ms: Optional[float] = None
-    if args.include_torch:
+    baseline_ms: Optional[float] = None
+    if args.include_baseline:
         print("")
-        print("Profiling torch baseline...")
-        torch_ms = benchmark_torch(
+        print("Profiling BaselineImpl GEMM...")
+        baseline_ms = benchmark_baseline(
             bench=bench,
             timing_mode=args.timing_mode,
             warmup=args.warmup,
             iters=args.iters,
             graph_repeats=args.graph_repeats,
         )
-        torch_tflops = flops / (torch_ms * 1e-3) / 1e12
-        print(f"  torch_{args.timing_mode}_ms={torch_ms:.6f} TFLOP/s={torch_tflops:.2f}")
+        baseline_tflops = flops / (baseline_ms * 1e-3) / 1e12
+        print(f"  baseline_{args.timing_mode}_ms={baseline_ms:.6f} TFLOP/s={baseline_tflops:.2f}")
 
     sample_map: Dict[int, List[float]] = {int(c["algo"]): [] for c in candidates}
     fail_map: Dict[int, str] = {}
@@ -866,10 +915,9 @@ def main() -> None:
 
         print(f"round {round_idx + 1}/{args.rounds}")
 
-        # A small guard warmup before each round makes clock-state bias less tied
-        # to candidate order.  Keep it outside per-candidate timing.
+        # Guard warmup before each round. Keep it outside per-candidate timing.
         try:
-            event_time_loop(bench.torch_fn, warmup=3, iters=3)
+            event_time_loop(bench.baseline_fn, warmup=3, iters=3)
         except Exception:
             pass
 
@@ -945,7 +993,6 @@ def main() -> None:
         print("")
         print(f"Correctness top1: algo={best_algo} max_abs_err={err}")
 
-    # Add rank after sorting.
     for idx, row in enumerate(rows, start=1):
         row["rank"] = idx
 
@@ -979,7 +1026,7 @@ def main() -> None:
         "iters": args.iters,
         "mm_mode": args.mm_mode,
         "rank_metric": args.rank_metric,
-        "torch_ms": torch_ms,
+        "baseline_ms": baseline_ms,
         "BM": [int(r["tile_m"]) for r in top_rows],
         "BN": [int(r["tile_n"]) for r in top_rows],
         "BK": [int(r["tile_k"]) for r in top_rows],

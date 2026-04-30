@@ -45,7 +45,7 @@
 #endif
 
 #ifndef OOVERLAP_ENABLE_EPILOGUE_MONITOR
-#define OOVERLAP_ENABLE_EPILOGUE_MONITOR 0
+#define OOVERLAP_ENABLE_EPILOGUE_MONITOR 1
 #endif
 
 namespace cutlass {
@@ -405,14 +405,41 @@ struct ReorderSignalEpilogue {
         atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);
 
 #if OOVERLAP_ENABLE_EPILOGUE_MONITOR
-        int tile_cols = (N_ + params_.signal.ThreadblockN - 1) / params_.signal.ThreadblockN;
         if (params_.signal.if_monitor) {
+          // MM layout used by the SM90 port:
+          //   MM[0 : num_segments]
+          //       per-segment ready counters, consumed by comm stream
+          //   MM[num_segments : num_segments + tile_num]
+          //       per-tile epilogue arrival counters, used internally here
+          //   MM[num_segments + tile_num]
+          //       global monitor/order counter, only used when if_monitor=true
+          //   MM[num_segments + tile_num + 1 : num_segments + tile_num + 1 + tile_num]
+          //       monitor output: monitor_order[tile] = tile completion order
+          //
+          // Do not store monitor data in tile_done. tile_done is live
+          // synchronization state and must remain arrival counts.
+          int tile_cols =
+            (N_ + params_.signal.ThreadblockN - 1) /
+            params_.signal.ThreadblockN;
+
+          int tile_rows =
+            (M_ + params_.signal.ThreadblockM - 1) /
+            params_.signal.ThreadblockM;
+
+          int tile_num = tile_rows * tile_cols;
+
+          int* monitor_counter =
+            params_.signal.ptr_Monitored_Matrix +
+            params_.signal.num_segments + tile_num;
+
+          int* monitor_order = monitor_counter + 1;
+
           int global_order =
-            atomicAdd(&params_.signal.ptr_Monitored_Matrix[tile_cols - 1], 1);
+            atomicAdd(monitor_counter, 1);
 
           cutlass::arch::global_store<int, sizeof(int)>(
             global_order,
-            (void*)(params_.signal.ptr_Monitored_Matrix + tile_cols + tile),
+            (void*)(monitor_order + tile),
             true
           );
         }

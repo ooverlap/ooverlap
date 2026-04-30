@@ -312,19 +312,20 @@ def main():
 
     A = torch.randn((M, K), device="cuda", dtype=torch.float16)
 
-    # Torch sees B as [K, N].
-    B_ref = torch.randn((K, N), device="cuda", dtype=torch.float16)
+    # BaselineImpl and our SM90 wrapper both expect B as [N, K].
+    B_packed = torch.randn((N, K), device="cuda", dtype=torch.float16)
 
-    # Our CUTLASS wrapper expects B_packed as [N, K].
-    B_packed = B_ref.t().contiguous()
+    C_baseline = torch.empty((M, N), device="cuda", dtype=torch.float16)
 
-    C_torch = torch.empty((M, N), device="cuda", dtype=torch.float16)
+    baseline = ext.BaselineImpl()
+    baseline.cublas_init()
+    
     C_ours = torch.empty(D_shape, device="cuda", dtype=torch.float16)
 
     monitor = False
 
     def run_torch_eager():
-        torch.matmul(A, B_ref, out=C_torch)
+        baseline.gemm(A, B_packed, C_baseline)
 
     def run_ours_eager():
         if args.reset_mm:
@@ -370,13 +371,13 @@ def main():
             reldn,
         )
 
-    max_err = (C_ours_normal - C_torch).abs().max().item()
+    max_err = (C_ours_normal - C_baseline).abs().max().item()
 
-    torch_eager_ms = None
+    baseline_eager_ms = None
     ours_eager_ms = None
 
     if not args.skip_eager:
-        torch_eager_ms = time_cuda(run_torch_eager, args.warmup, args.iters)
+        baseline_eager_ms = time_cuda(run_torch_eager, args.warmup, args.iters)
 
         # Make no-reset mode deterministic enough before timing.
         if not args.reset_mm:
@@ -385,13 +386,13 @@ def main():
 
         ours_eager_ms = time_cuda(run_ours_eager, args.warmup, args.iters)
 
-    # Capture torch GEMM.
+    # Capture cuBLAS baseline GEMM.
     torch.cuda.synchronize()
-    g_torch = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g_torch):
-        torch.matmul(A, B_ref, out=C_torch)
+    g_baseline = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g_baseline):
+        baseline.gemm(A, B_packed, C_baseline)
 
-    torch_graph_ms = time_cuda(g_torch.replay, args.warmup, args.iters)
+    baseline_graph_ms = time_cuda(g_baseline.replay, args.warmup, args.iters) 
 
     # Capture our GEMM.
     our_graph_capture_ok = True
@@ -429,7 +430,7 @@ def main():
     flops = 2.0 * M * N * K
 
     print("========================================")
-    print("GEMM-only eager vs CUDA Graph benchmark")
+    print("GEMM-only cuBLAS baseline vs SM90 signal GEMM benchmark")
     print(f"algo={args.algo}")
     print(f"algo_dict={algo_dict_path}")
     print(
@@ -447,8 +448,8 @@ def main():
     print("")
     print(f"max_abs_err:            {max_err}")
     print("")
-    print(f"torch eager latency:    {fmt_ms(torch_eager_ms)}")
-    print(f"torch graph latency:    {fmt_ms(torch_graph_ms)}")
+    print(f"baseline eager latency: {fmt_ms(baseline_eager_ms)}")
+    print(f"baseline graph latency: {fmt_ms(baseline_graph_ms)}")
     print(f"our eager latency:      {fmt_ms(ours_eager_ms)}")
 
     if our_graph_capture_ok:
@@ -458,8 +459,8 @@ def main():
         print(f"our graph error:        {our_graph_error}")
 
     print("")
-    print(f"torch eager TFLOP/s:    {fmt_tflops(torch_eager_ms, flops)}")
-    print(f"torch graph TFLOP/s:    {fmt_tflops(torch_graph_ms, flops)}")
+    print(f"baseline eager TFLOP/s: {fmt_tflops(baseline_eager_ms, flops)}")
+    print(f"baseline graph TFLOP/s: {fmt_tflops(baseline_graph_ms, flops)}")
     print(f"our eager TFLOP/s:      {fmt_tflops(ours_eager_ms, flops)}")
 
     if our_graph_capture_ok:
@@ -467,7 +468,7 @@ def main():
         print("")
         if ours_eager_ms is not None:
             print(f"our eager / graph slow: {ours_eager_ms / our_graph_ms:.4f}x")
-        print(f"torch graph / our graph speed: {torch_graph_ms / our_graph_ms:.4f}x")
+        print(f"baseline graph / our graph speed: {baseline_graph_ms / our_graph_ms:.4f}x")
 
     print("========================================")
 

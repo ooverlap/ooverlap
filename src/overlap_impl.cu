@@ -241,6 +241,16 @@ void OverlapImpl::GemmAllReduceOverlap(
                 " num_segments=", seg_size,
                 " num_tiles=", tile_num);
 
+    if (if_monitor) {
+        TORCH_CHECK(MM.numel() >= static_cast<int64_t>(seg_size) + tile_num + 1 + tile_num,
+                    "When if_monitor=true, MM must have at least "
+                    "num_segments + num_tiles + 1 + num_tiles elements. MM.numel()=",
+                    MM.numel(),
+                    " num_segments=", seg_size,
+                    " num_tiles=", tile_num,
+                    " required=", static_cast<int64_t>(seg_size) + tile_num + 1 + tile_num);
+    }
+
     auto* cseg_cpu_ptr = cSEG_CPU.data_ptr<int>();
 
     int64_t total_segment_tiles = 0;
@@ -426,6 +436,21 @@ void OverlapImpl::GemmReduceScatterOverlap(
     const int seg_size = static_cast<int>(cSEG_GPU.numel());
     TORCH_CHECK(seg_size == static_cast<int>(cSEG_CPU.numel()),
                 "cSEG_CPU/GPU size mismatch");
+
+
+    TORCH_CHECK(MM.numel() >= static_cast<int64_t>(seg_size) + tile_num,
+                "MM must have at least num_segments + num_tiles elements. MM.numel()=",
+                MM.numel(),
+                " num_segments=", seg_size,
+                " num_tiles=", tile_num);
+
+    if (if_monitor) {
+        TORCH_CHECK(MM.numel() >= static_cast<int64_t>(seg_size) + tile_num + 1 + tile_num,
+                    "When if_monitor=true, MM must have at least "
+                    "num_segments + num_tiles + 1 + num_tiles elements. MM.numel()=",
+                    MM.numel(),
+                    " required=", static_cast<int64_t>(seg_size) + tile_num + 1 + tile_num);
+    }
 
     auto* a_ptr = reinterpret_cast<half*>(A.data_ptr<at::Half>());
     auto* b_ptr = reinterpret_cast<half*>(B.data_ptr<at::Half>());
