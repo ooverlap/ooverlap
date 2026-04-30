@@ -358,11 +358,18 @@ def main():
     )
     torch.cuda.synchronize()
 
+    physical_rows = C_ours.shape[0]
+    C_ours_logical = torch.as_strided(
+        C_ours,
+        size=tuple(C_ours.shape),
+        stride=(1, physical_rows),
+    )
+    
     if args.layout == "normal":
-        C_ours_normal = C_ours
+        C_ours_normal = C_ours_logical
     else:
         C_ours_normal = unpack_packed_to_normal(
-            C_ours,
+            C_ours_logical,
             RA,
             M,
             N,

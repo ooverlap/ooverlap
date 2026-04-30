@@ -676,10 +676,12 @@ def main() -> None:
     ap.add_argument("--csv-accum-dtype", choices=["f32"], default="f32")
     ap.add_argument("--csv-c-dtype", choices=["f16", "void", "any"], default="f16")
     ap.add_argument("--csv-d-dtype", choices=["f16", "f32", "any"], default="f16")
+
+    ap.add_argument("--csv-c-layout", choices=["row", "column", "any"], default="column")
+    ap.add_argument("--csv-d-layout", choices=["row", "column", "any"], default="column")
+
     ap.add_argument("--csv-a-layout", choices=["row", "column"], default="row")
     ap.add_argument("--csv-b-layout", choices=["row", "column"], default="column")
-    ap.add_argument("--csv-c-layout", choices=["row", "column", "any"], default="row")
-    ap.add_argument("--csv-d-layout", choices=["row", "column", "any"], default="row")
     ap.add_argument("--no-filter-layouts", dest="filter_layouts", action="store_false")
     ap.add_argument("--allow-split-k", action="store_true")
     ap.add_argument(
