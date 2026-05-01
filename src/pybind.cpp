@@ -266,6 +266,110 @@ static void gemm_plain_sm90(
   TORCH_CHECK(ok, "gemm_plain_sm90 failed for algo=", algo);
 }
 
+static const char* cublas_status_to_string(cublasStatus_t status) {
+  switch (status) {
+    case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
+    case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
+    case CUBLAS_STATUS_LICENSE_ERROR: return "CUBLAS_STATUS_LICENSE_ERROR";
+    default: return "CUBLAS_STATUS_UNKNOWN";
+  }
+}
+
+static void baseline_gemm_col(
+    torch::Tensor A,
+    torch::Tensor B_col,
+    torch::Tensor D_col) {
+  TORCH_CHECK(A.is_cuda() && B_col.is_cuda() && D_col.is_cuda(),
+              "A/B_col/D_col must be CUDA");
+
+  TORCH_CHECK(A.scalar_type() == torch::kFloat16, "A must be float16");
+  TORCH_CHECK(B_col.scalar_type() == torch::kFloat16, "B_col must be float16");
+  TORCH_CHECK(D_col.scalar_type() == torch::kFloat16, "D_col must be float16");
+
+  TORCH_CHECK(A.dim() == 2 && B_col.dim() == 2 && D_col.dim() == 2,
+              "A/B_col/D_col must be 2D");
+
+  TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+  TORCH_CHECK(B_col.is_contiguous(), "B_col must be contiguous");
+  TORCH_CHECK(D_col.is_contiguous(), "D_col must be contiguous");
+
+  const int64_t M64 = A.size(0);
+  const int64_t K64 = A.size(1);
+  const int64_t N64 = B_col.size(0);
+
+  TORCH_CHECK(B_col.size(1) == K64,
+              "B_col must have physical shape (N, K)");
+
+  TORCH_CHECK(D_col.size(0) == N64 && D_col.size(1) == M64,
+              "D_col must have physical shape (N, M)");
+
+  TORCH_CHECK(M64 <= INT_MAX && N64 <= INT_MAX && K64 <= INT_MAX,
+              "M/N/K exceed int range for cuBLAS");
+
+  const int M = static_cast<int>(M64);
+  const int N = static_cast<int>(N64);
+  const int K = static_cast<int>(K64);
+
+  const int dev = A.get_device();
+  cudaError_t cuda_err = cudaSetDevice(dev);
+  TORCH_CHECK(cuda_err == cudaSuccess,
+              "cudaSetDevice failed: ", cudaGetErrorString(cuda_err));
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev).stream();
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+
+  cublasStatus_t st = cublasSetStream(handle, stream);
+  TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
+              "cublasSetStream failed: ", cublas_status_to_string(st));
+
+  st = cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+  TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
+              "cublasSetMathMode failed: ", cublas_status_to_string(st));
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+
+  // We want logical:
+  //
+  //   D[M, N] = A[M, K] @ B_col.t()[K, N]
+  //
+  // but D_col is physical [N, M], i.e. logical column-major D[M, N].
+  //
+  // cuBLAS is column-major:
+  //   A physical [M,K] row-major is column-major [K,M], use OP_T => [M,K]
+  //   B_col physical [N,K] row-major is column-major [K,N], use OP_N => [K,N]
+  //   D_col physical [N,M] row-major is column-major [M,N], ldc=M
+  st = cublasGemmEx(
+      handle,
+      CUBLAS_OP_T,
+      CUBLAS_OP_N,
+      M, N, K,
+      static_cast<const void*>(&alpha),
+      static_cast<const void*>(A.data_ptr<at::Half>()),
+      CUDA_R_16F,
+      K,
+      static_cast<const void*>(B_col.data_ptr<at::Half>()),
+      CUDA_R_16F,
+      K,
+      static_cast<const void*>(&beta),
+      static_cast<void*>(D_col.data_ptr<at::Half>()),
+      CUDA_R_16F,
+      M,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+  TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
+              "cublasGemmEx baseline_gemm_col failed: ",
+              cublas_status_to_string(st));
+}
+
 PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("gemm_signal_sm90", &gemm_signal_sm90,
         "SM90 fused reorder+signal GEMM (bring-up: algo=0 only)");
@@ -357,6 +461,9 @@ PYBIND11_MODULE(ooverlap_ext, m) {
   
   m.def("gemm_plain_sm90", &gemm_plain_sm90,
       "Plain SM90 CUTLASS GEMM: A row-major, B column-major, D column-major");
+
+  m.def("baseline_gemm_col", &baseline_gemm_col,
+      "cuBLAS GEMM baseline: A row-major [M,K], B_col [N,K], D_col [N,M]");
 
   py::class_<BaselineImpl>(m, "BaselineImpl")
       .def(py::init<>())
