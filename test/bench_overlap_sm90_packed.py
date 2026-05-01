@@ -294,6 +294,27 @@ def worker(
         def run_nccl_only_full():
             ov.nccl_allreduce(C_nccl_only)
 
+        MM_overlap.zero_()
+        ext.gemm_signal_sm90(
+            A,
+            B_packed,
+            C_packed,
+            MM_overlap,
+            RA,
+            overlap_cseg_gpu,
+            int(reldn),
+            int(algo),
+            False,
+        )
+        torch.cuda.synchronize()
+        
+        if rank == 0:
+            seg_counts = MM_overlap[:len(overlap_cseg)].detach().cpu().tolist()
+            tile_arrivals = MM_overlap[len(overlap_cseg):].detach().cpu()
+            print("expected segments:", overlap_cseg, flush=True)
+            print("actual segment counts:", seg_counts, flush=True)
+            print("tile_done unique:", torch.unique(tile_arrivals, return_counts=True), flush=True)
+
         overlap_ms, overlap_local_ms = time_cuda_max(
             run_packed_overlap,
             warmup,
