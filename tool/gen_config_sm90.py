@@ -436,6 +436,32 @@ def make_segments(num_tiles: int, group_tiles: int, device: torch.device):
         left -= x
     return torch.tensor(vals, device=device, dtype=torch.int32)
 
+def time_cuda_eager_with_setup_excluded(
+    fn: Callable[[], None],
+    setup: Callable[[], None],
+    warmup: int,
+    iters: int,
+) -> float:
+    for _ in range(warmup):
+        setup()
+        fn()
+    torch.cuda.synchronize()
+
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+
+    for i in range(iters):
+        # This is queued before the start event on the same stream, so it is
+        # required for correctness but excluded from elapsed_time(start,end).
+        setup()
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+
+    vals = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    return float(sum(vals)) / float(len(vals))
 
 def time_cuda_eager(fn: Callable[[], None], warmup: int, iters: int) -> float:
     for _ in range(warmup):
@@ -498,20 +524,57 @@ def benchmark_algo(ext, args, meta, A, B_nk, D, RA, CommThr, MM):
     if args.layout == "packed" and reldn == 0:
         reldn = 1
 
-    def run():
-        ext.gemm_signal_sm90(A, B_nk, D, MM, RA, CommThr, int(reldn), int(meta["algo"]), False)
+    def setup():
+        if args.reset_mm:
+            MM.zero_()
 
+    def run():
+        ext.gemm_signal_sm90(
+            A,
+            B_nk,
+            D,
+            MM,
+            RA,
+            CommThr,
+            int(reldn),
+            int(meta["algo"]),
+            False,
+        )
+
+    setup()
     run()
     torch.cuda.synchronize()
+
+    if args.reset_mm:
+        if args.timing_mode != "eager":
+            raise RuntimeError(
+                "--reset-mm with graph/auto timing is ambiguous: either reset is captured "
+                "and counted, or MM is not reset per launch. Use --timing-mode eager."
+            )
+        return (
+            time_cuda_eager_with_setup_excluded(run, setup, args.warmup, args.iters),
+            "eager_reset_mm_excluded",
+            None,
+        )
+
     if args.timing_mode == "eager":
         return time_cuda_eager(run, args.warmup, args.iters), "eager", None
+
     if args.timing_mode == "graph":
-        return time_cuda_graph_unrolled(run, args.warmup, args.iters, args.graph_repeats), f"graph_unrolled_{args.graph_repeats}", None
+        return (
+            time_cuda_graph_unrolled(run, args.warmup, args.iters, args.graph_repeats),
+            f"graph_unrolled_{args.graph_repeats}",
+            None,
+        )
+
     try:
-        return time_cuda_graph_unrolled(run, args.warmup, args.iters, args.graph_repeats), f"graph_unrolled_{args.graph_repeats}", None
+        return (
+            time_cuda_graph_unrolled(run, args.warmup, args.iters, args.graph_repeats),
+            f"graph_unrolled_{args.graph_repeats}",
+            None,
+        )
     except Exception as e:
         return time_cuda_eager(run, args.warmup, args.iters), "eager_fallback", repr(e)
-
 
 def write_json(path: Path, data: Any):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -572,6 +635,11 @@ def main():
     ap.add_argument("--csv-b-layout", choices=["row", "column", "any"], default="column")
     ap.add_argument("--csv-c-layout", choices=["row", "column", "any"], default="column")
     ap.add_argument("--csv-d-layout", choices=["row", "column", "any"], default="column")
+    ap.add_argument(
+        "--reset-mm",
+        action="store_true",
+        help="Zero MM before each GEMM launch, outside the measured interval. Needed for standalone signal/reorder tests.",
+    )
     args = ap.parse_args()
 
     root = repo_root()
@@ -620,6 +688,7 @@ def main():
     print(f"csv A/B/C/D:      {args.csv_a_dtype}:{args.csv_a_layout} / {args.csv_b_dtype}:{args.csv_b_layout} / {args.csv_c_dtype}:{args.csv_c_layout} / {args.csv_d_dtype}:{args.csv_d_layout}")
     print(f"csv accum:        {args.csv_accum_dtype}")
     print(f"check:            {args.check} atol={args.check_atol}")
+    print(f"reset_mm:         {args.reset_mm} (excluded from timing)")
     print("CSV filter counts:")
     for k, v in counts.items():
         print(f"  {k:20s}: {v}")
@@ -735,6 +804,8 @@ def main():
         "dur": [float(x["signal_gemm_ms"]) for x in selected],
         "top": selected,
         "all_profiled": ok_rows,
+        "reset_mm": bool(args.reset_mm),
+        "reset_mm_timing": "excluded" if args.reset_mm else "not_used",
     }
     write_json(out_json, result)
     write_csv(out_csv, ok_rows)
