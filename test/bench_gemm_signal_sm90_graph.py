@@ -113,10 +113,6 @@ def make_segments(num_tiles, group_tiles, device="cuda"):
     return torch.tensor(segs, device=device, dtype=torch.int32)
 
 
-def logical_col_major_view(buf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-    return torch.as_strided(buf, size=(rows, cols), stride=(1, rows))
-
-
 def unpack_packed_to_normal(D_packed_logical, RA, M, N, tile_m, tile_n, reldn):
     tile_rows = M // tile_m
     tile_cols = N // tile_n
@@ -227,7 +223,7 @@ def main():
     ap.add_argument(
         "--check-ref",
         choices=["auto", "baseline_col", "baseline_impl", "torch"],
-        default="auto",
+        default="baseline_impl",
         help="Correctness reference. auto prefers baseline_gemm_col, then BaselineImpl, then torch.",
     )
     ap.add_argument(
@@ -333,10 +329,9 @@ def main():
         )
 
     def ours_normal_view():
-        D_logical = logical_col_major_view(C_ours, C_ours.shape[0], C_ours.shape[1])
         if args.layout == "normal":
-            return D_logical
-        return unpack_packed_to_normal(D_logical, RA, M, N, tile_m, tile_n, reldn)
+            return C_ours[:M, :N]
+        return unpack_packed_to_normal(C_ours, RA, M, N, tile_m, tile_n, reldn)
 
     check_ref = resolve_check_ref(args.check_ref, baseline_col_fn, baseline_impl)
 

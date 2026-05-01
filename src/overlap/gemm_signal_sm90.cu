@@ -100,7 +100,7 @@ void cutlass_gemm_signal_sm90(
   using ElementB           = cutlass::half_t;
   using LayoutB            = cutlass::layout::ColumnMajor;
   using ElementC           = cutlass::half_t;
-  using LayoutC            = cutlass::layout::ColumnMajor;
+  using LayoutC            = cutlass::layout::RowMajor;
   using ElementAccumulator = cutlass::half_t;
 
   using GemmSignal = cutlass::GemmSignalSm90<
@@ -151,7 +151,13 @@ void cutlass_gemm_signal_sm90(
   int64_t tile_cols = (int64_t(N) + TileN - 1) / TileN;
   int64_t tile_num = tile_rows * tile_cols;
   int64_t packed_tile_rows = (tile_num + int64_t(ReLDN) - 1) / int64_t(ReLDN);
-  int64_t ld_D_reshaped = packed_tile_rows * int64_t(TileM);
+
+  int64_t packed_rows = packed_tile_rows * int64_t(TileM);
+  int64_t packed_cols = int64_t(ReLDN) * int64_t(TileN);
+  
+  // Row-major leading dimension.
+  int64_t ld_D_reshaped = packed_cols;
+
 
   typename GemmSignal::Arguments arguments(
     problem_size,

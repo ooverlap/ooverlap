@@ -2,8 +2,8 @@
 """
 Profile ooverlap SM90 signal GEMM candidates against a CUTLASS profiler CSV.
 
-This replacement uses the same f16/B=[N,K]/column-output convention as the
-plain GEMM bring-up. Correctness checks use baseline_gemm_col when available
+This replacement uses the same f16/B=[N,K]/row-output convention as the
+plain GEMM bring-up. Correctness checks use row-major output references
 and default to a tolerance suitable for f16-accumulate / different reduction
 orders.
 """
@@ -398,6 +398,9 @@ def make_ra(tile_rows: int, tile_cols: int, reorder: str, device: torch.device) 
 
 
 def logical_col_major_view(buf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    # Legacy helper for the temporary column-major-output experiment.
+    # FlashOverlap-style signal GEMM uses row-major output, so normal code
+    # should not call this.
     return torch.as_strided(buf, size=(rows, cols), stride=(1, rows))
 
 
@@ -633,8 +636,8 @@ def main():
     ap.add_argument("--csv-d-dtype", choices=["f16", "f32", "any"], default="f16")
     ap.add_argument("--csv-a-layout", choices=["row", "column", "any"], default="row")
     ap.add_argument("--csv-b-layout", choices=["row", "column", "any"], default="column")
-    ap.add_argument("--csv-c-layout", choices=["row", "column", "any"], default="column")
-    ap.add_argument("--csv-d-layout", choices=["row", "column", "any"], default="column")
+    ap.add_argument("--csv-c-layout", choices=["row", "column", "any"], default="row")
+    ap.add_argument("--csv-d-layout", choices=["row", "column", "any"], default="row")
     ap.add_argument(
         "--reset-mm",
         action="store_true",

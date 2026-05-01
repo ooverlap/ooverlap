@@ -148,8 +148,8 @@ public:
   );
 
   static_assert(
-    cutlass::platform::is_same<LayoutOutput, cutlass::layout::ColumnMajor>::value,
-    "This wrapper currently expects D column-major, physical shape [N, M]."
+    cutlass::platform::is_same<LayoutOutput, cutlass::layout::RowMajor>::value,
+    "This wrapper currently expects D row-major, physical shape [N, M]."
   );
 
   using OperatorClass = cutlass::arch::OpClassTensorOp;
@@ -324,22 +324,28 @@ public:
     auto stride_B = cutlass::make_cute_packed_stride(
         StrideB{}, cute::make_shape(N, K, 1));
 
-    int out_ld_c = static_cast<int>(args_.ldm_C);
-    int out_ld_d = static_cast<int>(args_.ldm_D);
+    int original_tile_rows = (M + ThreadblockShape::kM - 1) / ThreadblockShape::kM;
+    int original_tile_cols = (N + ThreadblockShape::kN - 1) / ThreadblockShape::kN;
+    int original_tile_num  = original_tile_rows * original_tile_cols;
     
-    int out_cols = N;
+    int packed_tile_cols = original_tile_cols;
     
     #if !(defined(OOVERLAP_USE_BASE_EPILOGUE_ONLY) && OOVERLAP_USE_BASE_EPILOGUE_ONLY)
     if (args_.signal_params.kReorderedColumn > 0) {
-      out_cols = args_.signal_params.kReorderedColumn * ThreadblockShape::kN;
+      packed_tile_cols = args_.signal_params.kReorderedColumn;
     }
     #endif
     
+    int packed_tile_rows = (original_tile_num + packed_tile_cols - 1) / packed_tile_cols;
+    
+    int out_rows = packed_tile_rows * ThreadblockShape::kM;
+    int out_cols = packed_tile_cols * ThreadblockShape::kN;
+    
     auto stride_C = cutlass::make_cute_packed_stride(
-        StrideC{}, cute::make_shape(out_ld_c, out_cols, 1));
+        StrideC{}, cute::make_shape(out_rows, out_cols, 1));
     
     auto stride_D = cutlass::make_cute_packed_stride(
-        StrideD{}, cute::make_shape(out_ld_d, out_cols, 1));
+        StrideD{}, cute::make_shape(out_rows, out_cols, 1));
 
     MainloopArguments mainloop_args{
       reinterpret_cast<ElementInputA const*>(args_.ptr_A),
