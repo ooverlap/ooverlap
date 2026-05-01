@@ -79,6 +79,42 @@ inline bool check_cuda(cudaError_t err, const char* where) {
   return false;
 }
 
+struct PlainCacheKey {
+  bool valid;
+  int device;
+  int M;
+  int N;
+  int K;
+  void* A;
+  void* B;
+  void* D;
+
+  PlainCacheKey()
+      : valid(false),
+        device(-1),
+        M(0),
+        N(0),
+        K(0),
+        A(nullptr),
+        B(nullptr),
+        D(nullptr) {}
+
+  bool same_as(PlainCacheKey const& other) const {
+    return valid &&
+           other.valid &&
+           device == other.device &&
+           M == other.M &&
+           N == other.N &&
+           K == other.K &&
+           A == other.A &&
+           B == other.B &&
+           D == other.D;
+  }
+};
+
+}  // namespace detail
+}  // namespace ooverlap
+
 template <
     int TileM,
     int TileN,
@@ -88,7 +124,7 @@ template <
     typename MainloopSchedule,
     typename EpilogueSchedule,
     typename TileScheduler>
-bool launch_plain_tnn_colmajor(
+bool cutlass_gemm_plain_sm90(
     int M,
     int N,
     int K,
@@ -155,7 +191,7 @@ bool launch_plain_tnn_colmajor(
           EpilogueSchedule>::CollectiveOp;
 
   using GemmKernel =
-      typename GemmKernelSelector<
+      typename ooverlap::detail::GemmKernelSelector<
           CollectiveMainloop,
           CollectiveEpilogue,
           TileScheduler>::type;
@@ -174,11 +210,11 @@ bool launch_plain_tnn_colmajor(
   //   B shape is (N, K, L)
   //   C/D shape is (M, N, L)
   //
-  // With LayoutB=ColumnMajor, StrideB should become (K, 1, ...), matching
-  // physical B_col shape (N, K) contiguous.
+  // With LayoutB=ColumnMajor, StrideB becomes (K, 1, ...), matching physical
+  // B_col shape (N, K) contiguous.
   //
-  // With LayoutD=ColumnMajor, StrideD should become (1, M, ...), matching
-  // physical D_col shape (N, M) contiguous.
+  // With LayoutD=ColumnMajor, StrideD becomes (1, M, ...), matching physical
+  // D_col shape (N, M) contiguous.
   auto stride_A = cutlass::make_cute_packed_stride(
       StrideA{}, cute::make_shape(M, K, 1));
   auto stride_B = cutlass::make_cute_packed_stride(
@@ -191,7 +227,7 @@ bool launch_plain_tnn_colmajor(
   cutlass::KernelHardwareInfo hw_info;
 
   int device_id = 0;
-  if (!check_cuda(cudaGetDevice(&device_id), "cudaGetDevice")) {
+  if (!ooverlap::detail::check_cuda(cudaGetDevice(&device_id), "cudaGetDevice")) {
     return false;
   }
 
@@ -203,7 +239,7 @@ bool launch_plain_tnn_colmajor(
   float beta = 0.0f;
 
   typename Gemm::Arguments arguments = [&]() {
-    if constexpr (IsStreamK<TileScheduler>::value) {
+    if constexpr (ooverlap::detail::IsStreamK<TileScheduler>::value) {
       using DecompositionMode =
           typename cutlass::gemm::kernel::detail::
               PersistentTileSchedulerSm90StreamKParams::DecompositionMode;
@@ -256,48 +292,110 @@ bool launch_plain_tnn_colmajor(
     }
   }();
 
-  Gemm gemm;
+  static Gemm gemm;
+  static ooverlap::detail::PlainCacheKey cached_key;
+  static void* workspace = nullptr;
+  static size_t workspace_size = 0;
 
-  cutlass::Status status = gemm.can_implement(arguments);
-  if (!check_status(status, "can_implement")) {
-    return false;
-  }
+  ooverlap::detail::PlainCacheKey new_key;
+  new_key.valid = true;
+  new_key.device = device_id;
+  new_key.M = M;
+  new_key.N = N;
+  new_key.K = K;
+  new_key.A = reinterpret_cast<void*>(A);
+  new_key.B = reinterpret_cast<void*>(B_col);
+  new_key.D = reinterpret_cast<void*>(D_col);
 
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-  void* workspace = nullptr;
+  // Normal schedulers can safely reuse the initialized GEMM object. This also
+  // makes the normal path CUDA-graph-capturable after the first warmup call.
+  //
+  // Stream-K scheduler state is more delicate; keep it correct first by
+  // reinitializing each launch. Use eager timing for Stream-K experiments.
+  bool must_initialize =
+      !cached_key.same_as(new_key) ||
+      ooverlap::detail::IsStreamK<TileScheduler>::value;
 
-  if (workspace_size > 0) {
-    if (!check_cuda(cudaMalloc(&workspace, workspace_size), "cudaMalloc(workspace)")) {
+  if (must_initialize) {
+    cutlass::Status status = gemm.can_implement(arguments);
+    if (!ooverlap::detail::check_status(status, "can_implement")) {
       return false;
     }
-  }
 
-  status = gemm.initialize(arguments, workspace, stream);
-  if (!check_status(status, "initialize")) {
-    if (workspace != nullptr) {
-      cudaFree(workspace);
+    size_t needed_workspace = Gemm::get_workspace_size(arguments);
+    if (needed_workspace > workspace_size) {
+      if (workspace != nullptr) {
+        if (!ooverlap::detail::check_cuda(cudaFree(workspace), "cudaFree(old workspace)")) {
+          return false;
+        }
+        workspace = nullptr;
+        workspace_size = 0;
+      }
+
+      if (needed_workspace > 0) {
+        if (!ooverlap::detail::check_cuda(
+                cudaMalloc(&workspace, needed_workspace),
+                "cudaMalloc(workspace)")) {
+          return false;
+        }
+        workspace_size = needed_workspace;
+      }
     }
-    return false;
-  }
 
-  status = gemm.run(stream);
-  if (!check_status(status, "run")) {
-    if (workspace != nullptr) {
-      cudaFree(workspace);
-    }
-    return false;
-  }
-
-  if (workspace != nullptr) {
-    if (!check_cuda(cudaFree(workspace), "cudaFree(workspace)")) {
+    status = gemm.initialize(arguments, workspace, stream);
+    if (!ooverlap::detail::check_status(status, "initialize")) {
       return false;
     }
+
+    cached_key = new_key;
   }
 
-  return check_cuda(cudaGetLastError(), "cudaGetLastError");
+  cutlass::Status status = gemm.run(stream);
+  if (!ooverlap::detail::check_status(status, "run")) {
+    return false;
+  }
+
+  return ooverlap::detail::check_cuda(cudaGetLastError(), "cudaGetLastError");
 }
 
-}  // namespace detail
+// explicit instantiations
+#include "inc/plain_instances_sm90.inc"
+
+// function pointer table
+#include "tiling/plain_tiling_sm90.cuh"
+
+namespace ooverlap {
+
+int gemm_plain_sm90_algo_count() {
+  return plain_sm90_func_count;
+}
+
+bool gemm_plain_sm90_get_algo_meta(
+    int algo,
+    GemmPlainSm90AlgoMeta* out) {
+  if (out == nullptr) {
+    return false;
+  }
+
+  if (algo < 0 || algo >= plain_sm90_func_count) {
+    return false;
+  }
+
+  auto const& src = plain_sm90_algo_meta[algo];
+
+  out->tile_m = src.tile_m;
+  out->tile_n = src.tile_n;
+  out->tile_k = src.tile_k;
+  out->cluster_m = src.cluster_m;
+  out->cluster_n = src.cluster_n;
+  out->cluster_k = src.cluster_k;
+  out->stages = src.stages;
+  out->mainloop = src.mainloop;
+  out->epilogue = src.epilogue;
+  out->scheduler = src.scheduler;
+
+  return true;
+}
 
 bool gemm_plain_sm90_dispatch(
     int algo,
@@ -308,143 +406,20 @@ bool gemm_plain_sm90_dispatch(
     void* B_col,
     void* D_col,
     cudaStream_t stream) {
-  using Stage4 = cutlass::gemm::collective::StageCount<4>;
-  using Stage5 = cutlass::gemm::collective::StageCount<5>;
-  using Stage6 = cutlass::gemm::collective::StageCount<6>;
-  using Stage7 = cutlass::gemm::collective::StageCount<7>;
-
-  using Cluster1x1x1 = cute::Shape<cute::_1, cute::_1, cute::_1>;
-  using Cluster1x2x1 = cute::Shape<cute::_1, cute::_2, cute::_1>;
-  using Cluster2x1x1 = cute::Shape<cute::_2, cute::_1, cute::_1>;
-
-  using Coop = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
-  using Pingpong = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
-  using WS = cutlass::gemm::KernelTmaWarpSpecialized;
-
-  using EpiAuto = cutlass::epilogue::collective::EpilogueScheduleAuto;
-  using StreamK = cutlass::gemm::StreamKScheduler;
-
-  half* a = reinterpret_cast<half*>(A);
-  half* b = reinterpret_cast<half*>(B_col);
-  half* d = reinterpret_cast<half*>(D_col);
-
-  switch (algo) {
-    // Normal cooperative configs matching the fast non-Stream-K CSV candidates.
-    case 0:
-      return detail::launch_plain_tnn_colmajor<
-          128, 256, 64,
-          Stage4,
-          Cluster2x1x1,
-          Coop,
-          EpiAuto,
-          void>(M, N, K, a, b, d, stream);
-
-    case 1:
-      return detail::launch_plain_tnn_colmajor<
-          256, 128, 64,
-          Stage4,
-          Cluster2x1x1,
-          Coop,
-          EpiAuto,
-          void>(M, N, K, a, b, d, stream);
-
-    case 2:
-      return detail::launch_plain_tnn_colmajor<
-          128, 256, 64,
-          Stage4,
-          Cluster1x2x1,
-          Coop,
-          EpiAuto,
-          void>(M, N, K, a, b, d, stream);
-
-    case 3:
-      return detail::launch_plain_tnn_colmajor<
-          256, 128, 64,
-          Stage4,
-          Cluster1x2x1,
-          Coop,
-          EpiAuto,
-          void>(M, N, K, a, b, d, stream);
-
-    // A couple of non-cooperative sanity configs.
-    case 4:
-      return detail::launch_plain_tnn_colmajor<
-          64, 256, 64,
-          Stage5,
-          Cluster2x1x1,
-          Pingpong,
-          EpiAuto,
-          void>(M, N, K, a, b, d, stream);
-
-    case 5:
-      return detail::launch_plain_tnn_colmajor<
-          128, 128, 64,
-          Stage7,
-          Cluster1x1x1,
-          WS,
-          EpiAuto,
-          void>(M, N, K, a, b, d, stream);
-
-    // Stream-K versions of the two main candidates.
-    case 10:
-      return detail::launch_plain_tnn_colmajor<
-          128, 256, 64,
-          Stage4,
-          Cluster2x1x1,
-          Coop,
-          EpiAuto,
-          StreamK>(M, N, K, a, b, d, stream);
-
-    case 11:
-      return detail::launch_plain_tnn_colmajor<
-          256, 128, 64,
-          Stage4,
-          Cluster2x1x1,
-          Coop,
-          EpiAuto,
-          StreamK>(M, N, K, a, b, d, stream);
-
-    case 12:
-      return detail::launch_plain_tnn_colmajor<
-          128, 256, 64,
-          Stage4,
-          Cluster1x2x1,
-          Coop,
-          EpiAuto,
-          StreamK>(M, N, K, a, b, d, stream);
-
-    case 13:
-      return detail::launch_plain_tnn_colmajor<
-          256, 128, 64,
-          Stage4,
-          Cluster1x2x1,
-          Coop,
-          EpiAuto,
-          StreamK>(M, N, K, a, b, d, stream);
-
-    // Backup 128x128 cooperative configs.
-    case 20:
-      return detail::launch_plain_tnn_colmajor<
-          128, 128, 64,
-          Stage6,
-          Cluster2x1x1,
-          Coop,
-          EpiAuto,
-          void>(M, N, K, a, b, d, stream);
-
-    case 21:
-      return detail::launch_plain_tnn_colmajor<
-          128, 128, 64,
-          Stage6,
-          Cluster1x2x1,
-          Coop,
-          EpiAuto,
-          void>(M, N, K, a, b, d, stream);
-
-    default:
-      std::cerr << "Unsupported plain SM90 algo=" << algo << std::endl;
-      return false;
+  if (algo < 0 || algo >= plain_sm90_func_count) {
+    std::cerr << "Unsupported plain SM90 algo=" << algo
+              << " count=" << plain_sm90_func_count << std::endl;
+    return false;
   }
+
+  return plain_sm90_func_table[algo](
+      M,
+      N,
+      K,
+      reinterpret_cast<half*>(A),
+      reinterpret_cast<half*>(B_col),
+      reinterpret_cast<half*>(D_col),
+      stream);
 }
 
 }  // namespace ooverlap
