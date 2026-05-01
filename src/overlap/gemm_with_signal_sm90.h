@@ -42,7 +42,7 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 #ifndef OOVERLAP_USE_BASE_EPILOGUE_ONLY
-#define OOVERLAP_USE_BASE_EPILOGUE_ONLY 1
+#define OOVERLAP_USE_BASE_EPILOGUE_ONLY 0
 #endif
 
 #define CUTLASS_CHECK_SM90(status)                                                 \
