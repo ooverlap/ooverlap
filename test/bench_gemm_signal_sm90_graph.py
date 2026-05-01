@@ -401,38 +401,44 @@ def main():
 
     baseline_graph_ms = time_cuda(g_baseline.replay, args.warmup, args.iters) 
 
+    is_stream_k = info.get("scheduler", "normal") == "stream_k"
+
     # Capture our GEMM.
     our_graph_capture_ok = True
     our_graph_ms = None
     our_graph_error = None
 
-    try:
-        if not args.reset_mm:
-            MM.zero_()
-            torch.cuda.synchronize()
-
-        torch.cuda.synchronize()
-        g_ours = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g_ours):
-            if args.reset_mm:
-                MM.zero_()
-            ext.gemm_signal_sm90(
-                A,
-                B_packed,
-                C_ours,
-                MM,
-                RA,
-                CommThr,
-                int(reldn),
-                int(args.algo),
-                monitor,
-            )
-
-        our_graph_ms = time_cuda(g_ours.replay, args.warmup, args.iters)
-
-    except Exception as e:
+    if is_stream_k:
         our_graph_capture_ok = False
-        our_graph_error = repr(e)
+        our_graph_error = "skipped: Stream-K workspace/state reinit is not graph-safe in this benchmark yet"
+    else:
+        try:
+            if not args.reset_mm:
+                MM.zero_()
+                torch.cuda.synchronize()
+    
+            torch.cuda.synchronize()
+            g_ours = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g_ours):
+                if args.reset_mm:
+                    MM.zero_()
+                ext.gemm_signal_sm90(
+                    A,
+                    B_packed,
+                    C_ours,
+                    MM,
+                    RA,
+                    CommThr,
+                    int(reldn),
+                    int(args.algo),
+                    monitor,
+                )
+    
+            our_graph_ms = time_cuda(g_ours.replay, args.warmup, args.iters)
+    
+        except Exception as e:
+            our_graph_capture_ok = False
+            our_graph_error = repr(e)
 
     flops = 2.0 * M * N * K
 

@@ -7,6 +7,7 @@
 #include <pybind11/stl.h>
 
 #include "overlap/gemm_signal_sm90_dispatch.h"
+#include "overlap/gemm_plain_sm90_dispatch.h"
 #include "overlap/gemm_scatter_sm90_dispatch.h"
 #include "overlap_impl.h"
 
@@ -217,6 +218,54 @@ static void gemm_scatter_sm90(
   TORCH_CHECK(ok, "Unsupported algo=", algo);
 }
 
+static void gemm_plain_sm90(
+    torch::Tensor A,
+    torch::Tensor B_col,
+    torch::Tensor D_col,
+    int64_t algo) {
+  TORCH_CHECK(A.is_cuda() && B_col.is_cuda() && D_col.is_cuda(),
+              "A/B_col/D_col must be CUDA");
+
+  TORCH_CHECK(A.scalar_type() == torch::kFloat16, "A must be float16");
+  TORCH_CHECK(B_col.scalar_type() == torch::kFloat16, "B_col must be float16");
+  TORCH_CHECK(D_col.scalar_type() == torch::kFloat16, "D_col must be float16");
+
+  TORCH_CHECK(A.dim() == 2 && B_col.dim() == 2 && D_col.dim() == 2,
+              "A/B_col/D_col must be 2D");
+
+  TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+  TORCH_CHECK(B_col.is_contiguous(), "B_col must be contiguous");
+  TORCH_CHECK(D_col.is_contiguous(), "D_col must be contiguous");
+
+  const int64_t M = A.size(0);
+  const int64_t K = A.size(1);
+  const int64_t N = B_col.size(0);
+
+  TORCH_CHECK(B_col.size(1) == K,
+              "B_col must have physical shape (N, K)");
+
+  TORCH_CHECK(D_col.size(0) == N && D_col.size(1) == M,
+              "D_col must have physical shape (N, M), because logical D is column-major [M,N]");
+
+  const int dev = A.get_device();
+  cudaError_t err = cudaSetDevice(dev);
+  TORCH_CHECK(err == cudaSuccess, "cudaSetDevice failed: ", cudaGetErrorString(err));
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev).stream();
+
+  bool ok = ooverlap::gemm_plain_sm90_dispatch(
+      static_cast<int>(algo),
+      static_cast<int>(M),
+      static_cast<int>(N),
+      static_cast<int>(K),
+      static_cast<void*>(A.data_ptr<at::Half>()),
+      static_cast<void*>(B_col.data_ptr<at::Half>()),
+      static_cast<void*>(D_col.data_ptr<at::Half>()),
+      stream);
+
+  TORCH_CHECK(ok, "gemm_plain_sm90 failed for algo=", algo);
+}
+
 PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("gemm_signal_sm90", &gemm_signal_sm90,
         "SM90 fused reorder+signal GEMM (bring-up: algo=0 only)");
@@ -305,6 +354,9 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev0") = 0,
         py::arg("dev1") = 1,
         "Benchmark public oo_allreduce_tuned API vs NCCL in one process.");
+  
+  m.def("gemm_plain_sm90", &gemm_plain_sm90,
+      "Plain SM90 CUTLASS GEMM: A row-major, B column-major, D column-major");
 
   py::class_<BaselineImpl>(m, "BaselineImpl")
       .def(py::init<>())

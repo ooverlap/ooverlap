@@ -566,6 +566,10 @@ public:
   };
 
 private:
+  static constexpr bool kIsStreamK =
+    !std::is_void<TileScheduler>::value &&
+    std::is_same<TileScheduler, cutlass::gemm::StreamKScheduler>::value;
+
   Arguments  args_;
   GemmDevice gemm_device_;
   bool       initialized_;
@@ -691,15 +695,27 @@ public:
     return cutlass::Status::kSuccess;
   }
 
+ 
   Status run(cudaStream_t stream) {
-    if (!initialized_) {
+    if constexpr (kIsStreamK) {
+      // Stream-K uses workspace/counters. Reinitialize every launch so CUTLASS
+      // resets scheduler state. Do not rely on the cached initialized_ path.
       Status status = initialize(args_, stream);
       if (status != Status::kSuccess) {
         return status;
       }
+  
+      return gemm_device_.run(stream);
+    } else {
+      if (!initialized_) {
+        Status status = initialize(args_, stream);
+        if (status != Status::kSuccess) {
+          return status;
+        }
+      }
+  
+      return gemm_device_.run(stream);
     }
-
-    return gemm_device_.run(stream);
   }
 
   Status operator()(cudaStream_t stream = nullptr) {
