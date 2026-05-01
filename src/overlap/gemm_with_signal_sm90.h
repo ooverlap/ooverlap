@@ -324,11 +324,22 @@ public:
     auto stride_B = cutlass::make_cute_packed_stride(
         StrideB{}, cute::make_shape(N, K, 1));
 
+    int out_ld_c = static_cast<int>(args_.ldm_C);
+    int out_ld_d = static_cast<int>(args_.ldm_D);
+    
+    int out_cols = N;
+    
+    #if !(defined(OOVERLAP_USE_BASE_EPILOGUE_ONLY) && OOVERLAP_USE_BASE_EPILOGUE_ONLY)
+    if (args_.signal_params.kReorderedColumn > 0) {
+      out_cols = args_.signal_params.kReorderedColumn * ThreadblockShape::kN;
+    }
+    #endif
+    
     auto stride_C = cutlass::make_cute_packed_stride(
-        StrideC{}, cute::make_shape(M, N, 1));
-
+        StrideC{}, cute::make_shape(out_ld_c, out_cols, 1));
+    
     auto stride_D = cutlass::make_cute_packed_stride(
-        StrideD{}, cute::make_shape(M, N, 1));
+        StrideD{}, cute::make_shape(out_ld_d, out_cols, 1));
 
     MainloopArguments mainloop_args{
       reinterpret_cast<ElementInputA const*>(args_.ptr_A),
