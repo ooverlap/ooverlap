@@ -1,19 +1,17 @@
 /***************************************************************************************************
- * SM90 CUTLASS 3.x GEMM wrapper.
+ * SM90 CUTLASS 3.x GEMM-with-signal wrapper.
  *
- * This version adds TileScheduler as an explicit template parameter so generated algos can
- * instantiate both normal CUTLASS scheduling and Stream-K scheduling:
+ * This version is intentionally aligned with gemm_plain_sm90.cu:
  *
- *   TileM, TileN, TileK,
- *   StageCount,
- *   ClusterM, ClusterN, ClusterK,
- *   MainloopSchedule,
- *   EpilogueSchedule,
- *   TileScheduler
+ *   A      : logical row-major [M, K], physical torch shape (M, K), contiguous
+ *   B_col  : logical column-major [K, N], physical torch shape (N, K), contiguous
+ *   D_col  : logical column-major [M, N], physical torch shape (N, M), contiguous
  *
- * OOVERLAP_USE_BASE_EPILOGUE_ONLY:
- *   0: use ReorderSignalEpilogue
- *   1: use CUTLASS base epilogue only
+ * For now, OOVERLAP_USE_BASE_EPILOGUE_ONLY defaults to 1, so reorder/signal epilogue
+ * is compiled out and the kernel behaves like plain CUTLASS GEMM while keeping the
+ * same signal API shape.
+ *
+ * Later, set OOVERLAP_USE_BASE_EPILOGUE_ONLY=0 to re-enable ReorderSignalEpilogue.
  **************************************************************************************************/
 #pragma once
 
@@ -23,24 +21,19 @@
 #include <cstdlib>
 #include <iostream>
 #include <type_traits>
-#include <utility>
 
 #include "cutlass/cutlass.h"
-#include "cutlass/arch/memory.h"
-#include "cutlass/float8.h"
-#include "cutlass/numeric_conversion.h"
 #include "cutlass/kernel_hardware_info.h"
+#include "cutlass/numeric_types.h"
 
-#include "cutlass/gemm/collective/collective_builder_decl.hpp"
 #include "cutlass/gemm/gemm.h"
-#include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
 #include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
+#include "cutlass/util/packed_stride.hpp"
 
 #include "cute/tensor.hpp"
 
@@ -52,352 +45,50 @@
 #define OOVERLAP_USE_BASE_EPILOGUE_ONLY 1
 #endif
 
-#define CUTLASS_CHECK_SM90(status)                                                               \
-  {                                                                                              \
-    cutlass::Status error = status;                                                              \
-    if (error != cutlass::Status::kSuccess) {                                                    \
-      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error)                         \
-                << " at line " << __LINE__ << std::endl;                                         \
-      std::exit(EXIT_FAILURE);                                                                   \
-    }                                                                                            \
+#define CUTLASS_CHECK_SM90(status)                                                 \
+  {                                                                                \
+    cutlass::Status error = status;                                                \
+    if (error != cutlass::Status::kSuccess) {                                      \
+      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error)          \
+                << " at line " << __LINE__ << std::endl;                          \
+      std::exit(EXIT_FAILURE);                                                     \
+    }                                                                              \
   }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
+namespace ooverlap_sm90_detail {
 
-namespace detail {
-
-template <class T, class... Args>
-struct is_brace_constructible {
-private:
-  template <class U, class... A>
-  static auto test(int) -> decltype(U{std::declval<A>()...}, std::true_type{});
-
-  template <class, class...>
-  static auto test(...) -> std::false_type;
-
-public:
-  static constexpr bool value = decltype(test<T, Args...>(0))::value;
+template <
+    typename CollectiveMainloop,
+    typename CollectiveEpilogue,
+    typename TileScheduler>
+struct GemmKernelSelector {
+  using type = cutlass::gemm::kernel::GemmUniversal<
+      cute::Shape<int, int, int>,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      TileScheduler>;
 };
 
 template <
-  class KernelArguments,
-  class ProblemShape,
-  class MainloopArguments,
-  class EpilogueArguments,
-  class TileSchedArguments
->
-CUTLASS_HOST
-KernelArguments make_kernel_arguments(
-    ProblemShape const& problem_shape,
-    MainloopArguments const& mainloop_args,
-    EpilogueArguments const& epilogue_args,
-    cutlass::KernelHardwareInfo const& hw_info,
-    TileSchedArguments const& sched_args) {
-
-  if constexpr (std::is_constructible<
-      KernelArguments,
-      cutlass::gemm::GemmUniversalMode,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      cutlass::KernelHardwareInfo,
-      TileSchedArguments>::value) {
-
-    return KernelArguments(
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      hw_info,
-      sched_args
-    );
-
-  } else if constexpr (is_brace_constructible<
-      KernelArguments,
-      cutlass::gemm::GemmUniversalMode,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      cutlass::KernelHardwareInfo,
-      TileSchedArguments>::value) {
-
-    return KernelArguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      hw_info,
-      sched_args
-    };
-
-  } else if constexpr (std::is_constructible<
-      KernelArguments,
-      cutlass::gemm::GemmUniversalMode,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      TileSchedArguments>::value) {
-
-    return KernelArguments(
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      sched_args
-    );
-
-  } else if constexpr (is_brace_constructible<
-      KernelArguments,
-      cutlass::gemm::GemmUniversalMode,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      TileSchedArguments>::value) {
-
-    return KernelArguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      sched_args
-    };
-
-  } else if constexpr (std::is_constructible<
-      KernelArguments,
-      cutlass::gemm::GemmUniversalMode,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      cutlass::KernelHardwareInfo>::value) {
-
-    return KernelArguments(
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      hw_info
-    );
-
-  } else if constexpr (is_brace_constructible<
-      KernelArguments,
-      cutlass::gemm::GemmUniversalMode,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      cutlass::KernelHardwareInfo>::value) {
-
-    return KernelArguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      hw_info
-    };
-
-  } else if constexpr (std::is_constructible<
-      KernelArguments,
-      cutlass::gemm::GemmUniversalMode,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments>::value) {
-
-    return KernelArguments(
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      problem_shape,
-      mainloop_args,
-      epilogue_args
-    );
-
-  } else if constexpr (is_brace_constructible<
-      KernelArguments,
-      cutlass::gemm::GemmUniversalMode,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments>::value) {
-
-    return KernelArguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      problem_shape,
-      mainloop_args,
-      epilogue_args
-    };
-
-  } else if constexpr (std::is_constructible<
-      KernelArguments,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      cutlass::KernelHardwareInfo,
-      TileSchedArguments>::value) {
-
-    return KernelArguments(
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      hw_info,
-      sched_args
-    );
-
-  } else if constexpr (is_brace_constructible<
-      KernelArguments,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      cutlass::KernelHardwareInfo,
-      TileSchedArguments>::value) {
-
-    return KernelArguments{
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      hw_info,
-      sched_args
-    };
-
-  } else if constexpr (std::is_constructible<
-      KernelArguments,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      TileSchedArguments>::value) {
-
-    return KernelArguments(
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      sched_args
-    );
-
-  } else if constexpr (is_brace_constructible<
-      KernelArguments,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      TileSchedArguments>::value) {
-
-    return KernelArguments{
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      sched_args
-    };
-
-  } else if constexpr (std::is_constructible<
-      KernelArguments,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      cutlass::KernelHardwareInfo>::value) {
-
-    return KernelArguments(
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      hw_info
-    );
-
-  } else if constexpr (is_brace_constructible<
-      KernelArguments,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments,
-      cutlass::KernelHardwareInfo>::value) {
-
-    return KernelArguments{
-      problem_shape,
-      mainloop_args,
-      epilogue_args,
-      hw_info
-    };
-
-  } else if constexpr (std::is_constructible<
-      KernelArguments,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments>::value) {
-
-    return KernelArguments(
-      problem_shape,
-      mainloop_args,
-      epilogue_args
-    );
-
-  } else if constexpr (is_brace_constructible<
-      KernelArguments,
-      ProblemShape,
-      MainloopArguments,
-      EpilogueArguments>::value) {
-
-    return KernelArguments{
-      problem_shape,
-      mainloop_args,
-      epilogue_args
-    };
-
-  } else {
-    static_assert(
-      is_brace_constructible<
-        KernelArguments,
-        cutlass::gemm::GemmUniversalMode,
-        ProblemShape,
-        MainloopArguments,
-        EpilogueArguments,
-        cutlass::KernelHardwareInfo,
-        TileSchedArguments>::value,
-      "Unsupported CUTLASS SM90 KernelArguments constructor/aggregate layout for this schedule."
-    );
-  }
-}
-
-} // namespace detail
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Mainloop stride helper.
-// For this repo, B is physically [N, K] contiguous and is passed as logical B^T.
-// Your CUTLASS rev expects the mainloop stride type for LayoutB=ColumnMajor to be
-// cute::tuple<int64_t, C<1>, int64_t>, so ColumnMajor intentionally uses the same
-// physical row-major stride here.
-template <typename LayoutTag>
-struct CuteMainloopStride2D;
-
-template <>
-struct CuteMainloopStride2D<cutlass::layout::RowMajor> {
-  CUTLASS_HOST_DEVICE
-  static auto make(int64_t ld) {
-    return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
-  }
+    typename CollectiveMainloop,
+    typename CollectiveEpilogue>
+struct GemmKernelSelector<CollectiveMainloop, CollectiveEpilogue, void> {
+  using type = cutlass::gemm::kernel::GemmUniversal<
+      cute::Shape<int, int, int>,
+      CollectiveMainloop,
+      CollectiveEpilogue>;
 };
 
-template <>
-struct CuteMainloopStride2D<cutlass::layout::ColumnMajor> {
-  CUTLASS_HOST_DEVICE
-  static auto make(int64_t ld) {
-    return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
-  }
-};
-
-// Epilogue stride helper. This one uses true output layout semantics.
-template <typename LayoutTag>
-struct CuteEpilogueStride2D;
+template <typename Scheduler>
+struct IsStreamK : std::false_type {};
 
 template <>
-struct CuteEpilogueStride2D<cutlass::layout::RowMajor> {
-  CUTLASS_HOST_DEVICE
-  static auto make(int64_t ld) {
-    return cute::make_stride(ld, cute::Int<1>{}, int64_t{0});
-  }
-};
+struct IsStreamK<cutlass::gemm::StreamKScheduler> : std::true_type {};
 
-template <>
-struct CuteEpilogueStride2D<cutlass::layout::ColumnMajor> {
-  CUTLASS_HOST_DEVICE
-  static auto make(int64_t ld) {
-    return cute::make_stride(cute::Int<1>{}, ld, int64_t{0});
-  }
-};
+}  // namespace ooverlap_sm90_detail
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -447,8 +138,18 @@ public:
   using TileScheduler    = TileScheduler_;
 
   static_assert(
+    cutlass::platform::is_same<LayoutInputA, cutlass::layout::RowMajor>::value,
+    "This wrapper currently expects A row-major."
+  );
+
+  static_assert(
+    cutlass::platform::is_same<LayoutInputB, cutlass::layout::ColumnMajor>::value,
+    "This wrapper currently expects B column-major, physical shape [N, K]."
+  );
+
+  static_assert(
     cutlass::platform::is_same<LayoutOutput, cutlass::layout::ColumnMajor>::value,
-    "Temporary GEMM-only test expects ColumnMajor output."
+    "This wrapper currently expects D column-major, physical shape [N, M]."
   );
 
   using OperatorClass = cutlass::arch::OpClassTensorOp;
@@ -459,47 +160,51 @@ public:
   static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementOutput>::value;
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementOutput>::value;
 
-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag,
-    OperatorClass,
-    ElementInputA, LayoutInputA, AlignmentA,
-    ElementInputB, LayoutInputB, AlignmentB,
-    ElementCompute,
-    TileShape,
-    ClusterShape,
-    StageCountType,
-    MainloopSchedule
-  >::CollectiveOp;
+  using CollectiveMainloop =
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          ArchTag,
+          OperatorClass,
+          ElementInputA,
+          LayoutInputA,
+          AlignmentA,
+          ElementInputB,
+          LayoutInputB,
+          AlignmentB,
+          ElementCompute,
+          TileShape,
+          ClusterShape,
+          StageCountType,
+          MainloopSchedule>::CollectiveOp;
 
-  using BaseCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag,
-    OperatorClass,
-    TileShape,
-    ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementCompute,
-    ElementCompute,
-    ElementOutput,
-    LayoutOutput,
-    AlignmentC,
-    ElementOutput,
-    LayoutOutput,
-    AlignmentD,
-    EpilogueSchedule
-  >::CollectiveOp;
+  using BaseCollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          ArchTag,
+          OperatorClass,
+          TileShape,
+          ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementCompute,
+          ElementCompute,
+          ElementOutput,
+          LayoutOutput,
+          AlignmentC,
+          ElementOutput,
+          LayoutOutput,
+          AlignmentD,
+          EpilogueSchedule>::CollectiveOp;
 
 #if defined(OOVERLAP_USE_BASE_EPILOGUE_ONLY) && OOVERLAP_USE_BASE_EPILOGUE_ONLY
   using CollectiveEpilogue = BaseCollectiveEpilogue;
 #else
-  using CollectiveEpilogue = ReorderSignalEpilogue<BaseCollectiveEpilogue, ThreadblockShape>;
+  using CollectiveEpilogue =
+      ReorderSignalEpilogue<BaseCollectiveEpilogue, ThreadblockShape>;
 #endif
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    cute::Shape<int, int, int, int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    TileScheduler
-  >;
+  using GemmKernel =
+      typename cutlass::ooverlap_sm90_detail::GemmKernelSelector<
+          CollectiveMainloop,
+          CollectiveEpilogue,
+          TileScheduler>::type;
 
   using GemmDevice = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
@@ -510,12 +215,17 @@ public:
     ElementInputB             *ptr_B;
     ElementOutput             *ptr_C;
     ElementOutput             *ptr_D;
+
+    // Kept for API compatibility with the old signal path.
+    // The base-epilogue path now uses CUTLASS packed strides instead.
     int64_t                    ldm_A;
     int64_t                    ldm_B;
     int64_t                    ldm_C;
     int64_t                    ldm_D;
+
     ElementCompute             alpha;
     ElementCompute             beta;
+
     SignalingEpilogueParams    signal_params;
 
     Arguments() {}
@@ -526,11 +236,14 @@ public:
       ElementInputB *ptr_B_,
       ElementOutput *ptr_C_,
       ElementOutput *ptr_D_,
-      int64_t ldm_A_, int64_t ldm_B_,
-      int64_t ldm_C_, int64_t ldm_D_,
+      int64_t ldm_A_,
+      int64_t ldm_B_,
+      int64_t ldm_C_,
+      int64_t ldm_D_,
       ElementCompute alpha_,
       ElementCompute beta_,
-      int *ptr_MM, int *ptr_RA,
+      int *ptr_MM,
+      int *ptr_RA,
       int  kMonitoredColumn,
       int  kReorderedColumn,
       int *kCommuSegArray,
@@ -567,8 +280,7 @@ public:
 
 private:
   static constexpr bool kIsStreamK =
-    !std::is_void<TileScheduler>::value &&
-    std::is_same<TileScheduler, cutlass::gemm::StreamKScheduler>::value;
+      cutlass::ooverlap_sm90_detail::IsStreamK<TileScheduler>::value;
 
   Arguments  args_;
   GemmDevice gemm_device_;
@@ -577,10 +289,10 @@ private:
   size_t     workspace_size_;
 
 public:
-  GemmSignalSm90() : 
-      initialized_(false),
-      workspace_(nullptr),
-      workspace_size_(0) {}
+  GemmSignalSm90()
+      : initialized_(false),
+        workspace_(nullptr),
+        workspace_size_(0) {}
 
   ~GemmSignalSm90() {
     if (workspace_ != nullptr) {
@@ -597,20 +309,32 @@ public:
     int N = args_.problem_size.n();
     int K = args_.problem_size.k();
 
-    using Kernel             = GemmKernel;
-    using KernelArguments    = typename Kernel::Arguments;
-    using ProblemShape       = typename Kernel::ProblemShape;
-    using MainloopArguments  = typename Kernel::MainloopArguments;
-    using EpilogueArguments  = typename Kernel::EpilogueArguments;
-    using TileSchedArguments = typename Kernel::TileSchedulerArguments;
+    using MainloopArguments  = typename GemmKernel::MainloopArguments;
+    using EpilogueArguments  = typename GemmKernel::EpilogueArguments;
+    using StrideA            = typename GemmKernel::StrideA;
+    using StrideB            = typename GemmKernel::StrideB;
+    using StrideC            = typename GemmKernel::StrideC;
+    using StrideD            = typename GemmKernel::StrideD;
 
-    ProblemShape problem_shape = cute::make_shape(M, N, K, 1);
+    auto problem_shape = cute::make_shape(M, N, K);
+
+    auto stride_A = cutlass::make_cute_packed_stride(
+        StrideA{}, cute::make_shape(M, K, 1));
+
+    auto stride_B = cutlass::make_cute_packed_stride(
+        StrideB{}, cute::make_shape(N, K, 1));
+
+    auto stride_C = cutlass::make_cute_packed_stride(
+        StrideC{}, cute::make_shape(M, N, 1));
+
+    auto stride_D = cutlass::make_cute_packed_stride(
+        StrideD{}, cute::make_shape(M, N, 1));
 
     MainloopArguments mainloop_args{
       reinterpret_cast<ElementInputA const*>(args_.ptr_A),
-      CuteMainloopStride2D<LayoutInputA>::make(args_.ldm_A),
+      stride_A,
       reinterpret_cast<ElementInputB const*>(args_.ptr_B),
-      CuteMainloopStride2D<LayoutInputB>::make(args_.ldm_B)
+      stride_B
     };
 
 #if defined(OOVERLAP_USE_BASE_EPILOGUE_ONLY) && OOVERLAP_USE_BASE_EPILOGUE_ONLY
@@ -618,9 +342,9 @@ public:
     EpilogueArguments epilogue_args{
       {args_.alpha, args_.beta},
       reinterpret_cast<ElementOutput const*>(args_.ptr_C),
-      CuteEpilogueStride2D<LayoutOutput>::make(args_.ldm_C),
+      stride_C,
       reinterpret_cast<ElementOutput*>(args_.ptr_D),
-      CuteEpilogueStride2D<LayoutOutput>::make(args_.ldm_D)
+      stride_D
     };
 
 #else
@@ -629,9 +353,9 @@ public:
     epilogue_args.base = typename BaseCollectiveEpilogue::Arguments{
       {args_.alpha, args_.beta},
       reinterpret_cast<ElementOutput const*>(args_.ptr_C),
-      CuteEpilogueStride2D<LayoutOutput>::make(args_.ldm_C),
+      stride_C,
       reinterpret_cast<ElementOutput*>(args_.ptr_D),
-      CuteEpilogueStride2D<LayoutOutput>::make(args_.ldm_D)
+      stride_D
     };
     epilogue_args.signal = args_.signal_params;
 
@@ -640,24 +364,49 @@ public:
     cutlass::KernelHardwareInfo hw_info;
 
     int device_id = 0;
-    cudaGetDevice(&device_id);
-
-    cudaDeviceProp prop{};
-    cudaGetDeviceProperties(&prop, device_id);
+    cudaError_t dev_err = cudaGetDevice(&device_id);
+    if (dev_err != cudaSuccess) {
+      initialized_ = false;
+      return cutlass::Status::kErrorInternal;
+    }
 
     hw_info.device_id = device_id;
-    hw_info.sm_count  = prop.multiProcessorCount;
+    hw_info.sm_count =
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device_id);
 
-    TileSchedArguments sched_args{};
+    typename GemmDevice::Arguments gemm_args = [&]() {
+      if constexpr (kIsStreamK) {
+        using DecompositionMode =
+            typename cutlass::gemm::kernel::detail::
+                PersistentTileSchedulerSm90StreamKParams::DecompositionMode;
 
-    KernelArguments gemm_args =
-      detail::make_kernel_arguments<KernelArguments>(
-        problem_shape,
-        mainloop_args,
-        epilogue_args,
-        hw_info,
-        sched_args
-      );
+        typename GemmKernel::TileScheduler::Arguments scheduler_args{
+            1,
+            static_cast<int>(
+                cutlass::gemm::kernel::detail::
+                    PersistentTileSchedulerSm90::RasterOrder::AlongN),
+            cutlass::gemm::kernel::detail::
+                PersistentTileSchedulerSm90::RasterOrderOptions::Heuristic,
+            DecompositionMode::StreamK};
+
+        return typename GemmDevice::Arguments{
+          cutlass::gemm::GemmUniversalMode::kGemm,
+          problem_shape,
+          mainloop_args,
+          epilogue_args,
+          hw_info,
+          scheduler_args
+        };
+      } else {
+        return typename GemmDevice::Arguments{
+          cutlass::gemm::GemmUniversalMode::kGemm,
+          problem_shape,
+          mainloop_args,
+          epilogue_args,
+          hw_info
+        };
+      }
+    }();
 
     Status status = gemm_device_.can_implement(gemm_args);
     if (status != Status::kSuccess) {
@@ -669,23 +418,30 @@ public:
 
     if (needed_workspace > workspace_size_) {
       if (workspace_ != nullptr) {
-        cudaFree(workspace_);
+        cudaError_t free_err = cudaFree(workspace_);
         workspace_ = nullptr;
         workspace_size_ = 0;
-      }
-    
-      if (needed_workspace > 0) {
-        cudaError_t err = cudaMalloc(&workspace_, needed_workspace);
-        if (err != cudaSuccess) {
+
+        if (free_err != cudaSuccess) {
           initialized_ = false;
+          return cutlass::Status::kErrorInternal;
+        }
+      }
+
+      if (needed_workspace > 0) {
+        cudaError_t malloc_err = cudaMalloc(&workspace_, needed_workspace);
+        if (malloc_err != cudaSuccess) {
+          initialized_ = false;
+          workspace_ = nullptr;
+          workspace_size_ = 0;
           return cutlass::Status::kErrorWorkspaceNull;
         }
+
         workspace_size_ = needed_workspace;
       }
     }
-    
-    status = gemm_device_.initialize(gemm_args, workspace_, stream);
 
+    status = gemm_device_.initialize(gemm_args, workspace_, stream);
     if (status != Status::kSuccess) {
       initialized_ = false;
       return status;
@@ -695,16 +451,15 @@ public:
     return cutlass::Status::kSuccess;
   }
 
- 
   Status run(cudaStream_t stream) {
     if constexpr (kIsStreamK) {
-      // Stream-K uses workspace/counters. Reinitialize every launch so CUTLASS
-      // resets scheduler state. Do not rely on the cached initialized_ path.
+      // Stream-K uses workspace/counters. Keep correctness first by resetting
+      // CUTLASS scheduler state each launch. Use eager timing for Stream-K.
       Status status = initialize(args_, stream);
       if (status != Status::kSuccess) {
         return status;
       }
-  
+
       return gemm_device_.run(stream);
     } else {
       if (!initialized_) {
@@ -713,7 +468,7 @@ public:
           return status;
         }
       }
-  
+
       return gemm_device_.run(stream);
     }
   }
@@ -729,4 +484,4 @@ public:
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace cutlass
+}  // namespace cutlass
