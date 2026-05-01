@@ -520,13 +520,32 @@ def time_cuda_graph_unrolled(fn: Callable[[], None], warmup: int, iters: int, gr
     return float(start.elapsed_time(end)) / float(iters * graph_repeats)
 
 
+def safe_quantile_1d(x: torch.Tensor, q: float, max_samples: int = 1_000_000) -> float:
+    """Compute a quantile without feeding huge tensors to torch.quantile.
+
+    torch.quantile can error on very large tensors. For profiler diagnostics we
+    only need a stable summary, so use an evenly-strided sample when the tensor
+    is huge. max/mean are still computed exactly in error_summary.
+    """
+    x = x.reshape(-1)
+    n = int(x.numel())
+    if n == 0:
+        return float("nan")
+
+    if n > max_samples:
+        step = (n + max_samples - 1) // max_samples
+        x = x[::step][:max_samples]
+
+    return float(torch.quantile(x, q).item())
+
+
 def error_summary(x: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
     diff = (x - y).abs().float().reshape(-1)
     return {
         "max_abs": float(diff.max().item()),
         "mean_abs": float(diff.mean().item()),
-        "p99_abs": float(torch.quantile(diff, 0.99).item()),
-        "p999_abs": float(torch.quantile(diff, 0.999).item()),
+        "p99_abs": safe_quantile_1d(diff, 0.99),
+        "p999_abs": safe_quantile_1d(diff, 0.999),
     }
 
 
