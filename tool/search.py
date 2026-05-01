@@ -72,6 +72,43 @@ def is_cooperative_algo(Algo: int):
     item = algo_dict[int(Algo)]
     return item.get("mainloop", "") == "cooperative"
 
+def algo_tile_shape(Algo: int):
+    algo_dict = load_algo_dict()
+    item = algo_dict[int(Algo)]
+    return int(item["tile_m"]), int(item["tile_n"])
+
+
+def normalize_loaded_candidates(BM_list, BN_list, gemm_dur_list, Algo_list):
+    algo_dict = load_algo_dict()
+
+    out_BM = []
+    out_BN = []
+    out_dur = []
+    out_Algo = []
+
+    for BM, BN, dur, Algo in zip(BM_list, BN_list, gemm_dur_list, Algo_list):
+        Algo = int(Algo)
+
+        if Algo not in algo_dict:
+            print(f"Skip unknown algo={Algo}")
+            continue
+
+        true_BM = int(algo_dict[Algo]["tile_m"])
+        true_BN = int(algo_dict[Algo]["tile_n"])
+
+        if int(BM) != true_BM or int(BN) != true_BN:
+            print(
+                f"Fix config tile mismatch for algo={Algo}: "
+                f"config BM/BN={BM}x{BN}, algo BM/BN={true_BM}x{true_BN}"
+            )
+
+        out_BM.append(true_BM)
+        out_BN.append(true_BN)
+        out_dur.append(float(dur))
+        out_Algo.append(Algo)
+
+    return out_BM, out_BN, out_dur, out_Algo
+
 
 def packed_shape(M: int, N: int, BM: int, BN: int, rLDN: int = 1):
     TileNum = div_up(M, BM) * div_up(N, BN)
@@ -142,7 +179,12 @@ def load_json(M: int, N: int, K: int):
 
     print(f"Loaded shape config: {file_path}")
 
-    return data["BM"], data["BN"], data["dur"], data["Algo"]
+    return normalize_loaded_candidates(
+        data["BM"],
+        data["BN"],
+        data["dur"],
+        data["Algo"],
+    )
 
 def save_solution(M: int, N: int, K: int, BM: int, BN: int, gemm_dur: float, Algo: int, hint: list, cSeg: list, comm_sm_slack: int):
     out_path = solution_json_path(M, N, K)
