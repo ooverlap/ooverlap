@@ -2,6 +2,14 @@
 // Do not edit by hand.
 
 template bool cutlass_gemm_plain_sm90<
+  128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
   128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void
 >(
   int M, int N, int K,
@@ -10,7 +18,31 @@ template bool cutlass_gemm_plain_sm90<
 );
 
 template bool cutlass_gemm_plain_sm90<
+  128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
   128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void
 >(
   int M, int N, int K,
   half* A, half* B_col, half* D_col,
@@ -43,6 +75,118 @@ template bool cutlass_gemm_plain_sm90<
 
 template bool cutlass_gemm_plain_sm90<
   256, 128, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 128, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 128, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler
 >(
   int M, int N, int K,
   half* A, half* B_col, half* D_col,
@@ -91,6 +235,54 @@ template bool cutlass_gemm_plain_sm90<
 
 template bool cutlass_gemm_plain_sm90<
   128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 128, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 128, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void
 >(
   int M, int N, int K,
   half* A, half* B_col, half* D_col,
@@ -187,6 +379,22 @@ template bool cutlass_gemm_plain_sm90<
 
 template bool cutlass_gemm_plain_sm90<
   256, 128, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void
+>(
+  int M, int N, int K,
+  half* A, half* B_col, half* D_col,
+  cudaStream_t stream
+);
+
+template bool cutlass_gemm_plain_sm90<
+  256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void
 >(
   int M, int N, int K,
   half* A, half* B_col, half* D_col,

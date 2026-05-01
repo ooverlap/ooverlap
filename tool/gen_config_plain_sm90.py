@@ -250,31 +250,52 @@ def make_key(meta: Dict[str, Any]) -> Tuple[Any, ...]:
         str(meta["scheduler"]),
     )
 
+def normalize_stage_for_key(x: Any) -> int:
+    if x is None:
+        return -1
+    s = str(x).strip().lower()
+    if s in ("auto", "-1"):
+        return -1
+    return int(float(s))
+
 
 def load_plain_algo_map(path: Optional[str]) -> Dict[int, Dict[str, Any]]:
-    if path is None:
-        return {k: dict(v, algo=k) for k, v in DEFAULT_PLAIN_ALGOS.items()}
+    # Default to the generated shared AlgoDict. Fall back to the old hardcoded
+    # tiny map only if the generated file does not exist.
+    if path is None or path == "auto":
+        p = repo_root() / "configs" / "AlgoDictSm90.json"
+        if not p.exists():
+            print("[WARN] configs/AlgoDictSm90.json not found; using built-in DEFAULT_PLAIN_ALGOS")
+            return {k: dict(v, algo=k) for k, v in DEFAULT_PLAIN_ALGOS.items()}
+    else:
+        p = Path(path).expanduser().resolve()
 
-    p = Path(path).expanduser().resolve()
     with open(p, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     items = data.get("algorithms", data if isinstance(data, list) else [])
     out: Dict[int, Dict[str, Any]] = {}
+
     for item in items:
         algo = int(item["algo"])
-        cluster = item.get("cluster", [item.get("cluster_m", 1), item.get("cluster_n", 1), item.get("cluster_k", 1)])
+        cluster = item.get(
+            "cluster",
+            [item.get("cluster_m", 1), item.get("cluster_n", 1), item.get("cluster_k", 1)],
+        )
+
         out[algo] = {
             "algo": algo,
             "tile_m": int(item["tile_m"]),
             "tile_n": int(item["tile_n"]),
             "tile_k": int(item["tile_k"]),
-            "stages": int(item["stages"]),
+            "stages": normalize_stage_for_key(item.get("stages", -1)),
             "cluster": [int(x) for x in cluster],
             "mainloop": str(item.get("mainloop", "cooperative")),
             "epilogue": str(item.get("epilogue", "auto")),
             "scheduler": str(item.get("scheduler", "normal")),
         }
+
+    print(f"loaded plain algo map: {p} ({len(out)} algos)")
     return out
 
 
@@ -619,7 +640,7 @@ def main() -> None:
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--k", type=int, required=True)
     ap.add_argument("--csv", type=str, required=True)
-    ap.add_argument("--plain-algo-json", type=str, default=None)
+    ap.add_argument("--plain-algo-json", type=str, default="auto")
     ap.add_argument("--device", type=int, default=0)
 
     ap.add_argument("--top-csv", type=int, default=50)
