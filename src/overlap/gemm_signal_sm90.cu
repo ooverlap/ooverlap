@@ -101,7 +101,7 @@ void cutlass_gemm_signal_sm90(
   using LayoutB            = cutlass::layout::ColumnMajor;
   using ElementC           = cutlass::half_t;
   using LayoutC            = cutlass::layout::ColumnMajor;
-  using ElementAccumulator = float;
+  using ElementAccumulator = cutlass::half_t;
 
   using GemmSignal = cutlass::GemmSignalSm90<
     ElementA, LayoutA,

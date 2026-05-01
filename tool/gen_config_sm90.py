@@ -673,7 +673,7 @@ def main() -> None:
     # ElementC=f16 row, ElementD=f16 row.
     ap.add_argument("--csv-a-dtype", choices=["f16"], default="f16")
     ap.add_argument("--csv-b-dtype", choices=["f16"], default="f16")
-    ap.add_argument("--csv-accum-dtype", choices=["f32"], default="f32")
+    ap.add_argument("--csv-accum-dtype", choices=["f16", "f32"], default="f16")
     ap.add_argument("--csv-c-dtype", choices=["f16", "void", "any"], default="f16")
     ap.add_argument("--csv-d-dtype", choices=["f16", "f32", "any"], default="f16")
 

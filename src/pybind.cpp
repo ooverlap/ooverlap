@@ -5,6 +5,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <pybind11/stl.h>
+#include <cuda_bf16.h>
 
 #include "overlap/gemm_signal_sm90_dispatch.h"
 #include "overlap/gemm_plain_sm90_dispatch.h"
@@ -333,8 +334,8 @@ static void baseline_gemm_col(
   TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
               "cublasSetMathMode failed: ", cublas_status_to_string(st));
 
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
+  const half alpha = __float2half(1.0f);
+  const half beta  = __float2half(0.0f);
 
   // We want logical:
   //
@@ -362,7 +363,7 @@ static void baseline_gemm_col(
       static_cast<void*>(D_col.data_ptr<at::Half>()),
       CUDA_R_16F,
       M,
-      CUBLAS_COMPUTE_32F,
+      CUBLAS_COMPUTE_16F,
       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
   TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,

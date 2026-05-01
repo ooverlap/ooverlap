@@ -136,8 +136,8 @@ bool cutlass_gemm_plain_sm90(
   using ElementB = cutlass::half_t;
   using ElementC = cutlass::half_t;
   using ElementD = cutlass::half_t;
-  using ElementAccumulator = float;
-  using ElementCompute = float;
+  using ElementAccumulator = cutlass::half_t;
+  using ElementCompute = cutlass::half_t;
 
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::ColumnMajor;
@@ -235,8 +235,8 @@ bool cutlass_gemm_plain_sm90(
   hw_info.sm_count =
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device_id);
 
-  float alpha = 1.0f;
-  float beta = 0.0f;
+  ElementCompute alpha = ElementCompute(1.0f);
+  ElementCompute beta = ElementCompute(0.0f);
 
   typename Gemm::Arguments arguments = [&]() {
     if constexpr (ooverlap::detail::IsStreamK<TileScheduler>::value) {
