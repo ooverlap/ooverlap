@@ -25,6 +25,7 @@ public:
         at::Tensor cSEG_CPU,
         at::Tensor cSEG_GPU,
         int64_t Algo,
+        int64_t active_sm_count,
         bool if_monitor);
 
     void GemmReduceScatterOverlap(

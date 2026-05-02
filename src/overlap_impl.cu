@@ -134,6 +134,7 @@ void OverlapImpl::GemmAllReduceOverlap(
     at::Tensor cSEG_CPU,
     at::Tensor cSEG_GPU,
     int64_t Algo,
+    int64_t active_sm_count,
     bool if_monitor) {
 
     ooverlap::torch_utils::check_common_gemm_inputs(A, B);
@@ -301,6 +302,9 @@ void OverlapImpl::GemmAllReduceOverlap(
     auto* ra_ptr = RA.data_ptr<int>();
     auto* cseg_gpu_ptr = cSEG_GPU.data_ptr<int>();
 
+    TORCH_CHECK(active_sm_count >= 0,
+                "active_sm_count must be >= 0, got ", active_sm_count);
+
     cudaError_t err = cudaEventRecord(mm_ready_, gemm_stream_);
     TORCH_CHECK(err == cudaSuccess,
                 "cudaEventRecord mm_ready_ failed: ",
@@ -322,6 +326,7 @@ void OverlapImpl::GemmAllReduceOverlap(
         reinterpret_cast<void*>(c_ptr),
         reinterpret_cast<int32_t*>(mm_ptr),
         reinterpret_cast<int32_t*>(ra_ptr),
+        static_cast<int>(active_sm_count),
         if_monitor,
         gemm_stream_);
 

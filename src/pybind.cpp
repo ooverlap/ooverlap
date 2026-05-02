@@ -124,6 +124,7 @@ static void gemm_signal_sm90(
       static_cast<void*>(D.data_ptr<at::Half>()),
       reinterpret_cast<int32_t*>(MM.data_ptr<int32_t>()),
       reinterpret_cast<int32_t*>(RA.data_ptr<int32_t>()),
+      0,
       monitor,
       stream);
 
