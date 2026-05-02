@@ -611,121 +611,227 @@ def compute_stable_hint_from_rounds(
     rank: int,
 ):
     """
-    Build a stable hint from one or more sampling rounds.
+    Build a hint using majority-window assignment instead of exact-only stability.
 
-    Each nominal window has size:
-        wSize = nominal_min_group_size * compute_sms
+    The old implementation only accepted tiles that landed in the same nominal
+    window in every sample of every confirmation round. That was too strict:
+    missing even a few tiles from a full window, e.g. 971/992, made
+    floor(971 / compute_sms) drop the effective group from 8 to 7.
 
-    A tile is considered stable for a window only if it lands in that same
-    nominal window in every sample of every round.
-
-    effective_min_group_size is chosen by:
-        floor(min_stable_count_across_full_windows / compute_sms)
-
-    This lets us accept a nominal min_group_size=20 run even if only 19 waves
-    worth of tiles are perfectly stable inside each nominal 20-wave window.
+    New policy:
+      1. Start from nominal_min_group_size and only reduce if validation fails.
+      2. In the design round, assign a tile to the window where it appears with
+         high confidence. For 10 samples this means 7, 8, 9, or 10 hits.
+         Ambiguous 4/5/6-style tiles go to the tail.
+      3. Confirmation rounds do not require exact stability. They only count
+         high-confidence movement to a different window as a conflict. Ambiguous
+         4/5/6-style behavior is ignored and left to the tail/straggler margin.
+      4. If a full window has at least one wave worth of high-confidence
+         conflicts in a confirmation round, reduce the effective group and
+         re-build the hint with the smaller candidate group size.
     """
     assert len(sample_rounds) > 0
-    WaveNum = div_up(TileNum, wSize)
     device = sample_rounds[0].device
 
-    stable_per_window = []
-    effective_group = int(nominal_min_group_size)
+    def majority_threshold(sample_count: int):
+        # For 10 samples: 7. This intentionally treats 4/5/6 as ambiguous.
+        return min(sample_count, max(sample_count // 2 + 1, sample_count - 3))
+
+    def classify_round(samples, candidate_wSize: int):
+        sample_count = int(samples.shape[0])
+        WaveNum = div_up(TileNum, candidate_wSize)
+        threshold = majority_threshold(sample_count)
+
+        counts = torch.empty((WaveNum, TileNum), dtype=torch.int16, device=device)
+        for w in range(WaveNum):
+            lo = w * candidate_wSize
+            hi = min((w + 1) * candidate_wSize, TileNum)
+            counts[w, :] = ((samples >= lo) & (samples < hi)).sum(dim=0).to(torch.int16)
+
+        max_counts, max_windows = counts.max(dim=0)
+        tie_counts = (counts == max_counts.unsqueeze(0)).sum(dim=0)
+        assigned = (max_counts >= threshold) & (tie_counts == 1)
+        return max_windows, max_counts, assigned, threshold
+
+    def sorted_tile_list(tiles, confidence, mean_order):
+        # Prefer high-confidence tiles, then earlier average completion order,
+        # then tile id for deterministic output.
+        items = []
+        for t in tiles.tolist():
+            items.append((-int(confidence[t].item()), float(mean_order[t].item()), int(t)))
+        items.sort()
+        return [t for _, __, t in items]
 
     if rank == 0:
         print("")
         print("----------------------------------------")
-        print("Effective hint stability summary:")
+        print("Majority hint stability summary:")
         print(
             f"nominal_min_group_size={nominal_min_group_size} "
             f"nominal_wSize={wSize} compute_sms={compute_sms} "
             f"min_effective_group_size={min_effective_group_size}"
         )
         print(
-            "A tile is final-stable for a window only if it is exact-stable "
-            "in that window for every confirmation round."
+            "A tile is assigned from the design round when it lands in one "
+            "window with high confidence. For 10 samples, 7/8/9/10 are "
+            "assigned; 4/5/6 are treated as ambiguous tail candidates."
         )
-
-    full_window_seen = False
-
-    for w in range(WaveNum):
-        lo = w * wSize
-        hi = min((w + 1) * wSize, TileNum)
-        expected = hi - lo
-
-        stable_mask = torch.ones((TileNum,), dtype=torch.bool, device=device)
-        round_exact_counts = []
-
-        for samples in sample_rounds:
-            sample_count = samples.shape[0]
-            count_in_window = ((samples >= lo) & (samples < hi)).sum(dim=0)
-            exact_mask = count_in_window == sample_count
-            stable_mask = stable_mask & exact_mask
-            round_exact_counts.append(int(exact_mask.sum().item()))
-
-        stable_tiles = torch.where(stable_mask)[0]
-        stable_count = int(stable_tiles.numel())
-        stable_per_window.append(stable_tiles)
-
-        if expected == wSize:
-            full_window_seen = True
-            window_effective_group = stable_count // compute_sms
-            window_effective_group = min(window_effective_group, nominal_min_group_size)
-            effective_group = min(effective_group, window_effective_group)
-        else:
-            window_effective_group = stable_count // compute_sms
-            window_effective_group = min(window_effective_group, nominal_min_group_size)
-
-        if rank == 0:
-            round_counts_str = " ".join(
-                f"round{idx}_exact={cnt}"
-                for idx, cnt in enumerate(round_exact_counts)
-            )
-            print(
-                f"window {w:03d}: range=[{lo}, {hi}) expected={expected} "
-                f"{round_counts_str} final_stable={stable_count} "
-                f"window_effective_group={window_effective_group}"
-            )
-
-    if not full_window_seen:
-        effective_group = min(nominal_min_group_size, div_up(TileNum, compute_sms))
-
-    if rank == 0:
         print(
-            f"chosen effective_min_group_size={effective_group} "
-            f"(requires >= {min_effective_group_size})"
+            "Confirmation rounds only force a smaller effective group when a "
+            "full window has at least one compute wave worth of high-confidence "
+            "movement into another window. Ambiguous confirmation samples are ignored."
         )
 
-    if effective_group < min_effective_group_size:
+    first_samples = sample_rounds[0]
+    first_mean_order = first_samples.float().mean(dim=0)
+
+    for candidate_group in range(int(nominal_min_group_size), int(min_effective_group_size) - 1, -1):
+        candidate_wSize = int(candidate_group) * int(compute_sms)
+        WaveNum = div_up(TileNum, candidate_wSize)
+
+        first_window, first_conf, first_assigned, first_threshold = classify_round(
+            first_samples,
+            candidate_wSize,
+        )
+
+        chosen_per_window = []
+        window_stats = []
+        candidate_ok = True
+        fail_reason = ""
+
+        for w in range(WaveNum):
+            lo = w * candidate_wSize
+            hi = min((w + 1) * candidate_wSize, TileNum)
+            expected = hi - lo
+            is_full_window = expected == candidate_wSize
+
+            tiles = torch.where(first_assigned & (first_window == w))[0]
+            sorted_tiles = sorted_tile_list(tiles, first_conf, first_mean_order)
+
+            if is_full_window and len(sorted_tiles) < expected:
+                candidate_ok = False
+                fail_reason = (
+                    f"window {w:03d} assigned_count={len(sorted_tiles)} "
+                    f"is below expected={expected}"
+                )
+
+            chosen = sorted_tiles[:expected]
+            chosen_per_window.append(chosen)
+            window_stats.append({
+                "w": w,
+                "lo": lo,
+                "hi": hi,
+                "expected": expected,
+                "is_full_window": is_full_window,
+                "assigned_count": len(sorted_tiles),
+                "chosen_count": len(chosen),
+                "tail_from_window": max(0, len(sorted_tiles) - len(chosen)),
+                "max_confirm_conflicts": 0,
+            })
+
+        # Validate later rounds without requiring exact stability. Ambiguous
+        # confirmation behavior is not considered a conflict; only a strong
+        # vote for a different window is counted.
+        if candidate_ok and len(sample_rounds) > 1:
+            for round_idx, samples in enumerate(sample_rounds[1:], start=1):
+                round_window, round_conf, round_assigned, round_threshold = classify_round(
+                    samples,
+                    candidate_wSize,
+                )
+
+                for stat in window_stats:
+                    if not stat["is_full_window"]:
+                        continue
+
+                    w = stat["w"]
+                    chosen = chosen_per_window[w]
+                    if len(chosen) == 0:
+                        continue
+
+                    chosen_tensor = torch.tensor(chosen, dtype=torch.long, device=device)
+                    conflict_mask = round_assigned[chosen_tensor] & (round_window[chosen_tensor] != w)
+                    conflict_count = int(conflict_mask.sum().item())
+                    stat["max_confirm_conflicts"] = max(
+                        stat["max_confirm_conflicts"],
+                        conflict_count,
+                    )
+
+                    if conflict_count >= compute_sms:
+                        candidate_ok = False
+                        fail_reason = (
+                            f"confirmation round {round_idx} window {w:03d} "
+                            f"has high-confidence conflicts={conflict_count}, "
+                            f"which is >= one compute wave ({compute_sms})"
+                        )
+                        break
+
+                if not candidate_ok:
+                    break
+
         if rank == 0:
+            print("")
             print(
-                f"compute_hint rejected: effective_min_group_size={effective_group} "
-                f"is below min_effective_group_size={min_effective_group_size}"
+                f"candidate effective_group={candidate_group} "
+                f"candidate_wSize={candidate_wSize} WaveNum={WaveNum} "
+                f"design_threshold={first_threshold}/{int(first_samples.shape[0])}"
             )
-        return False, [], effective_group
+            for stat in window_stats:
+                print(
+                    f"window {stat['w']:03d}: range=[{stat['lo']}, {stat['hi']}) "
+                    f"expected={stat['expected']} "
+                    f"design_assigned={stat['assigned_count']} "
+                    f"chosen={stat['chosen_count']} "
+                    f"tail_extra={stat['tail_from_window']} "
+                    f"max_confirm_conflicts={stat['max_confirm_conflicts']}"
+                )
+            if candidate_ok:
+                print(f"candidate effective_group={candidate_group} accepted")
+            else:
+                print(f"candidate effective_group={candidate_group} rejected: {fail_reason}")
 
-    hint = []
-    used = torch.zeros((TileNum,), dtype=torch.bool, device=device)
+        if not candidate_ok:
+            continue
 
-    for stable_tiles in stable_per_window:
-        for tile in stable_tiles.tolist():
-            if not bool(used[tile].item()):
-                hint.append(int(tile))
+        hint = []
+        used = torch.zeros((TileNum,), dtype=torch.bool, device=device)
+
+        duplicate_count = 0
+        for chosen in chosen_per_window:
+            for tile in chosen:
+                tile = int(tile)
+                if bool(used[tile].item()):
+                    duplicate_count += 1
+                    continue
+                hint.append(tile)
                 used[tile] = True
 
-    stable_total = len(hint)
-    unstable_total = TileNum - stable_total
+        hint_total = len(hint)
+        tail_total = TileNum - hint_total
+
+        if rank == 0:
+            print(
+                f"chosen effective_min_group_size={candidate_group} "
+                f"(requires >= {min_effective_group_size})"
+            )
+            print(
+                f"hint assigned tiles={hint_total}/{TileNum}; "
+                f"tail tiles left for reorder tail={tail_total}; "
+                f"duplicate_suppressed={duplicate_count}"
+            )
+            print("----------------------------------------")
+            print("")
+
+        return True, hint, candidate_group
 
     if rank == 0:
         print(
-            f"hint stable tiles={stable_total}/{TileNum}; "
-            f"unstable tiles left for reorder tail={unstable_total}"
+            f"compute_hint rejected: no candidate effective group in "
+            f"[{min_effective_group_size}, {nominal_min_group_size}] passed"
         )
         print("----------------------------------------")
         print("")
 
-    return True, hint, effective_group
-
+    return False, [], int(min_effective_group_size) - 1
 
 def compute_hint_process(rank, world_size, nccl_id,
     M: int, N: int, K: int,
