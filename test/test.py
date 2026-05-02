@@ -11,6 +11,12 @@
     It compares each backend overlap result against that backend's own baseline:
       - default: same SM90 Algo/BM/BN with cSeg=[tile_num], no overlap segmentation
       - optional: cublas baseline
+
+    CTA env behavior:
+      - --set_nccl_comm_ctas_to_comm_sms applies only to the NCCL overlap run.
+      - --set_ooverlap_comm_ctas_to_comm_sms applies only to the ooverlap overlap run.
+      - Baseline runs always clear OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS before spawning.
+      - Standalone comm timing always clears OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS before spawning.
 '''
 
 import argparse
@@ -28,6 +34,8 @@ import torch.multiprocessing as mp
 
 WARM_UP = 20
 REP = 200
+
+COMM_CTA_ENV_KEYS = ("OOVERLAP_MAX_CTAS", "NCCL_MAX_CTAS")
 
 
 def repo_root():
@@ -60,25 +68,50 @@ ext = load_ooverlap_ext()
 
 
 @contextmanager
-def temporary_env(env_updates):
-    old_values = {}
-    missing = set()
+def scoped_env(set_values=None, unset_keys=None):
+    set_values = dict(set_values or {})
+    unset_keys = set(unset_keys or [])
 
-    for key, value in env_updates.items():
-        if key in os.environ:
-            old_values[key] = os.environ[key]
-        else:
-            missing.add(key)
+    touched_keys = set(unset_keys) | set(set_values.keys())
+    old_present = {}
+    old_values = {}
+
+    for key in touched_keys:
+        old_present[key] = key in os.environ
+        old_values[key] = os.environ.get(key)
+
+    for key in unset_keys:
+        os.environ.pop(key, None)
+
+    for key, value in set_values.items():
         os.environ[key] = str(value)
 
     try:
         yield
     finally:
-        for key in env_updates:
-            if key in old_values:
+        for key in touched_keys:
+            if old_present[key]:
                 os.environ[key] = old_values[key]
-            elif key in missing:
+            else:
                 os.environ.pop(key, None)
+
+
+def comm_cta_env_values(comm_sm_slack: int):
+    value = str(int(comm_sm_slack))
+    return {
+        "OOVERLAP_MAX_CTAS": value,
+        "NCCL_MAX_CTAS": value,
+    }
+
+
+def clear_comm_cta_env_in_child():
+    for key in COMM_CTA_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def set_comm_cta_env_in_child(comm_sm_slack: int):
+    for key, value in comm_cta_env_values(comm_sm_slack).items():
+        os.environ[key] = value
 
 
 def div_up(x: int, y: int):
@@ -232,16 +265,17 @@ def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
     BM: int, BN: int, Algo: int, cSeg: list, hint: list, reorder_map,
     comm_op: str,
     active_sm_count: int,
-    set_ooverlap_comm_ctas: bool,
-    ooverlap_comm_ctas: int,
+    set_overlap_comm_ctas: bool,
+    overlap_comm_ctas: int,
     result_dict):
 
     torch.cuda.set_device(rank)
     validate_comm_backend(comm_backend, comm_op, world_size)
 
-    if set_ooverlap_comm_ctas:
-        os.environ["OOVERLAP_MAX_CTAS"] = str(int(ooverlap_comm_ctas))
-        os.environ["NCCL_MAX_CTAS"] = str(int(ooverlap_comm_ctas))
+    if set_overlap_comm_ctas:
+        set_comm_cta_env_in_child(overlap_comm_ctas)
+    else:
+        clear_comm_cta_env_in_child()
 
     cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32)
     cSeg_GPU = cSeg_CPU.cuda(rank)
@@ -391,8 +425,8 @@ def perf_running(M: int, N: int, K: int,
     comm_backend: str,
     active_sm_count: int,
     reorder_map=None,
-    set_ooverlap_comm_ctas: bool = False,
-    ooverlap_comm_ctas: int = 0):
+    set_overlap_comm_ctas: bool = False,
+    overlap_comm_ctas: int = 0):
 
     world_size = torch.cuda.device_count()
     if world_size < 2:
@@ -400,11 +434,8 @@ def perf_running(M: int, N: int, K: int,
 
     validate_comm_backend(comm_backend, comm_op, world_size)
 
-    if set_ooverlap_comm_ctas and comm_backend != "ooverlap":
-        raise ValueError("set_ooverlap_comm_ctas can only be used with comm_backend=ooverlap")
-
-    if set_ooverlap_comm_ctas and int(ooverlap_comm_ctas) <= 0:
-        raise ValueError(f"ooverlap_comm_ctas must be > 0, got {ooverlap_comm_ctas}")
+    if set_overlap_comm_ctas and int(overlap_comm_ctas) <= 0:
+        raise ValueError(f"overlap_comm_ctas must be > 0, got {overlap_comm_ctas}")
 
     nccl_id = ext.generate_nccl_id()
     broker_key = make_broker_key(f"test_{comm_backend}")
@@ -413,14 +444,14 @@ def perf_running(M: int, N: int, K: int,
     manager = mp.Manager()
     result_dict = manager.dict()
 
-    env_updates = {}
-    if set_ooverlap_comm_ctas:
-        env_updates = {
-            "OOVERLAP_MAX_CTAS": str(int(ooverlap_comm_ctas)),
-            "NCCL_MAX_CTAS": str(int(ooverlap_comm_ctas)),
-        }
+    if set_overlap_comm_ctas:
+        set_values = comm_cta_env_values(overlap_comm_ctas)
+        unset_keys = []
+    else:
+        set_values = {}
+        unset_keys = COMM_CTA_ENV_KEYS
 
-    with temporary_env(env_updates):
+    with scoped_env(set_values=set_values, unset_keys=unset_keys):
         mp.spawn(
             perf_running_process,
             args=(
@@ -439,8 +470,8 @@ def perf_running(M: int, N: int, K: int,
                 reorder_map,
                 comm_op,
                 active_sm_count,
-                set_ooverlap_comm_ctas,
-                int(ooverlap_comm_ctas),
+                set_overlap_comm_ctas,
+                int(overlap_comm_ctas),
                 result_dict,
             ),
             nprocs=world_size,
@@ -457,6 +488,8 @@ def perf_comm_process(rank, world_size, nccl_id, broker_key, comm_backend,
                       M, N, comm_op, result_dict):
     torch.cuda.set_device(rank)
     validate_comm_backend(comm_backend, comm_op, world_size)
+
+    clear_comm_cta_env_in_child()
 
     comm_class = ext.OverlapImpl()
 
@@ -549,11 +582,12 @@ def perf_comm(M: int, N: int, comm_op: str, comm_backend: str):
     manager = mp.Manager()
     result_dict = manager.dict()
 
-    mp.spawn(
-        perf_comm_process,
-        args=(world_size, nccl_id, broker_key, comm_backend, M, N, comm_op, result_dict),
-        nprocs=world_size,
-    )
+    with scoped_env(unset_keys=COMM_CTA_ENV_KEYS):
+        mp.spawn(
+            perf_comm_process,
+            args=(world_size, nccl_id, broker_key, comm_backend, M, N, comm_op, result_dict),
+            nprocs=world_size,
+        )
 
     dur = torch.empty((world_size))
     for i in range(world_size):
@@ -566,6 +600,8 @@ def perf_cublas_baseline_process(rank, world_size, nccl_id, broker_key, comm_bac
                                  M, N, K, comm_op, result_dict):
     torch.cuda.set_device(rank)
     validate_comm_backend(comm_backend, comm_op, world_size)
+
+    clear_comm_cta_env_in_child()
 
     A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
     B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
@@ -662,11 +698,12 @@ def perf_cublas_baseline(M: int, N: int, K: int, comm_op: str, comm_backend: str
     manager = mp.Manager()
     result_dict = manager.dict()
 
-    mp.spawn(
-        perf_cublas_baseline_process,
-        args=(world_size, nccl_id, broker_key, comm_backend, M, N, K, comm_op, result_dict),
-        nprocs=world_size,
-    )
+    with scoped_env(unset_keys=COMM_CTA_ENV_KEYS):
+        mp.spawn(
+            perf_cublas_baseline_process,
+            args=(world_size, nccl_id, broker_key, comm_backend, M, N, K, comm_op, result_dict),
+            nprocs=world_size,
+        )
 
     dur = torch.empty((world_size))
     for i in range(world_size):
@@ -689,6 +726,14 @@ def load_solution(m: int, n: int, k: int, comm_backend: str):
         )
 
     return file_path, data
+
+
+def should_set_overlap_comm_ctas(args, comm_backend: str):
+    if comm_backend == "nccl":
+        return bool(args.set_nccl_comm_ctas_to_comm_sms)
+    if comm_backend == "ooverlap":
+        return bool(args.set_ooverlap_comm_ctas_to_comm_sms)
+    return False
 
 
 def run_backend(args, comm_backend: str):
@@ -717,10 +762,7 @@ def run_backend(args, comm_backend: str):
 
     assert cseg_sum == tile_num, f"sum(cSeg)={cseg_sum} must equal tile_num={tile_num}"
 
-    set_overlap_comm_ctas = (
-        bool(args.set_ooverlap_comm_ctas_to_comm_sms)
-        and comm_backend == "ooverlap"
-    )
+    set_overlap_comm_ctas = should_set_overlap_comm_ctas(args, comm_backend)
 
     print("")
     print("########################################")
@@ -738,13 +780,18 @@ def run_backend(args, comm_backend: str):
     print(f"  baseline_impl={args.baseline_impl}")
     if set_overlap_comm_ctas:
         print(
-            "  ooverlap overlap env override: "
+            f"  {comm_backend} overlap env override: "
             f"OOVERLAP_MAX_CTAS={comm_sm_slack} NCCL_MAX_CTAS={comm_sm_slack}"
         )
+    else:
+        print(f"  {comm_backend} overlap env override: off; CTA env vars are cleared for spawned overlap run")
 
     config_gemm_dur = float(data["dur"])
+
+    # Standalone comm timing is uncapped.
     comm_dur = perf_comm(m, n, args.comm_op, comm_backend)
 
+    # Real overlap run. CTA caps are applied only if the backend-specific flag was passed.
     overlap_dur = perf_running(
         m,
         n,
@@ -758,8 +805,8 @@ def run_backend(args, comm_backend: str):
         comm_backend,
         active_sm_count,
         reorder_map,
-        set_ooverlap_comm_ctas=set_overlap_comm_ctas,
-        ooverlap_comm_ctas=comm_sm_slack,
+        set_overlap_comm_ctas=set_overlap_comm_ctas,
+        overlap_comm_ctas=comm_sm_slack,
     )
 
     if args.baseline_impl == "same_algo":
@@ -768,9 +815,7 @@ def run_backend(args, comm_backend: str):
             sm_count if args.baseline_same_algo_active_sms == "all" else active_sm_count
         )
 
-        # Important:
-        # Do NOT set OOVERLAP_MAX_CTAS/NCCL_MAX_CTAS for this baseline call.
-        # The requested env override is only for the real ooverlap overlap scenario.
+        # Baseline always clears OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS.
         baseline_dur = perf_running(
             m,
             n,
@@ -784,8 +829,8 @@ def run_backend(args, comm_backend: str):
             comm_backend,
             baseline_active_sm_count,
             reorder_map,
-            set_ooverlap_comm_ctas=False,
-            ooverlap_comm_ctas=0,
+            set_overlap_comm_ctas=False,
+            overlap_comm_ctas=0,
         )
 
         baseline_desc = "same_algo_full_segment"
@@ -805,7 +850,7 @@ def run_backend(args, comm_backend: str):
     env_override_desc = (
         f"OOVERLAP_MAX_CTAS=NCCL_MAX_CTAS={comm_sm_slack}"
         if set_overlap_comm_ctas
-        else "off"
+        else "off/cleared"
     )
 
     print(f"""
@@ -825,14 +870,17 @@ def run_backend(args, comm_backend: str):
         {'active_sm_count':<28} {active_sm_count:>18}
         {'comm_sm_slack':<28} {comm_sm_slack:>18}
         {'overlap_comm_ctas_env':<28} {env_override_desc:>18}
+        {'baseline_backend':<28} {comm_backend:>18}
         {'baseline_impl':<28} {baseline_desc:>18}
         {'baseline_cSeg':<28} {str(baseline_cSeg):>18}
         {'baseline_sms':<28} {baseline_sms:>18}
+        {'baseline_ctas_env':<28} {'cleared':>18}
+        {'comm_timing_ctas_env':<28} {'cleared':>18}
         {'config_gemm_dur (ms)':<28} {config_gemm_dur:>18.4f}
         {'comm_dur (ms)':<28} {comm_dur:>18.4f}
         {'baseline_dur (ms)':<28} {baseline_dur:>18.4f}
         {'overlap_dur (ms)':<28} {overlap_dur:>18.4f}
-        {'speedup':<28} {speedup:>18.4f}
+        {'speedup_vs_own_baseline':<28} {speedup:>18.4f}
     """)
 
     return {
@@ -848,8 +896,70 @@ def run_backend(args, comm_backend: str):
         "active_sm_count": int(active_sm_count),
         "comm_sm_slack": int(comm_sm_slack),
         "overlap_comm_ctas_env": env_override_desc,
+        "baseline_ctas_env": "cleared",
         "solution": str(file_path),
     }
+
+
+def print_summary(results):
+    if len(results) <= 1:
+        return
+
+    print("")
+    print("########################################")
+    print("# Summary")
+    print("########################################")
+    print(
+        f"{'backend':<12} {'baseline(ms)':>14} {'overlap(ms)':>14} "
+        f"{'own_speedup':>12} {'comm(ms)':>12} {'ctas_env':>28} {'cSeg':>24}"
+    )
+    print(
+        f"{'-------':<12} {'------------':>14} {'-----------':>14} "
+        f"{'-----------':>12} {'--------':>12} {'--------':>28} {'----':>24}"
+    )
+
+    for row in results:
+        print(
+            f"{row['comm_backend']:<12} "
+            f"{row['baseline_dur_ms']:>14.4f} "
+            f"{row['overlap_dur_ms']:>14.4f} "
+            f"{row['speedup']:>12.4f} "
+            f"{row['comm_dur_ms']:>12.4f} "
+            f"{row['overlap_comm_ctas_env']:>28} "
+            f"{str(row['cSeg']):>24}"
+        )
+
+    by_backend = {row["comm_backend"]: row for row in results}
+
+    if "nccl" in by_backend and "ooverlap" in by_backend:
+        nccl = by_backend["nccl"]
+        oo = by_backend["ooverlap"]
+
+        nccl_overlap_vs_ooverlap_baseline = oo["baseline_dur_ms"] / nccl["overlap_dur_ms"]
+        ooverlap_overlap_vs_nccl_baseline = nccl["baseline_dur_ms"] / oo["overlap_dur_ms"]
+
+        print("")
+        print("########################################")
+        print("# Cross-baseline speedups")
+        print("########################################")
+        print(
+            f"{'comparison':<44} {'baseline(ms)':>14} {'overlap(ms)':>14} {'speedup':>10}"
+        )
+        print(
+            f"{'----------':<44} {'------------':>14} {'-----------':>14} {'-------':>10}"
+        )
+        print(
+            f"{'nccl overlap vs ooverlap baseline':<44} "
+            f"{oo['baseline_dur_ms']:>14.4f} "
+            f"{nccl['overlap_dur_ms']:>14.4f} "
+            f"{nccl_overlap_vs_ooverlap_baseline:>10.4f}"
+        )
+        print(
+            f"{'ooverlap overlap vs nccl baseline':<44} "
+            f"{nccl['baseline_dur_ms']:>14.4f} "
+            f"{oo['overlap_dur_ms']:>14.4f} "
+            f"{ooverlap_overlap_vs_nccl_baseline:>10.4f}"
+        )
 
 
 def main():
@@ -886,12 +996,21 @@ def main():
         ),
     )
     parser.add_argument(
+        "--set_nccl_comm_ctas_to_comm_sms",
+        action="store_true",
+        help=(
+            "For the NCCL overlap run only, set both OOVERLAP_MAX_CTAS and "
+            "NCCL_MAX_CTAS to comm_sm_slack before spawning workers. Baselines "
+            "and standalone comm timing always clear these env vars."
+        ),
+    )
+    parser.add_argument(
         "--set_ooverlap_comm_ctas_to_comm_sms",
         action="store_true",
         help=(
-            "Only for the real ooverlap overlap run: set both OOVERLAP_MAX_CTAS "
-            "and NCCL_MAX_CTAS to comm_sm_slack before spawning the worker "
-            "processes. This is intentionally not applied to baseline runs."
+            "For the ooverlap overlap run only, set both OOVERLAP_MAX_CTAS and "
+            "NCCL_MAX_CTAS to comm_sm_slack before spawning workers. Baselines "
+            "and standalone comm timing always clear these env vars."
         ),
     )
 
@@ -916,30 +1035,7 @@ def main():
 
         results.append(run_backend(args, backend))
 
-    if len(results) > 1:
-        print("")
-        print("########################################")
-        print("# Summary")
-        print("########################################")
-        print(
-            f"{'backend':<12} {'baseline(ms)':>14} {'overlap(ms)':>14} "
-            f"{'speedup':>10} {'comm(ms)':>12} {'ctas_env':>20} {'cSeg':>24}"
-        )
-        print(
-            f"{'-------':<12} {'------------':>14} {'-----------':>14} "
-            f"{'-------':>10} {'--------':>12} {'--------':>20} {'----':>24}"
-        )
-
-        for row in results:
-            print(
-                f"{row['comm_backend']:<12} "
-                f"{row['baseline_dur_ms']:>14.4f} "
-                f"{row['overlap_dur_ms']:>14.4f} "
-                f"{row['speedup']:>10.4f} "
-                f"{row['comm_dur_ms']:>12.4f} "
-                f"{row['overlap_comm_ctas_env']:>20} "
-                f"{str(row['cSeg']):>24}"
-            )
+    print_summary(results)
 
 
 if __name__ == "__main__":
