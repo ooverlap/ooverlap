@@ -227,6 +227,7 @@ public:
     ElementCompute             beta;
 
     SignalingEpilogueParams    signal_params;
+    int                        active_sm_count;
 
     Arguments() {}
 
@@ -248,7 +249,8 @@ public:
       int  kReorderedColumn,
       int *kCommuSegArray,
       int  numSegments,
-      bool Monitor
+      bool Monitor,
+      int  activeSmCount = 0
     ) :
       problem_size(problem_size_),
       ptr_A(ptr_A_),
@@ -260,7 +262,8 @@ public:
       ldm_C(ldm_C_),
       ldm_D(ldm_D_),
       alpha(alpha_),
-      beta(beta_)
+      beta(beta_),
+      active_sm_count(activeSmCount)
     {
       signal_params.ptr_Monitored_Matrix = ptr_MM;
       signal_params.ptr_Reorder_Array    = ptr_RA;
@@ -388,8 +391,13 @@ public:
     }
 
     hw_info.device_id = device_id;
-    hw_info.sm_count =
+    int physical_sm_count =
         cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device_id);
+    hw_info.sm_count = physical_sm_count;
+
+    if (args_.active_sm_count > 0 && args_.active_sm_count < physical_sm_count) {
+      hw_info.sm_count = args_.active_sm_count;
+    }
 
     typename GemmDevice::Arguments gemm_args = [&]() {
       if constexpr (kIsStreamK) {

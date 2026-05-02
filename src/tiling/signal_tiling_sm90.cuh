@@ -16,6 +16,7 @@ using SignalSm90FuncPtr = void (*)(
     int* CommThr,
     half* A, half* B, half* D,
     int* MM, int* RA,
+    int active_sm_count,
     bool Monitor,
     cudaStream_t stream);
 

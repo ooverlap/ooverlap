@@ -35,6 +35,7 @@ struct GemmSignalCacheKey {
   int* RA;
   bool Monitor;
   int num_segments;
+  int active_sm_count;
 
   GemmSignalCacheKey()
       : valid(false),
@@ -50,7 +51,8 @@ struct GemmSignalCacheKey {
         MM(nullptr),
         RA(nullptr),
         Monitor(false),
-        num_segments(0) {}
+        num_segments(0),
+        active_sm_count(0) {}
 
   bool same_as(GemmSignalCacheKey const& other) const {
     return valid &&
@@ -67,7 +69,8 @@ struct GemmSignalCacheKey {
            MM      == other.MM &&
            RA      == other.RA &&
            Monitor == other.Monitor &&
-           num_segments == other.num_segments;
+           num_segments == other.num_segments &&
+           active_sm_count == other.active_sm_count;
   }
 };
 
@@ -92,6 +95,7 @@ void cutlass_gemm_signal_sm90(
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream = nullptr
 ) {
@@ -139,6 +143,7 @@ void cutlass_gemm_signal_sm90(
   new_key.RA      = RA;
   new_key.Monitor = Monitor;
   new_key.num_segments = num_segments;
+  new_key.active_sm_count = active_sm_count;
 
   cutlass::gemm::GemmCoord problem_size(M, N, K);
 
@@ -182,7 +187,8 @@ void cutlass_gemm_signal_sm90(
     ReLDN,
     CommThr,
     num_segments,
-    Monitor
+    Monitor,
+    active_sm_count
   );
 
   if (!cached_key.same_as(new_key)) {
@@ -242,6 +248,7 @@ bool gemm_signal_sm90_dispatch(
     int32_t* CommThr,
     void* A, void* B, void* D,
     int32_t* MM, int32_t* RA,
+    int active_sm_count,
     bool Monitor,
     cudaStream_t stream) {
 
@@ -259,6 +266,7 @@ bool gemm_signal_sm90_dispatch(
       reinterpret_cast<half*>(D),
       reinterpret_cast<int*>(MM),
       reinterpret_cast<int*>(RA),
+      active_sm_count,
       Monitor,
       stream);
 
