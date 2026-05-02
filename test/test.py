@@ -142,6 +142,7 @@ def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
     M: int, N: int, K: int,
     BM: int, BN: int, Algo: int, cSeg: list, hint: list,
     comm_op: str,
+    active_sm_count: int,
     result_dict):
 
     cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32)
@@ -184,17 +185,17 @@ def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
         if comm_op == "all_reduce":
             for _ in range(_warm_up):
                 reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
-                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
+                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, int(active_sm_count), False)
 
             reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
-            gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
+            gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, int(active_sm_count), False)
 
             start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
             end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
                 start_event[i].record()
-                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
+                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, int(active_sm_count), False)
                 end_event[i].record()
             torch.cuda.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
@@ -220,14 +221,14 @@ def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
         if comm_op == "all_reduce":
             for _ in range(_warm_up):
                 reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
-                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
+                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, int(active_sm_count), False)
 
             start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
             end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
                 start_event[i].record()
-                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
+                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, int(active_sm_count), False)
                 end_event[i].record()
             torch.cuda.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
@@ -254,7 +255,8 @@ def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
 def perf_running(M: int, N: int, K: int,
     BM: int, BN: int, Algo: int,
     cSeg: list, hint: list, comm_op: str,
-    comm_backend: str = "nccl"):
+    comm_backend: str = "nccl",
+    active_sm_count: int = 0):
     world_size = torch.cuda.device_count()
     if world_size < 2:
         raise RuntimeError("At least 2 GPUs are required for this program.")
@@ -269,7 +271,7 @@ def perf_running(M: int, N: int, K: int,
 
     mp.spawn(
             perf_running_process,
-            args=(world_size, nccl_id, broker_key, comm_backend, M, N, K, BM, BN, Algo, cSeg, hint, comm_op, result_dict),
+            args=(world_size, nccl_id, broker_key, comm_backend, M, N, K, BM, BN, Algo, cSeg, hint, comm_op, active_sm_count, result_dict),
             nprocs=world_size
         )
 
@@ -451,10 +453,26 @@ def main():
     tile_num = m // data["BM"] * n // data["BN"]
     wave_num = (tile_num + wave_size - 1) // wave_size
 
+    active_sm_count = int(data.get("compute_sms", sm_count))
+    comm_sm_slack = int(data.get("comm_sm_slack", sm_count - active_sm_count))
+    cseg_sum = int(sum(data["cSeg"]))
+
+    print("Loaded solution:", file_path)
+    print("Solution debug:")
+    print(f"  Algo={data['Algo']} BM={data['BM']} BN={data['BN']}")
+    print(f"  sm_count={sm_count} json_sm_count={data.get('sm_count')}")
+    print(f"  comm_sm_slack={comm_sm_slack} active_sm_count={active_sm_count}")
+    print(f"  cSeg={data['cSeg']}")
+    print(f"  len(cSeg)={len(data['cSeg'])} sum(cSeg)={cseg_sum} tile_num={tile_num}")
+    print(f"  hint_len={len(data['hint'])}")
+    print(f"  has_reorder_map={'reorder_map' in data} reorder_map_len={len(data.get('reorder_map', []))}")
+
+    assert cseg_sum == tile_num, f"sum(cSeg)={cseg_sum} must equal tile_num={tile_num}"
+
     gemm_dur = data["dur"]
     comm_dur = perf_comm(m, n, comm_op)
     overlap_dur = perf_running(m, n, k,
-        data["BM"], data["BN"], data["Algo"], data["cSeg"], data["hint"], comm_op, comm_backend)
+        data["BM"], data["BN"], data["Algo"], data["cSeg"], data["hint"], comm_op, comm_backend, active_sm_count)
     baseline_dur = perf_baseline(m, n, k, comm_op)
 
     speedup = baseline_dur / overlap_dur
@@ -466,6 +484,10 @@ def main():
         {'n':<20} {n:>15}
         {'k':<20} {k:>15}
         {'tile_num':<20} {tile_num:>15}
+        {'cSeg':<20} {str(data["cSeg"]):>15}
+        {'cSeg_len':<20} {len(data["cSeg"]):>15}
+        {'active_sm_count':<20} {active_sm_count:>15}
+        {'comm_sm_slack':<20} {comm_sm_slack:>15}
         {'gemm_dur (ms)':<20} {gemm_dur:>15.4f}
         {'comm_dur (ms)':<20} {comm_dur:>15.4f}
         {'baseline_dur (ms)':<20} {baseline_dur:>15.4f}
