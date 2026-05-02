@@ -85,8 +85,16 @@ def validate_comm_backend(comm_backend: str, comm_op: str, world_size: int):
             raise ValueError("ooverlap backend currently supports exactly 2 visible GPUs")
 
 
-def make_broker_key(prefix: str):
-    return f"{prefix}_{os.getpid()}_{uuid.uuid4().hex}"
+def make_broker_key(prefix: str = "oo"):
+    """
+    ooverlap IPC Broker uses the key to build a Unix-domain socket name.
+    Keep this very short; long shape/backend prefixes can exceed the socket
+    path limit and cause: "Broker: socket key is too long".
+    """
+    _ = prefix  # keep old call sites compatible, but do not include long prefixes
+    pid_part = format(os.getpid() & 0xffff, "04x")
+    rand_part = uuid.uuid4().hex[:8]
+    return f"oo{pid_part}{rand_part}"
 
 
 def init_overlap_backend(gemm_class, rank: int, world_size: int, nccl_id, broker_key: str,
