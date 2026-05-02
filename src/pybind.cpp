@@ -481,9 +481,15 @@ PYBIND11_MODULE(ooverlap_ext, m) {
       .def(py::init<>())
       .def("cutlass_init", &OverlapImpl::CutlassInit)
       .def("nccl_init", &OverlapImpl::NcclInit)
+      .def("ooverlap_ipc_init", &OverlapImpl::OoverlapIpcInit)
+      .def("ooverlap_release", &OverlapImpl::OoverlapRelease)
       .def("overlap_init", &OverlapImpl::OverlapInit)
+      .def("gemm", &OverlapImpl::Gemm)
+      .def("gemm_allreduce", &OverlapImpl::GemmAllReduce)
       .def("gemm_allreduce_overlap", &OverlapImpl::GemmAllReduceOverlap)
       .def("gemm_reducescatter_overlap", &OverlapImpl::GemmReduceScatterOverlap)
+      .def("seg_allreduce", &OverlapImpl::SegAllReduce)
+      .def("ooverlap_allreduce", &OverlapImpl::OoverlapAllReduce)
       .def("nccl_allreduce", &OverlapImpl::NcclAllReduce)
       .def("nccl_reducescatter", &OverlapImpl::NcclReduceScatter);
 }

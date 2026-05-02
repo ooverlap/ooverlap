@@ -425,6 +425,9 @@ if(OOVERLAP_BUILD_PYTHON AND EXISTS ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
   if(TARGET ooverlap_norm)
     target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_norm)
   endif()
+  if(TARGET ooverlap_comm)
+    target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_comm)
+    endif()
 
   target_link_libraries(ooverlap_overlap_impl PUBLIC
     CUDA::cudart
