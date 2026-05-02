@@ -107,6 +107,17 @@ def reorder_indices(S, hint):
     return torch.tensor(new_order, dtype=torch.int, device="cuda")
 
 
+def make_reordered_array(TileNum: int, hint: list, reorder_map=None):
+    if reorder_map is not None:
+        if len(reorder_map) != TileNum:
+            raise ValueError(
+                f"reorder_map length mismatch: got {len(reorder_map)}, expected {TileNum}"
+            )
+        return torch.tensor([int(x) for x in reorder_map], dtype=torch.int, device="cuda")
+
+    return reorder_indices(TileNum, hint)
+
+
 def generate_row_remap_array(
     M, N, BM, BN, S_list, world_size, device="cuda"
 ):
@@ -140,7 +151,7 @@ def generate_row_remap_array(
 
 def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
     M: int, N: int, K: int,
-    BM: int, BN: int, Algo: int, cSeg: list, hint: list,
+    BM: int, BN: int, Algo: int, cSeg: list, hint: list, reorder_map,
     comm_op: str,
     active_sm_count: int,
     result_dict):
@@ -170,7 +181,7 @@ def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
     C = torch.empty((packed_M, packed_N), dtype=torch.float16, device="cuda")
 
     MonitoredMatrix = torch.zeros((monitor_size(TileNum, len(cSeg), False),), dtype=torch.int, device="cuda")
-    ReorderedArray = reorder_indices(TileNum, hint).reshape(((M+BM-1)//BM, (N+BN-1)//BN))
+    ReorderedArray = make_reordered_array(TileNum, hint, reorder_map).reshape(((M+BM-1)//BM, (N+BN-1)//BN))
 
     if comm_op == "reduce_scatter":
         D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
@@ -256,7 +267,8 @@ def perf_running(M: int, N: int, K: int,
     BM: int, BN: int, Algo: int,
     cSeg: list, hint: list, comm_op: str,
     comm_backend: str = "nccl",
-    active_sm_count: int = 0):
+    active_sm_count: int = 0,
+    reorder_map=None):
     world_size = torch.cuda.device_count()
     if world_size < 2:
         raise RuntimeError("At least 2 GPUs are required for this program.")
@@ -271,7 +283,7 @@ def perf_running(M: int, N: int, K: int,
 
     mp.spawn(
             perf_running_process,
-            args=(world_size, nccl_id, broker_key, comm_backend, M, N, K, BM, BN, Algo, cSeg, hint, comm_op, active_sm_count, result_dict),
+            args=(world_size, nccl_id, broker_key, comm_backend, M, N, K, BM, BN, Algo, cSeg, hint, reorder_map, comm_op, active_sm_count, result_dict),
             nprocs=world_size
         )
 
@@ -437,11 +449,33 @@ def main():
         default="nccl",
         choices=["nccl", "ooverlap"],
     )
+    parser.add_argument(
+        "--baseline_impl",
+        type=str,
+        default="same_algo",
+        choices=["same_algo", "cublas"],
+        help=(
+            "Baseline implementation. same_algo uses the same SM90 CUTLASS "
+            "Algo/BM/BN as overlap with cSeg=[tile_num]. cublas keeps the old baseline."
+        ),
+    )
+    parser.add_argument(
+        "--baseline_same_algo_active_sms",
+        type=str,
+        default="all",
+        choices=["all", "solution"],
+        help=(
+            "For --baseline_impl same_algo: use all physical SMs, or use the "
+            "solution active_sm_count/compute_sms."
+        ),
+    )
     args = parser.parse_args()
 
     comm_op = args.comm_op
     comm_backend = args.comm_backend
+    baseline_impl = args.baseline_impl
     print(f"comm_backend: {comm_backend}")
+    print(f"baseline_impl: {baseline_impl}")
 
     m, n, k = args.m, args.n, args.k
 
@@ -456,6 +490,7 @@ def main():
     active_sm_count = int(data.get("compute_sms", sm_count))
     comm_sm_slack = int(data.get("comm_sm_slack", sm_count - active_sm_count))
     cseg_sum = int(sum(data["cSeg"]))
+    reorder_map = data.get("reorder_map")
 
     print("Loaded solution:", file_path)
     print("Solution debug:")
@@ -466,14 +501,46 @@ def main():
     print(f"  len(cSeg)={len(data['cSeg'])} sum(cSeg)={cseg_sum} tile_num={tile_num}")
     print(f"  hint_len={len(data['hint'])}")
     print(f"  has_reorder_map={'reorder_map' in data} reorder_map_len={len(data.get('reorder_map', []))}")
+    print(f"  baseline_impl={baseline_impl}")
+    if baseline_impl == "same_algo":
+        print(f"  baseline_same_algo_active_sms={args.baseline_same_algo_active_sms}")
 
     assert cseg_sum == tile_num, f"sum(cSeg)={cseg_sum} must equal tile_num={tile_num}"
 
     gemm_dur = data["dur"]
     comm_dur = perf_comm(m, n, comm_op)
-    overlap_dur = perf_running(m, n, k,
-        data["BM"], data["BN"], data["Algo"], data["cSeg"], data["hint"], comm_op, comm_backend, active_sm_count)
-    baseline_dur = perf_baseline(m, n, k, comm_op)
+
+    overlap_dur = perf_running(
+        m, n, k,
+        data["BM"], data["BN"], data["Algo"],
+        data["cSeg"], data["hint"],
+        comm_op,
+        comm_backend,
+        active_sm_count,
+        reorder_map,
+    )
+
+    if baseline_impl == "same_algo":
+        baseline_cSeg = [tile_num]
+        baseline_active_sm_count = (
+            sm_count if args.baseline_same_algo_active_sms == "all" else active_sm_count
+        )
+
+        # Same CUTLASS SM90 Algo/BM/BN as overlap, but no overlap segmentation:
+        # one full segment, then one full communication.
+        baseline_dur = perf_running(
+            m, n, k,
+            data["BM"], data["BN"], data["Algo"],
+            baseline_cSeg, data["hint"],
+            comm_op,
+            comm_backend,
+            baseline_active_sm_count,
+            reorder_map,
+        )
+    else:
+        baseline_cSeg = ["cublas"]
+        baseline_active_sm_count = "cublas"
+        baseline_dur = perf_baseline(m, n, k, comm_op)
 
     speedup = baseline_dur / overlap_dur
 
@@ -488,6 +555,9 @@ def main():
         {'cSeg_len':<20} {len(data["cSeg"]):>15}
         {'active_sm_count':<20} {active_sm_count:>15}
         {'comm_sm_slack':<20} {comm_sm_slack:>15}
+        {'baseline_impl':<20} {baseline_impl:>15}
+        {'baseline_cSeg':<20} {str(baseline_cSeg):>15}
+        {'baseline_sms':<20} {str(baseline_active_sm_count):>15}
         {'gemm_dur (ms)':<20} {gemm_dur:>15.4f}
         {'comm_dur (ms)':<20} {comm_dur:>15.4f}
         {'baseline_dur (ms)':<20} {baseline_dur:>15.4f}
