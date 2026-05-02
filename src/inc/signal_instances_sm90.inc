@@ -10,6 +10,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -23,6 +24,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -36,6 +38,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -49,6 +52,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -62,6 +66,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -75,6 +80,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -88,6 +94,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -101,6 +108,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -114,6 +122,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -127,6 +136,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -140,6 +150,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -153,6 +164,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -166,6 +178,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -179,6 +192,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -192,6 +206,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -205,6 +220,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -218,6 +234,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -231,6 +248,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -244,6 +262,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -257,6 +276,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -270,6 +290,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -283,6 +304,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -296,6 +318,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -309,6 +332,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -322,6 +346,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -335,6 +360,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -348,6 +374,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -361,6 +388,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -374,6 +402,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -387,6 +416,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -400,6 +430,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -413,6 +444,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -426,6 +458,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -439,6 +472,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -452,6 +486,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -465,6 +500,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -478,6 +514,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -491,6 +528,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -504,6 +542,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -517,6 +556,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -530,6 +570,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -543,6 +584,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -556,6 +598,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -569,6 +612,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -582,6 +626,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -595,6 +640,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -608,6 +654,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -621,6 +668,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -634,6 +682,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );
@@ -647,6 +696,7 @@ template void cutlass_gemm_signal_sm90<
   int* CommThr,
   half* A, half* B, half* D,
   int* MM, int* RA,
+  int active_sm_count,
   bool Monitor,
   cudaStream_t stream
 );

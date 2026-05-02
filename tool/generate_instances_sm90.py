@@ -413,6 +413,7 @@ def write_signal_instances(root: Path, candidates: List[Dict[str, Any]]) -> None
                 "  int* CommThr,\n"
                 "  half* A, half* B, half* D,\n"
                 "  int* MM, int* RA,\n"
+                "  int active_sm_count,\n"
                 "  bool Monitor,\n"
                 "  cudaStream_t stream\n"
                 ");\n\n"
@@ -434,6 +435,7 @@ def write_signal_instances(root: Path, candidates: List[Dict[str, Any]]) -> None
             "    int* CommThr,\n"
             "    half* A, half* B, half* D,\n"
             "    int* MM, int* RA,\n"
+            "    int active_sm_count,\n"
             "    bool Monitor,\n"
             "    cudaStream_t stream);\n\n"
         )

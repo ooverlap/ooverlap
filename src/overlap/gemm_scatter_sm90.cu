@@ -31,6 +31,7 @@ bool gemm_scatter_sm90_dispatch(
       CommThr,
       A, B, D,
       MM, RA,
+      0,
       Monitor,
       stream);
 }
