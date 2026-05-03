@@ -1,11 +1,10 @@
 #pragma once
 
+#include "comm/kernels/window_task_executor.cuh"
+#include "comm/plan/window_plan.cuh"
 #include "comm/tma_variant_config.h"
-#include "comm/window_task.cuh"
 
 #include <cuda_runtime.h>
-
-#include <cstddef>
 
 namespace ooverlap {
 namespace comm {
@@ -16,14 +15,14 @@ template <
     int StageDepth,
     int MaxTasks>
 cudaError_t launch_window_task_executor_sm90(
-    WindowTaskExecutorPlan<MaxTasks> plan,
+    comm::plan::WindowTaskExecutorPlan<MaxTasks> plan,
     int num_blocks,
     int threads,
     int* local_ready_signal,
     const int* peer_ready_signal,
     int collective_epoch,
     cudaStream_t stream) {
-    using Variant = TmaPipelineVariant<ChunkBytes, StageDepth>;
+    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
 
     if (num_blocks <= 0) {
         return cudaSuccess;
@@ -33,7 +32,7 @@ cudaError_t launch_window_task_executor_sm90(
         return cudaErrorInvalidValue;
     }
 
-    window_task_executor_kernel_sm90<
+    comm::kernels::window_task_executor_kernel_sm90<
         ReduceApply,
         ChunkBytes,
         StageDepth,

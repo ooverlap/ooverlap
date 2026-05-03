@@ -1,11 +1,11 @@
 #include "test/tma_bandwidth_experiment_sm90.h"
 
-#include "comm/fast_gmem_copy.cuh"
+#include "comm/kernels/fast_gmem_copy.cuh"
 #include "comm/params.h"
-#include "comm/pipeline_stage.h"
-#include "comm/pipeline_tma_copy.h"
-#include "comm/pipeline_tma_load.h"
-#include "comm/pipeline_tma_reduce.h"
+#include "comm/pipeline/pipeline_stage.h"
+#include "comm/pipeline/pipeline_tma_copy.h"
+#include "comm/pipeline/pipeline_tma_load.h"
+#include "comm/pipeline/pipeline_tma_reduce.h"
 
 #include "ooverlap/system/peer_buffer.cuh"
 #include "ooverlap/system/runtime_utils.cuh"
@@ -126,7 +126,7 @@ __device__ void run_window_pipeline(
     size_t total_bytes,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    comm::PipelineTMALoad load{};
+    comm::pipeline::PipelineTMALoad load{};
     Apply apply{};
 
     for (int warm = 0; warm < FillDepth; ++warm) {
@@ -142,8 +142,8 @@ __device__ void run_window_pipeline(
         const size_t bytes =
             min_sz(kExperimentChunkBytes, total_bytes - offset);
 
-        comm::PipelineStage stage = comm::make_pipeline_stage(
-            comm::make_pipeline_chunk(
+        comm::pipeline::PipelineStage stage = comm::pipeline::make_pipeline_stage(
+            comm::pipeline::make_pipeline_chunk(
                 src_bytes + offset,
                 dst_bytes + offset,
                 bytes),
@@ -166,8 +166,8 @@ __device__ void run_window_pipeline(
         const size_t bytes =
             min_sz(kExperimentChunkBytes, total_bytes - offset);
 
-        comm::PipelineStage cur_stage = comm::make_pipeline_stage(
-            comm::make_pipeline_chunk(
+        comm::pipeline::PipelineStage cur_stage = comm::pipeline::make_pipeline_stage(
+            comm::pipeline::make_pipeline_chunk(
                 src_bytes + offset,
                 dst_bytes + offset,
                 bytes),
@@ -190,8 +190,8 @@ __device__ void run_window_pipeline(
             const size_t future_bytes =
                 min_sz(kExperimentChunkBytes, total_bytes - future_offset);
 
-            comm::PipelineStage future_stage = comm::make_pipeline_stage(
-                comm::make_pipeline_chunk(
+            comm::pipeline::PipelineStage future_stage = comm::pipeline::make_pipeline_stage(
+                comm::pipeline::make_pipeline_chunk(
                     src_bytes + future_offset,
                     dst_bytes + future_offset,
                     future_bytes),
@@ -248,7 +248,7 @@ __global__ void tma_pipeline_copy_kernel(
     __shared__ sync::semaphore barriers[kExperimentBarrierCount];
 
     using CopyApply =
-        comm::PipelineTMACopy<kExperimentStageDepth, kExperimentFillDepth>;
+        comm::pipeline::PipelineTMACopy<kExperimentStageDepth, kExperimentFillDepth>;
 
     run_window_pipeline<
         kExperimentStageDepth,
@@ -284,10 +284,10 @@ __global__ void tma_pipeline_reduce_add_f16_kernel(
     __shared__ sync::semaphore barriers[kExperimentBarrierCount];
 
     using ReduceApply =
-        comm::PipelineTMAReduce<
+        comm::pipeline::PipelineTMAReduce<
             kExperimentStageDepth,
             kExperimentFillDepth,
-            comm::PipelineReduceAddNoFtzF16>;
+            comm::pipeline::PipelineReduceAddNoFtzF16>;
 
     run_window_pipeline<
         kExperimentStageDepth,
@@ -431,28 +431,28 @@ void configure_experiment_kernels_once(int device) {
 
     configure_one_kernel(
         reinterpret_cast<const void*>(
-            comm::fast_copy::gmem_copy_coalesced_kernel<uint32_t>),
+            comm::kernels::fast_copy::gmem_copy_coalesced_kernel<uint32_t>),
         0,
         device,
         "gmem_copy_coalesced_kernel<uint32_t>");
 
     configure_one_kernel(
         reinterpret_cast<const void*>(
-            comm::fast_copy::gmem_copy_coalesced_kernel<uint2>),
+            comm::kernels::fast_copy::gmem_copy_coalesced_kernel<uint2>),
         0,
         device,
         "gmem_copy_coalesced_kernel<uint2>");
 
     configure_one_kernel(
         reinterpret_cast<const void*>(
-            comm::fast_copy::gmem_copy_coalesced_kernel<uint4>),
+            comm::kernels::fast_copy::gmem_copy_coalesced_kernel<uint4>),
         0,
         device,
         "gmem_copy_coalesced_kernel<uint4>");
 
     configure_one_kernel(
         reinterpret_cast<const void*>(
-            comm::fast_copy::gmem_add_f16_u128_kernel<4>),
+            comm::kernels::fast_copy::gmem_add_f16_u128_kernel<4>),
         0,
         device,
         "gmem_add_f16_u128_kernel<4>");
@@ -510,7 +510,7 @@ cudaError_t launch_method(
             return cudaGetLastError();
 
         case ExperimentMethod::kGmemCopyU32:
-            comm::fast_copy::gmem_copy_coalesced_kernel<uint32_t><<<
+            comm::kernels::fast_copy::gmem_copy_coalesced_kernel<uint32_t><<<
                 num_blocks,
                 kExperimentGmemThreads,
                 0,
@@ -521,7 +521,7 @@ cudaError_t launch_method(
             return cudaGetLastError();
 
         case ExperimentMethod::kGmemCopyU64:
-            comm::fast_copy::gmem_copy_coalesced_kernel<uint2><<<
+            comm::kernels::fast_copy::gmem_copy_coalesced_kernel<uint2><<<
                 num_blocks,
                 kExperimentGmemThreads,
                 0,
@@ -532,7 +532,7 @@ cudaError_t launch_method(
             return cudaGetLastError();
 
         case ExperimentMethod::kGmemCopyU128:
-            comm::fast_copy::gmem_copy_coalesced_kernel<uint4><<<
+            comm::kernels::fast_copy::gmem_copy_coalesced_kernel<uint4><<<
                 num_blocks,
                 kExperimentGmemThreads,
                 0,
@@ -543,7 +543,7 @@ cudaError_t launch_method(
             return cudaGetLastError();
 
         case ExperimentMethod::kGmemAddF16U128:
-            comm::fast_copy::gmem_add_f16_u128_kernel<4><<<
+            comm::kernels::fast_copy::gmem_add_f16_u128_kernel<4><<<
                 num_blocks,
                 kExperimentGmemThreads,
                 0,

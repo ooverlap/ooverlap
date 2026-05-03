@@ -79,16 +79,19 @@ target_link_libraries(ooverlap_system
 # -------------------------
 # Core public communication library
 # -------------------------
+# -------------------------
+# Core public communication library
+# -------------------------
 if(OOVERLAP_BUILD_CORE)
   set_source_files_properties(
-    ${OOVERLAP_SRC_DIR}/comm/tuning_policy.cpp
+    ${OOVERLAP_SRC_DIR}/comm/tuning/tuning_policy.cpp
     PROPERTIES LANGUAGE CUDA
   )
-  
+
   add_library(ooverlap_comm STATIC
     ${OOVERLAP_SRC_DIR}/comm/ooverlap_comm.cu
     ${OOVERLAP_SRC_DIR}/comm/tma_two_gpu_peer_allreduce_sm90.cu
-    ${OOVERLAP_SRC_DIR}/comm/tuning_policy.cpp
+    ${OOVERLAP_SRC_DIR}/comm/tuning/tuning_policy.cpp
   )
 
   add_library(ooverlap::comm ALIAS ooverlap_comm)

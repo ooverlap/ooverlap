@@ -935,7 +935,8 @@ __device__ __forceinline__ void copy_gmem_range_no_fence(
         return;
     }
 
-    comm::fast_copy::copy_byte_range<VecT, Unroll>(
+    // TODO: this is not good. It is like two namespace uses each other
+    comm::kernels::fast_copy::copy_byte_range<VecT, Unroll>(
         src_base,
         dst_base,
         begin_byte,

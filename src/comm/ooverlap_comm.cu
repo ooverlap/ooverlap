@@ -1,6 +1,6 @@
 #include "comm/ooverlap_comm_internal.h"
 
-#include "comm/plan/tma_two_gpu_peer_allreduce_sm90.h"
+#include "comm/tma_two_gpu_peer_allreduce_sm90.h"
 #include "ooverlap/system/logging.h"
 #include "comm/tuning/tuning_policy.h"
 

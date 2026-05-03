@@ -8,6 +8,7 @@
 
 namespace ooverlap {
 namespace comm {
+namespace kernels {
 namespace fast_copy {
 
 __host__ __device__ __forceinline__ size_t min_sz(size_t a, size_t b) {
@@ -534,5 +535,6 @@ __global__ void gmem_add_f16_u128_kernel(
 }
 
 } // namespace fast_copy
+} // namespace kernels
 } // namespace comm
 } // namespace ooverlap
