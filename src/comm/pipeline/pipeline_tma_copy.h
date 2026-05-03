@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/pipeline_stage.h"
+#include "comm/pipeline/pipeline_stage.h"
 #include "ooverlap/tma/tma.cuh"
 
 #include <cstddef>
@@ -8,6 +8,7 @@
 
 namespace ooverlap {
 namespace comm {
+namespace pipeline {
 
 template <int StageDepth, int FillDepth>
 struct PipelineTMACopy {
@@ -55,5 +56,6 @@ struct PipelineTMACopy {
     }
 };
 
+} // namespace pipeline
 } // namespace comm
 } // namespace ooverlap

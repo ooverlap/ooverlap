@@ -6,6 +6,7 @@
 
 namespace ooverlap {
 namespace comm {
+namespace pipeline {
 
 struct PipelineChunk {
     const unsigned char* src = nullptr;
@@ -51,5 +52,6 @@ __host__ __device__ __forceinline__ PipelineStage make_pipeline_stage(
     return stage;
 }
 
+} // namespace pipeline
 } // namespace comm
 } // namespace ooverlap

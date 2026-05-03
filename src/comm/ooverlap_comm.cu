@@ -1,8 +1,8 @@
 #include "comm/ooverlap_comm_internal.h"
 
-#include "comm/tma_two_gpu_peer_allreduce_sm90.h"
+#include "comm/plan/tma_two_gpu_peer_allreduce_sm90.h"
 #include "ooverlap/system/logging.h"
-#include "comm/tuning_policy.h"
+#include "comm/tuning/tuning_policy.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

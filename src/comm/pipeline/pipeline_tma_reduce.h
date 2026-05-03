@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/pipeline_stage.h"
+#include "comm/pipeline/pipeline_stage.h"
 #include "ooverlap/tma/tma_reduce.cuh"
 
 #include <cuda_bf16.h>
@@ -11,6 +11,7 @@
 
 namespace ooverlap {
 namespace comm {
+namespace pipeline {
 
 struct PipelineReduceAddF16 {
     using scalar_t = half;
@@ -211,5 +212,6 @@ struct PipelineTMAReduce {
     }
 };
 
+} // namespace pipeline
 } // namespace comm
 } // namespace ooverlap

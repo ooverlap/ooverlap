@@ -1,10 +1,10 @@
-#include "comm/tma_two_gpu_peer_allreduce_sm90.h"
+#include "comm/plan/tma_two_gpu_peer_allreduce_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
 
 #include "comm/launch_config.h"
 #include "comm/params.h"
-#include "comm/pipeline_tma_reduce.h"
+#include "comm/pipeline/pipeline_tma_reduce.h"
 #include "comm/tma_variant_config.h"
 #include "comm/utils.h"
 #include "comm/window_task.cuh"

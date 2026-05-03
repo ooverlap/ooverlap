@@ -1,9 +1,9 @@
 #pragma once
 
-#include "comm/fast_gmem_copy.cuh"
-#include "comm/pipeline_stage.h"
-#include "comm/pipeline_tma_copy.h"
-#include "comm/pipeline_tma_load.h"
+#include "comm/kernels/fast_gmem_copy.cuh"
+#include "comm/pipeline/pipeline_stage.h"
+#include "comm/pipeline/pipeline_tma_copy.h"
+#include "comm/pipeline/pipeline_tma_load.h"
 
 #include <cuda_runtime.h>
 
@@ -12,7 +12,7 @@
 
 namespace ooverlap {
 namespace comm {
-namespace window_pipeline {
+namespace pipeline {
 
 struct ChunkRange {
     int begin = 0;
@@ -1102,6 +1102,6 @@ __device__ void copy_window_range_gmem_after_ready(
     __syncthreads();
 }
 
-} // namespace window_pipeline
+} // namespace pipeline
 } // namespace comm
 } // namespace ooverlap
