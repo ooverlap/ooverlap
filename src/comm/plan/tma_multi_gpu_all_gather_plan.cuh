@@ -83,9 +83,12 @@ __host__ __device__ __forceinline__ comm::task::WindowTask make_all_gather_copy_
             terminal);
     }
 
+    // For tma it is better to change the src and dst
+    // TODO: fix this really bad workaround.
+    void* new_src = const_cast<void*>(src);
     return comm::task::make_copy_tma_task(
-        src,
         dst,
+        new_src,
         total_bytes,
         begin_window,
         end_window,
