@@ -1319,7 +1319,7 @@ oo_status_t oo_allreduce_offset_impl(
 
     return report_cuda_error(
         err,
-        "enqueue_tma_two_gpu_peer_allreduce_rank_sm90");
+        "enqueue_tma_multi_gpu_allreduce_rank_sm90");
 }
 
 oo_status_t oo_allreduce_offset_tuned(
