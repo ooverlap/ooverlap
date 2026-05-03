@@ -91,6 +91,7 @@ if(OOVERLAP_BUILD_CORE)
   add_library(ooverlap_comm STATIC
     ${OOVERLAP_SRC_DIR}/comm/ooverlap_comm.cu
     ${OOVERLAP_SRC_DIR}/comm/tma_multi_gpu_allreduce_sm90.cu
+    ${OOVERLAP_SRC_DIR}/comm/tma_multi_gpu_reduce_scatter_sm90.cu
     ${OOVERLAP_SRC_DIR}/comm/tuning/tuning_policy.cpp
   )
 
