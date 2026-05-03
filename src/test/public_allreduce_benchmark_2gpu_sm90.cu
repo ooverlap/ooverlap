@@ -174,11 +174,20 @@ void launch_public_once(
     oo_tuning_mode_t tuning_mode,
     cudaStream_t stream0,
     cudaStream_t stream1) {
+    oo_buffer_t* rank0_peers[] = {
+        rank1_buf
+    };
+
+    oo_buffer_t* rank1_peers[] = {
+        rank0_buf
+    };
+
     check_oo(
         oo_allreduce_tuned(
             node0,
             rank0_buf,
-            rank1_buf,
+            rank0_peers,
+            1,
             numel,
             OO_DTYPE_FLOAT16,
             OO_REDUCE_SUM,
@@ -190,7 +199,8 @@ void launch_public_once(
         oo_allreduce_tuned(
             node1,
             rank1_buf,
-            rank0_buf,
+            rank1_peers,
+            1,
             numel,
             OO_DTYPE_FLOAT16,
             OO_REDUCE_SUM,

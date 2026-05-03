@@ -530,10 +530,15 @@ bool tma_ipc_two_gpu_allreduce_rank_smoke_test(
                     oo_buffer_ptr(local_buf),
                     oo_buffer_ptr(peer_buf));
 
+            oo_buffer_t* peer_bufs[] = {
+                peer_buf
+            };
+
             st = oo_allreduce(
                 node,
                 local_buf,
-                peer_buf,
+                peer_bufs,
+                1,
                 static_cast<size_t>(numel),
                 OO_DTYPE_FLOAT16,
                 OO_REDUCE_SUM,

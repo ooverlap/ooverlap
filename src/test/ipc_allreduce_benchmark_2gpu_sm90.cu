@@ -396,11 +396,16 @@ double benchmark_ooverlap_ipc_rank(
 
         ctx.group->broker->sync();
 
+        oo_buffer_t* peer_bufs[] = {
+            ctx.peer_buf
+        };
+
         check_oo(
             oo_allreduce(
                 ctx.node,
                 ctx.local_buf,
-                ctx.peer_buf,
+                peer_bufs,
+                1,
                 static_cast<size_t>(numel),
                 OO_DTYPE_FLOAT16,
                 OO_REDUCE_SUM,
@@ -436,11 +441,16 @@ double benchmark_ooverlap_ipc_rank(
             local_device,
             stream,
             [&]() {
+                oo_buffer_t* peer_bufs[] = {
+                    ctx.peer_buf
+                };
+
                 check_oo(
                     oo_allreduce(
                         ctx.node,
                         ctx.local_buf,
-                        ctx.peer_buf,
+                        peer_bufs,
+                        1,
                         static_cast<size_t>(numel),
                         OO_DTYPE_FLOAT16,
                         OO_REDUCE_SUM,
@@ -634,11 +644,16 @@ std::map<std::string, double> benchmark_ipc_two_gpu_allreduce_rank_sm90(
 
             oo_ctx.group->broker->sync();
 
+            oo_buffer_t* peer_bufs[] = {
+                oo_ctx.peer_buf
+            };
+
             check_oo(
                 oo_allreduce(
                     oo_ctx.node,
                     oo_ctx.local_buf,
-                    oo_ctx.peer_buf,
+                    peer_bufs,
+                    1,
                     static_cast<size_t>(numel),
                     OO_DTYPE_FLOAT16,
                     OO_REDUCE_SUM,
