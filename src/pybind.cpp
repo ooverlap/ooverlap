@@ -268,6 +268,16 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev1") = 1,
         "Benchmark public oo_allreduce_tuned API vs NCCL in one process.");
 
+  m.def("benchmark_persistent_two_gpu_collective_sm90",
+      &ooverlap::benchmark_persistent_two_gpu_collective_sm90,
+      py::arg("collective"),
+      py::arg("numel"),
+      py::arg("iters"),
+      py::arg("warmup"),
+      py::arg("dev0") = 0,
+      py::arg("dev1") = 1,
+      "Benchmark persistent 2-GPU collective vs NCCL. collective: allreduce, reduce_scatter, all_gather");
+
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
       .def("cutlass_init", &OverlapImpl::CutlassInit)
