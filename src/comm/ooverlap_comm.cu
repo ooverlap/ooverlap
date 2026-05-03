@@ -1291,15 +1291,14 @@ oo_status_t oo_allreduce_offset_impl(
             transfer_bytes,
             preference);
 
-    cudaError_t err =
-        ooverlap::([&]() {
-            void* oo_peer_bufs__[] = {
-                peer_ptr
-            };
-            const int* oo_peer_ready_signals__[] = {
-                peer_ready_signal
-            };
-            return enqueue_tma_multi_gpu_allreduce_rank_sm90(
+    void* oo_peer_bufs__[] = {
+        peer_ptr
+    };
+    const int* oo_peer_ready_signals__[] = {
+        peer_ready_signal
+    };
+
+    cudaError_t err = ooverlap::enqueue_tma_multi_gpu_allreduce_rank_sm90(
                 local_ptr,
                 local_ptr,
                 oo_peer_bufs__,
@@ -1315,7 +1314,6 @@ oo_status_t oo_allreduce_offset_impl(
                 oo_peer_ready_signals__,
                 collective_epoch,
                 launch_config);
-        }());
 
     return report_cuda_error(
         err,

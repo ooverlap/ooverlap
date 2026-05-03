@@ -6,3 +6,4 @@ results/
 *png
 tmp/
 configs/
+compile_commands.json
