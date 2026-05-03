@@ -4,7 +4,7 @@
 #include "comm/ooverlap_comm.h"
 #include "comm/ooverlap_comm_internal.h"
 #include "comm/params.h"
-#include "comm/tma_two_gpu_peer_allreduce_sm90.h"
+#include "comm/tma_multi_gpu_allreduce_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/test_utils.cuh"
@@ -429,38 +429,56 @@ void launch_candidate_once(
     launch_config.plan_kind = launch_kernel_kind(kernel);
 
     cudaError_t err0 =
-        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            rank0_work,
-            rank0_work,
-            rank1_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            0,
-            dev0,
-            dev1,
-            stream0,
-            rank0_ready,
-            rank1_ready,
-            collective_epoch,
-            launch_config);
+        ([&]() {
+            void* oo_peer_bufs__[] = {
+                rank1_work
+            };
+            const int* oo_peer_ready_signals__[] = {
+                rank1_ready
+            };
+            return enqueue_tma_multi_gpu_allreduce_rank_sm90(
+                rank0_work,
+                rank0_work,
+                oo_peer_bufs__,
+                1,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                0,
+                2,
+                ((0) == 0 ? (dev0) : (dev1)),
+                stream0,
+                rank0_ready,
+                oo_peer_ready_signals__,
+                collective_epoch,
+                launch_config);
+        }());
 
     cudaError_t err1 =
-        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            rank1_work,
-            rank1_work,
-            rank0_work,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            1,
-            dev0,
-            dev1,
-            stream1,
-            rank1_ready,
-            rank0_ready,
-            collective_epoch,
-            launch_config);
+        ([&]() {
+            void* oo_peer_bufs__[] = {
+                rank0_work
+            };
+            const int* oo_peer_ready_signals__[] = {
+                rank0_ready
+            };
+            return enqueue_tma_multi_gpu_allreduce_rank_sm90(
+                rank1_work,
+                rank1_work,
+                oo_peer_bufs__,
+                1,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                1,
+                2,
+                ((1) == 0 ? (dev0) : (dev1)),
+                stream1,
+                rank1_ready,
+                oo_peer_ready_signals__,
+                collective_epoch,
+                launch_config);
+        }());
 
     system::runtime::check_cuda(err0, "enqueue sweep candidate rank0");
     system::runtime::check_cuda(err1, "enqueue sweep candidate rank1");

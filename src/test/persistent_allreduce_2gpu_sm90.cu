@@ -3,7 +3,7 @@
 #include "comm/launch_config.h"
 #include "comm/ooverlap_comm.h"
 #include "comm/ooverlap_comm_internal.h"
-#include "comm/tma_two_gpu_peer_allreduce_sm90.h"
+#include "comm/tma_multi_gpu_allreduce_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/test_utils.cuh"
@@ -312,39 +312,57 @@ void launch_unified_once(
     comm::LaunchConfig config = config_for_kind(kind);
 
     system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            rank0_in,
-            rank0_buf,
-            rank0_peer,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            0,
-            dev0,
-            dev1,
-            stream0,
-            rank0_ready,
-            rank1_ready,
-            collective_epoch,
-            config),
+        ([&]() {
+            void* oo_peer_bufs__[] = {
+                rank0_peer
+            };
+            const int* oo_peer_ready_signals__[] = {
+                rank1_ready
+            };
+            return enqueue_tma_multi_gpu_allreduce_rank_sm90(
+                rank0_in,
+                rank0_buf,
+                oo_peer_bufs__,
+                1,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                0,
+                2,
+                ((0) == 0 ? (dev0) : (dev1)),
+                stream0,
+                rank0_ready,
+                oo_peer_ready_signals__,
+                collective_epoch,
+                config);
+        }()),
         "enqueue unified allreduce rank0");
 
     system::runtime::check_cuda(
-        enqueue_tma_two_gpu_peer_allreduce_rank_sm90(
-            rank1_in,
-            rank1_buf,
-            rank1_peer,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            1,
-            dev0,
-            dev1,
-            stream1,
-            rank1_ready,
-            rank0_ready,
-            collective_epoch,
-            config),
+        ([&]() {
+            void* oo_peer_bufs__[] = {
+                rank1_peer
+            };
+            const int* oo_peer_ready_signals__[] = {
+                rank0_ready
+            };
+            return enqueue_tma_multi_gpu_allreduce_rank_sm90(
+                rank1_in,
+                rank1_buf,
+                oo_peer_bufs__,
+                1,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                1,
+                2,
+                ((1) == 0 ? (dev0) : (dev1)),
+                stream1,
+                rank1_ready,
+                oo_peer_ready_signals__,
+                collective_epoch,
+                config);
+        }()),
         "enqueue unified allreduce rank1");
 }
 
