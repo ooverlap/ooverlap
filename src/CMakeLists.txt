@@ -90,6 +90,9 @@ if(OOVERLAP_BUILD_CORE)
 
   add_library(ooverlap_comm STATIC
     ${OOVERLAP_SRC_DIR}/comm/ooverlap_comm.cu
+    ${OOVERLAP_SRC_DIR}/comm/ooverlap_allreduce.cu
+    ${OOVERLAP_SRC_DIR}/comm/ooverlap_reduce_scatter.cu
+    ${OOVERLAP_SRC_DIR}/comm/ooverlap_all_gather.cu
     ${OOVERLAP_SRC_DIR}/comm/tma_multi_gpu_allreduce_sm90.cu
     ${OOVERLAP_SRC_DIR}/comm/tma_multi_gpu_reduce_scatter_sm90.cu
     ${OOVERLAP_SRC_DIR}/comm/tma_multi_gpu_all_gather_sm90.cu

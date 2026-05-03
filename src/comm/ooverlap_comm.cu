@@ -1,15 +1,16 @@
-#include "comm/ooverlap_comm_internal.h"
+#include "comm/ooverlap_comm_private.h"
 
-#include "comm/tma_multi_gpu_allreduce_sm90.h"
-#include "ooverlap/system/logging.h"
 #include "comm/tuning/tuning_policy.h"
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include "ooverlap/system/runtime_utils.cuh"
+
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -17,57 +18,544 @@
 
 namespace {
 
-constexpr size_t kOoReadySignalBytes = sizeof(int);
+bool valid_group_size(int num_devices) {
+    return num_devices > 0 && num_devices <= kOoMaxLocalDevices;
+}
 
-oo_status_t report_cuda_error(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        OOVERLAP_LOG_ERROR(
-            "%s failed: %s\n",
-            what,
-            cudaGetErrorString(err));
-        return OO_ERROR_CUDA;
+std::vector<int> devices_vector(const int* devices, int num_devices) {
+    std::vector<int> out;
+    out.reserve(static_cast<size_t>(num_devices));
+
+    for (int i = 0; i < num_devices; ++i) {
+        out.push_back(devices[i]);
     }
+
+    return out;
+}
+
+void clear_ready_signal(oo_ready_signal& slot) {
+    if (slot.kind == oo_ready_signal_kind::owned_vmm) {
+        ooverlap::system::free_peer_visible_buffer(slot.owned_vmm);
+    } else if (slot.kind == oo_ready_signal_kind::owned_legacy) {
+        if (slot.owned_legacy_ptr != nullptr) {
+            if (slot.owner_device >= 0) {
+                ooverlap::system::runtime::set_device(slot.owner_device);
+            }
+            cudaFree(slot.owned_legacy_ptr);
+        }
+    } else if (slot.kind == oo_ready_signal_kind::imported_legacy ||
+               slot.kind == oo_ready_signal_kind::imported_vmm) {
+        slot.imported.reset();
+    }
+
+    slot.ptr = nullptr;
+    slot.bytes = 0;
+    slot.mapped_bytes = 0;
+    slot.owner_rank = -1;
+    slot.owner_device = -1;
+    slot.kind = oo_ready_signal_kind::empty;
+    slot.owned_legacy_ptr = nullptr;
+}
+
+void destroy_group_ready_signals(oo_group_t* group) {
+    if (group == nullptr) {
+        return;
+    }
+
+    for (int i = 0; i < kOoMaxLocalDevices; ++i) {
+        clear_ready_signal(group->ready_signal_slots[i]);
+        group->ready_signals[i] = {};
+    }
+}
+
+oo_status_t allocate_same_process_ready_signals(oo_group_t* group) {
+    if (group == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const std::vector<int> access_devices =
+        devices_vector(group->devices, group->num_devices);
+
+    for (int rank = 0; rank < group->num_devices; ++rank) {
+        const int device = group->devices[rank];
+
+        auto mapped =
+            ooverlap::system::alloc_peer_visible_buffer(
+                sizeof(int),
+                device,
+                access_devices);
+
+        ooverlap::system::runtime::set_device(device);
+        ooverlap::system::runtime::check_cuda(
+            cudaMemset(mapped.ptr, 0, sizeof(int)),
+            "cudaMemset(ready signal)");
+
+        oo_ready_signal& slot = group->ready_signal_slots[rank];
+        slot.ptr = mapped.ptr;
+        slot.bytes = sizeof(int);
+        slot.mapped_bytes = mapped.mapped_size;
+        slot.owner_rank = rank;
+        slot.owner_device = device;
+        slot.kind = oo_ready_signal_kind::owned_vmm;
+        slot.owned_vmm = mapped;
+
+        group->ready_signals[rank] = mapped;
+    }
+
     return OO_SUCCESS;
 }
 
-oo_status_t report_exception(const char* where, const std::exception& e) {
-    OOVERLAP_LOG_ERROR("%s threw: %s\n", where, e.what());
-    return OO_ERROR_INTERNAL;
-}
-
-oo_status_t report_unknown_exception(const char* where) {
-    OOVERLAP_LOG_ERROR("%s threw unknown exception\n", where);
-    return OO_ERROR_INTERNAL;
-}
-
-oo_status_t cuda_status_to_oo(cudaError_t err) {
-    return (err == cudaSuccess) ? OO_SUCCESS : OO_ERROR_CUDA;
-}
-
-bool valid_cuda_device(int device) {
-    int count = 0;
-    cudaError_t err = cudaGetDeviceCount(&count);
-    if (err != cudaSuccess) {
-        return false;
+oo_status_t allocate_ipc_ready_signals(oo_group_t* group) {
+    if (group == nullptr || group->broker == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
     }
-    return device >= 0 && device < count;
+
+    const int rank = group->local_rank;
+    const int world_size = group->local_world_size;
+
+    if (rank < 0 || rank >= world_size || world_size != group->num_devices) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const int local_device = group->devices[rank];
+
+    void* local_signal = nullptr;
+
+    ooverlap::system::runtime::set_device(local_device);
+    ooverlap::system::runtime::check_cuda(
+        cudaMalloc(&local_signal, sizeof(int)),
+        "cudaMalloc(ipc ready signal)");
+    ooverlap::system::runtime::check_cuda(
+        cudaMemset(local_signal, 0, sizeof(int)),
+        "cudaMemset(ipc ready signal)");
+
+    ooverlap::system::legacy_peer_buffer_descriptor local_desc =
+        ooverlap::system::export_legacy_peer_buffer(
+            local_signal,
+            sizeof(int),
+            local_device,
+            sizeof(int));
+
+    std::vector<ooverlap::system::legacy_peer_buffer_descriptor> descs(
+        static_cast<size_t>(world_size));
+
+    group->broker->exchange_data(
+        descs.data(),
+        &local_desc,
+        sizeof(local_desc));
+
+    group->broker->sync();
+
+    for (int r = 0; r < world_size; ++r) {
+        oo_ready_signal& slot = group->ready_signal_slots[r];
+
+        if (r == rank) {
+            slot.ptr = local_signal;
+            slot.bytes = sizeof(int);
+            slot.mapped_bytes = sizeof(int);
+            slot.owner_rank = r;
+            slot.owner_device = local_device;
+            slot.kind = oo_ready_signal_kind::owned_legacy;
+            slot.owned_legacy_ptr = local_signal;
+            continue;
+        }
+
+        auto imported =
+            ooverlap::system::import_legacy_peer_buffer(
+                descs[static_cast<size_t>(r)],
+                std::vector<int>{local_device});
+
+        slot.ptr = imported.ptr;
+        slot.bytes = imported.bytes;
+        slot.mapped_bytes = imported.mapped_size;
+        slot.owner_rank = r;
+        slot.owner_device = imported.owner_device;
+        slot.kind = oo_ready_signal_kind::imported_legacy;
+        slot.imported = std::move(imported);
+    }
+
+    group->broker->sync();
+
+    return OO_SUCCESS;
 }
 
-bool checked_mul_size(size_t a, size_t b, size_t* out) {
+void destroy_buffer_storage(oo_buffer_t* buffer) {
+    if (buffer == nullptr) {
+        return;
+    }
+
+    if (buffer->system_kind == ooverlap::system::peer_buffer_kind::owned_vmm) {
+        ooverlap::system::free_peer_visible_buffer(buffer->mapped);
+    } else if (
+        buffer->system_kind == ooverlap::system::peer_buffer_kind::imported_legacy ||
+        buffer->system_kind == ooverlap::system::peer_buffer_kind::imported_vmm) {
+        buffer->imported.reset();
+    }
+
+    buffer->ptr = nullptr;
+    buffer->bytes = 0;
+    buffer->mapped_bytes = 0;
+    buffer->group = nullptr;
+    buffer->owner_rank = -1;
+    buffer->owner_device = -1;
+    buffer->system_kind = ooverlap::system::peer_buffer_kind::empty;
+}
+
+} // namespace
+
+namespace ooverlap {
+namespace comm {
+namespace api {
+
+oo_status_t exception_to_status() {
+    try {
+        throw;
+    } catch (const std::invalid_argument&) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    } catch (const std::out_of_range&) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    } catch (const std::bad_alloc&) {
+        return OO_ERROR_INTERNAL;
+    } catch (const std::exception&) {
+        return OO_ERROR_INTERNAL;
+    } catch (...) {
+        return OO_ERROR_INTERNAL;
+    }
+}
+
+oo_status_t cuda_to_status(cudaError_t error) {
+    if (error == cudaSuccess) {
+        return OO_SUCCESS;
+    }
+
+    if (error == cudaErrorInvalidDevice) {
+        return OO_ERROR_INVALID_DEVICE;
+    }
+
+    if (error == cudaErrorInvalidValue) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    return OO_ERROR_CUDA;
+}
+
+oo_status_t checked_element_bytes(
+    size_t count,
+    oo_dtype_t dtype,
+    size_t* out_bytes) {
+    if (out_bytes == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const size_t dtype_size = oo_dtype_size(dtype);
+
+    if (dtype_size == 0) {
+        return OO_ERROR_UNSUPPORTED;
+    }
+
+    if (count > static_cast<size_t>(-1) / dtype_size) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_bytes = count * dtype_size;
+    return OO_SUCCESS;
+}
+
+oo_status_t checked_element_offset_bytes(
+    size_t element_offset,
+    oo_dtype_t dtype,
+    size_t* out_offset_bytes) {
+    if (out_offset_bytes == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const size_t dtype_size = oo_dtype_size(dtype);
+
+    if (dtype_size == 0) {
+        return OO_ERROR_UNSUPPORTED;
+    }
+
+    if (element_offset > static_cast<size_t>(-1) / dtype_size) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_offset_bytes = element_offset * dtype_size;
+    return OO_SUCCESS;
+}
+
+oo_status_t fill_rank_partition(
+    int rank,
+    int world_size,
+    size_t count,
+    size_t* out_element_offset,
+    size_t* out_count) {
+    if (out_element_offset == nullptr || out_count == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_element_offset = 0;
+    *out_count = 0;
+
+    if (world_size <= 0 || rank < 0 || rank >= world_size) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const size_t world = static_cast<size_t>(world_size);
+    const size_t r = static_cast<size_t>(rank);
+
+    const size_t base = count / world;
+    const size_t rem = count % world;
+
+    *out_element_offset = r * base + ((r < rem) ? r : rem);
+    *out_count = base + ((r < rem) ? 1 : 0);
+
+    return OO_SUCCESS;
+}
+
+oo_status_t fill_tensor_slice(
+    oo_buffer_t* local,
+    int rank,
+    int world_size,
+    size_t base_element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_tensor_slice_t* out_slice) {
+    if (out_slice == nullptr) {
+        return OO_SUCCESS;
+    }
+
+    if (local == nullptr || local->ptr == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    size_t local_offset = 0;
+    size_t local_count = 0;
+
+    oo_status_t status =
+        fill_rank_partition(
+            rank,
+            world_size,
+            count,
+            &local_offset,
+            &local_count);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
+    size_t absolute_offset = base_element_offset + local_offset;
+
+    if (absolute_offset < base_element_offset) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    size_t absolute_offset_bytes = 0;
+
+    status =
+        checked_element_offset_bytes(
+            absolute_offset,
+            dtype,
+            &absolute_offset_bytes);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
+    const size_t dtype_size = oo_dtype_size(dtype);
+
+    if (dtype_size == 0) {
+        return OO_ERROR_UNSUPPORTED;
+    }
+
+    if (local_count > static_cast<size_t>(-1) / dtype_size) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const size_t local_bytes = local_count * dtype_size;
+
+    if (absolute_offset_bytes > local->bytes ||
+        local_bytes > local->bytes - absolute_offset_bytes) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    out_slice->element_offset = absolute_offset;
+    out_slice->count = local_count;
+    out_slice->ptr =
+        reinterpret_cast<void*>(
+            reinterpret_cast<std::uint8_t*>(local->ptr) +
+            absolute_offset_bytes);
+
+    return OO_SUCCESS;
+}
+
+LaunchConfig select_public_launch_config(
+    size_t bytes,
+    oo_tuning_mode_t tuning_mode) {
+    return select_launch_config_for_allreduce(
+        bytes,
+        tuning_preference_from_public(tuning_mode));
+}
+
+oo_status_t prepare_collective_launch(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    CollectiveLaunchState* out) {
     if (out == nullptr) {
-        return false;
+        return OO_ERROR_INVALID_ARGUMENT;
     }
-    if (a != 0 && b > static_cast<size_t>(-1) / a) {
-        return false;
+
+    *out = CollectiveLaunchState{};
+
+    if (node == nullptr ||
+        node->group == nullptr ||
+        local == nullptr ||
+        local->ptr == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
     }
-    *out = a * b;
-    return true;
+
+    oo_group_t* group = node->group;
+
+    if (!valid_group_size(group->num_devices)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (node->rank < 0 || node->rank >= group->num_devices) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (node->device != group->devices[node->rank]) {
+        return OO_ERROR_INVALID_DEVICE;
+    }
+
+    if (peer_count != group->num_devices - 1 ||
+        peer_count < 0 ||
+        peer_count > kMaxPublicPeers) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (peer_count > 0 && peers == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (local->group != group ||
+        local->owner_rank != node->rank ||
+        local->owner_device != node->device) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    size_t bytes = 0;
+    oo_status_t status = checked_element_bytes(count, dtype, &bytes);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
+    size_t offset_bytes = 0;
+    status = checked_element_offset_bytes(element_offset, dtype, &offset_bytes);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
+    if (offset_bytes > local->bytes || bytes > local->bytes - offset_bytes) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    out->local_ptr =
+        reinterpret_cast<void*>(
+            reinterpret_cast<std::uint8_t*>(local->ptr) + offset_bytes);
+
+    bool seen_rank[kOoMaxLocalDevices] = {};
+
+    for (int peer_idx = 0; peer_idx < peer_count; ++peer_idx) {
+        oo_buffer_t* peer = peers[peer_idx];
+
+        if (peer == nullptr || peer->ptr == nullptr || peer->group != group) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (peer->owner_rank == node->rank ||
+            peer->owner_rank < 0 ||
+            peer->owner_rank >= group->num_devices) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (seen_rank[peer->owner_rank]) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        seen_rank[peer->owner_rank] = true;
+
+        if (offset_bytes > peer->bytes || bytes > peer->bytes - offset_bytes) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        out->peer_ptrs[peer_idx] =
+            reinterpret_cast<void*>(
+                reinterpret_cast<std::uint8_t*>(peer->ptr) + offset_bytes);
+
+        const oo_ready_signal& ready =
+            group->ready_signal_slots[peer->owner_rank];
+
+        out->peer_ready_signals[peer_idx] =
+            reinterpret_cast<const int*>(ready.ptr);
+    }
+
+    out->peer_count = peer_count;
+    out->local_ready_signal =
+        reinterpret_cast<int*>(
+            group->ready_signal_slots[node->rank].ptr);
+    out->rank = node->rank;
+    out->world_size = group->num_devices;
+    out->local_device = node->device;
+    out->collective_epoch = ++node->collective_epoch;
+    out->dtype_size = oo_dtype_size(dtype);
+    out->bytes = bytes;
+
+    return OO_SUCCESS;
 }
 
-bool reduce_op_supported_for_dtype(
+} // namespace api
+} // namespace comm
+} // namespace ooverlap
+
+extern "C" size_t oo_dtype_size(
+    oo_dtype_t dtype) {
+    switch (dtype) {
+        case OO_DTYPE_FLOAT16:
+            return 2;
+        case OO_DTYPE_BFLOAT16:
+            return 2;
+        case OO_DTYPE_FLOAT32:
+            return 4;
+        default:
+            return 0;
+    }
+}
+
+extern "C" oo_status_t oo_rank_partition(
+    int rank,
+    int world_size,
+    size_t count,
+    size_t* out_element_offset,
+    size_t* out_count) {
+    return ooverlap::comm::api::fill_rank_partition(
+        rank,
+        world_size,
+        count,
+        out_element_offset,
+        out_count);
+}
+
+extern "C" int oo_allreduce_supported(
     oo_dtype_t dtype,
     oo_reduce_op_t op) {
-    if (op == OO_REDUCE_ADD) {
+    if (op == OO_REDUCE_ADD || op == OO_REDUCE_SUM) {
         return dtype == OO_DTYPE_FLOAT16 ||
                dtype == OO_DTYPE_BFLOAT16 ||
                dtype == OO_DTYPE_FLOAT32;
@@ -78,715 +566,73 @@ bool reduce_op_supported_for_dtype(
                dtype == OO_DTYPE_BFLOAT16;
     }
 
-    return false;
+    return 0;
 }
 
-bool same_group(const oo_group_t* a, const oo_group_t* b) {
-    return a != nullptr && b != nullptr && a == b;
-}
-
-int find_rank_for_device(const oo_group_t* group, int device) {
-    if (group == nullptr) {
-        return -1;
-    }
-
-    for (int r = 0; r < group->num_devices; ++r) {
-        if (group->devices[r] == device) {
-            return r;
-        }
-    }
-
-    return -1;
-}
-
-std::vector<int> group_devices_vector(const oo_group_t* group) {
-    std::vector<int> out;
-    if (group == nullptr) {
-        return out;
-    }
-
-    out.reserve(static_cast<size_t>(group->num_devices));
-    for (int i = 0; i < group->num_devices; ++i) {
-        out.push_back(group->devices[i]);
-    }
-
-    return out;
-}
-
-void clear_ready_signal_slot(oo_ready_signal& slot) {
-    slot.ptr = nullptr;
-    slot.bytes = 0;
-    slot.mapped_bytes = 0;
-    slot.owner_rank = -1;
-    slot.owner_device = -1;
-    slot.kind = oo_ready_signal_kind::empty;
-    slot.owned_legacy_ptr = nullptr;
-}
-
-void free_ready_signal_slot(oo_ready_signal& slot) {
-    switch (slot.kind) {
-        case oo_ready_signal_kind::owned_vmm:
-            ooverlap::system::free_peer_visible_buffer(slot.owned_vmm);
-            break;
-
-        case oo_ready_signal_kind::owned_legacy:
-            if (slot.owned_legacy_ptr != nullptr) {
-                if (slot.owner_device >= 0) {
-                    cudaSetDevice(slot.owner_device);
-                }
-                cudaFree(slot.owned_legacy_ptr);
-                slot.owned_legacy_ptr = nullptr;
-            }
-            break;
-
-        case oo_ready_signal_kind::imported_legacy:
-            if (slot.ptr != nullptr) {
-                cudaIpcCloseMemHandle(slot.ptr);
-            }
-            break;
-
-        case oo_ready_signal_kind::imported_vmm:
-            slot.imported.reset();
-            break;
-
-        case oo_ready_signal_kind::empty:
-        default:
-            break;
-    }
-
-    clear_ready_signal_slot(slot);
-}
-
-void mirror_ready_signal_for_compat(oo_group_t* group, int rank) {
-    if (group == nullptr || rank < 0 || rank >= group->num_devices) {
-        return;
-    }
-
-    oo_ready_signal& slot = group->ready_signal_slots[rank];
-    group->ready_signals[rank].ptr = slot.ptr;
-    group->ready_signals[rank].mapped_size = slot.mapped_bytes;
-    group->ready_signals[rank].requested_size = slot.bytes;
-    group->ready_signals[rank].owner_device = slot.owner_device;
-}
-
-void clear_ready_signal_compat_mirror(oo_group_t* group, int rank) {
-    if (group == nullptr || rank < 0 || rank >= kOoMaxLocalDevices) {
-        return;
-    }
-
-    group->ready_signals[rank].ptr = nullptr;
-    group->ready_signals[rank].mapped_size = 0;
-    group->ready_signals[rank].requested_size = 0;
-    group->ready_signals[rank].owner_device = -1;
-}
-
-void free_group_ready_signals_same_process(oo_group_t* group) {
-    if (group == nullptr) {
-        return;
-    }
-
-    for (int r = 0; r < group->num_devices; ++r) {
-        free_ready_signal_slot(group->ready_signal_slots[r]);
-        clear_ready_signal_compat_mirror(group, r);
-    }
-}
-
-void free_group_ready_signals_ipc(oo_group_t* group) {
-    if (group == nullptr) {
-        return;
-    }
-
-    try {
-        if (group->broker) {
-            group->broker->sync();
-        }
-    } catch (...) {
-    }
-
-    for (int r = 0; r < group->num_devices; ++r) {
-        oo_ready_signal& slot = group->ready_signal_slots[r];
-        if (slot.kind == oo_ready_signal_kind::imported_legacy ||
-            slot.kind == oo_ready_signal_kind::imported_vmm) {
-            free_ready_signal_slot(slot);
-            clear_ready_signal_compat_mirror(group, r);
-        }
-    }
-
-    try {
-        if (group->broker) {
-            group->broker->sync();
-        }
-    } catch (...) {
-    }
-
-    const int local_rank = group->local_rank;
-    if (local_rank >= 0 && local_rank < group->num_devices) {
-        oo_ready_signal& local_slot = group->ready_signal_slots[local_rank];
-        if (local_slot.kind == oo_ready_signal_kind::owned_legacy ||
-            local_slot.kind == oo_ready_signal_kind::owned_vmm) {
-            free_ready_signal_slot(local_slot);
-            clear_ready_signal_compat_mirror(group, local_rank);
-        }
-    }
-
-    try {
-        if (group->broker) {
-            group->broker->sync();
-        }
-    } catch (...) {
-    }
-}
-
-void free_group_ready_signals(oo_group_t* group) {
-    if (group == nullptr) {
-        return;
-    }
-
-    if (group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc) {
-        free_group_ready_signals_ipc(group);
-    } else {
-        free_group_ready_signals_same_process(group);
-    }
-}
-
-oo_status_t init_group_ready_signals_same_process(oo_group_t* group) {
-    if (group == nullptr || group->num_devices <= 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    try {
-        std::vector<int> access_devices = group_devices_vector(group);
-
-        for (int rank = 0; rank < group->num_devices; ++rank) {
-            oo_ready_signal& slot = group->ready_signal_slots[rank];
-
-            slot.owned_vmm =
-                ooverlap::system::alloc_peer_visible_buffer(
-                    kOoReadySignalBytes,
-                    group->devices[rank],
-                    access_devices);
-
-            slot.ptr = slot.owned_vmm.ptr;
-            slot.bytes = kOoReadySignalBytes;
-            slot.mapped_bytes = slot.owned_vmm.mapped_size;
-            slot.owner_rank = rank;
-            slot.owner_device = group->devices[rank];
-            slot.kind = oo_ready_signal_kind::owned_vmm;
-
-            mirror_ready_signal_for_compat(group, rank);
-
-            cudaError_t set_err = cudaSetDevice(group->devices[rank]);
-            if (set_err != cudaSuccess) {
-                free_group_ready_signals_same_process(group);
-                return OO_ERROR_CUDA;
-            }
-
-            cudaError_t memset_err = cudaMemset(
-                slot.ptr,
-                0,
-                slot.mapped_bytes);
-            if (memset_err != cudaSuccess) {
-                free_group_ready_signals_same_process(group);
-                return OO_ERROR_CUDA;
-            }
-        }
-    } catch (const std::bad_alloc&) {
-        free_group_ready_signals_same_process(group);
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception&) {
-        free_group_ready_signals_same_process(group);
-        return OO_ERROR_CUDA;
-    } catch (...) {
-        free_group_ready_signals_same_process(group);
-        return OO_ERROR_INTERNAL;
-    }
-
-    return OO_SUCCESS;
-}
-
-oo_status_t init_group_ready_signals_ipc(oo_group_t* group) {
-    if (group == nullptr ||
-        group->num_devices <= 0 ||
-        group->local_rank < 0 ||
-        group->local_rank >= group->num_devices ||
-        !group->broker) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    const int local_rank = group->local_rank;
-    const int signal_owner_rank = 0;
-    const int signal_owner_device = group->devices[signal_owner_rank];
-
-    const size_t signal_block_bytes =
-        static_cast<size_t>(group->num_devices) * kOoReadySignalBytes;
-
-    struct ready_signal_block_desc {
-        cudaIpcMemHandle_t handle{};
-        std::uint64_t bytes = 0;
-        int owner_rank = -1;
-        int owner_device = -1;
-    };
-
-    auto cleanup_ready_signals_local_only = [&]() {
-        for (int r = 0; r < group->num_devices; ++r) {
-            oo_ready_signal& slot = group->ready_signal_slots[r];
-
-            if (slot.kind == oo_ready_signal_kind::owned_legacy) {
-                if (slot.owned_legacy_ptr != nullptr) {
-                    cudaSetDevice(slot.owner_device);
-                    cudaFree(slot.owned_legacy_ptr);
-                }
-            } else if (slot.kind == oo_ready_signal_kind::imported_legacy) {
-                if (slot.ptr != nullptr) {
-                    cudaIpcCloseMemHandle(slot.ptr);
-                }
-            } else if (slot.kind == oo_ready_signal_kind::owned_vmm ||
-                       slot.kind == oo_ready_signal_kind::imported_vmm) {
-                free_ready_signal_slot(slot);
-            }
-
-            clear_ready_signal_slot(slot);
-            clear_ready_signal_compat_mirror(group, r);
-        }
-    };
-
-    try {
-        void* signal_base = nullptr;
-        ready_signal_block_desc local_desc{};
-
-        if (local_rank == signal_owner_rank) {
-            cudaError_t err = cudaSetDevice(signal_owner_device);
-            if (err != cudaSuccess) {
-                return report_cuda_error(err, "cudaSetDevice(signal_owner_device)");
-            }
-
-            err = cudaMalloc(&signal_base, signal_block_bytes);
-            if (err != cudaSuccess) {
-                return report_cuda_error(err, "cudaMalloc(legacy ready-signal block)");
-            }
-
-            err = cudaMemset(signal_base, 0, signal_block_bytes);
-            if (err != cudaSuccess) {
-                cudaFree(signal_base);
-                return report_cuda_error(err, "cudaMemset(legacy ready-signal block)");
-            }
-
-            local_desc.bytes = static_cast<std::uint64_t>(signal_block_bytes);
-            local_desc.owner_rank = signal_owner_rank;
-            local_desc.owner_device = signal_owner_device;
-
-            err = cudaIpcGetMemHandle(&local_desc.handle, signal_base);
-            if (err != cudaSuccess) {
-                cudaFree(signal_base);
-                return report_cuda_error(err, "cudaIpcGetMemHandle(ready-signal block)");
-            }
-
-            oo_ready_signal& owner_slot = group->ready_signal_slots[signal_owner_rank];
-            owner_slot.ptr = signal_base;
-            owner_slot.bytes = signal_block_bytes;
-            owner_slot.mapped_bytes = signal_block_bytes;
-            owner_slot.owner_rank = signal_owner_rank;
-            owner_slot.owner_device = signal_owner_device;
-            owner_slot.kind = oo_ready_signal_kind::owned_legacy;
-            owner_slot.owned_legacy_ptr = signal_base;
-        }
-
-        static_assert(
-            sizeof(ready_signal_block_desc) <=
-                ooverlap::system::broker_detail::VAULT_SIZE_PER_RANK,
-            "ready_signal_block_desc does not fit in Broker exchange vault");
-
-        std::vector<ready_signal_block_desc> all_desc(
-            static_cast<size_t>(group->num_devices));
-
-        OOVERLAP_LOG_DEBUG(
-            "ready signal before broker exchange_data rank=%d broker.get()=%p group=%p sizeof(Broker)=%zu\n",
-            local_rank,
-            static_cast<void*>(group->broker.get()),
-            static_cast<void*>(group),
-            sizeof(ooverlap::system::Broker));
-
-        group->broker->exchange_data(
-            all_desc.data(),
-            &local_desc,
-            sizeof(local_desc));
-
-        const ready_signal_block_desc signal_desc = all_desc[signal_owner_rank];
-
-        if (signal_desc.bytes != signal_block_bytes ||
-            signal_desc.owner_rank != signal_owner_rank ||
-            signal_desc.owner_device != signal_owner_device) {
-            OOVERLAP_LOG_ERROR(
-                "bad legacy ready-signal descriptor: bytes=%llu owner_rank=%d owner_device=%d expected_bytes=%llu expected_owner_rank=%d expected_owner_device=%d\n",
-                static_cast<unsigned long long>(signal_desc.bytes),
-                signal_desc.owner_rank,
-                signal_desc.owner_device,
-                static_cast<unsigned long long>(signal_block_bytes),
-                signal_owner_rank,
-                signal_owner_device);
-
-            cleanup_ready_signals_local_only();
-            return OO_ERROR_INTERNAL;
-        }
-
-        if (local_rank != signal_owner_rank) {
-            cudaError_t err = cudaSetDevice(group->devices[local_rank]);
-            if (err != cudaSuccess) {
-                cleanup_ready_signals_local_only();
-                return report_cuda_error(err, "cudaSetDevice(before ready-signal import)");
-            }
-
-            err = cudaIpcOpenMemHandle(
-                &signal_base,
-                signal_desc.handle,
-                cudaIpcMemLazyEnablePeerAccess);
-
-            if (err != cudaSuccess) {
-                OOVERLAP_LOG_ERROR(
-                    "cudaIpcOpenMemHandle(ready-signal block) failed local_rank=%d local_device=%d owner_device=%d: %s\n",
-                    local_rank,
-                    group->devices[local_rank],
-                    signal_owner_device,
-                    cudaGetErrorString(err));
-
-                cleanup_ready_signals_local_only();
-                return OO_ERROR_CUDA;
-            }
-
-            oo_ready_signal& imported_owner_slot =
-                group->ready_signal_slots[signal_owner_rank];
-
-            imported_owner_slot.ptr = signal_base;
-            imported_owner_slot.bytes = signal_block_bytes;
-            imported_owner_slot.mapped_bytes = signal_block_bytes;
-            imported_owner_slot.owner_rank = signal_owner_rank;
-            imported_owner_slot.owner_device = signal_owner_device;
-            imported_owner_slot.kind = oo_ready_signal_kind::imported_legacy;
-        }
-
-        if (signal_base == nullptr) {
-            cleanup_ready_signals_local_only();
-            return OO_ERROR_INTERNAL;
-        }
-
-        for (int rank = 0; rank < group->num_devices; ++rank) {
-            oo_ready_signal& slot = group->ready_signal_slots[rank];
-
-            void* slot_ptr = reinterpret_cast<void*>(
-                reinterpret_cast<std::uint8_t*>(signal_base) +
-                static_cast<size_t>(rank) * kOoReadySignalBytes);
-
-            if (rank == signal_owner_rank) {
-                slot.ptr = slot_ptr;
-                slot.bytes = kOoReadySignalBytes;
-                slot.mapped_bytes = kOoReadySignalBytes;
-                slot.owner_rank = rank;
-                slot.owner_device = group->devices[rank];
-
-                if (local_rank == signal_owner_rank) {
-                    slot.kind = oo_ready_signal_kind::owned_legacy;
-                    slot.owned_legacy_ptr = signal_base;
-                } else {
-                    slot.kind = oo_ready_signal_kind::imported_legacy;
-                }
-            } else {
-                slot.ptr = slot_ptr;
-                slot.bytes = kOoReadySignalBytes;
-                slot.mapped_bytes = kOoReadySignalBytes;
-                slot.owner_rank = rank;
-                slot.owner_device = group->devices[rank];
-                slot.kind = oo_ready_signal_kind::empty;
-            }
-
-            mirror_ready_signal_for_compat(group, rank);
-        }
-
-        group->broker->sync();
-
-        return OO_SUCCESS;
-
-    } catch (const std::bad_alloc&) {
-        cleanup_ready_signals_local_only();
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception& e) {
-        cleanup_ready_signals_local_only();
-        return report_exception("init_group_ready_signals_ipc", e);
-    } catch (...) {
-        cleanup_ready_signals_local_only();
-        return report_unknown_exception("init_group_ready_signals_ipc");
-    }
-}
-
-oo_status_t init_group_ready_signals(oo_group_t* group) {
-    if (group == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc) {
-        return init_group_ready_signals_ipc(group);
-    }
-
-    return init_group_ready_signals_same_process(group);
-}
-
-bool buffer_is_valid_for_allreduce(
-    const oo_buffer_t* buffer,
-    size_t required_bytes) {
-    if (buffer == nullptr) {
-        return false;
-    }
-    if (buffer->ptr == nullptr) {
-        return false;
-    }
-    if (buffer->bytes < required_bytes) {
-        return false;
-    }
-    if (buffer->mapped_bytes < required_bytes) {
-        return false;
-    }
-    if (buffer->owner_device < 0) {
-        return false;
-    }
-    if (buffer->system_kind == ooverlap::system::peer_buffer_kind::empty) {
-        return false;
-    }
-
-    return true;
-}
-
-bool buffer_is_imported(const oo_buffer_t* buffer) {
-    return buffer != nullptr &&
-           (buffer->system_kind == ooverlap::system::peer_buffer_kind::imported_legacy ||
-            buffer->system_kind == ooverlap::system::peer_buffer_kind::imported_vmm);
-}
-
-void initialize_buffer_from_view(
-    oo_buffer_t* buffer,
-    oo_node_t* node,
-    const ooverlap::system::peer_buffer_view& view,
-    oo_buffer_kind_t public_kind) {
-    buffer->ptr = view.ptr;
-    buffer->bytes = view.bytes;
-    buffer->mapped_bytes = view.mapped_size;
-    buffer->kind = public_kind;
-    buffer->group = node->group;
-    buffer->owner_device = view.owner_device;
-    buffer->owner_rank = find_rank_for_device(node->group, view.owner_device);
-    buffer->system_kind = view.kind;
-}
-
-} // namespace
-
-oo_status_t oo_buffer_export_legacy_descriptor(
-    oo_buffer_t* buffer,
-    ooverlap::system::legacy_peer_buffer_descriptor* out_desc) {
-    if (buffer == nullptr || out_desc == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-    if (buffer->ptr == nullptr || buffer->bytes == 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-    if (buffer->owner_device < 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (buffer->system_kind == ooverlap::system::peer_buffer_kind::owned_vmm ||
-        buffer->kind == OO_BUFFER_KIND_VMM) {
-        return OO_ERROR_UNSUPPORTED;
-    }
-
-    try {
-        *out_desc = ooverlap::system::export_legacy_peer_buffer(
-            buffer->ptr,
-            buffer->bytes,
-            buffer->owner_device,
-            buffer->mapped_bytes != 0 ? buffer->mapped_bytes : buffer->bytes);
-    } catch (const std::bad_alloc&) {
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception&) {
-        return OO_ERROR_CUDA;
-    } catch (...) {
-        return OO_ERROR_INTERNAL;
-    }
-
-    return OO_SUCCESS;
-}
-
-oo_status_t oo_buffer_import_legacy_descriptor(
-    oo_node_t* node,
-    const ooverlap::system::legacy_peer_buffer_descriptor& desc,
-    oo_buffer_t** out_buffer) {
-    if (out_buffer == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-    *out_buffer = nullptr;
-
-    if (node == nullptr || node->group == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-    if (desc.bytes == 0 || desc.mapped_size == 0 || desc.owner_device < 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    const int owner_rank = find_rank_for_device(node->group, desc.owner_device);
-    if (owner_rank < 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    oo_buffer_t* buffer = new (std::nothrow) oo_buffer_t;
-    if (buffer == nullptr) {
-        return OO_ERROR_INTERNAL;
-    }
-
-    try {
-        std::vector<int> access_devices = group_devices_vector(node->group);
-
-        cudaError_t set_err = cudaSetDevice(node->device);
-        if (set_err != cudaSuccess) {
-            delete buffer;
-            return OO_ERROR_CUDA;
-        }
-
-        ooverlap::system::imported_peer_buffer imported =
-            ooverlap::system::import_legacy_peer_buffer(
-                desc,
-                access_devices);
-
-        ooverlap::system::peer_buffer_view view = imported.view();
-        initialize_buffer_from_view(buffer, node, view, OO_BUFFER_KIND_WRAPPED);
-
-        buffer->owner_rank = owner_rank;
-        buffer->imported = std::move(imported);
-
-    } catch (const std::bad_alloc&) {
-        delete buffer;
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception&) {
-        delete buffer;
-        return OO_ERROR_CUDA;
-    } catch (...) {
-        delete buffer;
-        return OO_ERROR_INTERNAL;
-    }
-
-    *out_buffer = buffer;
-    return OO_SUCCESS;
-}
-
-oo_status_t oo_buffer_adopt_imported_peer_buffer(
-    oo_node_t* node,
-    ooverlap::system::imported_peer_buffer&& imported,
-    oo_buffer_t** out_buffer) {
-    if (out_buffer == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-    *out_buffer = nullptr;
-
-    if (node == nullptr || node->group == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-    if (!imported.valid()) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    const int owner_rank = find_rank_for_device(node->group, imported.owner_device);
-    if (owner_rank < 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    oo_buffer_t* buffer = new (std::nothrow) oo_buffer_t;
-    if (buffer == nullptr) {
-        return OO_ERROR_INTERNAL;
-    }
-
-    ooverlap::system::peer_buffer_view view = imported.view();
-    initialize_buffer_from_view(buffer, node, view, OO_BUFFER_KIND_WRAPPED);
-    buffer->owner_rank = owner_rank;
-    buffer->imported = std::move(imported);
-
-    *out_buffer = buffer;
-    return OO_SUCCESS;
-}
-
-extern "C" {
-
-size_t oo_dtype_size(
-    oo_dtype_t dtype) {
-    switch (dtype) {
-        case OO_DTYPE_FLOAT16:
-            return sizeof(half);
-        case OO_DTYPE_BFLOAT16:
-            return sizeof(__nv_bfloat16);
-        case OO_DTYPE_FLOAT32:
-            return sizeof(float);
-        default:
-            return 0;
-    }
-}
-
-int oo_allreduce_supported(
+extern "C" int oo_reduce_scatter_supported(
     oo_dtype_t dtype,
     oo_reduce_op_t op) {
-    return reduce_op_supported_for_dtype(dtype, op) ? 1 : 0;
+    return oo_allreduce_supported(dtype, op);
 }
 
-oo_status_t oo_group_create(
+extern "C" int oo_all_gather_supported(
+    oo_dtype_t dtype) {
+    return dtype == OO_DTYPE_FLOAT16 ||
+           dtype == OO_DTYPE_BFLOAT16 ||
+           dtype == OO_DTYPE_FLOAT32;
+}
+
+extern "C" oo_status_t oo_group_create(
     const int* devices,
     int num_devices,
     oo_group_t** out_group) {
     if (out_group == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
+
     *out_group = nullptr;
 
-    if (devices == nullptr || num_devices <= 0) {
+    if (devices == nullptr || !valid_group_size(num_devices)) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    if (num_devices != 2) {
-        return OO_ERROR_UNSUPPORTED;
-    }
+    try {
+        auto group = std::make_unique<oo_group_t>();
 
-    if (num_devices > kOoMaxLocalDevices) {
-        return OO_ERROR_UNSUPPORTED;
-    }
+        group->num_devices = num_devices;
+        group->bootstrap_kind = oo_group_bootstrap_kind::same_process;
+        group->local_rank = -1;
+        group->local_world_size = num_devices;
 
-    for (int i = 0; i < num_devices; ++i) {
-        if (!valid_cuda_device(devices[i])) {
-            return OO_ERROR_INVALID_DEVICE;
-        }
-        for (int j = 0; j < i; ++j) {
-            if (devices[i] == devices[j]) {
-                return OO_ERROR_INVALID_ARGUMENT;
+        for (int i = 0; i < num_devices; ++i) {
+            if (devices[i] < 0) {
+                return OO_ERROR_INVALID_DEVICE;
             }
+
+            for (int j = 0; j < i; ++j) {
+                if (devices[i] == devices[j]) {
+                    return OO_ERROR_INVALID_ARGUMENT;
+                }
+            }
+
+            group->devices[i] = devices[i];
         }
+
+        oo_status_t status = allocate_same_process_ready_signals(group.get());
+
+        if (status != OO_SUCCESS) {
+            destroy_group_ready_signals(group.get());
+            return status;
+        }
+
+        *out_group = group.release();
+        return OO_SUCCESS;
+    } catch (...) {
+        return ooverlap::comm::api::exception_to_status();
     }
-
-    oo_group_t* group = new (std::nothrow) oo_group_t;
-    if (group == nullptr) {
-        return OO_ERROR_INTERNAL;
-    }
-
-    group->num_devices = num_devices;
-    group->bootstrap_kind = oo_group_bootstrap_kind::same_process;
-    group->local_rank = -1;
-    group->local_world_size = num_devices;
-
-    for (int i = 0; i < num_devices; ++i) {
-        group->devices[i] = devices[i];
-    }
-
-    oo_status_t sig_status = init_group_ready_signals(group);
-    if (sig_status != OO_SUCCESS) {
-        delete group;
-        return sig_status;
-    }
-
-    *out_group = group;
-    return OO_SUCCESS;
 }
 
-oo_status_t oo_group_create_ipc(
+extern "C" oo_status_t oo_group_create_ipc(
     const int* devices,
     int num_devices,
     int local_rank,
@@ -795,113 +641,95 @@ oo_status_t oo_group_create_ipc(
     if (out_group == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
+
     *out_group = nullptr;
 
-    if (devices == nullptr || broker_key == nullptr || num_devices <= 0) {
+    if (devices == nullptr ||
+        broker_key == nullptr ||
+        !valid_group_size(num_devices) ||
+        local_rank < 0 ||
+        local_rank >= num_devices) {
         return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (num_devices != 2) {
-        return OO_ERROR_UNSUPPORTED;
-    }
-
-    if (num_devices > kOoMaxLocalDevices) {
-        return OO_ERROR_UNSUPPORTED;
-    }
-
-    if (local_rank < 0 || local_rank >= num_devices) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    for (int i = 0; i < num_devices; ++i) {
-        if (!valid_cuda_device(devices[i])) {
-            return OO_ERROR_INVALID_DEVICE;
-        }
-        for (int j = 0; j < i; ++j) {
-            if (devices[i] == devices[j]) {
-                return OO_ERROR_INVALID_ARGUMENT;
-            }
-        }
-    }
-
-    oo_group_t* group = new (std::nothrow) oo_group_t;
-    if (group == nullptr) {
-        return OO_ERROR_INTERNAL;
-    }
-
-    group->num_devices = num_devices;
-    group->bootstrap_kind = oo_group_bootstrap_kind::multiprocess_ipc;
-    group->local_rank = local_rank;
-    group->local_world_size = num_devices;
-
-    for (int i = 0; i < num_devices; ++i) {
-        group->devices[i] = devices[i];
     }
 
     try {
-        group->broker = std::make_unique<ooverlap::system::Broker>(
-            local_rank,
-            num_devices,
-            broker_key);
-    } catch (const std::bad_alloc&) {
-        delete group;
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception& e) {
-        OOVERLAP_LOG_ERROR("oo_group_create_ipc broker init threw: %s\n", e.what());
-        delete group;
-        return OO_ERROR_INTERNAL;
+        auto group = std::make_unique<oo_group_t>();
+
+        group->num_devices = num_devices;
+        group->bootstrap_kind = oo_group_bootstrap_kind::multiprocess_ipc;
+        group->local_rank = local_rank;
+        group->local_world_size = num_devices;
+
+        for (int i = 0; i < num_devices; ++i) {
+            if (devices[i] < 0) {
+                return OO_ERROR_INVALID_DEVICE;
+            }
+
+            group->devices[i] = devices[i];
+        }
+
+        group->broker =
+            std::make_unique<ooverlap::system::Broker>(
+                local_rank,
+                num_devices,
+                broker_key);
+
+        oo_status_t status = allocate_ipc_ready_signals(group.get());
+
+        if (status != OO_SUCCESS) {
+            destroy_group_ready_signals(group.get());
+            return status;
+        }
+
+        *out_group = group.release();
+        return OO_SUCCESS;
     } catch (...) {
-        delete group;
-        return OO_ERROR_INTERNAL;
+        return ooverlap::comm::api::exception_to_status();
     }
-
-    oo_status_t sig_status = init_group_ready_signals(group);
-    if (sig_status != OO_SUCCESS) {
-        delete group;
-        return sig_status;
-    }
-
-    *out_group = group;
-    return OO_SUCCESS;
 }
 
-void oo_group_destroy(
+extern "C" void oo_group_destroy(
     oo_group_t* group) {
     if (group == nullptr) {
         return;
     }
 
-    free_group_ready_signals(group);
+    destroy_group_ready_signals(group);
+
+    if (group->broker) {
+        group->broker->destroy();
+        group->broker.reset();
+    }
+
     delete group;
 }
 
-int oo_group_size(
+extern "C" int oo_group_size(
     const oo_group_t* group) {
-    return (group != nullptr) ? group->num_devices : 0;
+    return group != nullptr ? group->num_devices : 0;
 }
 
-int oo_group_device(
+extern "C" int oo_group_device(
     const oo_group_t* group,
     int rank) {
     if (group == nullptr || rank < 0 || rank >= group->num_devices) {
         return -1;
     }
+
     return group->devices[rank];
 }
 
-oo_status_t oo_node_create(
+extern "C" oo_status_t oo_node_create(
     oo_group_t* group,
     int rank,
     oo_node_t** out_node) {
     if (out_node == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
+
     *out_node = nullptr;
 
-    if (group == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-    if (rank < 0 || rank >= group->num_devices) {
+    if (group == nullptr || rank < 0 || rank >= group->num_devices) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
@@ -910,7 +738,8 @@ oo_status_t oo_node_create(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    oo_node_t* node = new (std::nothrow) oo_node_t;
+    auto* node = new (std::nothrow) oo_node_t();
+
     if (node == nullptr) {
         return OO_ERROR_INTERNAL;
     }
@@ -924,76 +753,69 @@ oo_status_t oo_node_create(
     return OO_SUCCESS;
 }
 
-void oo_node_destroy(
+extern "C" void oo_node_destroy(
     oo_node_t* node) {
     delete node;
 }
 
-oo_group_t* oo_node_group(
+extern "C" oo_group_t* oo_node_group(
     const oo_node_t* node) {
-    return (node != nullptr) ? node->group : nullptr;
+    return node != nullptr ? node->group : nullptr;
 }
 
-int oo_node_rank(
+extern "C" int oo_node_rank(
     const oo_node_t* node) {
-    return (node != nullptr) ? node->rank : -1;
+    return node != nullptr ? node->rank : -1;
 }
 
-int oo_node_device(
+extern "C" int oo_node_device(
     const oo_node_t* node) {
-    return (node != nullptr) ? node->device : -1;
+    return node != nullptr ? node->device : -1;
 }
 
-oo_status_t oo_buffer_alloc(
+extern "C" oo_status_t oo_buffer_alloc(
     oo_node_t* node,
     size_t bytes,
     oo_buffer_t** out_buffer) {
     if (out_buffer == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
+
     *out_buffer = nullptr;
 
     if (node == nullptr || node->group == nullptr || bytes == 0) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    oo_buffer_t* buffer = new (std::nothrow) oo_buffer_t;
-    if (buffer == nullptr) {
-        return OO_ERROR_INTERNAL;
-    }
-
     try {
-        std::vector<int> access_devices = group_devices_vector(node->group);
+        oo_group_t* group = node->group;
 
-        buffer->mapped = ooverlap::system::alloc_peer_visible_buffer(
-            bytes,
-            node->device,
-            access_devices);
+        auto mapped =
+            ooverlap::system::alloc_peer_visible_buffer(
+                bytes,
+                node->device,
+                devices_vector(group->devices, group->num_devices));
 
-        ooverlap::system::peer_buffer_view view =
-            ooverlap::system::make_owned_peer_buffer_view(
-                buffer->mapped,
-                bytes);
+        auto* buffer = new oo_buffer_t();
 
-        initialize_buffer_from_view(buffer, node, view, OO_BUFFER_KIND_VMM);
+        buffer->ptr = mapped.ptr;
+        buffer->bytes = bytes;
+        buffer->mapped_bytes = mapped.mapped_size;
+        buffer->kind = OO_BUFFER_KIND_VMM;
+        buffer->group = group;
         buffer->owner_rank = node->rank;
-    } catch (const std::bad_alloc&) {
-        delete buffer;
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception& e) {
-        OOVERLAP_LOG_ERROR("oo_buffer_alloc threw: %s\n", e.what());
-        delete buffer;
-        return OO_ERROR_CUDA;
-    } catch (...) {
-        delete buffer;
-        return OO_ERROR_INTERNAL;
-    }
+        buffer->owner_device = node->device;
+        buffer->system_kind = ooverlap::system::peer_buffer_kind::owned_vmm;
+        buffer->mapped = mapped;
 
-    *out_buffer = buffer;
-    return OO_SUCCESS;
+        *out_buffer = buffer;
+        return OO_SUCCESS;
+    } catch (...) {
+        return ooverlap::comm::api::exception_to_status();
+    }
 }
 
-oo_status_t oo_buffer_wrap(
+extern "C" oo_status_t oo_buffer_wrap(
     oo_node_t* node,
     void* ptr,
     size_t bytes,
@@ -1001,414 +823,250 @@ oo_status_t oo_buffer_wrap(
     if (out_buffer == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
+
     *out_buffer = nullptr;
 
-    if (node == nullptr || node->group == nullptr ||
-        ptr == nullptr || bytes == 0) {
+    if (node == nullptr ||
+        node->group == nullptr ||
+        ptr == nullptr ||
+        bytes == 0) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    oo_buffer_t* buffer = new (std::nothrow) oo_buffer_t;
+    auto* buffer = new (std::nothrow) oo_buffer_t();
+
     if (buffer == nullptr) {
         return OO_ERROR_INTERNAL;
     }
 
-    ooverlap::system::peer_buffer_view view =
-        ooverlap::system::make_wrapped_peer_buffer_view(
-            ptr,
-            bytes,
-            node->device);
-
-    initialize_buffer_from_view(buffer, node, view, OO_BUFFER_KIND_WRAPPED);
+    buffer->ptr = ptr;
+    buffer->bytes = bytes;
+    buffer->mapped_bytes = bytes;
+    buffer->kind = OO_BUFFER_KIND_WRAPPED;
+    buffer->group = node->group;
     buffer->owner_rank = node->rank;
+    buffer->owner_device = node->device;
+    buffer->system_kind = ooverlap::system::peer_buffer_kind::wrapped;
 
     *out_buffer = buffer;
     return OO_SUCCESS;
 }
 
-void oo_buffer_destroy(
+extern "C" void oo_buffer_destroy(
     oo_buffer_t* buffer) {
     if (buffer == nullptr) {
         return;
     }
 
-    if (buffer->system_kind == ooverlap::system::peer_buffer_kind::owned_vmm ||
-        buffer->kind == OO_BUFFER_KIND_VMM) {
-        ooverlap::system::free_peer_visible_buffer(buffer->mapped);
-    } else if (
-        buffer->system_kind == ooverlap::system::peer_buffer_kind::imported_legacy ||
-        buffer->system_kind == ooverlap::system::peer_buffer_kind::imported_vmm) {
-        buffer->imported.reset();
-    }
-
+    destroy_buffer_storage(buffer);
     delete buffer;
 }
 
-void* oo_buffer_ptr(
+extern "C" void* oo_buffer_ptr(
     const oo_buffer_t* buffer) {
-    return (buffer != nullptr) ? buffer->ptr : nullptr;
+    return buffer != nullptr ? buffer->ptr : nullptr;
 }
 
-size_t oo_buffer_bytes(
+extern "C" size_t oo_buffer_bytes(
     const oo_buffer_t* buffer) {
-    return (buffer != nullptr) ? buffer->bytes : 0;
+    return buffer != nullptr ? buffer->bytes : 0;
 }
 
-size_t oo_buffer_mapped_bytes(
+extern "C" size_t oo_buffer_mapped_bytes(
     const oo_buffer_t* buffer) {
-    return (buffer != nullptr) ? buffer->mapped_bytes : 0;
+    return buffer != nullptr ? buffer->mapped_bytes : 0;
 }
 
-oo_buffer_kind_t oo_buffer_kind(
+extern "C" oo_buffer_kind_t oo_buffer_kind(
     const oo_buffer_t* buffer) {
-    return (buffer != nullptr) ? buffer->kind : OO_BUFFER_KIND_WRAPPED;
+    return buffer != nullptr ? buffer->kind : OO_BUFFER_KIND_WRAPPED;
 }
 
-oo_status_t oo_group_sync(
+extern "C" oo_status_t oo_group_sync(
     oo_group_t* group) {
     if (group == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    if (!group->broker) {
-        return OO_SUCCESS;
-    }
-
     try {
-        group->broker->sync();
+        if (group->broker) {
+            group->broker->sync();
+            return OO_SUCCESS;
+        }
+
+        for (int i = 0; i < group->num_devices; ++i) {
+            ooverlap::system::runtime::set_device(group->devices[i]);
+            ooverlap::system::runtime::check_cuda(
+                cudaDeviceSynchronize(),
+                "cudaDeviceSynchronize(group sync)");
+        }
+
         return OO_SUCCESS;
-    } catch (const std::bad_alloc&) {
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception& e) {
-        OOVERLAP_LOG_ERROR("oo_group_sync threw: %s\n", e.what());
-        return OO_ERROR_INTERNAL;
     } catch (...) {
-        return OO_ERROR_INTERNAL;
+        return ooverlap::comm::api::exception_to_status();
     }
 }
 
-oo_status_t oo_buffer_exchange_ipc_peer(
-    oo_node_t* node,
-    oo_buffer_t* local,
-    oo_buffer_t** out_peer) {
-    if (out_peer == nullptr) {
+oo_status_t oo_buffer_export_legacy_descriptor(
+    oo_buffer_t* buffer,
+    ooverlap::system::legacy_peer_buffer_descriptor* out_desc) {
+    if (buffer == nullptr || buffer->ptr == nullptr || out_desc == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
-    *out_peer = nullptr;
 
-    if (node == nullptr || node->group == nullptr || local == nullptr) {
+    try {
+        *out_desc =
+            ooverlap::system::export_legacy_peer_buffer(
+                buffer->ptr,
+                buffer->bytes,
+                buffer->owner_device,
+                buffer->mapped_bytes != 0 ? buffer->mapped_bytes : buffer->bytes);
+
+        return OO_SUCCESS;
+    } catch (...) {
+        return ooverlap::comm::api::exception_to_status();
+    }
+}
+
+oo_status_t oo_buffer_adopt_imported_peer_buffer(
+    oo_node_t* node,
+    ooverlap::system::imported_peer_buffer&& imported,
+    oo_buffer_t** out_buffer) {
+    if (node == nullptr ||
+        node->group == nullptr ||
+        out_buffer == nullptr ||
+        !imported.valid()) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_buffer = nullptr;
+
+    auto* buffer = new (std::nothrow) oo_buffer_t();
+
+    if (buffer == nullptr) {
+        return OO_ERROR_INTERNAL;
+    }
+
+    buffer->ptr = imported.ptr;
+    buffer->bytes = imported.bytes;
+    buffer->mapped_bytes = imported.mapped_size;
+    buffer->kind = OO_BUFFER_KIND_WRAPPED;
+    buffer->group = node->group;
+    buffer->owner_rank = -1;
+    buffer->owner_device = imported.owner_device;
+    buffer->system_kind = imported.kind;
+    buffer->imported = std::move(imported);
+
+    *out_buffer = buffer;
+    return OO_SUCCESS;
+}
+
+oo_status_t oo_buffer_import_legacy_descriptor(
+    oo_node_t* node,
+    const ooverlap::system::legacy_peer_buffer_descriptor& desc,
+    oo_buffer_t** out_buffer) {
+    if (node == nullptr || node->group == nullptr || out_buffer == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    try {
+        auto imported =
+            ooverlap::system::import_legacy_peer_buffer(
+                desc,
+                std::vector<int>{node->device});
+
+        return oo_buffer_adopt_imported_peer_buffer(
+            node,
+            std::move(imported),
+            out_buffer);
+    } catch (...) {
+        return ooverlap::comm::api::exception_to_status();
+    }
+}
+
+extern "C" oo_status_t oo_buffer_exchange_ipc_peers(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t** out_peers,
+    int* out_peer_count) {
+    if (out_peer_count != nullptr) {
+        *out_peer_count = 0;
+    }
+
+    if (node == nullptr ||
+        node->group == nullptr ||
+        local == nullptr ||
+        local->ptr == nullptr ||
+        out_peers == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
     oo_group_t* group = node->group;
 
-    if (group->bootstrap_kind != oo_group_bootstrap_kind::multiprocess_ipc) {
+    if (group->bootstrap_kind != oo_group_bootstrap_kind::multiprocess_ipc ||
+        group->broker == nullptr ||
+        node->rank != group->local_rank) {
         return OO_ERROR_UNSUPPORTED;
-    }
-
-    if (!group->broker) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (group->num_devices != 2) {
-        return OO_ERROR_UNSUPPORTED;
-    }
-
-    if (node->rank < 0 || node->rank >= group->num_devices) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    ooverlap::system::legacy_peer_buffer_descriptor local_desc{};
-
-    oo_status_t st = oo_buffer_export_legacy_descriptor(
-        local,
-        &local_desc);
-
-    if (st != OO_SUCCESS) {
-        return st;
     }
 
     try {
-        std::vector<ooverlap::system::legacy_peer_buffer_descriptor> all_desc(
+        ooverlap::system::legacy_peer_buffer_descriptor local_desc{};
+
+        oo_status_t status =
+            oo_buffer_export_legacy_descriptor(
+                local,
+                &local_desc);
+
+        if (status != OO_SUCCESS) {
+            return status;
+        }
+
+        std::vector<ooverlap::system::legacy_peer_buffer_descriptor> descs(
             static_cast<size_t>(group->num_devices));
 
         group->broker->exchange_data(
-            all_desc.data(),
+            descs.data(),
             &local_desc,
             sizeof(local_desc));
 
-        const int peer_rank = node->rank ^ 1;
+        group->broker->sync();
 
-        st = oo_buffer_import_legacy_descriptor(
-            node,
-            all_desc[peer_rank],
-            out_peer);
+        int written = 0;
 
-        if (st != OO_SUCCESS) {
-            return st;
+        for (int rank = 0; rank < group->num_devices; ++rank) {
+            if (rank == node->rank) {
+                continue;
+            }
+
+            oo_buffer_t* peer = nullptr;
+
+            status =
+                oo_buffer_import_legacy_descriptor(
+                    node,
+                    descs[static_cast<size_t>(rank)],
+                    &peer);
+
+            if (status != OO_SUCCESS) {
+                for (int i = 0; i < written; ++i) {
+                    oo_buffer_destroy(out_peers[i]);
+                    out_peers[i] = nullptr;
+                }
+                return status;
+            }
+
+            peer->owner_rank = rank;
+            peer->group = group;
+            out_peers[written++] = peer;
+        }
+
+        if (out_peer_count != nullptr) {
+            *out_peer_count = written;
         }
 
         group->broker->sync();
 
         return OO_SUCCESS;
-
-    } catch (const std::bad_alloc&) {
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception& e) {
-        OOVERLAP_LOG_ERROR("oo_buffer_exchange_ipc_peer threw: %s\n", e.what());
-        return OO_ERROR_INTERNAL;
     } catch (...) {
-        return OO_ERROR_INTERNAL;
+        return ooverlap::comm::api::exception_to_status();
     }
 }
-
-oo_status_t oo_allreduce_offset_impl(
-    oo_node_t* node,
-    oo_buffer_t* local,
-    oo_buffer_t* peer,
-    size_t element_offset,
-    size_t count,
-    oo_dtype_t dtype,
-    oo_reduce_op_t op,
-    oo_tuning_mode_t tuning_mode,
-    cudaStream_t stream) {
-    if (node == nullptr || node->group == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (local == nullptr || peer == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (count == 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    oo_group_t* group = node->group;
-
-    if (group->num_devices != 2) {
-        return OO_ERROR_UNSUPPORTED;
-    }
-
-    const int rank = node->rank;
-
-    if (rank != 0 && rank != 1) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    const int peer_rank = 1 - rank;
-
-    if (!same_group(local->group, group) ||
-        !same_group(peer->group, group)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (local->owner_rank != rank) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (peer->owner_rank != peer_rank) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (!reduce_op_supported_for_dtype(dtype, op)) {
-        return OO_ERROR_UNSUPPORTED;
-    }
-
-    const size_t dtype_bytes = oo_dtype_size(dtype);
-
-    if (dtype_bytes == 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    size_t end_element = 0;
-    if (element_offset > static_cast<size_t>(-1) - count) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-    end_element = element_offset + count;
-
-    size_t required_bytes = 0;
-    if (!checked_mul_size(end_element, dtype_bytes, &required_bytes)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    size_t byte_offset = 0;
-    if (!checked_mul_size(element_offset, dtype_bytes, &byte_offset)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    const size_t transfer_bytes = count * dtype_bytes;
-
-    if (!buffer_is_valid_for_allreduce(local, required_bytes)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (!buffer_is_valid_for_allreduce(peer, required_bytes)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    /*
-     * Multiprocess IPC correctness guard:
-     *
-     * In IPC mode, the peer buffer must actually be an imported peer mapping.
-     * Otherwise a user could accidentally pass a local/wrapped pointer for the
-     * peer side and bypass the provenance guarantee.
-     */
-    if (group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc &&
-        !buffer_is_imported(peer)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (group->ready_signal_slots[rank].ptr == nullptr ||
-        group->ready_signal_slots[peer_rank].ptr == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    void* local_ptr =
-        reinterpret_cast<void*>(
-            reinterpret_cast<unsigned char*>(local->ptr) + byte_offset);
-
-    void* peer_ptr =
-        reinterpret_cast<void*>(
-            reinterpret_cast<unsigned char*>(peer->ptr) + byte_offset);
-
-    int* local_ready_signal =
-        reinterpret_cast<int*>(group->ready_signal_slots[rank].ptr);
-
-    const int* peer_ready_signal =
-        reinterpret_cast<const int*>(group->ready_signal_slots[peer_rank].ptr);
-
-    const int dev0 = group->devices[0];
-    const int dev1 = group->devices[1];
-
-    const int collective_epoch = ++node->collective_epoch;
-
-    const ooverlap::comm::TuningPreference preference =
-        ooverlap::comm::tuning_preference_from_public(tuning_mode);
-
-    ooverlap::comm::LaunchConfig launch_config =
-        ooverlap::comm::select_launch_config_for_allreduce(
-            transfer_bytes,
-            preference);
-
-    void* oo_peer_bufs__[] = {
-        peer_ptr
-    };
-    const int* oo_peer_ready_signals__[] = {
-        peer_ready_signal
-    };
-
-    cudaError_t err = ooverlap::enqueue_tma_multi_gpu_allreduce_rank_sm90(
-                local_ptr,
-                local_ptr,
-                oo_peer_bufs__,
-                1,
-                count,
-                dtype,
-                op,
-                rank,
-                2,
-                ((rank) == 0 ? (dev0) : (dev1)),
-                stream,
-                local_ready_signal,
-                oo_peer_ready_signals__,
-                collective_epoch,
-                launch_config);
-
-    return report_cuda_error(
-        err,
-        "enqueue_tma_multi_gpu_allreduce_rank_sm90");
-}
-
-oo_status_t oo_allreduce_offset_tuned(
-    oo_node_t* node,
-    oo_buffer_t* local,
-    oo_buffer_t* peer,
-    size_t element_offset,
-    size_t count,
-    oo_dtype_t dtype,
-    oo_reduce_op_t op,
-    oo_tuning_mode_t tuning_mode,
-    cudaStream_t stream) {
-    try {
-        return oo_allreduce_offset_impl(
-            node,
-            local,
-            peer,
-            element_offset,
-            count,
-            dtype,
-            op,
-            tuning_mode,
-            stream);
-    } catch (const std::bad_alloc&) {
-        return OO_ERROR_INTERNAL;
-    } catch (const std::exception& e) {
-        return report_exception("oo_allreduce_offset_tuned", e);
-    } catch (...) {
-        return report_unknown_exception("oo_allreduce_offset_tuned");
-    }
-}
-
-oo_status_t oo_allreduce_offset(
-    oo_node_t* node,
-    oo_buffer_t* local,
-    oo_buffer_t* peer,
-    size_t element_offset,
-    size_t count,
-    oo_dtype_t dtype,
-    oo_reduce_op_t op,
-    cudaStream_t stream) {
-    return oo_allreduce_offset_tuned(
-        node,
-        local,
-        peer,
-        element_offset,
-        count,
-        dtype,
-        op,
-        OO_TUNING_BEST_PERFORMANCE,
-        stream);
-}
-
-oo_status_t oo_allreduce_tuned(
-    oo_node_t* node,
-    oo_buffer_t* local,
-    oo_buffer_t* peer,
-    size_t count,
-    oo_dtype_t dtype,
-    oo_reduce_op_t op,
-    oo_tuning_mode_t tuning_mode,
-    cudaStream_t stream) {
-    return oo_allreduce_offset_tuned(
-        node,
-        local,
-        peer,
-        0,
-        count,
-        dtype,
-        op,
-        tuning_mode,
-        stream);
-}
-
-oo_status_t oo_allreduce(
-    oo_node_t* node,
-    oo_buffer_t* local,
-    oo_buffer_t* peer,
-    size_t count,
-    oo_dtype_t dtype,
-    oo_reduce_op_t op,
-    cudaStream_t stream) {
-    return oo_allreduce_tuned(
-        node,
-        local,
-        peer,
-        count,
-        dtype,
-        op,
-        OO_TUNING_BEST_PERFORMANCE,
-        stream);
-}
-
-} // extern "C"
