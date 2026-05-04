@@ -240,57 +240,6 @@ __device__ __forceinline__ void execute_window_task_stripe(
     }
 }
 
-/*
- * Stupid task executor kernel.
- *
- * This kernel intentionally does not know:
- *
- *   rank ownership
- *   CTA window ranges
- *   in-place vs out-of-place policy
- *   reduce/copy ordering
- *   local/peer pointer meaning
- *
- * The host builds a WindowTaskExecutorPlan. The kernel only waits for the peer
- * collective rendezvous and executes the static task stripe assigned to blockIdx.x.
- */
-template <
-    typename ReduceApply,
-    int ChunkBytes,
-    int StageDepth,
-    int MaxTasks>
-__global__ void window_task_executor_kernel_sm90(
-    plan::WindowTaskExecutorPlan<MaxTasks> plan,
-    int* local_ready_signal,
-    const int* peer_ready_signal,
-    int collective_epoch) {
-    using Variant = TmaPipelineVariant<ChunkBytes, StageDepth>;
-
-    pipeline::wait_for_collective_ready(
-        local_ready_signal,
-        peer_ready_signal,
-        collective_epoch);
-
-    extern __shared__ uint4 shared_storage_u4[];
-
-    unsigned char* shared_raw =
-        reinterpret_cast<unsigned char*>(shared_storage_u4);
-
-    __shared__ sync::semaphore barriers[Variant::barrier_count];
-
-    execute_window_task_stripe<
-        Variant::stage_depth,
-        Variant::stage_gap,
-        Variant::chunk_bytes,
-        ReduceApply>(
-            plan.tasks,
-            plan.total_tasks,
-            plan.tasks_per_cta,
-            static_cast<int>(blockIdx.x),
-            shared_raw,
-            barriers);
-}
-
 } // namespace kernels
 } // namespace comm
 } // namespace ooverlap
