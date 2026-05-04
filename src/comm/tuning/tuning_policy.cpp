@@ -1,6 +1,6 @@
 #include "comm/tuning/tuning_policy.h"
 
-#include "comm/params.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cerrno>
@@ -18,7 +18,13 @@ namespace ooverlap {
 namespace comm {
 namespace {
 
+using json = nlohmann::json;
+
+constexpr const char* kEnvPolicyPath = "OOVERLAP_TUNING_POLICY";
+constexpr const char* kDefaultPolicyPath = "./tma_collective_policy.json";
+
 struct PolicyEntry {
+    CollectivePlanFor collective = CollectivePlanFor::AllReduce;
     size_t bytes_per_rank = 0;
     double avg_ms = 0.0;
     LaunchConfig config{};
@@ -31,8 +37,8 @@ struct LoadedPolicy {
 };
 
 struct SelectionCacheKey {
+    int collective = 0;
     size_t bytes_per_rank = 0;
-
     int preference = 0;
 
     bool has_max_ctas = false;
@@ -41,23 +47,18 @@ struct SelectionCacheKey {
     bool has_max_threads = false;
     int max_threads = 0;
 
-    /*
-     * OOVERLAP_TUNING_TOLERANCE is represented in parts-per-million so that
-     * the cache key stays integer-only.
-     *
-     * 0.05 -> 50000.
-     */
     long long tolerance_ppm = 50000;
 };
 
 struct SelectionCacheKeyHash {
     size_t operator()(const SelectionCacheKey& key) const {
-        size_t h = std::hash<size_t>{}(key.bytes_per_rank);
+        size_t h = std::hash<int>{}(key.collective);
 
         auto mix = [&](size_t v) {
             h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
         };
 
+        mix(std::hash<size_t>{}(key.bytes_per_rank));
         mix(std::hash<int>{}(key.preference));
         mix(std::hash<bool>{}(key.has_max_ctas));
         mix(std::hash<int>{}(key.max_ctas));
@@ -73,7 +74,8 @@ struct SelectionCacheKeyEqual {
     bool operator()(
         const SelectionCacheKey& a,
         const SelectionCacheKey& b) const {
-        return a.bytes_per_rank == b.bytes_per_rank &&
+        return a.collective == b.collective &&
+               a.bytes_per_rank == b.bytes_per_rank &&
                a.preference == b.preference &&
                a.has_max_ctas == b.has_max_ctas &&
                a.max_ctas == b.max_ctas &&
@@ -118,13 +120,14 @@ bool parse_positive_int_env(
     }
 
     const char* text = std::getenv(name);
+
     if (text == nullptr || text[0] == '\0') {
         return false;
     }
 
     errno = 0;
     char* end = nullptr;
-    long value = std::strtol(text, &end, 10);
+    const long value = std::strtol(text, &end, 10);
 
     if (errno != 0 || end == text || *end != '\0') {
         return false;
@@ -146,13 +149,14 @@ bool parse_double_env(
     }
 
     const char* text = std::getenv(name);
+
     if (text == nullptr || text[0] == '\0') {
         return false;
     }
 
     errno = 0;
     char* end = nullptr;
-    double value = std::strtod(text, &end);
+    const double value = std::strtod(text, &end);
 
     if (errno != 0 || end == text || *end != '\0') {
         return false;
@@ -194,14 +198,8 @@ double tolerance_fraction_from_ppm(long long tolerance_ppm) {
 
 long long runtime_tolerance_ppm() {
     double value = 0.05;
-
-    /*
-     * Optional runtime override.
-     *
-     * Example:
-     *   OOVERLAP_TUNING_TOLERANCE=0.03
-     */
     double env_value = 0.0;
+
     if (parse_double_env("OOVERLAP_TUNING_TOLERANCE", &env_value)) {
         value = env_value;
     }
@@ -209,108 +207,36 @@ long long runtime_tolerance_ppm() {
     return tolerance_ppm_from_fraction(value);
 }
 
-bool find_json_key(
-    const std::string& line,
+bool json_get_string(
+    const json& obj,
     const char* key,
-    size_t* value_pos) {
-    if (value_pos == nullptr) {
+    std::string* out) {
+    if (out == nullptr || !obj.is_object() || !obj.contains(key)) {
         return false;
     }
 
-    const std::string needle =
-        std::string("\"") + key + "\"";
+    const json& value = obj.at(key);
 
-    const size_t key_pos = line.find(needle);
-    if (key_pos == std::string::npos) {
+    if (!value.is_string()) {
         return false;
     }
 
-    const size_t colon_pos = line.find(':', key_pos + needle.size());
-    if (colon_pos == std::string::npos) {
-        return false;
-    }
-
-    size_t pos = colon_pos + 1;
-    while (pos < line.size() &&
-           (line[pos] == ' ' || line[pos] == '\t')) {
-        ++pos;
-    }
-
-    if (pos >= line.size()) {
-        return false;
-    }
-
-    *value_pos = pos;
+    *out = value.get<std::string>();
     return true;
 }
 
-bool json_get_string(
-    const std::string& line,
-    const char* key,
-    std::string* out) {
-    if (out == nullptr) {
-        return false;
-    }
-
-    size_t pos = 0;
-    if (!find_json_key(line, key, &pos)) {
-        return false;
-    }
-
-    if (line.compare(pos, 4, "null") == 0) {
-        return false;
-    }
-
-    if (line[pos] != '"') {
-        return false;
-    }
-
-    ++pos;
-    std::string value;
-
-    while (pos < line.size()) {
-        const char c = line[pos++];
-
-        if (c == '"') {
-            *out = value;
-            return true;
-        }
-
-        if (c == '\\' && pos < line.size()) {
-            value.push_back(line[pos++]);
-            continue;
-        }
-
-        value.push_back(c);
-    }
-
-    return false;
-}
-
-bool json_get_double(
-    const std::string& line,
-    const char* key,
+bool parse_string_double(
+    const std::string& text,
     double* out) {
-    if (out == nullptr) {
+    if (out == nullptr || text.empty()) {
         return false;
     }
-
-    size_t pos = 0;
-    if (!find_json_key(line, key, &pos)) {
-        return false;
-    }
-
-    if (line.compare(pos, 4, "null") == 0) {
-        return false;
-    }
-
-    const char* begin = line.c_str() + pos;
-    char* end = nullptr;
 
     errno = 0;
-    const double value = std::strtod(begin, &end);
+    char* end = nullptr;
+    const double value = std::strtod(text.c_str(), &end);
 
-    if (errno != 0 || end == begin) {
+    if (errno != 0 || end == text.c_str() || *end != '\0') {
         return false;
     }
 
@@ -318,12 +244,35 @@ bool json_get_double(
     return true;
 }
 
+bool json_get_double(
+    const json& obj,
+    const char* key,
+    double* out) {
+    if (out == nullptr || !obj.is_object() || !obj.contains(key)) {
+        return false;
+    }
+
+    const json& value = obj.at(key);
+
+    if (value.is_number()) {
+        *out = value.get<double>();
+        return true;
+    }
+
+    if (value.is_string()) {
+        return parse_string_double(value.get<std::string>(), out);
+    }
+
+    return false;
+}
+
 bool json_get_int(
-    const std::string& line,
+    const json& obj,
     const char* key,
     int* out) {
     double value = 0.0;
-    if (!json_get_double(line, key, &value)) {
+
+    if (!json_get_double(obj, key, &value)) {
         return false;
     }
 
@@ -337,11 +286,12 @@ bool json_get_int(
 }
 
 bool json_get_size(
-    const std::string& line,
+    const json& obj,
     const char* key,
     size_t* out) {
     double value = 0.0;
-    if (!json_get_double(line, key, &value)) {
+
+    if (!json_get_double(obj, key, &value)) {
         return false;
     }
 
@@ -354,110 +304,262 @@ bool json_get_size(
     return true;
 }
 
-bool kernel_name_to_plan_kind(
+bool row_status_ok(const json& row) {
+    std::string status;
+
+    if (!json_get_string(row, "status", &status)) {
+        return true;
+    }
+
+    return status == "ok";
+}
+
+bool row_backend_ok(const json& row) {
+    std::string backend;
+
+    if (!json_get_string(row, "backend", &backend)) {
+        return true;
+    }
+
+    return backend == "ooverlap" || backend == "oo";
+}
+
+bool collective_name_to_plan_for(
     const std::string& name,
-    AllreducePlanKind* out) {
+    CollectivePlanFor* out) {
     if (out == nullptr) {
         return false;
     }
 
-    if (name == "nccl") {
-        return false;
-    }
-
-    if (name == "tma_copy" ||
-        name == "normal" ||
-        name == "tma") {
-        *out = AllreducePlanKind::TmaCopy;
+    if (name == "allreduce" ||
+        name == "all_reduce" ||
+        name == "all-reduce" ||
+        name == "ar") {
+        *out = CollectivePlanFor::AllReduce;
         return true;
     }
 
-    if (name == "seq_fast_gmem" ||
-        name == "not_fused" ||
-        name == "fast_gmem_seq") {
-        *out = AllreducePlanKind::SeqFastGmem;
+    if (name == "reduce_scatter" ||
+        name == "reduce-scatter" ||
+        name == "reducescatter" ||
+        name == "rs") {
+        *out = CollectivePlanFor::ReduceScatter;
         return true;
     }
 
-    if (name == "overlap_fast_gmem" ||
-        name == "fused" ||
-        name == "fast_gmem_overlap") {
-        *out = AllreducePlanKind::OverlapFastGmem;
+    if (name == "all_gather" ||
+        name == "all-gather" ||
+        name == "allgather" ||
+        name == "ag") {
+        *out = CollectivePlanFor::AllGather;
         return true;
     }
 
     return false;
 }
 
-bool parse_policy_line(
-    const std::string& line,
+bool kernel_name_to_plan(
+    CollectivePlanFor collective,
+    const std::string& kernel,
+    LaunchConfig* config) {
+    if (config == nullptr || kernel == "nccl") {
+        return false;
+    }
+
+    if (collective == CollectivePlanFor::AllReduce) {
+        config->plan_for = CollectivePlanFor::AllReduce;
+
+        if (kernel == "tma_copy" ||
+            kernel == "normal" ||
+            kernel == "tma") {
+            config->plan = CollectivePlanKind(AllReducePlanKind::TmaCopy);
+            return true;
+        }
+
+        if (kernel == "seq_fast_copy_gmem" ||
+            kernel == "seq_fast_gmem" ||
+            kernel == "not_fused" ||
+            kernel == "fast_gmem_seq") {
+            config->plan =
+                CollectivePlanKind(AllReducePlanKind::SeqFastCopyGmem);
+            return true;
+        }
+
+        if (kernel == "overlap_fast_copy_gmem" ||
+            kernel == "overlap_fast_gmem" ||
+            kernel == "fused" ||
+            kernel == "fast_gmem_overlap") {
+            config->plan =
+                CollectivePlanKind(AllReducePlanKind::OverlapFastCopyGmem);
+            return true;
+        }
+    }
+
+    if (collective == CollectivePlanFor::ReduceScatter) {
+        config->plan_for = CollectivePlanFor::ReduceScatter;
+
+        if (kernel == "tma_reduce" ||
+            kernel == "normal" ||
+            kernel == "tma") {
+            config->plan =
+                CollectivePlanKind(ReduceScatterPlanKind::TmaReduce);
+            return true;
+        }
+
+        if (kernel == "seq_fast_add_gmem" ||
+            kernel == "fast_add_gmem" ||
+            kernel == "seq_fast_gmem" ||
+            kernel == "not_fused" ||
+            kernel == "fast_gmem_seq") {
+            config->plan =
+                CollectivePlanKind(ReduceScatterPlanKind::SeqFastAddGmem);
+            return true;
+        }
+    }
+
+    if (collective == CollectivePlanFor::AllGather) {
+        config->plan_for = CollectivePlanFor::AllGather;
+
+        if (kernel == "tma_copy" ||
+            kernel == "normal" ||
+            kernel == "tma") {
+            config->plan =
+                CollectivePlanKind(AllGatherPlanKind::TmaCopy);
+            return true;
+        }
+
+        if (kernel == "seq_fast_copy_gmem" ||
+            kernel == "seq_fast_gmem" ||
+            kernel == "not_fused" ||
+            kernel == "fast_gmem_seq") {
+            config->plan =
+                CollectivePlanKind(AllGatherPlanKind::SeqFastCopyGmem);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool row_avg_ms(
+    const json& row,
+    double* out) {
+    if (json_get_double(row, "avg_ms", out)) {
+        return *out > 0.0;
+    }
+
+    double total_ms = 0.0;
+    int iters = 0;
+
+    if (json_get_double(row, "total_ms", &total_ms) &&
+        json_get_int(row, "iters", &iters) &&
+        iters > 0) {
+        *out = total_ms / static_cast<double>(iters);
+        return *out > 0.0;
+    }
+
+    double latency_us = 0.0;
+
+    if (json_get_double(row, "latency_us", &latency_us)) {
+        *out = latency_us * 1.0e-3;
+        return *out > 0.0;
+    }
+
+    return false;
+}
+
+bool parse_policy_row(
+    const json& row,
     PolicyEntry* out) {
-    if (out == nullptr || line.empty()) {
+    if (out == nullptr || !row.is_object()) {
+        return false;
+    }
+
+    if (!row_status_ok(row) || !row_backend_ok(row)) {
+        return false;
+    }
+
+    std::string collective_name;
+    if (!json_get_string(row, "collective", &collective_name)) {
+        return false;
+    }
+
+    CollectivePlanFor collective{};
+    if (!collective_name_to_plan_for(collective_name, &collective)) {
         return false;
     }
 
     std::string kernel;
-    if (!json_get_string(line, "kernel", &kernel)) {
-        return false;
-    }
-
-    AllreducePlanKind kind{};
-    if (!kernel_name_to_plan_kind(kernel, &kind)) {
+    if (!json_get_string(row, "kernel", &kernel)) {
         return false;
     }
 
     PolicyEntry entry{};
-    entry.config.plan_kind = kind;
+    entry.collective = collective;
+    entry.config = LaunchConfig{};
 
-    if (!json_get_size(line, "bytes_per_rank", &entry.bytes_per_rank)) {
+    if (!kernel_name_to_plan(collective, kernel, &entry.config)) {
         return false;
     }
 
-    if (!json_get_double(line, "avg_ms", &entry.avg_ms)) {
+    if (!json_get_size(row, "bytes_per_rank", &entry.bytes_per_rank) &&
+        !json_get_size(row, "bytes", &entry.bytes_per_rank)) {
         return false;
     }
 
-    if (!(entry.avg_ms > 0.0)) {
+    if (!row_avg_ms(row, &entry.avg_ms)) {
         return false;
     }
 
-    if (!json_get_int(line, "max_ctas", &entry.config.max_ctas)) {
-        return false;
+    json_get_int(row, "max_ctas", &entry.config.max_ctas);
+    json_get_int(row, "threads", &entry.config.threads);
+    json_get_int(row, "window_chunks", &entry.config.window_chunks);
+
+    if (!json_get_int(row, "chunk_bytes", &entry.config.chunk_bytes)) {
+        json_get_int(row, "compile_chunk_bytes", &entry.config.chunk_bytes);
     }
 
-    if (!json_get_int(line, "threads", &entry.config.threads)) {
-        return false;
-    }
-
-    if (!json_get_int(line, "window_chunks", &entry.config.window_chunks)) {
-        return false;
-    }
-
-    if (!json_get_int(line, "chunk_bytes", &entry.config.chunk_bytes)) {
-        json_get_int(
-            line,
-            "compile_chunk_bytes",
-            &entry.config.chunk_bytes);
-    }
-
-    if (!json_get_int(line, "stage_depth", &entry.config.stage_depth)) {
-        json_get_int(
-            line,
-            "compile_reduce_stage_depth",
-            &entry.config.stage_depth);
+    if (!json_get_int(row, "stage_depth", &entry.config.stage_depth)) {
+        if (!json_get_int(row, "compile_stage_depth", &entry.config.stage_depth)) {
+            json_get_int(
+                row,
+                "compile_reduce_stage_depth",
+                &entry.config.stage_depth);
+        }
     }
 
     if (!launch_config_valid(entry.config)) {
         return false;
     }
 
-    if (entry.config.plan_kind == AllreducePlanKind::OverlapFastGmem &&
-        !launch_config_valid_for_overlap(entry.config)) {
-        return false;
-    }
-
     *out = entry;
     return true;
+}
+
+void parse_policy_json_rows(
+    const json& rows,
+    std::vector<PolicyEntry>* entries) {
+    if (entries == nullptr) {
+        return;
+    }
+
+    if (rows.is_array()) {
+        for (const json& row : rows) {
+            PolicyEntry entry{};
+
+            if (parse_policy_row(row, &entry)) {
+                entries->push_back(entry);
+            }
+        }
+
+        return;
+    }
+
+    PolicyEntry entry{};
+
+    if (parse_policy_row(rows, &entry)) {
+        entries->push_back(entry);
+    }
 }
 
 bool load_policy_file(
@@ -468,23 +570,28 @@ bool load_policy_file(
     }
 
     std::ifstream file(path);
+
     if (!file) {
         return false;
     }
 
-    std::string line;
-    size_t loaded = 0;
+    json root;
 
-    while (std::getline(file, line)) {
-        PolicyEntry entry{};
-
-        if (parse_policy_line(line, &entry)) {
-            entries->push_back(entry);
-            ++loaded;
-        }
+    try {
+        file >> root;
+    } catch (...) {
+        return false;
     }
 
-    return loaded > 0;
+    const size_t before = entries->size();
+
+    if (root.is_object() && root.contains("results")) {
+        parse_policy_json_rows(root.at("results"), entries);
+    } else {
+        parse_policy_json_rows(root, entries);
+    }
+
+    return entries->size() > before;
 }
 
 void ensure_policy_loaded() {
@@ -497,61 +604,66 @@ void ensure_policy_loaded() {
     }
 
     policy.attempted = true;
+    policy.entries.clear();
 
-    const char* env_path = std::getenv("OOVERLAP_TUNING_POLICY");
+    const char* env_path = std::getenv(kEnvPolicyPath);
 
     if (load_policy_file(env_path, &policy.entries)) {
         policy.loaded = true;
-    } else if (load_policy_file(
-                   "results/tma_allreduce_policy.jsonl",
-                   &policy.entries)) {
-        policy.loaded = true;
-    } else if (load_policy_file(
-                   "results/tma_allreduce_best_configs.jsonl",
-                   &policy.entries)) {
-        policy.loaded = true;
-    } else if (load_policy_file(
-                   "results/tma_allreduce_sweep.jsonl",
-                   &policy.entries)) {
-        policy.loaded = true;
     } else {
-        policy.loaded = false;
+        policy.entries.clear();
+        policy.loaded = load_policy_file(kDefaultPolicyPath, &policy.entries);
     }
 
-    if (policy.loaded) {
-        std::sort(
-            policy.entries.begin(),
-            policy.entries.end(),
-            [](const PolicyEntry& a, const PolicyEntry& b) {
-                if (a.bytes_per_rank != b.bytes_per_rank) {
-                    return a.bytes_per_rank < b.bytes_per_rank;
-                }
-                if (a.config.max_ctas != b.config.max_ctas) {
-                    return a.config.max_ctas < b.config.max_ctas;
-                }
-                if (a.avg_ms != b.avg_ms) {
-                    return a.avg_ms < b.avg_ms;
-                }
-                if (a.config.threads != b.config.threads) {
-                    return a.config.threads < b.config.threads;
-                }
-                return static_cast<int>(a.config.plan_kind) <
-                       static_cast<int>(b.config.plan_kind);
-            });
+    if (!policy.loaded) {
+        return;
     }
+
+    std::sort(
+        policy.entries.begin(),
+        policy.entries.end(),
+        [](const PolicyEntry& a, const PolicyEntry& b) {
+            if (a.collective != b.collective) {
+                return static_cast<int>(a.collective) <
+                       static_cast<int>(b.collective);
+            }
+
+            if (a.bytes_per_rank != b.bytes_per_rank) {
+                return a.bytes_per_rank < b.bytes_per_rank;
+            }
+
+            if (a.config.max_ctas != b.config.max_ctas) {
+                return a.config.max_ctas < b.config.max_ctas;
+            }
+
+            if (a.avg_ms != b.avg_ms) {
+                return a.avg_ms < b.avg_ms;
+            }
+
+            if (a.config.threads != b.config.threads) {
+                return a.config.threads < b.config.threads;
+            }
+
+            return static_cast<int>(a.config.plan_for) <
+                   static_cast<int>(b.config.plan_for);
+        });
 }
 
 size_t select_policy_size(
     const std::vector<PolicyEntry>& entries,
+    CollectivePlanFor collective,
     size_t requested_bytes) {
-    if (entries.empty()) {
-        return requested_bytes;
-    }
+    bool has_prev = false;
+    bool has_next = false;
 
     size_t prev = 0;
     size_t next = 0;
 
     for (const PolicyEntry& entry : entries) {
+        if (entry.collective != collective) {
+            continue;
+        }
+
         const size_t b = entry.bytes_per_rank;
 
         if (b == requested_bytes) {
@@ -560,30 +672,27 @@ size_t select_policy_size(
 
         if (b < requested_bytes) {
             prev = b;
+            has_prev = true;
             continue;
         }
 
         next = b;
+        has_next = true;
         break;
     }
 
-    if (prev == 0) {
-        return entries.front().bytes_per_rank;
+    if (!has_prev && !has_next) {
+        return requested_bytes;
     }
 
-    if (next == 0) {
-        return entries.back().bytes_per_rank;
+    if (!has_prev) {
+        return next;
     }
 
-    /*
-     * Choose nearest size in multiplicative/log distance.
-     *
-     * This avoids pathological jumps:
-     *
-     *   requested = 32.35 MiB
-     *
-     * should map to 32 MiB, not 64 MiB.
-     */
+    if (!has_next) {
+        return prev;
+    }
+
     const long double prev_ratio =
         static_cast<long double>(requested_bytes) /
         static_cast<long double>(prev);
@@ -592,15 +701,33 @@ size_t select_policy_size(
         static_cast<long double>(next) /
         static_cast<long double>(requested_bytes);
 
-    if (prev_ratio <= next_ratio) {
-        return prev;
-    }
-
-    return next;
+    return (prev_ratio <= next_ratio) ? prev : next;
 }
 
-LaunchConfig fallback_config() {
-    LaunchConfig config{};
+LaunchConfig default_config_for_collective(
+    CollectivePlanFor collective) {
+    switch (collective) {
+        case CollectivePlanFor::AllReduce:
+            return make_allreduce_launch_config(
+                AllReducePlanKind::TmaCopy);
+
+        case CollectivePlanFor::ReduceScatter:
+            return make_reduce_scatter_launch_config(
+                ReduceScatterPlanKind::TmaReduce);
+
+        case CollectivePlanFor::AllGather:
+            return make_all_gather_launch_config(
+                AllGatherPlanKind::TmaCopy);
+
+        default:
+            return LaunchConfig{};
+    }
+}
+
+LaunchConfig fallback_config(
+    CollectivePlanFor collective) {
+    LaunchConfig config =
+        default_config_for_collective(collective);
 
     int max_ctas = 0;
     if (parse_positive_int_env("OOVERLAP_MAX_CTAS", &max_ctas)) {
@@ -618,7 +745,7 @@ LaunchConfig fallback_config() {
     }
 
     if (!launch_config_valid(config)) {
-        return LaunchConfig{};
+        return default_config_for_collective(collective);
     }
 
     return config;
@@ -641,6 +768,22 @@ bool env_filter_accepts(
     return true;
 }
 
+int plan_index(LaunchConfig config) {
+    switch (config.plan_for) {
+        case CollectivePlanFor::AllReduce:
+            return static_cast<int>(config.plan.allreduce);
+
+        case CollectivePlanFor::ReduceScatter:
+            return static_cast<int>(config.plan.reduce_scatter);
+
+        case CollectivePlanFor::AllGather:
+            return static_cast<int>(config.plan.all_gather);
+
+        default:
+            return 0;
+    }
+}
+
 bool better_efficiency_choice(
     const PolicyEntry& candidate,
     const PolicyEntry& current) {
@@ -656,8 +799,7 @@ bool better_efficiency_choice(
         return candidate.avg_ms < current.avg_ms;
     }
 
-    return static_cast<int>(candidate.config.plan_kind) <
-           static_cast<int>(current.config.plan_kind);
+    return plan_index(candidate.config) < plan_index(current.config);
 }
 
 bool select_from_candidates(
@@ -682,8 +824,11 @@ bool select_from_candidates(
         return true;
     }
 
-    const double tolerance = tolerance_fraction_from_ppm(tolerance_ppm);
-    const double max_allowed = best->avg_ms * (1.0 + tolerance);
+    const double tolerance =
+        tolerance_fraction_from_ppm(tolerance_ppm);
+
+    const double max_allowed =
+        best->avg_ms * (1.0 + tolerance);
 
     const PolicyEntry* efficient = nullptr;
 
@@ -698,16 +843,12 @@ bool select_from_candidates(
         }
     }
 
-    if (efficient == nullptr) {
-        *selected = *best;
-    } else {
-        *selected = *efficient;
-    }
-
+    *selected = efficient != nullptr ? *efficient : *best;
     return true;
 }
 
 SelectionCacheKey make_selection_cache_key(
+    CollectivePlanFor collective,
     size_t bytes_per_rank,
     TuningPreference preference,
     bool has_max_ctas,
@@ -716,6 +857,7 @@ SelectionCacheKey make_selection_cache_key(
     int env_max_threads,
     long long tolerance_ppm) {
     SelectionCacheKey key{};
+    key.collective = static_cast<int>(collective);
     key.bytes_per_rank = bytes_per_rank;
     key.preference = static_cast<int>(preference);
     key.has_max_ctas = has_max_ctas;
@@ -723,7 +865,7 @@ SelectionCacheKey make_selection_cache_key(
     key.has_max_threads = has_max_threads;
     key.max_threads = has_max_threads ? env_max_threads : 0;
     key.tolerance_ppm =
-        (preference == TuningPreference::BestEfficiency) ? tolerance_ppm : 0;
+        preference == TuningPreference::BestEfficiency ? tolerance_ppm : 0;
     return key;
 }
 
@@ -736,10 +878,9 @@ bool selection_cache_lookup(
 
     std::lock_guard<std::mutex> lock(selection_cache_mutex());
 
-    const SelectionCache& cache = selection_cache();
-    const auto it = cache.find(key);
+    const auto it = selection_cache().find(key);
 
-    if (it == cache.end()) {
+    if (it == selection_cache().end()) {
         return false;
     }
 
@@ -762,13 +903,15 @@ TuningPreference tuning_preference_from_public(
     switch (mode) {
         case OO_TUNING_BEST_EFFICIENCY:
             return TuningPreference::BestEfficiency;
+
         case OO_TUNING_BEST_PERFORMANCE:
         default:
             return TuningPreference::BestPerformance;
     }
 }
 
-LaunchConfig select_launch_config_for_allreduce(
+LaunchConfig select_launch_config_for_collective(
+    CollectivePlanFor collective,
     size_t bytes_per_rank,
     TuningPreference preference) {
     int env_max_ctas = 0;
@@ -779,10 +922,12 @@ LaunchConfig select_launch_config_for_allreduce(
     const bool has_max_threads =
         parse_positive_int_env("OOVERLAP_MAX_THREADS", &env_max_threads);
 
-    const long long tolerance_ppm = runtime_tolerance_ppm();
+    const long long tolerance_ppm =
+        runtime_tolerance_ppm();
 
     const SelectionCacheKey cache_key =
         make_selection_cache_key(
+            collective,
             bytes_per_rank,
             preference,
             has_max_ctas,
@@ -798,23 +943,31 @@ LaunchConfig select_launch_config_for_allreduce(
 
     ensure_policy_loaded();
 
-    LoadedPolicy& policy = global_policy();
+    LoadedPolicy& policy =
+        global_policy();
 
     LaunchConfig selected_config{};
 
     if (!policy.loaded || policy.entries.empty()) {
-        selected_config = fallback_config();
+        selected_config = fallback_config(collective);
         selection_cache_store(cache_key, selected_config);
         return selected_config;
     }
 
     const size_t selected_size =
-        select_policy_size(policy.entries, bytes_per_rank);
+        select_policy_size(
+            policy.entries,
+            collective,
+            bytes_per_rank);
 
     std::vector<PolicyEntry> candidates;
     candidates.reserve(64);
 
     for (const PolicyEntry& entry : policy.entries) {
+        if (entry.collective != collective) {
+            continue;
+        }
+
         if (entry.bytes_per_rank != selected_size) {
             continue;
         }
@@ -838,14 +991,40 @@ LaunchConfig select_launch_config_for_allreduce(
             preference,
             tolerance_ppm,
             &selected)) {
-        selected_config = fallback_config();
+        selected_config = fallback_config(collective);
     } else {
         selected_config = selected.config;
     }
 
     selection_cache_store(cache_key, selected_config);
-
     return selected_config;
+}
+
+LaunchConfig select_launch_config_for_allreduce(
+    size_t bytes_per_rank,
+    TuningPreference preference) {
+    return select_launch_config_for_collective(
+        CollectivePlanFor::AllReduce,
+        bytes_per_rank,
+        preference);
+}
+
+LaunchConfig select_launch_config_for_reduce_scatter(
+    size_t bytes_per_rank,
+    TuningPreference preference) {
+    return select_launch_config_for_collective(
+        CollectivePlanFor::ReduceScatter,
+        bytes_per_rank,
+        preference);
+}
+
+LaunchConfig select_launch_config_for_all_gather(
+    size_t bytes_per_rank,
+    TuningPreference preference) {
+    return select_launch_config_for_collective(
+        CollectivePlanFor::AllGather,
+        bytes_per_rank,
+        preference);
 }
 
 } // namespace comm

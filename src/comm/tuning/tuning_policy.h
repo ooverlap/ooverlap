@@ -17,7 +17,20 @@ enum class TuningPreference : int {
 TuningPreference tuning_preference_from_public(
     oo_tuning_mode_t mode);
 
+LaunchConfig select_launch_config_for_collective(
+    CollectivePlanFor collective,
+    size_t bytes_per_rank,
+    TuningPreference preference);
+
 LaunchConfig select_launch_config_for_allreduce(
+    size_t bytes_per_rank,
+    TuningPreference preference);
+
+LaunchConfig select_launch_config_for_reduce_scatter(
+    size_t bytes_per_rank,
+    TuningPreference preference);
+
+LaunchConfig select_launch_config_for_all_gather(
     size_t bytes_per_rank,
     TuningPreference preference);
 
