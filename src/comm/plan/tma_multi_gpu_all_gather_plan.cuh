@@ -1,7 +1,7 @@
 #pragma once
 
 #include "comm/launch_config.h"
-#include "comm/params.h"
+#include "comm/plan/plan_params.cuh"
 #include "comm/plan/window_plan.cuh"
 #include "comm/task/window_task.cuh"
 #include "comm/utils/utils.h"
@@ -12,37 +12,6 @@ namespace ooverlap {
 namespace comm {
 namespace plan {
 
-constexpr int kTmaMultiGpuAllGatherMaxPeers = 15;
-constexpr int kTmaMultiGpuAllGatherMaxWindowTasks = 256;
-
-/*
- * Naive multi-GPU all-gather plan.
- *
- * This plan only handles the local rank's partition.
- *
- * The caller already slices local_in/local_buf/peer_bufs to the local rank's
- * partition. Therefore, all tasks operate over [0, slice_bytes) for this rank.
- *
- * In-place path:
- *
- *   local_buf already contains this rank's partition.
- *
- *   copy local_buf -> peer0
- *   copy local_buf -> peer1
- *   ...
- *
- * Out-of-place path:
- *
- *   local_in is separate from local_buf, so local_buf must first be initialized.
- *
- *   copy local_in  -> local_buf
- *   copy local_buf -> peer0
- *   copy local_buf -> peer1
- *   ...
- *
- * Unlike allreduce, there is no reduce phase.
- */
-
 __host__ __device__ __forceinline__ int naive_multi_gpu_all_gather_tasks_per_cta(
     int peer_count,
     bool out_of_place) {
@@ -50,21 +19,16 @@ __host__ __device__ __forceinline__ int naive_multi_gpu_all_gather_tasks_per_cta
         return 0;
     }
 
-    /*
-     * out_of_place adds one local_in -> local_buf initialization task.
-     * Every peer adds one copy task.
-     */
     return (out_of_place ? 1 : 0) + peer_count;
 }
 
 __host__ __device__ __forceinline__ bool multi_gpu_all_gather_use_fast_copy(
-    comm::AllreducePlanKind plan_kind) {
-    return plan_kind == comm::AllreducePlanKind::SeqFastGmem ||
-           plan_kind == comm::AllreducePlanKind::OverlapFastGmem;
+    comm::AllGatherPlanKind plan_kind) {
+    return plan_kind == comm::AllGatherPlanKind::SeqFastCopyGmem;
 }
 
 __host__ __device__ __forceinline__ comm::task::WindowTask make_all_gather_copy_task(
-    comm::AllreducePlanKind plan_kind,
+    comm::AllGatherPlanKind plan_kind,
     const void* src,
     void* dst,
     size_t total_bytes,
@@ -83,12 +47,10 @@ __host__ __device__ __forceinline__ comm::task::WindowTask make_all_gather_copy_
             terminal);
     }
 
-    // For tma it is better to change the src and dst
-    // TODO: fix this really bad workaround.
-    void* new_src = const_cast<void*>(src);
+    // TMA copy task direction is encoded as dst first, then src.
     return comm::task::make_copy_tma_task(
         dst,
-        new_src,
+        const_cast<void*>(src),
         total_bytes,
         begin_window,
         end_window,
@@ -115,6 +77,10 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
     window_task_executor_plan_clear(plan);
     *out_num_blocks = 0;
 
+    if (launch_config.plan_for != comm::CollectivePlanFor::AllGather) {
+        return false;
+    }
+
     if (!comm::launch_config_valid(launch_config)) {
         return false;
     }
@@ -131,6 +97,9 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
         return false;
     }
 
+    const comm::AllGatherPlanKind plan_kind =
+        comm::all_gather_plan(launch_config);
+
     const bool out_of_place = (local_in != local_buf);
 
     const int tasks_per_cta =
@@ -138,15 +107,11 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
             peer_count,
             out_of_place);
 
-    /*
-     * Single-rank in-place all-gather has no data movement.
-     * Optionally launch one rendezvous-only CTA so collective ordering can be
-     * preserved.
-     */
     if (tasks_per_cta == 0 || slice_bytes == 0 || num_windows <= 0) {
         if (needs_rendezvous) {
             *out_num_blocks = 1;
         }
+
         return true;
     }
 
@@ -171,6 +136,7 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
         if (needs_rendezvous) {
             *out_num_blocks = 1;
         }
+
         return true;
     }
 
@@ -192,18 +158,14 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
                 cta_count,
                 full_range);
 
-        const int base = cta_idx * tasks_per_cta;
-        int task_idx = base;
+        int task_idx = cta_idx * tasks_per_cta;
 
-        /*
-         * Initialize out-of-place destination with this rank's local partition.
-         */
         if (out_of_place) {
             const bool terminal = (peer_count == 0);
 
             plan->tasks[task_idx++] =
                 make_all_gather_copy_task(
-                    launch_config.plan_kind,
+                    plan_kind,
                     local_in,
                     local_buf,
                     slice_bytes,
@@ -213,9 +175,6 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
                     terminal);
         }
 
-        /*
-         * Copy this rank's partition to all peers.
-         */
         for (int peer_idx = 0; peer_idx < peer_count; ++peer_idx) {
             if (peer_bufs[peer_idx] == nullptr) {
                 return false;
@@ -225,7 +184,7 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
 
             plan->tasks[task_idx++] =
                 make_all_gather_copy_task(
-                    launch_config.plan_kind,
+                    plan_kind,
                     local_buf,
                     peer_bufs[peer_idx],
                     slice_bytes,
