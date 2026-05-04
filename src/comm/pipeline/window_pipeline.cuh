@@ -310,6 +310,159 @@ __device__ __forceinline__ void publish_remaining_windows(
     }
 }
 
+
+template <size_t ChunkBytes>
+__host__ __device__ __forceinline__ bool chunk_range_is_16b_bulk_aligned(
+    size_t total_bytes,
+    int begin_chunk,
+    int end_chunk) {
+    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+
+    if ((ChunkBytes % 16) != 0) {
+        return false;
+    }
+
+    if (begin_chunk >= end_chunk || total_bytes == 0) {
+        return false;
+    }
+
+    const size_t begin_byte =
+        chunk_offset_bytes<ChunkBytes>(begin_chunk);
+
+    if (begin_byte >= total_bytes) {
+        return false;
+    }
+
+    const size_t raw_end_byte =
+        chunk_offset_bytes<ChunkBytes>(end_chunk);
+
+    const size_t end_byte =
+        min_size(raw_end_byte, total_bytes);
+
+    if (begin_byte >= end_byte) {
+        return false;
+    }
+
+    return ((begin_byte & static_cast<size_t>(15)) == 0) &&
+           ((end_byte & static_cast<size_t>(15)) == 0);
+}
+
+/*
+ * Fast path for the common case:
+ *
+ *   - chunk range boundaries are 16-byte aligned
+ *   - every chunk has zero software tail
+ *   - only thread 0 issues/waits TMA load/apply work
+ *
+ * This deliberately skips:
+ *
+ *   - per-chunk __syncthreads()
+ *   - apply.finish_tail()
+ *   - final __threadfence_system()
+ *
+ * We still call apply.wait_complete(). That wait is not a fence; it is the TMA
+ * completion wait for outstanding async store/reduce work issued by this CTA.
+ */
+template <
+    int StageDepth,
+    int FillDepth,
+    size_t ChunkBytes,
+    typename Apply>
+__device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
+    const void* src_base,
+    void* dst_base,
+    size_t total_bytes,
+    int begin_chunk,
+    int end_chunk,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    static_assert(StageDepth > 0, "StageDepth must be > 0");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    if (begin_chunk >= end_chunk || total_bytes == 0) {
+        return;
+    }
+
+    const unsigned char* src_bytes =
+        reinterpret_cast<const unsigned char*>(src_base);
+
+    unsigned char* dst_bytes =
+        reinterpret_cast<unsigned char*>(dst_base);
+
+    PipelineTMALoad load{};
+    Apply apply{};
+
+    const int total_range_chunks = end_chunk - begin_chunk;
+
+    for (int warm = 0; warm < FillDepth; ++warm) {
+        if (warm >= total_range_chunks) {
+            break;
+        }
+
+        const int abs_chunk = begin_chunk + warm;
+        const int slot = warm;
+
+        PipelineStage stage = make_stage_for_abs_chunk<ChunkBytes>(
+            src_bytes,
+            dst_bytes,
+            total_bytes,
+            abs_chunk,
+            slot,
+            shared_raw,
+            barriers);
+
+        load.issue(&stage);
+    }
+
+    for (int iter = 0; iter < total_range_chunks; ++iter) {
+        const int abs_chunk = begin_chunk + iter;
+        const int cur_slot = iter % StageDepth;
+
+        PipelineStage cur_stage = make_stage_for_abs_chunk<ChunkBytes>(
+            src_bytes,
+            dst_bytes,
+            total_bytes,
+            abs_chunk,
+            cur_slot,
+            shared_raw,
+            barriers);
+
+        load.wait_ready(&cur_stage);
+
+        const int future_iter = iter + FillDepth;
+
+        if (future_iter < total_range_chunks) {
+            const int future_abs_chunk = begin_chunk + future_iter;
+            const int future_slot = future_iter % StageDepth;
+
+            PipelineStage future_stage = make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                future_abs_chunk,
+                future_slot,
+                shared_raw,
+                barriers);
+
+            if (iter >= FillDepth) {
+                apply.wait_before_stage_reuse();
+            }
+
+            load.issue(&future_stage);
+        }
+
+        apply.issue_bulk(&cur_stage);
+    }
+
+    apply.wait_complete();
+}
+
 /*
  * Streaming TMA-load + apply pipeline over an absolute chunk range.
  */
@@ -332,6 +485,26 @@ __device__ void run_chunk_range(
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
 
     if (begin_chunk >= end_chunk || total_bytes == 0) {
+        return;
+    }
+
+
+    if (chunk_range_is_16b_bulk_aligned<ChunkBytes>(
+            total_bytes,
+            begin_chunk,
+            end_chunk)) {
+        run_chunk_range_16b_aligned_thread0<
+            StageDepth,
+            FillDepth,
+            ChunkBytes,
+            Apply>(
+                src_base,
+                dst_base,
+                total_bytes,
+                begin_chunk,
+                end_chunk,
+                shared_raw,
+                barriers);
         return;
     }
 

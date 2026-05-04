@@ -225,6 +225,18 @@ __device__ __forceinline__ void execute_window_task_stripe(
         if (task.terminal) {
             return;
         }
+
+        /*
+         * The fast aligned TMA path in run_chunk_range is intentionally
+         * thread0-only and has no internal __syncthreads().
+         *
+         * Keep one task-boundary barrier so nonzero threads do not start a
+         * later full-CTA task, for example CopyFast, before thread 0 has
+         * completed the previous TMA task.
+         *
+         * This replaces many per-chunk barriers with one barrier per task.
+         */
+        __syncthreads();
     }
 }
 
