@@ -10,16 +10,6 @@
 namespace ooverlap {
 
 /*
- * Configure the default SM90 multi-GPU all-gather kernel variant once.
- *
- * This exists for warmup / code that wants CUDA function attributes configured
- * before timing.
- */
-void tma_multi_gpu_all_gather_configure_kernel_once(
-    oo_dtype_t dtype,
-    int device);
-
-/*
  * Naive rank-local multi-GPU all-gather.
  *
  * Inputs:

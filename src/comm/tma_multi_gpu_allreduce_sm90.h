@@ -10,17 +10,6 @@
 namespace ooverlap {
 
 /*
- * Configure the default SM90 multi-GPU allreduce kernel variant once.
- *
- * This exists for warmup / compatibility with code that wants to force CUDA
- * function-attribute setup before timing.
- */
-void tma_multi_gpu_allreduce_configure_kernel_once(
-    oo_dtype_t dtype,
-    oo_reduce_op_t op,
-    int device);
-
-/*
  * Naive rank-local multi-GPU allreduce.
  *
  * Inputs:
