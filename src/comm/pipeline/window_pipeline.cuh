@@ -1,9 +1,11 @@
 #pragma once
 
-#include "comm/kernels/fast_gmem_copy.cuh"
+#include "comm/kernels/fast_add.cuh"
+#include "comm/kernels/fast_copy.cuh"
 #include "comm/pipeline/pipeline_stage.h"
 #include "comm/pipeline/pipeline_tma_copy.h"
 #include "comm/pipeline/pipeline_tma_load.h"
+#include "comm/utils/utils.h"
 
 #include <cuda_runtime.h>
 
@@ -19,29 +21,13 @@ struct ChunkRange {
     int end = 0;
 };
 
-__host__ __device__ __forceinline__ size_t min_size(
-    size_t a,
-    size_t b) {
-    return (a < b) ? a : b;
-}
-
-__host__ __device__ __forceinline__ int min_int(
-    int a,
-    int b) {
-    return (a < b) ? a : b;
-}
-
 template <size_t ChunkBytes>
 __host__ __device__ __forceinline__ int chunk_count_for_bytes(
     size_t byte_count) {
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
 
-    if (byte_count == 0) {
-        return 0;
-    }
-
-    return static_cast<int>(
-        (byte_count + static_cast<size_t>(ChunkBytes) - 1) /
+    return comm::utils::ceil_div_int64_to_int(
+        byte_count,
         static_cast<size_t>(ChunkBytes));
 }
 
@@ -58,13 +44,14 @@ template <size_t ChunkBytes>
 __host__ __device__ __forceinline__ size_t chunk_size_bytes_abs(
     int chunk_idx,
     size_t total_bytes) {
-    const size_t offset = chunk_offset_bytes<ChunkBytes>(chunk_idx);
+    const size_t offset =
+        chunk_offset_bytes<ChunkBytes>(chunk_idx);
 
     if (offset >= total_bytes) {
         return 0;
     }
 
-    return min_size(
+    return comm::utils::min_sz(
         static_cast<size_t>(ChunkBytes),
         total_bytes - offset);
 }
@@ -93,7 +80,7 @@ __host__ __device__ __forceinline__ int window_end_chunk_clamped(
     int window_idx,
     int total_chunks,
     int window_chunks) {
-    return min_int(
+    return comm::utils::min_int(
         window_end_chunk_raw(window_idx, window_chunks),
         total_chunks);
 }
@@ -111,13 +98,15 @@ __host__ __device__ __forceinline__ ChunkRange chunk_range_for_window_range(
         return range;
     }
 
-    range.begin = min_int(
-        window_begin_chunk(begin_window, window_chunks),
-        total_chunks);
+    range.begin =
+        comm::utils::min_int(
+            window_begin_chunk(begin_window, window_chunks),
+            total_chunks);
 
-    range.end = min_int(
-        window_begin_chunk(end_window, window_chunks),
-        total_chunks);
+    range.end =
+        comm::utils::min_int(
+            window_begin_chunk(end_window, window_chunks),
+            total_chunks);
 
     if (range.begin > range.end) {
         range.begin = range.end;
@@ -163,40 +152,13 @@ __device__ __forceinline__ PipelineStage make_stage_for_abs_chunk(
         &barriers[slot]);
 }
 
-__device__ __forceinline__ void wait_for_collective_ready(
-    int* local_ready_signal,
-    const int* peer_ready_signal,
-    int collective_epoch) {
-    if (local_ready_signal == nullptr ||
-        peer_ready_signal == nullptr ||
-        collective_epoch <= 0) {
-        return;
-    }
-
-    if (threadIdx.x == 0) {
-        atomicMax(local_ready_signal, collective_epoch);
-        __threadfence_system();
-
-        const volatile int* peer_ready =
-            reinterpret_cast<const volatile int*>(peer_ready_signal);
-
-        while (peer_ready[0] < collective_epoch) {
-#if defined(__CUDA_ARCH__)
-            __nanosleep(64);
-#endif
-        }
-    }
-
-    __syncthreads();
-}
-
 __device__ __forceinline__ void publish_window_ready(
     int* window_ready) {
     if (window_ready == nullptr) {
         return;
     }
 
-    __threadfence_system();
+    __threadfence();
     atomicMax(window_ready, 1);
 }
 
@@ -310,7 +272,6 @@ __device__ __forceinline__ void publish_remaining_windows(
     }
 }
 
-
 template <size_t ChunkBytes>
 __host__ __device__ __forceinline__ bool chunk_range_is_16b_bulk_aligned(
     size_t total_bytes,
@@ -337,7 +298,7 @@ __host__ __device__ __forceinline__ bool chunk_range_is_16b_bulk_aligned(
         chunk_offset_bytes<ChunkBytes>(end_chunk);
 
     const size_t end_byte =
-        min_size(raw_end_byte, total_bytes);
+        comm::utils::min_sz(raw_end_byte, total_bytes);
 
     if (begin_byte >= end_byte) {
         return false;
@@ -347,22 +308,6 @@ __host__ __device__ __forceinline__ bool chunk_range_is_16b_bulk_aligned(
            ((end_byte & static_cast<size_t>(15)) == 0);
 }
 
-/*
- * Fast path for the common case:
- *
- *   - chunk range boundaries are 16-byte aligned
- *   - every chunk has zero software tail
- *   - only thread 0 issues/waits TMA load/apply work
- *
- * This deliberately skips:
- *
- *   - per-chunk __syncthreads()
- *   - apply.finish_tail()
- *   - final __threadfence_system()
- *
- * We still call apply.wait_complete(). That wait is not a fence; it is the TMA
- * completion wait for outstanding async store/reduce work issued by this CTA.
- */
 template <
     int StageDepth,
     int FillDepth,
@@ -398,57 +343,68 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
     PipelineTMALoad load{};
     Apply apply{};
 
-    const int total_range_chunks = end_chunk - begin_chunk;
+    const int total_range_chunks =
+        end_chunk - begin_chunk;
 
     for (int warm = 0; warm < FillDepth; ++warm) {
         if (warm >= total_range_chunks) {
             break;
         }
 
-        const int abs_chunk = begin_chunk + warm;
-        const int slot = warm;
+        const int abs_chunk =
+            begin_chunk + warm;
 
-        PipelineStage stage = make_stage_for_abs_chunk<ChunkBytes>(
-            src_bytes,
-            dst_bytes,
-            total_bytes,
-            abs_chunk,
-            slot,
-            shared_raw,
-            barriers);
+        PipelineStage stage =
+            make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                abs_chunk,
+                warm,
+                shared_raw,
+                barriers);
 
         load.issue(&stage);
     }
 
     for (int iter = 0; iter < total_range_chunks; ++iter) {
-        const int abs_chunk = begin_chunk + iter;
-        const int cur_slot = iter % StageDepth;
+        const int abs_chunk =
+            begin_chunk + iter;
 
-        PipelineStage cur_stage = make_stage_for_abs_chunk<ChunkBytes>(
-            src_bytes,
-            dst_bytes,
-            total_bytes,
-            abs_chunk,
-            cur_slot,
-            shared_raw,
-            barriers);
+        const int cur_slot =
+            iter % StageDepth;
 
-        load.wait_ready(&cur_stage);
-
-        const int future_iter = iter + FillDepth;
-
-        if (future_iter < total_range_chunks) {
-            const int future_abs_chunk = begin_chunk + future_iter;
-            const int future_slot = future_iter % StageDepth;
-
-            PipelineStage future_stage = make_stage_for_abs_chunk<ChunkBytes>(
+        PipelineStage cur_stage =
+            make_stage_for_abs_chunk<ChunkBytes>(
                 src_bytes,
                 dst_bytes,
                 total_bytes,
-                future_abs_chunk,
-                future_slot,
+                abs_chunk,
+                cur_slot,
                 shared_raw,
                 barriers);
+
+        load.wait_ready(&cur_stage);
+
+        const int future_iter =
+            iter + FillDepth;
+
+        if (future_iter < total_range_chunks) {
+            const int future_abs_chunk =
+                begin_chunk + future_iter;
+
+            const int future_slot =
+                future_iter % StageDepth;
+
+            PipelineStage future_stage =
+                make_stage_for_abs_chunk<ChunkBytes>(
+                    src_bytes,
+                    dst_bytes,
+                    total_bytes,
+                    future_abs_chunk,
+                    future_slot,
+                    shared_raw,
+                    barriers);
 
             if (iter >= FillDepth) {
                 apply.wait_before_stage_reuse();
@@ -463,9 +419,6 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
     apply.wait_complete();
 }
 
-/*
- * Streaming TMA-load + apply pipeline over an absolute chunk range.
- */
 template <
     int StageDepth,
     int FillDepth,
@@ -487,7 +440,6 @@ __device__ void run_chunk_range(
     if (begin_chunk >= end_chunk || total_bytes == 0) {
         return;
     }
-
 
     if (chunk_range_is_16b_bulk_aligned<ChunkBytes>(
             total_bytes,
@@ -517,24 +469,26 @@ __device__ void run_chunk_range(
     PipelineTMALoad load{};
     Apply apply{};
 
-    const int total_range_chunks = end_chunk - begin_chunk;
+    const int total_range_chunks =
+        end_chunk - begin_chunk;
 
     for (int warm = 0; warm < FillDepth; ++warm) {
         if (warm >= total_range_chunks) {
             break;
         }
 
-        const int abs_chunk = begin_chunk + warm;
-        const int slot = warm;
+        const int abs_chunk =
+            begin_chunk + warm;
 
-        PipelineStage stage = make_stage_for_abs_chunk<ChunkBytes>(
-            src_bytes,
-            dst_bytes,
-            total_bytes,
-            abs_chunk,
-            slot,
-            shared_raw,
-            barriers);
+        PipelineStage stage =
+            make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                abs_chunk,
+                warm,
+                shared_raw,
+                barriers);
 
         if (threadIdx.x == 0) {
             load.issue(&stage);
@@ -544,17 +498,21 @@ __device__ void run_chunk_range(
     }
 
     for (int iter = 0; iter < total_range_chunks; ++iter) {
-        const int abs_chunk = begin_chunk + iter;
-        const int cur_slot = iter % StageDepth;
+        const int abs_chunk =
+            begin_chunk + iter;
 
-        PipelineStage cur_stage = make_stage_for_abs_chunk<ChunkBytes>(
-            src_bytes,
-            dst_bytes,
-            total_bytes,
-            abs_chunk,
-            cur_slot,
-            shared_raw,
-            barriers);
+        const int cur_slot =
+            iter % StageDepth;
+
+        PipelineStage cur_stage =
+            make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                abs_chunk,
+                cur_slot,
+                shared_raw,
+                barriers);
 
         if (threadIdx.x == 0) {
             load.wait_ready(&cur_stage);
@@ -562,20 +520,25 @@ __device__ void run_chunk_range(
 
         __syncthreads();
 
-        const int future_iter = iter + FillDepth;
+        const int future_iter =
+            iter + FillDepth;
 
         if (future_iter < total_range_chunks) {
-            const int future_abs_chunk = begin_chunk + future_iter;
-            const int future_slot = future_iter % StageDepth;
+            const int future_abs_chunk =
+                begin_chunk + future_iter;
 
-            PipelineStage future_stage = make_stage_for_abs_chunk<ChunkBytes>(
-                src_bytes,
-                dst_bytes,
-                total_bytes,
-                future_abs_chunk,
-                future_slot,
-                shared_raw,
-                barriers);
+            const int future_slot =
+                future_iter % StageDepth;
+
+            PipelineStage future_stage =
+                make_stage_for_abs_chunk<ChunkBytes>(
+                    src_bytes,
+                    dst_bytes,
+                    total_bytes,
+                    future_abs_chunk,
+                    future_slot,
+                    shared_raw,
+                    barriers);
 
             if (threadIdx.x == 0) {
                 if (iter >= FillDepth) {
@@ -599,15 +562,11 @@ __device__ void run_chunk_range(
 
     if (threadIdx.x == 0) {
         apply.wait_complete();
-        __threadfence_system();
     }
 
     __syncthreads();
 }
 
-/*
- * Streaming TMA-load + apply pipeline over a runtime window range.
- */
 template <
     int StageDepth,
     int FillDepth,
@@ -646,9 +605,6 @@ __device__ void run_window_range(
             barriers);
 }
 
-/*
- * Streaming reduce producer over a runtime window range.
- */
 template <
     int StageDepth,
     int FillDepth,
@@ -699,7 +655,8 @@ __device__ void run_window_range_signal(
     PipelineTMALoad load{};
     ReduceApply apply{};
 
-    const int total_range_chunks = chunks.end - chunks.begin;
+    const int total_range_chunks =
+        chunks.end - chunks.begin;
 
     WindowSignalCursor signal_cursor =
         make_window_signal_cursor(
@@ -715,17 +672,18 @@ __device__ void run_window_range_signal(
             break;
         }
 
-        const int abs_chunk = chunks.begin + warm;
-        const int slot = warm;
+        const int abs_chunk =
+            chunks.begin + warm;
 
-        PipelineStage stage = make_stage_for_abs_chunk<ChunkBytes>(
-            src_bytes,
-            dst_bytes,
-            total_bytes,
-            abs_chunk,
-            slot,
-            shared_raw,
-            barriers);
+        PipelineStage stage =
+            make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                abs_chunk,
+                warm,
+                shared_raw,
+                barriers);
 
         if (threadIdx.x == 0) {
             load.issue(&stage);
@@ -735,17 +693,21 @@ __device__ void run_window_range_signal(
     }
 
     for (int iter = 0; iter < total_range_chunks; ++iter) {
-        const int abs_chunk = chunks.begin + iter;
-        const int cur_slot = iter % StageDepth;
+        const int abs_chunk =
+            chunks.begin + iter;
 
-        PipelineStage cur_stage = make_stage_for_abs_chunk<ChunkBytes>(
-            src_bytes,
-            dst_bytes,
-            total_bytes,
-            abs_chunk,
-            cur_slot,
-            shared_raw,
-            barriers);
+        const int cur_slot =
+            iter % StageDepth;
+
+        PipelineStage cur_stage =
+            make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                abs_chunk,
+                cur_slot,
+                shared_raw,
+                barriers);
 
         if (threadIdx.x == 0) {
             load.wait_ready(&cur_stage);
@@ -753,20 +715,25 @@ __device__ void run_window_range_signal(
 
         __syncthreads();
 
-        const int future_iter = iter + FillDepth;
+        const int future_iter =
+            iter + FillDepth;
 
         if (future_iter < total_range_chunks) {
-            const int future_abs_chunk = chunks.begin + future_iter;
-            const int future_slot = future_iter % StageDepth;
+            const int future_abs_chunk =
+                chunks.begin + future_iter;
 
-            PipelineStage future_stage = make_stage_for_abs_chunk<ChunkBytes>(
-                src_bytes,
-                dst_bytes,
-                total_bytes,
-                future_abs_chunk,
-                future_slot,
-                shared_raw,
-                barriers);
+            const int future_slot =
+                future_iter % StageDepth;
+
+            PipelineStage future_stage =
+                make_stage_for_abs_chunk<ChunkBytes>(
+                    src_bytes,
+                    dst_bytes,
+                    total_bytes,
+                    future_abs_chunk,
+                    future_slot,
+                    shared_raw,
+                    barriers);
 
             if (threadIdx.x == 0) {
                 if (iter >= FillDepth) {
@@ -797,10 +764,7 @@ __device__ void run_window_range_signal(
 
     if (threadIdx.x == 0) {
         apply.wait_complete();
-
         publish_remaining_windows(&signal_cursor);
-
-        __threadfence_system();
     }
 
     __syncthreads();
@@ -814,10 +778,11 @@ __device__ __forceinline__ void wait_window_signal_for_window(
         return;
     }
 
-    const int flag_idx = window_idx - ready_window_base;
+    const int flag_idx =
+        window_idx - ready_window_base;
 
     const int* window_ready =
-        (flag_idx >= 0) ? window_ready_flags + flag_idx : nullptr;
+        flag_idx >= 0 ? window_ready_flags + flag_idx : nullptr;
 
     if (threadIdx.x == 0) {
         wait_window_ready(window_ready);
@@ -826,17 +791,6 @@ __device__ __forceinline__ void wait_window_signal_for_window(
     __syncthreads();
 }
 
-/*
- * Streaming TMA-load + apply pipeline over a runtime window range, but each
- * window is allowed to enter the issue stream only after its signal is ready.
- *
- * This is the consumer side for:
- *
- *   CopyTMASignal -> ReduceTMAAfterSignal
- *
- * The pipeline is still one flowing pipeline across the whole window range.
- * We only wait when the first chunk of a new window is about to be issued.
- */
 template <
     int StageDepth,
     int FillDepth,
@@ -887,7 +841,8 @@ __device__ void run_window_range_after_ready(
     PipelineTMALoad load{};
     Apply apply{};
 
-    const int total_range_chunks = chunks.end - chunks.begin;
+    const int total_range_chunks =
+        chunks.end - chunks.begin;
 
     int last_waited_window = -1;
 
@@ -896,8 +851,11 @@ __device__ void run_window_range_after_ready(
             break;
         }
 
-        const int abs_chunk = chunks.begin + warm;
-        const int window_idx = abs_chunk / window_chunks;
+        const int abs_chunk =
+            chunks.begin + warm;
+
+        const int window_idx =
+            abs_chunk / window_chunks;
 
         if (window_idx != last_waited_window) {
             wait_window_signal_for_window(
@@ -908,16 +866,15 @@ __device__ void run_window_range_after_ready(
             last_waited_window = window_idx;
         }
 
-        const int slot = warm;
-
-        PipelineStage stage = make_stage_for_abs_chunk<ChunkBytes>(
-            src_bytes,
-            dst_bytes,
-            total_bytes,
-            abs_chunk,
-            slot,
-            shared_raw,
-            barriers);
+        PipelineStage stage =
+            make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                abs_chunk,
+                warm,
+                shared_raw,
+                barriers);
 
         if (threadIdx.x == 0) {
             load.issue(&stage);
@@ -927,17 +884,21 @@ __device__ void run_window_range_after_ready(
     }
 
     for (int iter = 0; iter < total_range_chunks; ++iter) {
-        const int abs_chunk = chunks.begin + iter;
-        const int cur_slot = iter % StageDepth;
+        const int abs_chunk =
+            chunks.begin + iter;
 
-        PipelineStage cur_stage = make_stage_for_abs_chunk<ChunkBytes>(
-            src_bytes,
-            dst_bytes,
-            total_bytes,
-            abs_chunk,
-            cur_slot,
-            shared_raw,
-            barriers);
+        const int cur_slot =
+            iter % StageDepth;
+
+        PipelineStage cur_stage =
+            make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                abs_chunk,
+                cur_slot,
+                shared_raw,
+                barriers);
 
         if (threadIdx.x == 0) {
             load.wait_ready(&cur_stage);
@@ -945,11 +906,15 @@ __device__ void run_window_range_after_ready(
 
         __syncthreads();
 
-        const int future_iter = iter + FillDepth;
+        const int future_iter =
+            iter + FillDepth;
 
         if (future_iter < total_range_chunks) {
-            const int future_abs_chunk = chunks.begin + future_iter;
-            const int future_window_idx = future_abs_chunk / window_chunks;
+            const int future_abs_chunk =
+                chunks.begin + future_iter;
+
+            const int future_window_idx =
+                future_abs_chunk / window_chunks;
 
             if (future_window_idx != last_waited_window) {
                 wait_window_signal_for_window(
@@ -960,16 +925,18 @@ __device__ void run_window_range_after_ready(
                 last_waited_window = future_window_idx;
             }
 
-            const int future_slot = future_iter % StageDepth;
+            const int future_slot =
+                future_iter % StageDepth;
 
-            PipelineStage future_stage = make_stage_for_abs_chunk<ChunkBytes>(
-                src_bytes,
-                dst_bytes,
-                total_bytes,
-                future_abs_chunk,
-                future_slot,
-                shared_raw,
-                barriers);
+            PipelineStage future_stage =
+                make_stage_for_abs_chunk<ChunkBytes>(
+                    src_bytes,
+                    dst_bytes,
+                    total_bytes,
+                    future_abs_chunk,
+                    future_slot,
+                    shared_raw,
+                    barriers);
 
             if (threadIdx.x == 0) {
                 if (iter >= FillDepth) {
@@ -993,7 +960,6 @@ __device__ void run_window_range_after_ready(
 
     if (threadIdx.x == 0) {
         apply.wait_complete();
-        __threadfence_system();
     }
 
     __syncthreads();
@@ -1014,7 +980,8 @@ __device__ void copy_window_range_tma_signal(
     int ready_window_base,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    using CopyApply = PipelineTMACopy<StageDepth, FillDepth>;
+    using CopyApply =
+        PipelineTMACopy<StageDepth, FillDepth>;
 
     run_window_range_signal<
         StageDepth,
@@ -1079,7 +1046,8 @@ __device__ void copy_window_range_tma(
     int window_chunks,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    using CopyApply = PipelineTMACopy<StageDepth, FillDepth>;
+    using CopyApply =
+        PipelineTMACopy<StageDepth, FillDepth>;
 
     run_window_range<
         StageDepth,
@@ -1108,8 +1076,28 @@ __device__ __forceinline__ void copy_gmem_range_no_fence(
         return;
     }
 
-    // TODO: this is not good. It is like two namespace uses each other
     comm::kernels::fast_copy::copy_byte_range<VecT, Unroll>(
+        src_base,
+        dst_base,
+        begin_byte,
+        byte_count,
+        static_cast<size_t>(threadIdx.x),
+        static_cast<size_t>(blockDim.x));
+}
+
+template <int Unroll>
+__device__ __forceinline__ void add_gmem_range_no_fence(
+    const void* __restrict__ src_base,
+    void* __restrict__ dst_base,
+    size_t begin_byte,
+    size_t byte_count) {
+    static_assert(Unroll > 0, "Unroll must be > 0");
+
+    if (byte_count == 0) {
+        return;
+    }
+
+    comm::kernels::fast_add::add_f16_u128_byte_range<Unroll>(
         src_base,
         dst_base,
         begin_byte,
@@ -1134,7 +1122,7 @@ __host__ __device__ __forceinline__ size_t window_range_begin_byte(
         static_cast<size_t>(window_chunks) *
         static_cast<size_t>(ChunkBytes);
 
-    return min_size(begin, total_bytes);
+    return comm::utils::min_sz(begin, total_bytes);
 }
 
 template <size_t ChunkBytes>
@@ -1153,7 +1141,7 @@ __host__ __device__ __forceinline__ size_t window_range_end_byte(
         static_cast<size_t>(window_chunks) *
         static_cast<size_t>(ChunkBytes);
 
-    return min_size(end, total_bytes);
+    return comm::utils::min_sz(end, total_bytes);
 }
 
 template <size_t ChunkBytes>
@@ -1174,7 +1162,7 @@ __host__ __device__ __forceinline__ size_t window_range_size_bytes(
             total_bytes,
             window_chunks);
 
-    return (begin < end) ? (end - begin) : 0;
+    return begin < end ? end - begin : 0;
 }
 
 template <
@@ -1206,14 +1194,36 @@ __device__ void copy_window_range_gmem(
         dst_base,
         begin,
         bytes);
+}
 
-    __syncthreads();
+template <
+    int Unroll,
+    size_t ChunkBytes>
+__device__ void add_window_range_gmem(
+    const void* __restrict__ src_base,
+    void* __restrict__ dst_base,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks) {
+    const size_t begin =
+        window_range_begin_byte<ChunkBytes>(
+            begin_window,
+            total_bytes,
+            window_chunks);
 
-    if (threadIdx.x == 0) {
-        __threadfence_system();
-    }
+    const size_t bytes =
+        window_range_size_bytes<ChunkBytes>(
+            begin_window,
+            end_window,
+            total_bytes,
+            window_chunks);
 
-    __syncthreads();
+    add_gmem_range_no_fence<Unroll>(
+        src_base,
+        dst_base,
+        begin,
+        bytes);
 }
 
 template <
@@ -1238,7 +1248,8 @@ __device__ void copy_window_range_gmem_after_ready(
     for (int window_idx = begin_window;
          window_idx < end_window;
          ++window_idx) {
-        const int flag_idx = window_idx - ready_window_base;
+        const int flag_idx =
+            window_idx - ready_window_base;
 
         const int* window_ready =
             (window_ready_flags != nullptr && flag_idx >= 0)
@@ -1266,14 +1277,58 @@ __device__ void copy_window_range_gmem_after_ready(
             begin,
             bytes);
     }
+}
 
-    __syncthreads();
+template <
+    int Unroll,
+    size_t ChunkBytes>
+__device__ void add_window_range_gmem_after_ready(
+    const void* __restrict__ src_base,
+    void* __restrict__ dst_base,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    const int* window_ready_flags,
+    int ready_window_base) {
+    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
 
-    if (threadIdx.x == 0) {
-        __threadfence_system();
+    if (begin_window >= end_window || window_chunks <= 0) {
+        return;
     }
 
-    __syncthreads();
+    for (int window_idx = begin_window;
+         window_idx < end_window;
+         ++window_idx) {
+        const int flag_idx =
+            window_idx - ready_window_base;
+
+        const int* window_ready =
+            (window_ready_flags != nullptr && flag_idx >= 0)
+                ? window_ready_flags + flag_idx
+                : nullptr;
+
+        wait_window_ready(window_ready);
+
+        const size_t begin =
+            window_range_begin_byte<ChunkBytes>(
+                window_idx,
+                total_bytes,
+                window_chunks);
+
+        const size_t bytes =
+            window_range_size_bytes<ChunkBytes>(
+                window_idx,
+                window_idx + 1,
+                total_bytes,
+                window_chunks);
+
+        add_gmem_range_no_fence<Unroll>(
+            src_base,
+            dst_base,
+            begin,
+            bytes);
+    }
 }
 
 } // namespace pipeline
