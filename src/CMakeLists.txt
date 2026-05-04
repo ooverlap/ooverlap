@@ -225,7 +225,7 @@ if(OOVERLAP_BUILD_TESTS AND EXISTS ${OOVERLAP_SRC_DIR}/test/persistent_allreduce
     ${OOVERLAP_SRC_DIR}/test/persistent_allreduce_2gpu_sm90.cu
     ${OOVERLAP_SRC_DIR}/test/ipc_collective_sm90.cu
     ${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu
-    ${OOVERLAP_SRC_DIR}/test/tma_allreduce_sweep_2gpu_sm90.cu
+    ${OOVERLAP_SRC_DIR}/test/tma_collective_sweep_2gpu.cu
   )
 
   ooverlap_force_sm90a(ooverlap_tests)
@@ -246,6 +246,10 @@ if(OOVERLAP_BUILD_TESTS AND EXISTS ${OOVERLAP_SRC_DIR}/test/persistent_allreduce
     CUDA::cuda_driver
     ${NCCL_LIBRARY}
   )
+
+  if(TARGET nlohmann_json::nlohmann_json)
+    target_link_libraries(ooverlap_tests PUBLIC nlohmann_json::nlohmann_json)
+  endif()
 
   ooverlap_link_cudadevrt(ooverlap_tests PUBLIC)
 endif()
@@ -488,13 +492,13 @@ if(OOVERLAP_BUILD_PYTHON)
       "pybind.cpp requires src/test/tma_bandwidth_experiment_sm90.cu, but it was not found")
   endif()
 
-  if(EXISTS ${OOVERLAP_SRC_DIR}/test/tma_allreduce_sweep_2gpu_sm90.cu)
+  if(EXISTS ${OOVERLAP_SRC_DIR}/test/tma_collective_sweep_2gpu.cu)
     list(APPEND OOVERLAP_EXT_SOURCES
-      ${OOVERLAP_SRC_DIR}/test/tma_allreduce_sweep_2gpu_sm90.cu
+      ${OOVERLAP_SRC_DIR}/test/tma_collective_sweep_2gpu.cu
     )
   else()
     message(FATAL_ERROR
-      "pybind.cpp requires src/test/tma_allreduce_sweep_2gpu_sm90.cu, but it was not found")
+      "pybind.cpp requires src/test/tma_collective_sweep_2gpu.cu, but it was not found")
   endif()
   
   add_library(ooverlap_ext MODULE ${OOVERLAP_EXT_SOURCES})
@@ -558,6 +562,10 @@ if(OOVERLAP_BUILD_PYTHON)
 
   if(TARGET cutlass)
     target_link_libraries(ooverlap_ext PRIVATE cutlass)
+  endif()
+
+  if(TARGET nlohmann_json::nlohmann_json)
+    target_link_libraries(ooverlap_ext PRIVATE nlohmann_json::nlohmann_json)
   endif()
 
   ooverlap_link_cudadevrt(ooverlap_ext PRIVATE)

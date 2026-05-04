@@ -84,4 +84,19 @@ if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_TESTS OR OOVERLAP_BUILD_LEGACY_OVERLA
   endif()
 endif()
 
+if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_TESTS)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/third-party/nlohmann_json/include/nlohmann/json.hpp")
+    message(FATAL_ERROR
+      "nlohmann/json submodule not found. Run:\n"
+      "  git submodule update --init --recursive")
+  endif()
+
+  add_library(nlohmann_json INTERFACE)
+  add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+
+  target_include_directories(nlohmann_json INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third-party/nlohmann_json/include
+  )
+endif()
+
 add_subdirectory(src)

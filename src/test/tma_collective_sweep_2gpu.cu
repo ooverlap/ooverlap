@@ -1,10 +1,12 @@
-#include "test/tma_allreduce_sweep_2gpu_sm90.h"
+#include "test/tma_collective_sweep_2gpu.h"
 
 #include "comm/launch_config.h"
 #include "comm/ooverlap_comm.h"
 #include "comm/ooverlap_comm_internal.h"
 #include "comm/params.h"
+#include "comm/tma_multi_gpu_all_gather_sm90.h"
 #include "comm/tma_multi_gpu_allreduce_sm90.h"
+#include "comm/tma_multi_gpu_reduce_scatter_sm90.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/test_utils.cuh"
@@ -22,7 +24,6 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 #define OOVERLAP_SWEEP_NCCL_CHECK(cmd)                                        \
     do {                                                                      \
@@ -37,6 +38,18 @@ namespace ooverlap {
 namespace {
 
 using json = nlohmann::json;
+
+enum class SweepKernelKind {
+    kTmaCopy = 0,
+    kSeqFastGmem = 1,
+    kOverlapFastGmem = 2,
+};
+
+enum class SweepCollectiveKind {
+    kAllReduce = 0,
+    kReduceScatter = 1,
+    kAllGather = 2,
+};
 
 const char* oo_status_string(oo_status_t status) {
     switch (status) {
@@ -64,6 +77,46 @@ void check_oo(
         throw std::runtime_error(
             std::string(what) + " failed: " + oo_status_string(status));
     }
+}
+
+const char* collective_kind_name(
+    SweepCollectiveKind collective) {
+    switch (collective) {
+        case SweepCollectiveKind::kAllReduce:
+            return "allreduce";
+        case SweepCollectiveKind::kReduceScatter:
+            return "reduce_scatter";
+        case SweepCollectiveKind::kAllGather:
+            return "all_gather";
+        default:
+            return "unknown";
+    }
+}
+
+SweepCollectiveKind parse_collective_kind(
+    const std::string& name) {
+    if (name == "allreduce" ||
+        name == "all_reduce" ||
+        name == "all-reduce" ||
+        name == "ar") {
+        return SweepCollectiveKind::kAllReduce;
+    }
+
+    if (name == "reduce_scatter" ||
+        name == "reduce-scatter" ||
+        name == "reducescatter" ||
+        name == "rs") {
+        return SweepCollectiveKind::kReduceScatter;
+    }
+
+    if (name == "all_gather" ||
+        name == "all-gather" ||
+        name == "allgather" ||
+        name == "ag") {
+        return SweepCollectiveKind::kAllGather;
+    }
+
+    throw std::invalid_argument("unknown collective kind: " + name);
 }
 
 const char* kernel_kind_name(
@@ -176,15 +229,62 @@ size_t scenario_numel(
         const int64_t bytes =
             scenario.at("bytes_per_rank").get<int64_t>();
 
-        if (bytes <= 0 || (bytes % static_cast<int64_t>(sizeof(half))) != 0) {
+        if (bytes <= 0 ||
+            (bytes % static_cast<int64_t>(sizeof(half))) != 0) {
             throw std::invalid_argument(
                 "bytes_per_rank must be positive and divisible by sizeof(half)");
         }
 
-        return static_cast<size_t>(bytes / static_cast<int64_t>(sizeof(half)));
+        return static_cast<size_t>(
+            bytes / static_cast<int64_t>(sizeof(half)));
     }
 
     throw std::invalid_argument("scenario must contain numel or bytes_per_rank");
+}
+
+size_t rank_partition_begin(
+    size_t count,
+    int rank,
+    int world_size) {
+    const size_t world = static_cast<size_t>(world_size);
+    const size_t r = static_cast<size_t>(rank);
+    const size_t base = count / world;
+    const size_t rem = count % world;
+
+    return r * base + ((r < rem) ? r : rem);
+}
+
+size_t rank_partition_count(
+    size_t count,
+    int rank,
+    int world_size) {
+    const size_t world = static_cast<size_t>(world_size);
+    const size_t r = static_cast<size_t>(rank);
+    const size_t base = count / world;
+    const size_t rem = count % world;
+
+    return base + ((r < rem) ? 1 : 0);
+}
+
+void validate_collective_numel(
+    SweepCollectiveKind collective,
+    size_t numel) {
+    if (numel == 0) {
+        throw std::invalid_argument("numel must be > 0");
+    }
+
+    /*
+     * The ooverlap partition helper supports uneven partitions, but NCCL
+     * reduce-scatter/all-gather APIs need equal counts. Since this file is a
+     * two-GPU sweep/benchmark file, require even numel for those collectives.
+     */
+    if ((collective == SweepCollectiveKind::kReduceScatter ||
+         collective == SweepCollectiveKind::kAllGather) &&
+        ((numel % 2) != 0)) {
+        throw std::invalid_argument(
+            std::string(collective_kind_name(collective)) +
+            " requires even numel in this two-GPU NCCL-compatible sweep");
+    }
 }
 
 void sync_two_streams(
@@ -394,7 +494,93 @@ double elapsed_ms_two_stream_max(
     return static_cast<double>(std::max(ms0, ms1));
 }
 
-void launch_candidate_once(
+void launch_ooverlap_rank_once(
+    SweepCollectiveKind collective,
+    SweepKernelKind kernel,
+    half* local_work,
+    half* peer_work,
+    size_t numel,
+    int rank,
+    int local_device,
+    cudaStream_t stream,
+    int* local_ready,
+    int* peer_ready,
+    int collective_epoch,
+    comm::LaunchConfig launch_config) {
+    launch_config.plan_kind = launch_kernel_kind(kernel);
+
+    void* peer_bufs[] = {
+        peer_work,
+    };
+
+    const int* peer_ready_signals[] = {
+        peer_ready,
+    };
+
+    cudaError_t err = cudaSuccess;
+
+    if (collective == SweepCollectiveKind::kAllReduce) {
+        err =
+            enqueue_tma_multi_gpu_allreduce_rank_sm90(
+                local_work,
+                local_work,
+                peer_bufs,
+                1,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                rank,
+                2,
+                local_device,
+                stream,
+                local_ready,
+                peer_ready_signals,
+                collective_epoch,
+                launch_config);
+    } else if (collective == SweepCollectiveKind::kReduceScatter) {
+        err =
+            enqueue_tma_multi_gpu_reduce_scatter_rank_sm90(
+                local_work,
+                local_work,
+                peer_bufs,
+                1,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                rank,
+                2,
+                local_device,
+                stream,
+                local_ready,
+                peer_ready_signals,
+                collective_epoch,
+                launch_config);
+    } else if (collective == SweepCollectiveKind::kAllGather) {
+        err =
+            enqueue_tma_multi_gpu_all_gather_rank_sm90(
+                local_work,
+                local_work,
+                peer_bufs,
+                1,
+                numel,
+                OO_DTYPE_FLOAT16,
+                rank,
+                2,
+                local_device,
+                stream,
+                local_ready,
+                peer_ready_signals,
+                collective_epoch,
+                launch_config);
+    } else {
+        throw std::invalid_argument("unknown ooverlap collective");
+    }
+
+    system::runtime::check_cuda(err, "enqueue ooverlap sweep rank");
+}
+
+void launch_ooverlap_candidate_once(
+    SweepCollectiveKind collective,
     SweepKernelKind kernel,
     half* rank0_work,
     half* rank1_work,
@@ -407,66 +593,38 @@ void launch_candidate_once(
     int* rank1_ready,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
-    launch_config.plan_kind = launch_kernel_kind(kernel);
-
-    void* rank0_peers[] = {
-        rank1_work,
-    };
-
-    const int* rank0_peer_ready[] = {
-        rank1_ready,
-    };
-
-    cudaError_t err0 =
-        enqueue_tma_multi_gpu_allreduce_rank_sm90(
-            rank0_work,
-            rank0_work,
-            rank0_peers,
-            1,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            0,
-            2,
-            dev0,
-            stream0,
-            rank0_ready,
-            rank0_peer_ready,
-            collective_epoch,
-            launch_config);
-
-    void* rank1_peers[] = {
+    launch_ooverlap_rank_once(
+        collective,
+        kernel,
         rank0_work,
-    };
-
-    const int* rank1_peer_ready[] = {
+        rank1_work,
+        numel,
+        0,
+        dev0,
+        stream0,
         rank0_ready,
-    };
+        rank1_ready,
+        collective_epoch,
+        launch_config);
 
-    cudaError_t err1 =
-        enqueue_tma_multi_gpu_allreduce_rank_sm90(
-            rank1_work,
-            rank1_work,
-            rank1_peers,
-            1,
-            numel,
-            OO_DTYPE_FLOAT16,
-            OO_REDUCE_SUM,
-            1,
-            2,
-            dev1,
-            stream1,
-            rank1_ready,
-            rank1_peer_ready,
-            collective_epoch,
-            launch_config);
-
-    system::runtime::check_cuda(err0, "enqueue sweep candidate rank0");
-    system::runtime::check_cuda(err1, "enqueue sweep candidate rank1");
+    launch_ooverlap_rank_once(
+        collective,
+        kernel,
+        rank1_work,
+        rank0_work,
+        numel,
+        1,
+        dev1,
+        stream1,
+        rank1_ready,
+        rank0_ready,
+        collective_epoch,
+        launch_config);
 }
 
-void run_candidate_iters(
+void run_ooverlap_candidate_iters(
     oo_group_t* group,
+    SweepCollectiveKind collective,
     SweepKernelKind kernel,
     half* rank0_work,
     half* rank1_work,
@@ -487,7 +645,8 @@ void run_candidate_iters(
     int* rank1_ready = ready_signal_ptr(group, 1);
 
     for (int i = 0; i < iters; ++i) {
-        launch_candidate_once(
+        launch_ooverlap_candidate_once(
+            collective,
             kernel,
             rank0_work,
             rank1_work,
@@ -503,8 +662,9 @@ void run_candidate_iters(
     }
 }
 
-double elapsed_ms_candidate(
+double elapsed_ms_ooverlap_candidate(
     oo_group_t* group,
+    SweepCollectiveKind collective,
     SweepKernelKind kernel,
     half* rank0_work,
     half* rank1_work,
@@ -528,7 +688,8 @@ double elapsed_ms_candidate(
         stream1,
         iters,
         [&](int) {
-            launch_candidate_once(
+            launch_ooverlap_candidate_once(
+                collective,
                 kernel,
                 rank0_work,
                 rank1_work,
@@ -544,11 +705,103 @@ double elapsed_ms_candidate(
         });
 }
 
-void run_nccl_iters(
+void launch_nccl_collective_once(
+    SweepCollectiveKind collective,
     const half* rank0_src,
     const half* rank1_src,
-    half* nccl_rank0_out,
-    half* nccl_rank1_out,
+    half* rank0_out,
+    half* rank1_out,
+    size_t numel,
+    ncclComm_t* comms,
+    cudaStream_t stream0,
+    cudaStream_t stream1) {
+    OOVERLAP_SWEEP_NCCL_CHECK(ncclGroupStart());
+
+    if (collective == SweepCollectiveKind::kAllReduce) {
+        OOVERLAP_SWEEP_NCCL_CHECK(
+            ncclAllReduce(
+                rank0_src,
+                rank0_out,
+                numel,
+                ncclFloat16,
+                ncclSum,
+                comms[0],
+                stream0));
+
+        OOVERLAP_SWEEP_NCCL_CHECK(
+            ncclAllReduce(
+                rank1_src,
+                rank1_out,
+                numel,
+                ncclFloat16,
+                ncclSum,
+                comms[1],
+                stream1));
+    } else if (collective == SweepCollectiveKind::kReduceScatter) {
+        const size_t shard0_begin =
+            rank_partition_begin(numel, 0, 2);
+        const size_t shard1_begin =
+            rank_partition_begin(numel, 1, 2);
+        const size_t shard_count =
+            rank_partition_count(numel, 0, 2);
+
+        OOVERLAP_SWEEP_NCCL_CHECK(
+            ncclReduceScatter(
+                rank0_src,
+                rank0_out + shard0_begin,
+                shard_count,
+                ncclFloat16,
+                ncclSum,
+                comms[0],
+                stream0));
+
+        OOVERLAP_SWEEP_NCCL_CHECK(
+            ncclReduceScatter(
+                rank1_src,
+                rank1_out + shard1_begin,
+                shard_count,
+                ncclFloat16,
+                ncclSum,
+                comms[1],
+                stream1));
+    } else if (collective == SweepCollectiveKind::kAllGather) {
+        const size_t shard0_begin =
+            rank_partition_begin(numel, 0, 2);
+        const size_t shard1_begin =
+            rank_partition_begin(numel, 1, 2);
+        const size_t shard_count =
+            rank_partition_count(numel, 0, 2);
+
+        OOVERLAP_SWEEP_NCCL_CHECK(
+            ncclAllGather(
+                rank0_src + shard0_begin,
+                rank0_out,
+                shard_count,
+                ncclFloat16,
+                comms[0],
+                stream0));
+
+        OOVERLAP_SWEEP_NCCL_CHECK(
+            ncclAllGather(
+                rank1_src + shard1_begin,
+                rank1_out,
+                shard_count,
+                ncclFloat16,
+                comms[1],
+                stream1));
+    } else {
+        throw std::invalid_argument("unknown NCCL collective");
+    }
+
+    OOVERLAP_SWEEP_NCCL_CHECK(ncclGroupEnd());
+}
+
+void run_nccl_iters(
+    SweepCollectiveKind collective,
+    const half* rank0_src,
+    const half* rank1_src,
+    half* rank0_out,
+    half* rank1_out,
     size_t numel,
     ncclComm_t* comms,
     cudaStream_t stream0,
@@ -559,37 +812,25 @@ void run_nccl_iters(
     }
 
     for (int i = 0; i < iters; ++i) {
-        OOVERLAP_SWEEP_NCCL_CHECK(ncclGroupStart());
-
-        OOVERLAP_SWEEP_NCCL_CHECK(
-            ncclAllReduce(
-                rank0_src,
-                nccl_rank0_out,
-                numel,
-                ncclFloat16,
-                ncclSum,
-                comms[0],
-                stream0));
-
-        OOVERLAP_SWEEP_NCCL_CHECK(
-            ncclAllReduce(
-                rank1_src,
-                nccl_rank1_out,
-                numel,
-                ncclFloat16,
-                ncclSum,
-                comms[1],
-                stream1));
-
-        OOVERLAP_SWEEP_NCCL_CHECK(ncclGroupEnd());
+        launch_nccl_collective_once(
+            collective,
+            rank0_src,
+            rank1_src,
+            rank0_out,
+            rank1_out,
+            numel,
+            comms,
+            stream0,
+            stream1);
     }
 }
 
 double elapsed_ms_nccl(
+    SweepCollectiveKind collective,
     const half* rank0_src,
     const half* rank1_src,
-    half* nccl_rank0_out,
-    half* nccl_rank1_out,
+    half* rank0_out,
+    half* rank1_out,
     size_t numel,
     int dev0,
     int dev1,
@@ -604,29 +845,16 @@ double elapsed_ms_nccl(
         stream1,
         iters,
         [&](int) {
-            OOVERLAP_SWEEP_NCCL_CHECK(ncclGroupStart());
-
-            OOVERLAP_SWEEP_NCCL_CHECK(
-                ncclAllReduce(
-                    rank0_src,
-                    nccl_rank0_out,
-                    numel,
-                    ncclFloat16,
-                    ncclSum,
-                    comms[0],
-                    stream0));
-
-            OOVERLAP_SWEEP_NCCL_CHECK(
-                ncclAllReduce(
-                    rank1_src,
-                    nccl_rank1_out,
-                    numel,
-                    ncclFloat16,
-                    ncclSum,
-                    comms[1],
-                    stream1));
-
-            OOVERLAP_SWEEP_NCCL_CHECK(ncclGroupEnd());
+            launch_nccl_collective_once(
+                collective,
+                rank0_src,
+                rank1_src,
+                rank0_out,
+                rank1_out,
+                numel,
+                comms,
+                stream0,
+                stream1);
         });
 }
 
@@ -639,7 +867,8 @@ void add_common_metrics(
     int dev0,
     int dev1,
     double total_ms) {
-    const double avg_ms = total_ms / static_cast<double>(iters);
+    const double avg_ms =
+        total_ms / static_cast<double>(iters);
 
     const double gbps_per_rank =
         avg_ms > 0.0
@@ -659,17 +888,23 @@ void add_common_metrics(
     row["dev1"] = dev1;
     row["total_ms"] = total_ms;
     row["avg_ms"] = avg_ms;
+    row["latency_us"] = avg_ms * 1000.0;
     row["effective_gbps_per_rank"] = gbps_per_rank;
     row["effective_gbps_aggregate_2gpu"] = gbps_aggregate;
 }
 
 void add_env_metadata(
     json& row) {
-    const std::string ooverlap_max_ctas = getenv_string("OOVERLAP_MAX_CTAS");
-    const std::string nccl_max_ctas = getenv_string("NCCL_MAX_CTAS");
-    const std::string nccl_min_ctas = getenv_string("NCCL_MIN_CTAS");
-    const std::string nccl_algo = getenv_string("NCCL_ALGO");
-    const std::string nccl_proto = getenv_string("NCCL_PROTO");
+    const std::string ooverlap_max_ctas =
+        getenv_string("OOVERLAP_MAX_CTAS");
+    const std::string nccl_max_ctas =
+        getenv_string("NCCL_MAX_CTAS");
+    const std::string nccl_min_ctas =
+        getenv_string("NCCL_MIN_CTAS");
+    const std::string nccl_algo =
+        getenv_string("NCCL_ALGO");
+    const std::string nccl_proto =
+        getenv_string("NCCL_PROTO");
 
     row["ooverlap_max_ctas_env"] =
         ooverlap_max_ctas.empty() ? json(nullptr) : json(ooverlap_max_ctas);
@@ -687,7 +922,8 @@ json run_ooverlap_scenario(
     const json& root,
     const json& scenario,
     int scenario_index) {
-    const json id = scenario_id(scenario, scenario_index);
+    const json id =
+        scenario_id(scenario, scenario_index);
 
     const int iters =
         get_with_fallback<int>(scenario, root, "iters", 100);
@@ -706,8 +942,19 @@ json run_ooverlap_scenario(
         throw std::invalid_argument("dev0 and dev1 must differ");
     }
 
-    const size_t numel = scenario_numel(scenario);
-    const size_t bytes = numel * sizeof(half);
+    const std::string collective_name =
+        scenario.value("collective", std::string("allreduce"));
+
+    const SweepCollectiveKind collective =
+        parse_collective_kind(collective_name);
+
+    const size_t numel =
+        scenario_numel(scenario);
+
+    validate_collective_numel(collective, numel);
+
+    const size_t bytes =
+        numel * sizeof(half);
 
     const std::string kernel_name =
         scenario.value("kernel", std::string("seq_fast_gmem"));
@@ -716,20 +963,26 @@ json run_ooverlap_scenario(
         parse_kernel_kind(kernel_name);
 
     comm::LaunchConfig config{};
-    config.threads = scenario.value("threads", config.threads);
-    config.window_chunks = scenario.value("window_chunks", config.window_chunks);
-    config.chunk_bytes = scenario.value("chunk_bytes", config.chunk_bytes);
-    config.stage_depth = scenario.value("stage_depth", config.stage_depth);
+    config.threads =
+        scenario.value("threads", config.threads);
+    config.window_chunks =
+        scenario.value("window_chunks", config.window_chunks);
+    config.chunk_bytes =
+        scenario.value("chunk_bytes", config.chunk_bytes);
+    config.stage_depth =
+        scenario.value("stage_depth", config.stage_depth);
     config.max_ctas =
         scenario.value(
             "max_ctas",
             getenv_int_or("OOVERLAP_MAX_CTAS", config.max_ctas));
-    config.plan_kind = launch_kernel_kind(kernel);
+    config.plan_kind =
+        launch_kernel_kind(kernel);
 
     json row;
     row["id"] = id;
     row["status"] = "ok";
     row["backend"] = "ooverlap";
+    row["collective"] = collective_kind_name(collective);
     row["kernel"] = kernel_kind_name(kernel);
     row["threads"] = config.threads;
     row["max_ctas"] = config.max_ctas;
@@ -770,12 +1023,20 @@ json run_ooverlap_scenario(
             dev1,
         };
 
-        check_oo(oo_group_create(devices, 2, &group), "oo_group_create");
-        check_oo(oo_node_create(group, 0, &node0), "oo_node_create(rank0)");
-        check_oo(oo_node_create(group, 1, &node1), "oo_node_create(rank1)");
+        check_oo(
+            oo_group_create(devices, 2, &group),
+            "oo_group_create");
+        check_oo(
+            oo_node_create(group, 0, &node0),
+            "oo_node_create(rank0)");
+        check_oo(
+            oo_node_create(group, 1, &node1),
+            "oo_node_create(rank1)");
 
-        const int node0_dev = oo_node_device(node0);
-        const int node1_dev = oo_node_device(node1);
+        const int node0_dev =
+            oo_node_device(node0);
+        const int node1_dev =
+            oo_node_device(node1);
 
         stream0 =
             system::runtime::create_stream_on_device(node0_dev);
@@ -824,8 +1085,9 @@ json run_ooverlap_scenario(
             stream0,
             stream1);
 
-        run_candidate_iters(
+        run_ooverlap_candidate_iters(
             group,
+            collective,
             kernel,
             rank0_work,
             rank1_work,
@@ -856,8 +1118,9 @@ json run_ooverlap_scenario(
             stream1);
 
         const double total_ms =
-            elapsed_ms_candidate(
+            elapsed_ms_ooverlap_candidate(
                 group,
+                collective,
                 kernel,
                 rank0_work,
                 rank1_work,
@@ -970,7 +1233,8 @@ json run_nccl_scenario(
     const json& root,
     const json& scenario,
     int scenario_index) {
-    const json id = scenario_id(scenario, scenario_index);
+    const json id =
+        scenario_id(scenario, scenario_index);
 
     const int iters =
         get_with_fallback<int>(scenario, root, "iters", 100);
@@ -989,8 +1253,19 @@ json run_nccl_scenario(
         throw std::invalid_argument("dev0 and dev1 must differ");
     }
 
-    const size_t numel = scenario_numel(scenario);
-    const size_t bytes = numel * sizeof(half);
+    const std::string collective_name =
+        scenario.value("collective", std::string("allreduce"));
+
+    const SweepCollectiveKind collective =
+        parse_collective_kind(collective_name);
+
+    const size_t numel =
+        scenario_numel(scenario);
+
+    validate_collective_numel(collective, numel);
+
+    const size_t bytes =
+        numel * sizeof(half);
 
     half* rank0_src = nullptr;
     half* rank1_src = nullptr;
@@ -1011,6 +1286,7 @@ json run_nccl_scenario(
     row["id"] = id;
     row["status"] = "ok";
     row["backend"] = "nccl";
+    row["collective"] = collective_kind_name(collective);
     row["kernel"] = "nccl";
 
     try {
@@ -1058,6 +1334,7 @@ json run_nccl_scenario(
         nccl_initialized = true;
 
         run_nccl_iters(
+            collective,
             rank0_src,
             rank1_src,
             rank0_out,
@@ -1077,6 +1354,7 @@ json run_nccl_scenario(
 
         const double total_ms =
             elapsed_ms_nccl(
+                collective,
                 rank0_src,
                 rank1_src,
                 rank0_out,
@@ -1198,7 +1476,7 @@ json run_one_scenario(
 
 } // namespace
 
-std::string benchmark_tma_two_gpu_allreduce_sweep_json_sm90(
+std::string benchmark_tma_two_gpu_collective_sweep_json(
     const std::string& request_json) {
     json response;
     response["ok"] = true;
@@ -1206,16 +1484,21 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_json_sm90(
     response["errors"] = json::array();
 
     try {
-        const json root = json::parse(request_json);
+        const json root =
+            json::parse(request_json);
 
-        if (!root.contains("scenarios") || !root.at("scenarios").is_array()) {
-            throw std::invalid_argument("request must contain scenarios array");
+        if (!root.contains("scenarios") ||
+            !root.at("scenarios").is_array()) {
+            throw std::invalid_argument(
+                "request must contain scenarios array");
         }
 
-        const json& scenarios = root.at("scenarios");
+        const json& scenarios =
+            root.at("scenarios");
 
         for (size_t i = 0; i < scenarios.size(); ++i) {
-            const json& scenario = scenarios.at(i);
+            const json& scenario =
+                scenarios.at(i);
 
             try {
                 response["results"].push_back(
@@ -1227,9 +1510,12 @@ std::string benchmark_tma_two_gpu_allreduce_sweep_json_sm90(
                 response["ok"] = false;
 
                 json err;
-                err["id"] = scenario_id(scenario, static_cast<int>(i));
-                err["index"] = i;
-                err["error"] = exc.what();
+                err["id"] =
+                    scenario_id(scenario, static_cast<int>(i));
+                err["index"] =
+                    i;
+                err["error"] =
+                    exc.what();
 
                 response["errors"].push_back(err);
             }

@@ -12,8 +12,8 @@
 
 #include "test/persistent_allreduce_2gpu_sm90.h"
 #include "test/tma_bandwidth_experiment_sm90.h"
-#include "test/tma_allreduce_sweep_2gpu_sm90.h"
 #include "test/ipc_collective_sm90.h"
+#include "test/tma_collective_sweep_2gpu.h"
 
 namespace py = pybind11;
 
@@ -216,20 +216,10 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("include_nccl") = false,
         "Experimental TMA/global-memory/NCCL bandwidth sweep.");
 
-  m.def("benchmark_tma_two_gpu_allreduce_sweep_sm90",
-        &ooverlap::benchmark_tma_two_gpu_allreduce_sweep_sm90,
-        py::arg("numels"),
-        py::arg("kernels"),
-        py::arg("threads"),
-        py::arg("max_ctas"),
-        py::arg("window_chunks"),
-        py::arg("chunk_bytes"),
-        py::arg("stage_depths"),
-        py::arg("iters"),
-        py::arg("warmup"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1,
-        "Sweep SM90 2-GPU TMA allreduce runtime launch configs and selected chunk/stage variants.");
+  m.def("benchmark_tma_two_gpu_collective_sweep_json",
+      &ooverlap::benchmark_tma_two_gpu_collective_sweep_json,
+      py::arg("request_json"),
+      "Run JSON-driven TMA 2-GPU collective sweep scenarios.");
 
   m.def("benchmark_persistent_two_gpu_collective_sm90",
       &ooverlap::benchmark_persistent_two_gpu_collective_sm90,
