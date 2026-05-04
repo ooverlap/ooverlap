@@ -1,7 +1,7 @@
 #pragma once
 
 #include "comm/launch_config.h"
-#include "comm/params.h"
+#include "comm/plan/plan_params.cuh"
 #include "comm/plan/window_plan.cuh"
 #include "comm/task/window_task.cuh"
 #include "comm/utils/utils.h"
@@ -12,66 +12,24 @@ namespace ooverlap {
 namespace comm {
 namespace plan {
 
-constexpr int kTmaMultiGpuAllreduceMaxPeers = 15;
-constexpr int kTmaMultiGpuAllreduceMaxWindowTasks = 256;
-
-/*
- * Naive multi-GPU allreduce plan.
- *
- * This plan only handles the local rank's partition.
- *
- * The caller already slices local_in/local_buf/peer_bufs to the local rank's
- * partition. Therefore, all tasks operate over [0, slice_bytes) for this rank.
- *
- * In-place path:
- *
- *   local_buf already contains local rank contribution.
- *
- *   reduce peer0 -> local_buf
- *   reduce peer1 -> local_buf
- *   ...
- *   copy   local_buf -> peer0
- *   copy   local_buf -> peer1
- *   ...
- *
- * Out-of-place path:
- *
- *   local_in is separate from local_buf, so local_buf must first be initialized.
- *
- *   copy   local_in -> local_buf
- *   reduce peer0    -> local_buf
- *   reduce peer1    -> local_buf
- *   ...
- *   copy   local_buf -> peer0
- *   copy   local_buf -> peer1
- *   ...
- *
- * This is intentionally dumb and sequential. The point is to make the allreduce
- * rank/peer shape generic before optimizing.
- */
-
-__host__ __device__ __forceinline__ int naive_multi_gpu_tasks_per_cta(
+__host__ __device__ __forceinline__ int naive_multi_gpu_allreduce_tasks_per_cta(
     int peer_count,
     bool out_of_place) {
     if (peer_count < 0) {
         return 0;
     }
 
-    /*
-     * out_of_place adds one local_in -> local_buf initialization task.
-     * Every peer adds one reduce task and one broadcast-copy task.
-     */
     return (out_of_place ? 1 : 0) + 2 * peer_count;
 }
 
 __host__ __device__ __forceinline__ bool multi_gpu_allreduce_use_fast_copy(
-    comm::AllreducePlanKind plan_kind) {
-    return plan_kind == comm::AllreducePlanKind::SeqFastGmem ||
-           plan_kind == comm::AllreducePlanKind::OverlapFastGmem;
+    comm::AllReducePlanKind plan_kind) {
+    return plan_kind == comm::AllReducePlanKind::SeqFastCopyGmem ||
+           plan_kind == comm::AllReducePlanKind::OverlapFastCopyGmem;
 }
 
-__host__ __device__ __forceinline__ comm::task::WindowTask make_multi_gpu_copy_task(
-    comm::AllreducePlanKind plan_kind,
+__host__ __device__ __forceinline__ comm::task::WindowTask make_allreduce_copy_task(
+    comm::AllReducePlanKind plan_kind,
     const void* src,
     void* dst,
     size_t total_bytes,
@@ -119,11 +77,15 @@ bool build_tma_multi_gpu_allreduce_naive_plan(
     window_task_executor_plan_clear(plan);
     *out_num_blocks = 0;
 
+    if (launch_config.plan_for != comm::CollectivePlanFor::AllReduce) {
+        return false;
+    }
+
     if (!comm::launch_config_valid(launch_config)) {
         return false;
     }
 
-    if (peer_count < 0 || peer_count > kTmaMultiGpuAllreduceMaxPeers) {
+    if (peer_count < 0 || peer_count > kTmaMultiGpuAllReduceMaxPeers) {
         return false;
     }
 
@@ -135,19 +97,21 @@ bool build_tma_multi_gpu_allreduce_naive_plan(
         return false;
     }
 
+    const comm::AllReducePlanKind plan_kind =
+        comm::allreduce_plan(launch_config);
+
     const bool out_of_place = (local_in != local_buf);
 
     const int tasks_per_cta =
-        naive_multi_gpu_tasks_per_cta(peer_count, out_of_place);
+        naive_multi_gpu_allreduce_tasks_per_cta(
+            peer_count,
+            out_of_place);
 
-    /*
-     * Single-rank in-place allreduce has no data movement. We still optionally
-     * launch one rendezvous-only CTA so collective ordering can be preserved.
-     */
     if (tasks_per_cta == 0 || slice_bytes == 0 || num_windows <= 0) {
         if (needs_rendezvous) {
             *out_num_blocks = 1;
         }
+
         return true;
     }
 
@@ -172,6 +136,7 @@ bool build_tma_multi_gpu_allreduce_naive_plan(
         if (needs_rendezvous) {
             *out_num_blocks = 1;
         }
+
         return true;
     }
 
@@ -193,19 +158,14 @@ bool build_tma_multi_gpu_allreduce_naive_plan(
                 cta_count,
                 full_range);
 
-        const int base = cta_idx * tasks_per_cta;
-        int task_idx = base;
+        int task_idx = cta_idx * tasks_per_cta;
 
-        /*
-         * Initialize out-of-place destination with local contribution.
-         */
         if (out_of_place) {
-            const bool terminal =
-                (peer_count == 0);
+            const bool terminal = (peer_count == 0);
 
             plan->tasks[task_idx++] =
-                make_multi_gpu_copy_task(
-                    launch_config.plan_kind,
+                make_allreduce_copy_task(
+                    plan_kind,
                     local_in,
                     local_buf,
                     slice_bytes,
@@ -215,9 +175,6 @@ bool build_tma_multi_gpu_allreduce_naive_plan(
                     terminal);
         }
 
-        /*
-         * Reduce all peer partitions into local partition.
-         */
         for (int peer_idx = 0; peer_idx < peer_count; ++peer_idx) {
             if (peer_bufs[peer_idx] == nullptr) {
                 return false;
@@ -234,15 +191,12 @@ bool build_tma_multi_gpu_allreduce_naive_plan(
                     false);
         }
 
-        /*
-         * Broadcast finalized local partition back to all peers.
-         */
         for (int peer_idx = 0; peer_idx < peer_count; ++peer_idx) {
             const bool terminal = (peer_idx == peer_count - 1);
 
             plan->tasks[task_idx++] =
-                make_multi_gpu_copy_task(
-                    launch_config.plan_kind,
+                make_allreduce_copy_task(
+                    plan_kind,
                     local_buf,
                     peer_bufs[peer_idx],
                     slice_bytes,
