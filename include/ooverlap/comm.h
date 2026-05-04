@@ -53,6 +53,8 @@ typedef struct {
 size_t oo_dtype_size(
     oo_dtype_t dtype);
 
+const char* oo_status_string(oo_status_t status);
+
 oo_status_t oo_rank_partition(
     int rank,
     int world_size,
