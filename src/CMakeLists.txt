@@ -473,6 +473,15 @@ if(OOVERLAP_BUILD_PYTHON)
     message(FATAL_ERROR
       "pybind.cpp requires src/test/persistent_allreduce_2gpu_sm90.cu, but it was not found")
   endif()
+
+  if(EXISTS ${OOVERLAP_SRC_DIR}/test/ipc_collective_sm90.cu)
+    list(APPEND OOVERLAP_EXT_SOURCES
+      ${OOVERLAP_SRC_DIR}/test/ipc_collective_sm90.cu
+    )
+  else()
+    message(FATAL_ERROR
+      "pybind.cpp requires src/test/ipc_collective_sm90.cu, but it was not found")
+  endif()
    
   if(EXISTS ${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu)
     list(APPEND OOVERLAP_EXT_SOURCES

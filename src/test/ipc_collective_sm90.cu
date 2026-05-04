@@ -911,7 +911,7 @@ std::map<std::string, double> run_one_size(
     int dev0,
     int dev1,
     const std::string& broker_key,
-    const ncclUniqueId& nccl_id,
+    ncclComm_t nccl_comm,
     int iters,
     int warmup,
     bool verify) {
@@ -925,7 +925,6 @@ std::map<std::string, double> run_one_size(
     half* local_src = nullptr;
     half* nccl_work = nullptr;
     cudaStream_t stream = nullptr;
-    ncclComm_t nccl_comm = nullptr;
 
     try {
         system::runtime::set_device(local_device);
@@ -963,15 +962,6 @@ std::map<std::string, double> run_one_size(
         ctx.group->broker->sync();
 
         system::runtime::set_device(local_device);
-
-        OOVERLAP_IPC_COLLECTIVE_NCCL_CHECK(
-            ncclCommInitRank(
-                &nccl_comm,
-                2,
-                nccl_id,
-                local_rank));
-
-        ctx.group->broker->sync();
 
         warmup_ooverlap(
             collective,
@@ -1041,11 +1031,6 @@ std::map<std::string, double> run_one_size(
 
         ctx.group->broker->sync();
 
-        if (nccl_comm != nullptr) {
-            ncclCommDestroy(nccl_comm);
-            nccl_comm = nullptr;
-        }
-
         ctx.group->broker->sync();
 
         if (local_src != nullptr) {
@@ -1088,11 +1073,6 @@ std::map<std::string, double> run_one_size(
             {"verify", verify ? 1.0 : 0.0}
         };
     } catch (...) {
-        if (nccl_comm != nullptr) {
-            ncclCommDestroy(nccl_comm);
-            nccl_comm = nullptr;
-        }
-
         if (local_src != nullptr) {
             system::runtime::set_device(local_device);
             cudaFree(local_src);
@@ -1186,25 +1166,52 @@ std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
     const ncclUniqueId nccl_id =
         make_nccl_unique_id(nccl_unique_id_bytes);
 
-    std::vector<std::map<std::string, double>> rows;
-    rows.reserve(sizes.size());
+    const int local_device = local_rank == 0 ? dev0 : dev1;
 
-    for (int64_t numel : sizes) {
-        rows.push_back(
-            run_one_size(
-                collective,
-                numel,
-                local_rank,
-                dev0,
-                dev1,
-                broker_key,
+    ncclComm_t nccl_comm = nullptr;
+
+    try {
+        system::runtime::set_device(local_device);
+
+        OOVERLAP_IPC_COLLECTIVE_NCCL_CHECK(
+            ncclCommInitRank(
+                &nccl_comm,
+                2,
                 nccl_id,
-                iters,
-                warmup,
-                verify));
-    }
+                local_rank));
 
-    return rows;
+        std::vector<std::map<std::string, double>> rows;
+        rows.reserve(sizes.size());
+
+        for (int64_t numel : sizes) {
+            rows.push_back(
+                run_one_size(
+                    collective,
+                    numel,
+                    local_rank,
+                    dev0,
+                    dev1,
+                    broker_key,
+                    nccl_comm,
+                    iters,
+                    warmup,
+                    verify));
+        }
+
+        if (nccl_comm != nullptr) {
+            ncclCommDestroy(nccl_comm);
+            nccl_comm = nullptr;
+        }
+
+        return rows;
+    } catch (...) {
+        if (nccl_comm != nullptr) {
+            ncclCommDestroy(nccl_comm);
+            nccl_comm = nullptr;
+        }
+
+        throw;
+    }
 }
 
 } // namespace ooverlap
