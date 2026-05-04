@@ -11,11 +11,10 @@
 #include "overlap_impl.h"
 
 #include "test/persistent_allreduce_2gpu_sm90.h"
-#include "test/ipc_allreduce_2gpu_sm90.h"
-#include "test/ipc_allreduce_benchmark_2gpu_sm90.h"
 #include "test/tma_bandwidth_experiment_sm90.h"
 #include "test/tma_allreduce_sweep_2gpu_sm90.h"
 #include "test/public_allreduce_benchmark_2gpu_sm90.h"
+#include "test/ipc_collective_sm90.h"
 
 namespace py = pybind11;
 
@@ -205,29 +204,6 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev1") = 1,
         "Benchmark persistent 2-GPU all-reduce vs NCCL");
 
-  m.def("tma_ipc_two_gpu_allreduce_rank_smoke_test",
-        &ooverlap::tma_ipc_two_gpu_allreduce_rank_smoke_test,
-        py::arg("numel"),
-        py::arg("local_rank"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1,
-        py::arg("broker_key"),
-        py::arg("iters") = 1,
-        "2-process CUDA IPC 2-GPU all-reduce smoke test; call once per local rank");
-
-  m.def("benchmark_ipc_two_gpu_allreduce_rank_sm90",
-        &ooverlap::benchmark_ipc_two_gpu_allreduce_rank_sm90,
-        py::arg("numel"),
-        py::arg("local_rank"),
-        py::arg("dev0"),
-        py::arg("dev1"),
-        py::arg("broker_key"),
-        py::arg("nccl_unique_id_bytes"),
-        py::arg("iters"),
-        py::arg("warmup"),
-        py::arg("verify") = false,
-        "Per-rank 2-process IPC benchmark: ooverlap IPC allreduce vs NCCL");
-
   m.def("benchmark_tma_bandwidth_experiment_sm90",
         &ooverlap::benchmark_tma_bandwidth_experiment_sm90,
         py::arg("min_bytes") = 512 * 1024,
@@ -277,6 +253,30 @@ PYBIND11_MODULE(ooverlap_ext, m) {
       py::arg("dev0") = 0,
       py::arg("dev1") = 1,
       "Benchmark persistent 2-GPU collective vs NCCL. collective: allreduce, reduce_scatter, all_gather");
+
+  m.def("smoke_ipc_collective_rank_sm90",
+      &ooverlap::smoke_ipc_collective_rank_sm90,
+      py::arg("collective"),
+      py::arg("numel"),
+      py::arg("local_rank"),
+      py::arg("dev0"),
+      py::arg("dev1"),
+      py::arg("broker_key"),
+      py::arg("nccl_unique_id_bytes"),
+      py::arg("verify") = true);
+
+  m.def("benchmark_ipc_collective_rank_sm90",
+      &ooverlap::benchmark_ipc_collective_rank_sm90,
+      py::arg("collective"),
+      py::arg("sizes"),
+      py::arg("local_rank"),
+      py::arg("dev0"),
+      py::arg("dev1"),
+      py::arg("broker_key"),
+      py::arg("nccl_unique_id_bytes"),
+      py::arg("iters"),
+      py::arg("warmup"),
+      py::arg("verify"));
 
   py::class_<OverlapImpl>(m, "OverlapImpl")
       .def(py::init<>())
