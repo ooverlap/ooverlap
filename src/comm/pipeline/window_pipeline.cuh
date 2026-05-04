@@ -1,7 +1,7 @@
 #pragma once
 
-#include "comm/kernels/fast_add.cuh"
-#include "comm/kernels/fast_copy.cuh"
+#include "ooverlap/mem/fast_add.cuh"
+#include "ooverlap/mem/fast_copy.cuh"
 #include "comm/pipeline/pipeline_stage.h"
 #include "comm/pipeline/pipeline_tma_copy.h"
 #include "comm/pipeline/pipeline_tma_load.h"

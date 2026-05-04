@@ -1,7 +1,6 @@
 #include "test/tma_collective_sweep_2gpu.h"
 
 #include "comm/launch_config.h"
-#include "comm/ooverlap_comm.h"
 #include "comm/ooverlap_comm_internal.h"
 #include "comm/params.h"
 #include "comm/tma_multi_gpu_all_gather_sm90.h"

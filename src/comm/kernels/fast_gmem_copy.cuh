@@ -1,6 +1,6 @@
 #pragma once
 
-#include "comm/kernels/fast_copy.cuh"
+#include "ooverlap/mem/fast_copy.cuh"
 #include "comm/kernels/fast_gmem_add.cuh"
 
 #include <cuda_runtime.h>

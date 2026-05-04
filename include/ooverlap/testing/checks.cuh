@@ -11,25 +11,6 @@
 namespace ooverlap {
 namespace testing {
 
-inline const char* oo_status_string(oo_status_t status) {
-    switch (status) {
-        case OO_SUCCESS:
-            return "OO_SUCCESS";
-        case OO_ERROR_INVALID_ARGUMENT:
-            return "OO_ERROR_INVALID_ARGUMENT";
-        case OO_ERROR_INVALID_DEVICE:
-            return "OO_ERROR_INVALID_DEVICE";
-        case OO_ERROR_UNSUPPORTED:
-            return "OO_ERROR_UNSUPPORTED";
-        case OO_ERROR_CUDA:
-            return "OO_ERROR_CUDA";
-        case OO_ERROR_INTERNAL:
-            return "OO_ERROR_INTERNAL";
-        default:
-            return "OO_ERROR_UNKNOWN";
-    }
-}
-
 inline void check_oo(
     oo_status_t status,
     const char* what) {
