@@ -52,6 +52,24 @@ def parse_sizes(s: str) -> list[int]:
     return out
 
 
+def format_size_bytes(n: int) -> str:
+    n = int(n)
+    units = [
+        (1024**3, "G"),
+        (1024**2, "M"),
+        (1024, "K"),
+    ]
+
+    for scale, suffix in units:
+        if n >= scale:
+            value = n / scale
+            if value.is_integer():
+                return f"{int(value)}{suffix}"
+            return f"{value:.1f}{suffix}"
+
+    return f"{n}B"
+
+
 def bytes_to_numel(size_bytes: int) -> int:
     if size_bytes <= 0:
         raise ValueError("buffer size must be > 0")
@@ -268,6 +286,8 @@ def plot_metric(metric: str, all_rows, out_path: Path):
         ax.plot(x, y_nccl, marker="o", label="nccl")
 
         ax.set_xscale("log", base=2)
+        ax.set_xticks(x)
+        ax.set_xticklabels([format_size_bytes(v) for v in x])
         ax.set_title(collective)
         ax.set_ylabel(ylabel)
         ax.grid(True, which="both", linestyle="--", alpha=0.35)
