@@ -271,6 +271,9 @@ def plot_metric(metric, all_rows, out_path: Path):
     fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(15, 4), sharex=True)
     legend_handles, legend_labels, ylabel = None, None, ""
 
+    cta_values = list(next(iter(all_rows.values())).keys())
+    only_cta = cta_values[0] if len(cta_values) == 1 else None
+
     for ax, collective in zip(axes, COLLECTIVES):
         for ctas, rows in all_rows[collective].items():
             x = [r["bytes"] for r in rows]
@@ -295,6 +298,12 @@ def plot_metric(metric, all_rows, out_path: Path):
         ax.set_title(collective)
         ax.grid(True, which="both", linestyle="--", alpha=0.35)
 
+    if metric == "speedup":
+        fig.suptitle(
+            "Unrestricted CTAs" if only_cta is None else f"{only_cta} CTAs",
+            y=1.13,
+        )
+
     fig.supylabel(ylabel)
     fig.supxlabel("buffer size")
     fig.legend(
@@ -302,10 +311,10 @@ def plot_metric(metric, all_rows, out_path: Path):
         legend_labels,
         loc="upper center",
         ncol=min(len(legend_labels), 6),
-        bbox_to_anchor=(0.5, 1.08),
+        bbox_to_anchor=(0.5, 1.08 if metric != "speedup" else 1.02),
         frameon=False,
     )
-    fig.tight_layout(rect=(0.02, 0.02, 1.0, 0.88))
+    fig.tight_layout(rect=(0.02, 0.02, 1.0, 0.88 if metric != "speedup" else 0.84))
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
     print(f"[plot] wrote {out_path}")
 
