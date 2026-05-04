@@ -261,42 +261,68 @@ def run_metric_suite(
 
 def plot_metric(metric: str, all_rows, out_path: Path):
     fig, axes = plt.subplots(
-        nrows=3,
-        ncols=1,
-        figsize=(8, 10),
+        nrows=1,
+        ncols=3,
+        figsize=(15, 4),
         sharex=True,
     )
+
+    legend_handles = None
+    legend_labels = None
+    ylabel = ""
 
     for ax, collective in zip(axes, COLLECTIVES):
         rows = all_rows[collective]
         x = [r["bytes"] for r in rows]
 
         if metric == "latency":
-            y_oo = [r["oo_latency_ms"] for r in rows]
-            y_nccl = [r["nccl_latency_ms"] for r in rows]
-            ylabel = "latency (ms)"
+            y_oo = [r["oo_latency_ms"] * 1000.0 for r in rows]
+            y_nccl = [r["nccl_latency_ms"] * 1000.0 for r in rows]
+            ylabel = "latency (us)"
         elif metric == "bandwidth":
             y_oo = [bandwidth_gbps(r["bytes"], r["oo_latency_ms"]) for r in rows]
             y_nccl = [bandwidth_gbps(r["bytes"], r["nccl_latency_ms"]) for r in rows]
             ylabel = "bandwidth (GB/s)"
+        elif metric == "speedup":
+            y_oo = [
+                r["nccl_latency_ms"] / r["oo_latency_ms"]
+                if r["oo_latency_ms"] > 0.0 else 0.0
+                for r in rows
+            ]
+            y_nccl = None
+            ylabel = "speedup vs NCCL (x)"
         else:
             raise ValueError(f"unknown metric: {metric}")
 
-        ax.plot(x, y_oo, marker="o", label="ooverlap")
-        ax.plot(x, y_nccl, marker="o", label="nccl")
+        ax.plot(x, y_oo, marker="o", label="ooverlap / nccl" if metric == "speedup" else "ooverlap")
+
+        if y_nccl is not None:
+            ax.plot(x, y_nccl, marker="o", label="nccl")
+        else:
+            ax.axhline(1.0, linestyle="--", linewidth=1.0, label="nccl baseline")
+
+        if legend_handles is None:
+            legend_handles, legend_labels = ax.get_legend_handles_labels()
 
         ax.set_xscale("log", base=2)
         ax.set_xticks(x)
-        ax.set_xticklabels([format_size_bytes(v) for v in x])
+        ax.set_xticklabels([format_size_bytes(v) for v in x], rotation=30, ha="right")
         ax.set_title(collective)
-        ax.set_ylabel(ylabel)
         ax.grid(True, which="both", linestyle="--", alpha=0.35)
-        ax.legend()
 
-    axes[-1].set_xlabel("buffer size (bytes)")
+    fig.supylabel(ylabel)
+    fig.supxlabel("buffer size")
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        loc="upper center",
+        ncol=len(legend_labels),
+        bbox_to_anchor=(0.5, 1.04),
+        frameon=False,
+    )
 
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160)
+    fig.tight_layout(rect=(0.02, 0.02, 1.0, 0.92))
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
     print(f"[plot] wrote {out_path}")
 
 
@@ -318,7 +344,7 @@ def main():
 
     parser.add_argument(
         "--metric",
-        choices=["latency", "bandwidth", "both"],
+        choices=["latency", "bandwidth", "speedup", "both", "all"],
         default="bandwidth",
     )
 
@@ -368,10 +394,12 @@ def main():
         default_sizes = parse_sizes(args.bytes)
 
         metrics = []
-        if args.metric in ("latency", "both"):
+        if args.metric in ("latency", "both", "all"):
             metrics.append("latency")
-        if args.metric in ("bandwidth", "both"):
+        if args.metric in ("bandwidth", "both", "all"):
             metrics.append("bandwidth")
+        if args.metric in ("speedup", "all"):
+            metrics.append("speedup")
 
         for metric in metrics:
             if metric == "latency" and args.latency_bytes is not None:
