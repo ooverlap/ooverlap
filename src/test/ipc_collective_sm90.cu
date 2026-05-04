@@ -2,7 +2,10 @@
 
 #include "comm/ooverlap_comm_internal.h"
 #include "ooverlap/system/runtime_utils.cuh"
-#include "ooverlap/testing/test_utils.cuh"
+#include "ooverlap/testing/checks.cuh"
+#include "ooverlap/testing/collective_test_utils.cuh"
+#include "ooverlap/testing/nccl_utils.cuh"
+#include "ooverlap/testing/timing.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -10,394 +13,16 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <functional>
 #include <map>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-#define OOVERLAP_IPC_COLLECTIVE_NCCL_CHECK(cmd)                              \
-    do {                                                                      \
-        ncclResult_t result__ = (cmd);                                        \
-        if (result__ != ncclSuccess) {                                        \
-            throw std::runtime_error(                                         \
-                std::string("NCCL error at ") + __FILE__ + ":" +              \
-                std::to_string(__LINE__) + " " +                              \
-                ncclGetErrorString(result__));                                \
-        }                                                                     \
-    } while (0)
-
 namespace ooverlap {
 namespace {
 
-enum class IpcCollective {
-    AllReduce = 0,
-    ReduceScatter = 1,
-    AllGather = 2,
-};
-
-IpcCollective parse_collective(const std::string& value) {
-    if (value == "allreduce" ||
-        value == "all_reduce" ||
-        value == "all-reduce" ||
-        value == "ar") {
-        return IpcCollective::AllReduce;
-    }
-
-    if (value == "reduce_scatter" ||
-        value == "reduce-scatter" ||
-        value == "reducescatter" ||
-        value == "rs") {
-        return IpcCollective::ReduceScatter;
-    }
-
-    if (value == "all_gather" ||
-        value == "all-gather" ||
-        value == "allgather" ||
-        value == "ag") {
-        return IpcCollective::AllGather;
-    }
-
-    throw std::invalid_argument(
-        "unknown collective '" + value +
-        "'; expected allreduce, reduce_scatter, or all_gather");
-}
-
-const char* collective_name(IpcCollective collective) {
-    switch (collective) {
-        case IpcCollective::AllReduce:
-            return "allreduce";
-        case IpcCollective::ReduceScatter:
-            return "reduce_scatter";
-        case IpcCollective::AllGather:
-            return "all_gather";
-        default:
-            return "unknown";
-    }
-}
-
-double collective_code(IpcCollective collective) {
-    return static_cast<double>(static_cast<int>(collective));
-}
-
-const char* oo_status_string(oo_status_t status) {
-    switch (status) {
-        case OO_SUCCESS:
-            return "OO_SUCCESS";
-        case OO_ERROR_INVALID_ARGUMENT:
-            return "OO_ERROR_INVALID_ARGUMENT";
-        case OO_ERROR_INVALID_DEVICE:
-            return "OO_ERROR_INVALID_DEVICE";
-        case OO_ERROR_UNSUPPORTED:
-            return "OO_ERROR_UNSUPPORTED";
-        case OO_ERROR_CUDA:
-            return "OO_ERROR_CUDA";
-        case OO_ERROR_INTERNAL:
-            return "OO_ERROR_INTERNAL";
-        default:
-            return "OO_ERROR_UNKNOWN";
-    }
-}
-
-void check_oo(oo_status_t status, const char* what) {
-    if (status != OO_SUCCESS) {
-        throw std::runtime_error(
-            std::string(what) + " failed: " + oo_status_string(status));
-    }
-}
-
-void check_cuda(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(
-            std::string(what) + " failed: " + cudaGetErrorString(err));
-    }
-}
-
-float rank_scale(int rank) {
-    return rank == 0 ? 0.25f : 0.50f;
-}
-
-float rank_offset(int rank) {
-    return rank == 0 ? 1.0f : 2.0f;
-}
-
-size_t rank_partition_begin(
-    size_t count,
-    int rank,
-    int world_size) {
-    const size_t world = static_cast<size_t>(world_size);
-    const size_t r = static_cast<size_t>(rank);
-    const size_t base = count / world;
-    const size_t rem = count % world;
-
-    return r * base + ((r < rem) ? r : rem);
-}
-
-size_t rank_partition_count(
-    size_t count,
-    int rank,
-    int world_size) {
-    const size_t world = static_cast<size_t>(world_size);
-    const size_t r = static_cast<size_t>(rank);
-    const size_t base = count / world;
-    const size_t rem = count % world;
-
-    return base + ((r < rem) ? 1 : 0);
-}
-
-std::vector<float> reference_rank_fp16(
-    int64_t numel,
-    int rank) {
-    return testing::host_reference_pattern_fp16(
-        numel,
-        rank_scale(rank),
-        rank_offset(rank));
-}
-
-std::vector<float> reference_sum_fp16(int64_t numel) {
-    std::vector<float> ref0 = reference_rank_fp16(numel, 0);
-    std::vector<float> ref1 = reference_rank_fp16(numel, 1);
-
-    std::vector<float> out(static_cast<size_t>(numel));
-
-    for (int64_t i = 0; i < numel; ++i) {
-        float acc = ref0[static_cast<size_t>(i)];
-        acc = testing::round_to_half(acc + ref1[static_cast<size_t>(i)]);
-        out[static_cast<size_t>(i)] = acc;
-    }
-
-    return out;
-}
-
-std::vector<float> reference_all_gather_fp16(int64_t numel) {
-    std::vector<float> ref0 = reference_rank_fp16(numel, 0);
-    std::vector<float> ref1 = reference_rank_fp16(numel, 1);
-
-    std::vector<float> out(static_cast<size_t>(numel), 0.0f);
-
-    const size_t begin0 =
-        rank_partition_begin(static_cast<size_t>(numel), 0, 2);
-    const size_t count0 =
-        rank_partition_count(static_cast<size_t>(numel), 0, 2);
-
-    const size_t begin1 =
-        rank_partition_begin(static_cast<size_t>(numel), 1, 2);
-    const size_t count1 =
-        rank_partition_count(static_cast<size_t>(numel), 1, 2);
-
-    for (size_t i = 0; i < count0; ++i) {
-        const size_t idx = begin0 + i;
-        out[idx] = ref0[idx];
-    }
-
-    for (size_t i = 0; i < count1; ++i) {
-        const size_t idx = begin1 + i;
-        out[idx] = ref1[idx];
-    }
-
-    return out;
-}
-
-std::vector<float> slice_vector(
-    const std::vector<float>& values,
-    size_t begin,
-    size_t count) {
-    if (begin > values.size() || count > values.size() - begin) {
-        throw std::invalid_argument("slice_vector: invalid slice");
-    }
-
-    return std::vector<float>(
-        values.begin() + static_cast<std::ptrdiff_t>(begin),
-        values.begin() + static_cast<std::ptrdiff_t>(begin + count));
-}
-
-void validate_numel_for_collective(
-    IpcCollective collective,
-    int64_t numel) {
-    if (numel <= 0) {
-        throw std::invalid_argument("numel must be > 0");
-    }
-
-    if ((collective == IpcCollective::ReduceScatter ||
-         collective == IpcCollective::AllGather) &&
-        (numel % 2) != 0) {
-        throw std::invalid_argument(
-            std::string(collective_name(collective)) +
-            " requires numel divisible by 2 for NCCL comparison");
-    }
-}
-
-void fill_local_source(
-    half* local_src,
-    int64_t numel,
-    int local_rank,
-    int device,
-    cudaStream_t stream) {
-    system::runtime::set_device(device);
-
-    testing::fill_pattern(
-        local_src,
-        numel,
-        rank_scale(local_rank),
-        rank_offset(local_rank),
-        stream);
-
-    system::runtime::sync_stream_on_device(
-        device,
-        stream,
-        "sync fill_local_source");
-}
-
-void reset_work_buffer_async(
-    half* local_work,
-    const half* local_src,
-    size_t bytes,
-    int device,
-    cudaStream_t stream) {
-    system::runtime::set_device(device);
-
-    check_cuda(
-        cudaMemcpyAsync(
-            local_work,
-            local_src,
-            bytes,
-            cudaMemcpyDeviceToDevice,
-            stream),
-        "cudaMemcpyAsync(local_src -> local_work)");
-}
-
-void sync_stream(
-    int device,
-    cudaStream_t stream,
-    const char* label) {
-    system::runtime::sync_stream_on_device(device, stream, label);
-}
-
-void verify_collective_result(
-    IpcCollective collective,
-    const char* label,
-    half* local_work,
-    int64_t numel,
-    int local_rank,
-    int device) {
-    const std::vector<float> got =
-        testing::copy_half_device_to_host_float(
-            local_work,
-            numel,
-            device);
-
-    if (collective == IpcCollective::AllReduce) {
-        const std::vector<float> ref = reference_sum_fp16(numel);
-
-        testing::expect_allclose(
-            got,
-            ref,
-            (std::string(label) + " rank" +
-             std::to_string(local_rank) + " allreduce").c_str());
-
-        return;
-    }
-
-    if (collective == IpcCollective::ReduceScatter) {
-        const std::vector<float> ref = reference_sum_fp16(numel);
-
-        const size_t begin =
-            rank_partition_begin(static_cast<size_t>(numel), local_rank, 2);
-
-        const size_t count =
-            rank_partition_count(static_cast<size_t>(numel), local_rank, 2);
-
-        testing::expect_allclose(
-            slice_vector(got, begin, count),
-            slice_vector(ref, begin, count),
-            (std::string(label) + " rank" +
-             std::to_string(local_rank) + " reduce_scatter").c_str());
-
-        return;
-    }
-
-    if (collective == IpcCollective::AllGather) {
-        const std::vector<float> ref = reference_all_gather_fp16(numel);
-
-        testing::expect_allclose(
-            got,
-            ref,
-            (std::string(label) + " rank" +
-             std::to_string(local_rank) + " all_gather").c_str());
-
-        return;
-    }
-
-    throw std::invalid_argument("verify_collective_result: unknown collective");
-}
-
-ncclUniqueId make_nccl_unique_id(
-    const std::vector<int64_t>& encoded) {
-    ncclUniqueId id;
-    std::memset(&id, 0, sizeof(id));
-
-    const size_t expected_bytes = sizeof(id.internal);
-
-    if (encoded.size() * sizeof(int64_t) == expected_bytes) {
-        std::memcpy(id.internal, encoded.data(), expected_bytes);
-        return id;
-    }
-
-    if (encoded.size() == expected_bytes) {
-        for (size_t i = 0; i < encoded.size(); ++i) {
-            if (encoded[i] < 0 || encoded[i] > 255) {
-                throw std::invalid_argument(
-                    "NCCL unique ID byte out of range");
-            }
-
-            id.internal[i] = static_cast<char>(encoded[i]);
-        }
-
-        return id;
-    }
-
-    throw std::invalid_argument(
-        "NCCL unique ID has wrong encoded size: got " +
-        std::to_string(encoded.size()) +
-        " int64 values; expected either " +
-        std::to_string(expected_bytes / sizeof(int64_t)) +
-        " packed int64 values or " +
-        std::to_string(expected_bytes) +
-        " byte values");
-}
-
-double elapsed_one_rank_ms(
-    int device,
-    cudaStream_t stream,
-    const std::function<void()>& launch_once) {
-    cudaEvent_t start = nullptr;
-    cudaEvent_t stop = nullptr;
-
-    system::runtime::set_device(device);
-
-    check_cuda(cudaEventCreate(&start), "cudaEventCreate(start)");
-    check_cuda(cudaEventCreate(&stop), "cudaEventCreate(stop)");
-
-    check_cuda(cudaEventRecord(start, stream), "cudaEventRecord(start)");
-
-    launch_once();
-
-    check_cuda(cudaEventRecord(stop, stream), "cudaEventRecord(stop)");
-    check_cuda(cudaEventSynchronize(stop), "cudaEventSynchronize(stop)");
-
-    float ms = 0.0f;
-
-    check_cuda(
-        cudaEventElapsedTime(&ms, start, stop),
-        "cudaEventElapsedTime");
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
-    return static_cast<double>(ms);
-}
+using testing::TestCollective;
 
 struct IpcOoContext {
     oo_group_t* group = nullptr;
@@ -406,6 +31,12 @@ struct IpcOoContext {
     oo_buffer_t* peer_buf = nullptr;
     half* local_work = nullptr;
 };
+
+void broker_sync(IpcOoContext& ctx) {
+    if (ctx.group != nullptr && ctx.group->broker) {
+        ctx.group->broker->sync();
+    }
+}
 
 void destroy_ipc_oo_context(IpcOoContext& ctx) {
     if (ctx.group != nullptr && ctx.group->broker) {
@@ -464,7 +95,7 @@ IpcOoContext create_ipc_oo_context(
 
     IpcOoContext ctx;
 
-    check_oo(
+    testing::check_oo(
         oo_group_create_ipc(
             devices,
             2,
@@ -473,14 +104,14 @@ IpcOoContext create_ipc_oo_context(
             &ctx.group),
         "oo_group_create_ipc");
 
-    check_oo(
+    testing::check_oo(
         oo_node_create(
             ctx.group,
             local_rank,
             &ctx.node),
         "oo_node_create(local)");
 
-    check_oo(
+    testing::check_oo(
         oo_buffer_alloc(
             ctx.node,
             bytes,
@@ -530,7 +161,7 @@ IpcOoContext create_ipc_oo_context(
             all_desc[peer_rank],
             access_devices);
 
-    check_oo(
+    testing::check_oo(
         oo_buffer_adopt_imported_peer_buffer(
             ctx.node,
             std::move(imported_peer),
@@ -538,22 +169,22 @@ IpcOoContext create_ipc_oo_context(
         "oo_buffer_adopt_imported_peer_buffer(peer VMM)");
 
     ctx.peer_buf->owner_rank = peer_rank;
-    ctx.group->broker->sync();
+    broker_sync(ctx);
 
     return ctx;
 }
 
 void launch_ooverlap_collective(
-    IpcCollective collective,
+    TestCollective collective,
     IpcOoContext& ctx,
     size_t numel,
     cudaStream_t stream) {
     oo_buffer_t* peer_bufs[] = {
-        ctx.peer_buf
+        ctx.peer_buf,
     };
 
-    if (collective == IpcCollective::AllReduce) {
-        check_oo(
+    if (collective == TestCollective::AllReduce) {
+        testing::check_oo(
             oo_allreduce(
                 ctx.node,
                 ctx.local_buf,
@@ -567,10 +198,10 @@ void launch_ooverlap_collective(
         return;
     }
 
-    if (collective == IpcCollective::ReduceScatter) {
+    if (collective == TestCollective::ReduceScatter) {
         oo_tensor_slice_t slice{};
 
-        check_oo(
+        testing::check_oo(
             oo_reduce_scatter(
                 ctx.node,
                 ctx.local_buf,
@@ -585,8 +216,8 @@ void launch_ooverlap_collective(
         return;
     }
 
-    if (collective == IpcCollective::AllGather) {
-        check_oo(
+    if (collective == TestCollective::AllGather) {
+        testing::check_oo(
             oo_all_gather(
                 ctx.node,
                 ctx.local_buf,
@@ -602,68 +233,32 @@ void launch_ooverlap_collective(
     throw std::invalid_argument("launch_ooverlap_collective: unknown collective");
 }
 
-void launch_nccl_collective(
-    IpcCollective collective,
-    ncclComm_t comm,
+void sync_device_stream(
+    int device,
+    cudaStream_t stream,
+    const char* label) {
+    system::runtime::sync_stream_on_device(device, stream, label);
+}
+
+void reset_and_sync(
     half* work,
-    size_t numel,
-    int local_rank,
-    cudaStream_t stream) {
-    if (collective == IpcCollective::AllReduce) {
-        OOVERLAP_IPC_COLLECTIVE_NCCL_CHECK(
-            ncclAllReduce(
-                work,
-                work,
-                numel,
-                ncclFloat16,
-                ncclSum,
-                comm,
-                stream));
-        return;
-    }
+    const half* src,
+    size_t bytes,
+    int device,
+    cudaStream_t stream,
+    const char* label) {
+    testing::reset_work_buffer_async(
+        work,
+        src,
+        bytes,
+        device,
+        stream);
 
-    if (collective == IpcCollective::ReduceScatter) {
-        const size_t shard_begin =
-            rank_partition_begin(numel, local_rank, 2);
-
-        const size_t shard_count =
-            rank_partition_count(numel, local_rank, 2);
-
-        OOVERLAP_IPC_COLLECTIVE_NCCL_CHECK(
-            ncclReduceScatter(
-                work,
-                work + shard_begin,
-                shard_count,
-                ncclFloat16,
-                ncclSum,
-                comm,
-                stream));
-        return;
-    }
-
-    if (collective == IpcCollective::AllGather) {
-        const size_t shard_begin =
-            rank_partition_begin(numel, local_rank, 2);
-
-        const size_t shard_count =
-            rank_partition_count(numel, local_rank, 2);
-
-        OOVERLAP_IPC_COLLECTIVE_NCCL_CHECK(
-            ncclAllGather(
-                work + shard_begin,
-                work,
-                shard_count,
-                ncclFloat16,
-                comm,
-                stream));
-        return;
-    }
-
-    throw std::invalid_argument("launch_nccl_collective: unknown collective");
+    sync_device_stream(device, stream, label);
 }
 
 void warmup_ooverlap(
-    IpcCollective collective,
+    TestCollective collective,
     IpcOoContext& ctx,
     const half* local_src,
     size_t numel,
@@ -673,16 +268,15 @@ void warmup_ooverlap(
     const size_t bytes = numel * sizeof(half);
 
     for (int i = 0; i < warmup; ++i) {
-        reset_work_buffer_async(
+        reset_and_sync(
             ctx.local_work,
             local_src,
             bytes,
             local_device,
-            stream);
+            stream,
+            "sync oo warmup reset");
 
-        sync_stream(local_device, stream, "sync oo warmup reset");
-
-        ctx.group->broker->sync();
+        broker_sync(ctx);
 
         launch_ooverlap_collective(
             collective,
@@ -690,14 +284,13 @@ void warmup_ooverlap(
             numel,
             stream);
 
-        sync_stream(local_device, stream, "sync oo warmup");
-
-        ctx.group->broker->sync();
+        sync_device_stream(local_device, stream, "sync oo warmup");
+        broker_sync(ctx);
     }
 }
 
 double benchmark_ooverlap_total_ms(
-    IpcCollective collective,
+    TestCollective collective,
     IpcOoContext& ctx,
     const half* local_src,
     size_t numel,
@@ -708,36 +301,36 @@ double benchmark_ooverlap_total_ms(
     double total_ms = 0.0;
 
     for (int i = 0; i < iters; ++i) {
-        reset_work_buffer_async(
+        reset_and_sync(
             ctx.local_work,
             local_src,
             bytes,
             local_device,
-            stream);
-
-        sync_stream(local_device, stream, "sync oo timed reset");
-
-        ctx.group->broker->sync();
-
-        total_ms += elapsed_one_rank_ms(
-            local_device,
             stream,
-            [&]() {
-                launch_ooverlap_collective(
-                    collective,
-                    ctx,
-                    numel,
-                    stream);
-            });
+            "sync oo timed reset");
 
-        ctx.group->broker->sync();
+        broker_sync(ctx);
+
+        total_ms +=
+            testing::elapsed_one_rank_ms(
+                local_device,
+                stream,
+                [&]() {
+                    launch_ooverlap_collective(
+                        collective,
+                        ctx,
+                        numel,
+                        stream);
+                });
+
+        broker_sync(ctx);
     }
 
     return total_ms;
 }
 
 void warmup_nccl(
-    IpcCollective collective,
+    TestCollective collective,
     ncclComm_t comm,
     half* work,
     const half* local_src,
@@ -750,33 +343,32 @@ void warmup_nccl(
     const size_t bytes = numel * sizeof(half);
 
     for (int i = 0; i < warmup; ++i) {
-        reset_work_buffer_async(
+        reset_and_sync(
             work,
             local_src,
             bytes,
             local_device,
-            stream);
+            stream,
+            "sync nccl warmup reset");
 
-        sync_stream(local_device, stream, "sync nccl warmup reset");
+        broker_sync(barrier_ctx);
 
-        barrier_ctx.group->broker->sync();
-
-        launch_nccl_collective(
+        testing::launch_nccl_collective_fp16(
             collective,
             comm,
             work,
             numel,
             local_rank,
+            2,
             stream);
 
-        sync_stream(local_device, stream, "sync nccl warmup");
-
-        barrier_ctx.group->broker->sync();
+        sync_device_stream(local_device, stream, "sync nccl warmup");
+        broker_sync(barrier_ctx);
     }
 }
 
 double benchmark_nccl_total_ms(
-    IpcCollective collective,
+    TestCollective collective,
     ncclComm_t comm,
     half* work,
     const half* local_src,
@@ -790,38 +382,39 @@ double benchmark_nccl_total_ms(
     double total_ms = 0.0;
 
     for (int i = 0; i < iters; ++i) {
-        reset_work_buffer_async(
+        reset_and_sync(
             work,
             local_src,
             bytes,
             local_device,
-            stream);
-
-        sync_stream(local_device, stream, "sync nccl timed reset");
-
-        barrier_ctx.group->broker->sync();
-
-        total_ms += elapsed_one_rank_ms(
-            local_device,
             stream,
-            [&]() {
-                launch_nccl_collective(
-                    collective,
-                    comm,
-                    work,
-                    numel,
-                    local_rank,
-                    stream);
-            });
+            "sync nccl timed reset");
 
-        barrier_ctx.group->broker->sync();
+        broker_sync(barrier_ctx);
+
+        total_ms +=
+            testing::elapsed_one_rank_ms(
+                local_device,
+                stream,
+                [&]() {
+                    testing::launch_nccl_collective_fp16(
+                        collective,
+                        comm,
+                        work,
+                        numel,
+                        local_rank,
+                        2,
+                        stream);
+                });
+
+        broker_sync(barrier_ctx);
     }
 
     return total_ms;
 }
 
 void verify_ooverlap_once(
-    IpcCollective collective,
+    TestCollective collective,
     IpcOoContext& ctx,
     const half* local_src,
     int64_t numel,
@@ -830,16 +423,15 @@ void verify_ooverlap_once(
     cudaStream_t stream) {
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
 
-    reset_work_buffer_async(
+    reset_and_sync(
         ctx.local_work,
         local_src,
         bytes,
         local_device,
-        stream);
+        stream,
+        "sync oo verify reset");
 
-    sync_stream(local_device, stream, "sync oo verify reset");
-
-    ctx.group->broker->sync();
+    broker_sync(ctx);
 
     launch_ooverlap_collective(
         collective,
@@ -847,21 +439,22 @@ void verify_ooverlap_once(
         static_cast<size_t>(numel),
         stream);
 
-    sync_stream(local_device, stream, "sync oo verify");
+    sync_device_stream(local_device, stream, "sync oo verify");
 
-    verify_collective_result(
+    testing::verify_collective_fp16(
         collective,
         "ooverlap IPC verify",
         ctx.local_work,
         numel,
         local_rank,
+        2,
         local_device);
 
-    ctx.group->broker->sync();
+    broker_sync(ctx);
 }
 
 void verify_nccl_once(
-    IpcCollective collective,
+    TestCollective collective,
     ncclComm_t comm,
     half* work,
     const half* local_src,
@@ -872,40 +465,41 @@ void verify_nccl_once(
     IpcOoContext& barrier_ctx) {
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
 
-    reset_work_buffer_async(
+    reset_and_sync(
         work,
         local_src,
         bytes,
         local_device,
-        stream);
+        stream,
+        "sync nccl verify reset");
 
-    sync_stream(local_device, stream, "sync nccl verify reset");
+    broker_sync(barrier_ctx);
 
-    barrier_ctx.group->broker->sync();
-
-    launch_nccl_collective(
+    testing::launch_nccl_collective_fp16(
         collective,
         comm,
         work,
         static_cast<size_t>(numel),
         local_rank,
+        2,
         stream);
 
-    sync_stream(local_device, stream, "sync nccl verify");
+    sync_device_stream(local_device, stream, "sync nccl verify");
 
-    verify_collective_result(
+    testing::verify_collective_fp16(
         collective,
         "NCCL IPC verify",
         work,
         numel,
         local_rank,
+        2,
         local_device);
 
-    barrier_ctx.group->broker->sync();
+    broker_sync(barrier_ctx);
 }
 
 std::map<std::string, double> run_one_size(
-    IpcCollective collective,
+    TestCollective collective,
     int64_t numel,
     int local_rank,
     int dev0,
@@ -915,7 +509,10 @@ std::map<std::string, double> run_one_size(
     int iters,
     int warmup,
     bool verify) {
-    validate_numel_for_collective(collective, numel);
+    testing::validate_numel_for_collective(
+        collective,
+        numel,
+        2);
 
     const int local_device = local_rank == 0 ? dev0 : dev1;
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
@@ -932,19 +529,19 @@ std::map<std::string, double> run_one_size(
         stream =
             system::runtime::create_stream_on_device(local_device);
 
-        check_cuda(
+        testing::check_cuda(
             cudaMalloc(
                 reinterpret_cast<void**>(&local_src),
                 bytes),
             "cudaMalloc(local_src)");
 
-        check_cuda(
+        testing::check_cuda(
             cudaMalloc(
                 reinterpret_cast<void**>(&nccl_work),
                 bytes),
             "cudaMalloc(nccl_work)");
 
-        fill_local_source(
+        testing::fill_rank_source_fp16(
             local_src,
             numel,
             local_rank,
@@ -959,7 +556,7 @@ std::map<std::string, double> run_one_size(
                 dev1,
                 broker_key);
 
-        ctx.group->broker->sync();
+        broker_sync(ctx);
 
         system::runtime::set_device(local_device);
 
@@ -1029,9 +626,8 @@ std::map<std::string, double> run_one_size(
                 ctx);
         }
 
-        ctx.group->broker->sync();
-
-        ctx.group->broker->sync();
+        broker_sync(ctx);
+        broker_sync(ctx);
 
         if (local_src != nullptr) {
             system::runtime::set_device(local_device);
@@ -1055,10 +651,13 @@ std::map<std::string, double> run_one_size(
         }
 
         const size_t local_shard_count =
-            rank_partition_count(static_cast<size_t>(numel), local_rank, 2);
+            testing::rank_partition_count(
+                static_cast<size_t>(numel),
+                local_rank,
+                2);
 
         return {
-            {"collective", collective_code(collective)},
+            {"collective", testing::collective_code(collective)},
             {"rank", static_cast<double>(local_rank)},
             {"world_size", 2.0},
             {"numel", static_cast<double>(numel)},
@@ -1070,7 +669,7 @@ std::map<std::string, double> run_one_size(
             {"nccl_total_ms", nccl_total_ms},
             {"iters", static_cast<double>(iters)},
             {"warmup", static_cast<double>(warmup)},
-            {"verify", verify ? 1.0 : 0.0}
+            {"verify", verify ? 1.0 : 0.0},
         };
     } catch (...) {
         if (local_src != nullptr) {
@@ -1160,11 +759,11 @@ std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
         throw std::invalid_argument("broker_key must be non-empty");
     }
 
-    const IpcCollective collective =
-        parse_collective(collective_name_arg);
+    const TestCollective collective =
+        testing::parse_collective(collective_name_arg);
 
     const ncclUniqueId nccl_id =
-        make_nccl_unique_id(nccl_unique_id_bytes);
+        testing::make_nccl_unique_id(nccl_unique_id_bytes);
 
     const int local_device = local_rank == 0 ? dev0 : dev1;
 
@@ -1173,7 +772,7 @@ std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
     try {
         system::runtime::set_device(local_device);
 
-        OOVERLAP_IPC_COLLECTIVE_NCCL_CHECK(
+        OOVERLAP_TEST_NCCL_CHECK(
             ncclCommInitRank(
                 &nccl_comm,
                 2,
