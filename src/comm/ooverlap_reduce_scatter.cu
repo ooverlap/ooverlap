@@ -53,6 +53,7 @@ oo_status_t reduce_scatter_impl(
 
     ooverlap::comm::LaunchConfig config =
         ooverlap::comm::api::select_public_launch_config(
+            ooverlap::comm::CollectivePlanFor::ReduceScatter,
             launch.bytes,
             tuning_mode);
 

@@ -120,6 +120,10 @@ if(OOVERLAP_BUILD_CORE)
       CUDA::cuda_driver
   )
 
+  if(TARGET nlohmann_json::nlohmann_json)
+    target_link_libraries(ooverlap_comm PRIVATE nlohmann_json::nlohmann_json)
+  endif()
+
   ooverlap_link_cudadevrt(ooverlap_comm PRIVATE)
 endif()
 

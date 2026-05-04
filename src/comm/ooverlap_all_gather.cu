@@ -37,6 +37,7 @@ oo_status_t all_gather_impl(
 
     ooverlap::comm::LaunchConfig config =
         ooverlap::comm::api::select_public_launch_config(
+            ooverlap::comm::CollectivePlanFor::AllGather,
             launch.bytes,
             tuning_mode);
 

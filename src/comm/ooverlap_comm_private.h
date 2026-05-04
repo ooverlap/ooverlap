@@ -63,6 +63,7 @@ oo_status_t fill_tensor_slice(
     oo_tensor_slice_t* out_slice);
 
 LaunchConfig select_public_launch_config(
+    CollectivePlanFor collective,
     size_t bytes,
     oo_tuning_mode_t tuning_mode);
 

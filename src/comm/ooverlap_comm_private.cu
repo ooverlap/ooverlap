@@ -207,9 +207,11 @@ oo_status_t fill_tensor_slice(
 }
 
 LaunchConfig select_public_launch_config(
+    CollectivePlanFor collective,
     size_t bytes,
     oo_tuning_mode_t tuning_mode) {
-    return select_launch_config_for_allreduce(
+    return select_launch_config_for_collective(
+        collective,
         bytes,
         tuning_preference_from_public(tuning_mode));
 }
