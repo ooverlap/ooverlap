@@ -6,3 +6,6 @@ tmp/
 .cache
 .clangd
 *png
+tmp/
+configs/
+compile_commands.json

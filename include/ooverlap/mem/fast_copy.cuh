@@ -1,0 +1,182 @@
+#pragma once
+
+#include <cuda_runtime.h>
+
+#include <cstddef>
+
+namespace ooverlap {
+namespace comm {
+namespace kernels {
+namespace fast_copy {
+
+__host__ __device__ __forceinline__ size_t min_sz(
+    size_t a,
+    size_t b) {
+    return a < b ? a : b;
+}
+
+template <typename VecT>
+__device__ __forceinline__ VecT load_copy_vec(
+    const VecT* __restrict__ ptr) {
+    return ptr[0];
+}
+
+template <typename VecT>
+__device__ __forceinline__ void store_copy_vec(
+    VecT* __restrict__ ptr,
+    VecT value) {
+    ptr[0] = value;
+}
+
+template <>
+__device__ __forceinline__ uint4 load_copy_vec<uint4>(
+    const uint4* __restrict__ ptr) {
+    uint4 value;
+
+    asm volatile(
+        "{\n"
+        "  .reg .u64 addr;\n"
+        "  cvta.to.global.u64 addr, %4;\n"
+        "  ld.global.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [addr];\n"
+        "}\n"
+        : "=r"(value.x),
+          "=r"(value.y),
+          "=r"(value.z),
+          "=r"(value.w)
+        : "l"(ptr));
+
+    return value;
+}
+
+template <>
+__device__ __forceinline__ void store_copy_vec<uint4>(
+    uint4* __restrict__ ptr,
+    uint4 value) {
+    asm volatile(
+        "{\n"
+        "  .reg .u64 addr;\n"
+        "  cvta.to.global.u64 addr, %0;\n"
+        "  st.global.L1::no_allocate.v4.u32 [addr], {%1, %2, %3, %4};\n"
+        "}\n"
+        :
+        : "l"(ptr),
+          "r"(value.x),
+          "r"(value.y),
+          "r"(value.z),
+          "r"(value.w)
+        : "memory");
+}
+
+template <typename VecT, int Unroll>
+__device__ __forceinline__ void copy_vec_span(
+    const VecT* __restrict__ src_vec,
+    VecT* __restrict__ dst_vec,
+    size_t begin_vec,
+    size_t end_vec,
+    size_t lane,
+    size_t lane_count) {
+    const size_t step = lane_count * static_cast<size_t>(Unroll);
+    size_t base = begin_vec + lane;
+
+    // Keep the load-all/store-all shape. It was faster for local-to-peer push.
+    if constexpr (Unroll == 8) {
+        for (; base + static_cast<size_t>(7) * lane_count < end_vec;
+             base += step) {
+            const VecT v0 =
+                load_copy_vec<VecT>(src_vec + base + 0 * lane_count);
+            const VecT v1 =
+                load_copy_vec<VecT>(src_vec + base + 1 * lane_count);
+            const VecT v2 =
+                load_copy_vec<VecT>(src_vec + base + 2 * lane_count);
+            const VecT v3 =
+                load_copy_vec<VecT>(src_vec + base + 3 * lane_count);
+            const VecT v4 =
+                load_copy_vec<VecT>(src_vec + base + 4 * lane_count);
+            const VecT v5 =
+                load_copy_vec<VecT>(src_vec + base + 5 * lane_count);
+            const VecT v6 =
+                load_copy_vec<VecT>(src_vec + base + 6 * lane_count);
+            const VecT v7 =
+                load_copy_vec<VecT>(src_vec + base + 7 * lane_count);
+
+            store_copy_vec<VecT>(dst_vec + base + 0 * lane_count, v0);
+            store_copy_vec<VecT>(dst_vec + base + 1 * lane_count, v1);
+            store_copy_vec<VecT>(dst_vec + base + 2 * lane_count, v2);
+            store_copy_vec<VecT>(dst_vec + base + 3 * lane_count, v3);
+            store_copy_vec<VecT>(dst_vec + base + 4 * lane_count, v4);
+            store_copy_vec<VecT>(dst_vec + base + 5 * lane_count, v5);
+            store_copy_vec<VecT>(dst_vec + base + 6 * lane_count, v6);
+            store_copy_vec<VecT>(dst_vec + base + 7 * lane_count, v7);
+        }
+    } else {
+        for (; base + static_cast<size_t>(Unroll - 1) * lane_count < end_vec;
+             base += step) {
+#pragma unroll
+            for (int u = 0; u < Unroll; ++u) {
+                const size_t i =
+                    base + static_cast<size_t>(u) * lane_count;
+
+                const VecT value =
+                    load_copy_vec<VecT>(src_vec + i);
+
+                store_copy_vec<VecT>(dst_vec + i, value);
+            }
+        }
+    }
+
+    for (; base < end_vec; base += lane_count) {
+        const VecT value =
+            load_copy_vec<VecT>(src_vec + base);
+
+        store_copy_vec<VecT>(dst_vec + base, value);
+    }
+}
+
+template <typename VecT, int Unroll>
+__device__ __forceinline__ void copy_byte_range(
+    const void* __restrict__ src,
+    void* __restrict__ dst,
+    size_t byte_offset,
+    size_t byte_count,
+    size_t lane,
+    size_t lane_count) {
+    const unsigned char* __restrict__ src_u8 =
+        reinterpret_cast<const unsigned char*>(src);
+
+    unsigned char* __restrict__ dst_u8 =
+        reinterpret_cast<unsigned char*>(dst);
+
+    const size_t vec_size = sizeof(VecT);
+    const size_t vec_begin = byte_offset / vec_size;
+    const size_t vec_count = byte_count / vec_size;
+    const size_t vec_end = vec_begin + vec_count;
+
+    const VecT* __restrict__ src_vec =
+        reinterpret_cast<const VecT*>(src);
+
+    VecT* __restrict__ dst_vec =
+        reinterpret_cast<VecT*>(dst);
+
+    copy_vec_span<VecT, Unroll>(
+        src_vec,
+        dst_vec,
+        vec_begin,
+        vec_end,
+        lane,
+        lane_count);
+
+    const size_t tail_begin =
+        byte_offset + vec_count * vec_size;
+
+    const size_t tail_end =
+        byte_offset + byte_count;
+
+    for (size_t i = tail_begin + lane; i < tail_end; i += lane_count) {
+        dst_u8[i] = src_u8[i];
+    }
+}
+
+} // namespace fast_copy
+} // namespace kernels
+} // namespace comm
+} // namespace ooverlap
