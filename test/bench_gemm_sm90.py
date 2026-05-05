@@ -18,6 +18,14 @@ def import_ooverlap_ext(ext_dir=None):
     return ooverlap_ext
 
 
+def get_algo_tile(ext, kind, algo, fallback_m, fallback_n):
+    name = f"gemm_{kind}_sm90_algo_info"
+    if hasattr(ext, name):
+        tile_m, tile_n = getattr(ext, name)(algo)
+        return int(tile_m), int(tile_n)
+    return fallback_m, fallback_n
+
+
 def make_segments(tile_num, num_segments, device):
     assert num_segments > 0
     assert tile_num >= num_segments
@@ -81,11 +89,11 @@ def unpack_signal_output(packed, m, n, tile_m, tile_n, rldn):
     return out
 
 
-def check_shape(m, n, k, tile_m, tile_n):
+def check_shape(m, n, k, tile_m, tile_n, label):
     if m % tile_m != 0:
-        raise ValueError(f"M={m} must be divisible by tile_m={tile_m}")
+        raise ValueError(f"{label}: M={m} must be divisible by tile_m={tile_m}")
     if n % tile_n != 0:
-        raise ValueError(f"N={n} must be divisible by tile_n={tile_n}")
+        raise ValueError(f"{label}: N={n} must be divisible by tile_n={tile_n}")
     if k <= 0:
         raise ValueError("K must be > 0")
 
@@ -123,15 +131,18 @@ def bench_plain(ext, a, b, ref, args):
 
 
 def bench_signal(ext, a, b, ref, args):
-    tile_rows = args.m // args.tile_m
-    tile_cols = args.n // args.tile_n
+    tile_m = args.signal_tile_m
+    tile_n = args.signal_tile_n
+
+    tile_rows = args.m // tile_m
+    tile_cols = args.n // tile_n
     tile_num = tile_rows * tile_cols
 
     rldn = args.rldn if args.rldn > 0 else tile_cols
     packed_rows = (tile_num + rldn - 1) // rldn
 
     d = torch.empty(
-        (packed_rows * args.tile_m, rldn * args.tile_n),
+        (packed_rows * tile_m, rldn * tile_n),
         device=a.device,
         dtype=torch.float16,
     )
@@ -159,7 +170,7 @@ def bench_signal(ext, a, b, ref, args):
     ms = time_cuda(run, args.warmup, args.iters)
 
     if args.check:
-        got = unpack_signal_output(d, args.m, args.n, args.tile_m, args.tile_n, rldn)
+        got = unpack_signal_output(d, args.m, args.n, tile_m, tile_n, rldn)
         mx, mean = max_mean_abs(got, ref)
         print(f"signal_sm90 algo={args.signal_algo}: {ms:.4f} ms  {tflops(args.m, args.n, args.k, ms):.2f} TFLOP/s  max={mx:.5f} mean={mean:.5f}")
     else:
@@ -198,16 +209,32 @@ def main():
 
     args = parser.parse_args()
 
-    check_shape(args.m, args.n, args.k, args.tile_m, args.tile_n)
-
-    tile_num = (args.m // args.tile_m) * (args.n // args.tile_n)
-    if args.segments <= 0 or args.segments > tile_num:
-        raise ValueError(f"segments must be in [1, {tile_num}]")
-
     torch.cuda.set_device(args.device)
     torch.manual_seed(args.seed)
 
     ext = import_ooverlap_ext(args.ext_dir)
+
+    args.plain_tile_m, args.plain_tile_n = get_algo_tile(
+        ext, "plain", args.plain_algo, args.tile_m, args.tile_n
+    )
+
+    args.signal_tile_m, args.signal_tile_n = get_algo_tile(
+        ext, "signal", args.signal_algo, args.tile_m, args.tile_n
+    )
+
+    if args.mode in ("plain", "both"):
+        check_shape(args.m, args.n, args.k, args.plain_tile_m, args.plain_tile_n, "plain")
+
+    if args.mode in ("signal", "both"):
+        check_shape(args.m, args.n, args.k, args.signal_tile_m, args.signal_tile_n, "signal")
+
+        signal_tile_num = (
+            (args.m // args.signal_tile_m) *
+            (args.n // args.signal_tile_n)
+        )
+
+        if args.segments <= 0 or args.segments > signal_tile_num:
+            raise ValueError(f"segments must be in [1, {signal_tile_num}]")
 
     a = torch.randn((args.m, args.k), device="cuda", dtype=torch.float16)
     b = torch.randn((args.n, args.k), device="cuda", dtype=torch.float16)
@@ -219,7 +246,8 @@ def main():
 
     print(
         f"M={args.m} N={args.n} K={args.k} "
-        f"tile=({args.tile_m},{args.tile_n}) "
+        f"plain_tile=({args.plain_tile_m},{args.plain_tile_n}) "
+        f"signal_tile=({args.signal_tile_m},{args.signal_tile_n}) "
         f"warmup={args.warmup} iters={args.iters}"
     )
 

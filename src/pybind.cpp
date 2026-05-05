@@ -70,6 +70,17 @@ TileInfo plain_tile_info(int64_t algo) {
   return {meta.tile_m, meta.tile_n};
 }
 
+
+py::tuple gemm_signal_sm90_algo_info(int64_t algo) {
+  auto tile = signal_tile_info(algo);
+  return py::make_tuple(tile.tile_m, tile.tile_n);
+}
+
+py::tuple gemm_plain_sm90_algo_info(int64_t algo) {
+  auto tile = plain_tile_info(algo);
+  return py::make_tuple(tile.tile_m, tile.tile_n);
+}
+
 const char* cublas_status_to_string(cublasStatus_t status) {
   switch (status) {
     case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
@@ -294,6 +305,9 @@ PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("gemm_scatter_sm90", &gemm_scatter_sm90);
   m.def("gemm_plain_sm90", &gemm_plain_sm90);
   m.def("baseline_gemm_col", &baseline_gemm_col);
+  m.def("gemm_signal_sm90_algo_info", &gemm_signal_sm90_algo_info);
+  m.def("gemm_plain_sm90_algo_info", &gemm_plain_sm90_algo_info);
+
 
   m.def("tma_persistent_two_gpu_allreduce_smoke_test",
         &ooverlap::tma_persistent_two_gpu_allreduce_smoke_test,
