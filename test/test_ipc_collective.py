@@ -93,11 +93,10 @@ def bytes_to_numel(size_bytes: int) -> int:
 
 
 def set_cta_env(ctas: int | None):
-    for k in ("OOVERLAP_MAX_CTAS", "NCCL_MIN_CTAS", "NCCL_MAX_CTAS"):
+    for k in ("OOVERLAP_MAX_CTAS", "NCCL_MAX_CTAS"):
         os.environ.pop(k, None)
     if ctas is not None:
         os.environ["OOVERLAP_MAX_CTAS"] = str(ctas)
-        os.environ["NCCL_MIN_CTAS"] = str(ctas)
         os.environ["NCCL_MAX_CTAS"] = str(ctas)
 
 
