@@ -41,16 +41,5 @@ inline double elapsed_one_rank_ms(
     return static_cast<double>(ms);
 }
 
-template <typename Fn>
-inline double elapsed_one_rank_ms(
-    int device,
-    cudaStream_t stream,
-    Fn&& launch_once) {
-    return elapsed_one_rank_ms(
-        device,
-        stream,
-        std::function<void()>(std::forward<Fn>(launch_once)));
-}
-
 } // namespace testing
 } // namespace ooverlap

@@ -11,9 +11,9 @@
 // These are defaults only. Runtime launch paths should use comm::LaunchConfig.
 // -----------------------------------------------------------------------------
 
-#define TMA_TWO_GPU_PEER_DEFAULT_THREADS 1024
-#define TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS 8
-#define TMA_TWO_GPU_PEER_DEFAULT_WINDOW_CHUNKS 64
+#define TMA_TWO_GPU_PEER_DEFAULT_THREADS 512
+#define TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS 16
+#define TMA_TWO_GPU_PEER_DEFAULT_WINDOW_CHUNKS 16
 
 #define TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES (8 * 1024)
 #define TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH 16
