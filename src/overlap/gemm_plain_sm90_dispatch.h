@@ -5,7 +5,7 @@
 
 namespace ooverlap {
 
-// Plain SM90 GEMM, no signal, no reorder, no NCCL.
+// Plain SM90 GEMM for baseline.
 //
 // Layout contract:
 //   A      : logical row-major [M, K], physical torch shape (M, K), contiguous
