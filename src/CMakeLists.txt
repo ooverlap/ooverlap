@@ -450,9 +450,21 @@ if(OOVERLAP_BUILD_PYTHON)
     message(FATAL_ERROR "src/pybind.cpp not found")
   endif()
 
-  add_library(ooverlap_ext MODULE
+  set(OOVERLAP_EXT_SOURCES
     ${OOVERLAP_SRC_DIR}/pybind.cpp
+    ${OOVERLAP_SRC_DIR}/test/persistent_allreduce_2gpu_sm90.cu
+    ${OOVERLAP_SRC_DIR}/test/ipc_collective_sm90.cu
+    ${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu
+    ${OOVERLAP_SRC_DIR}/test/tma_collective_sweep_2gpu.cu
   )
+  
+  foreach(ext_src IN LISTS OOVERLAP_EXT_SOURCES)
+    if(NOT EXISTS ${ext_src})
+      message(FATAL_ERROR "Required Python extension source not found: ${ext_src}")
+    endif()
+  endforeach()
+  
+  add_library(ooverlap_ext MODULE ${OOVERLAP_EXT_SOURCES})
 
   ooverlap_force_sm90a(ooverlap_ext)
   ooverlap_enable_pic(ooverlap_ext)
@@ -477,7 +489,6 @@ if(OOVERLAP_BUILD_PYTHON)
     ooverlap_system
     ooverlap_comm
     ooverlap_gemm
-    ooverlap_tests
     ooverlap_baseline_impl
     ooverlap_overlap_impl
     ooverlap_nccl_tool
