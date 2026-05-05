@@ -29,7 +29,33 @@ NUMELS = [
     134217728,
     268435456,
     536870912,
-    1073741824
+    623104,
+    741376,
+    881664,
+    1246720,
+    1482752,
+    1763328,
+    2493440,
+    2965504,
+    3526656,
+    4987392,
+    5931520,
+    7053824,
+    9975296,
+    11863040,
+    14107648,
+    19951104,
+    23726080,
+    28215296,
+    39902720,
+    47452672,
+    56431104,
+    79805952,
+    94905856,
+    112862720,
+    159612416,
+    189812224,
+    225725952,
 ]
 
 COLLECTIVES = [
@@ -71,7 +97,7 @@ CTA_LIMITS = [
     2,
     4,
     8,
-    16
+    16,
 ]
 
 WINDOW_CHUNKS = [
@@ -80,7 +106,7 @@ WINDOW_CHUNKS = [
     64,
     128,
     256,
-    512
+    512,
 ]
 
 # Each pair is:
@@ -108,7 +134,6 @@ LOGS_DIR = OUT_DIR / "tma_collective_sweep_logs"
 MERGED_RESULT_JSON = OUT_DIR / "tma_collective_sweep_result.json"
 SKIPPED_JSON = OUT_DIR / "tma_collective_sweep_skipped.json"
 BEST_JSON = OUT_DIR / "tma_collective_sweep_best.json"
-
 
 # Extra NCCL knobs. Leave None to not set.
 NCCL_ALGO = None
@@ -169,19 +194,24 @@ def skip_scenario(s):
     if s["kernel"] == "tma_copy" and s["threads"] > 32:
         return "address is already 16-bit aligned we dont need tons of threads"
 
-    # Example custom pruning. Delete this if you want to test everything.
-    # if s["kernel"] == "overlap_fast_gmem" and s["collective"] != "allreduce":
-    #     return "skip overlap_fast_gmem for non-allreduce"
     if s["numel"] > 67108864:
-        if (s["kernel"] == "seq_fast_gmem" or s["kernel"] == "overlap_fast_gmem") and s["threads"] < 512:
+        if (
+            s["kernel"] in ("seq_fast_gmem", "overlap_fast_gmem")
+            and s["threads"] < 512
+        ):
             return "for huge numel numbers threads should be above 512"
+
         if s["max_ctas"] < 8:
             return "for these huge numel numbers lower cta does not give anything back"
 
     if s["numel"] < 16777216:
         if s["window_chunks"] > 64:
             return "windows with huge chunks is not needed"
-        if (s["kernel"] == "seq_fast_gmem" or s["kernel"] == "overlap_fast_gmem") and s["threads"] > 512:
+
+        if (
+            s["kernel"] in ("seq_fast_gmem", "overlap_fast_gmem")
+            and s["threads"] > 512
+        ):
             return "we dont need that much threads"
 
     return None
@@ -352,10 +382,15 @@ def run_one_cta_process(max_ctas, scenarios):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    # This is the important part.
     env["OOVERLAP_MAX_CTAS"] = str(max_ctas)
     env["NCCL_MAX_CTAS"] = str(max_ctas)
-    
+
+    if NCCL_ALGO is not None:
+        env["NCCL_ALGO"] = str(NCCL_ALGO)
+
+    if NCCL_PROTO is not None:
+        env["NCCL_PROTO"] = str(NCCL_PROTO)
+
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -411,13 +446,101 @@ def run_one_cta_process(max_ctas, scenarios):
 def tag_rows_with_cta(response, max_ctas):
     for row in response.get("results", []):
         row["process_max_ctas"] = max_ctas
-
-        # Keep this explicit even if C++ also reports max_ctas.
         row["ooverlap_max_ctas_env"] = max_ctas
         row["nccl_max_ctas_env"] = max_ctas
 
     for err in response.get("errors", []):
         err["process_max_ctas"] = max_ctas
+
+
+def load_json_if_exists(path, default):
+    path = Path(path)
+
+    if not path.exists() or path.stat().st_size == 0:
+        return default
+
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        backup = path.with_suffix(path.suffix + ".bad")
+        backup.write_text(path.read_text())
+        print(f"[warn] could not parse {path}; backed it up to {backup}")
+        return default
+
+
+def row_key(row, fallback_prefix, index):
+    row_id = row.get("id")
+    if row_id is not None:
+        return ("id", str(row_id))
+
+    return (
+        fallback_prefix,
+        row.get("backend"),
+        row.get("collective"),
+        row.get("kernel"),
+        row.get("numel"),
+        row.get("process_max_ctas"),
+        row.get("max_ctas"),
+        row.get("threads"),
+        row.get("window_chunks"),
+        row.get("chunk_bytes"),
+        row.get("stage_depth"),
+        index,
+    )
+
+
+def merge_rows(old_rows, new_rows, fallback_prefix):
+    merged = {}
+    order = []
+
+    for i, row in enumerate(old_rows or []):
+        key = row_key(row, fallback_prefix, i)
+        if key not in merged:
+            order.append(key)
+        merged[key] = row
+
+    for i, row in enumerate(new_rows or []):
+        key = row_key(row, fallback_prefix, i)
+        if key not in merged:
+            order.append(key)
+
+        # New run wins for the same scenario id/config.
+        merged[key] = row
+
+    return [merged[k] for k in order]
+
+
+def extract_result_rows(payload):
+    if isinstance(payload, list):
+        return payload
+
+    if isinstance(payload, dict):
+        rows = payload.get("results", [])
+        if isinstance(rows, list):
+            return rows
+
+    return []
+
+
+def extract_skipped_rows(payload):
+    if isinstance(payload, list):
+        return payload
+
+    if isinstance(payload, dict):
+        rows = payload.get("skipped", [])
+        if isinstance(rows, list):
+            return rows
+
+    return []
+
+
+def write_json_atomic(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp.replace(path)
 
 
 def best_rows(results):
@@ -447,12 +570,10 @@ def parent_main():
     REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    merged = {
-        "ok": True,
-        "results": [],
-        "errors": [],
-        "skipped": [],
-    }
+    current_results = []
+    current_errors = []
+    current_skipped = []
+    current_ok = True
 
     total_generated = 0
     total_skipped = 0
@@ -463,7 +584,7 @@ def parent_main():
         total_generated += len(scenarios)
         total_skipped += len(skipped)
 
-        merged["skipped"].extend(skipped)
+        current_skipped.extend(skipped)
 
         if not scenarios:
             print(f"[parent] ctas={max_ctas} has no scenarios")
@@ -473,44 +594,64 @@ def parent_main():
         tag_rows_with_cta(response, max_ctas)
 
         if not response.get("ok", False):
-            merged["ok"] = False
+            current_ok = False
 
-        merged["results"].extend(response.get("results", []))
-        merged["errors"].extend(response.get("errors", []))
+        current_results.extend(response.get("results", []))
+        current_errors.extend(response.get("errors", []))
 
-    MERGED_RESULT_JSON.write_text(
-        json.dumps(merged, indent=2, sort_keys=True) + "\n"
+    old_result_payload = load_json_if_exists(
+        MERGED_RESULT_JSON,
+        {
+            "ok": True,
+            "results": [],
+        },
     )
 
-    SKIPPED_JSON.write_text(
-        json.dumps(merged["skipped"], indent=2, sort_keys=True) + "\n"
-    )
+    old_skipped_payload = load_json_if_exists(SKIPPED_JSON, [])
 
-    best = best_rows(merged["results"])
-    BEST_JSON.write_text(json.dumps(best, indent=2, sort_keys=True) + "\n")
+    old_results = extract_result_rows(old_result_payload)
+    old_skipped = extract_skipped_rows(old_skipped_payload)
+
+    merged_results = merge_rows(old_results, current_results, "result")
+    merged_skipped = merge_rows(old_skipped, current_skipped, "skipped")
+
+    # Important: result JSON intentionally contains only measured result rows.
+    # Skipped rows stay in SKIPPED_JSON. Errors are printed and kept in per-CTA logs.
+    result_payload = {
+        "ok": bool(old_result_payload.get("ok", True)) and current_ok,
+        "results": merged_results,
+    }
+
+    write_json_atomic(MERGED_RESULT_JSON, result_payload)
+    write_json_atomic(SKIPPED_JSON, merged_skipped)
+
+    best = best_rows(merged_results)
+    write_json_atomic(BEST_JSON, best)
 
     ok_rows = [
-        r for r in merged["results"]
+        r for r in merged_results
         if r.get("status") == "ok"
     ]
 
     cpp_skipped = [
-        r for r in merged["results"]
+        r for r in merged_results
         if r.get("status") == "skipped"
     ]
 
-    print(f"[result] generated scenarios: {total_generated}")
-    print(f"[result] python skipped:      {total_skipped}")
-    print(f"[result] ok rows:             {len(ok_rows)}")
-    print(f"[result] cpp skipped:         {len(cpp_skipped)}")
-    print(f"[result] errors:              {len(merged['errors'])}")
-    print(f"[result] merged:              {MERGED_RESULT_JSON}")
-    print(f"[result] skipped:             {SKIPPED_JSON}")
-    print(f"[result] best:                {BEST_JSON}")
+    print(f"[result] generated scenarios this run: {total_generated}")
+    print(f"[result] python skipped this run:      {total_skipped}")
+    print(f"[result] merged result rows:           {len(merged_results)}")
+    print(f"[result] ok rows:                       {len(ok_rows)}")
+    print(f"[result] cpp skipped in results:        {len(cpp_skipped)}")
+    print(f"[result] merged python skipped rows:    {len(merged_skipped)}")
+    print(f"[result] errors this run:               {len(current_errors)}")
+    print(f"[result] merged:                        {MERGED_RESULT_JSON}")
+    print(f"[result] skipped:                       {SKIPPED_JSON}")
+    print(f"[result] best:                          {BEST_JSON}")
 
-    if merged["errors"]:
+    if current_errors:
         print("[errors]")
-        for err in merged["errors"][:20]:
+        for err in current_errors[:20]:
             print(json.dumps(err, sort_keys=True))
 
     if best:
@@ -526,7 +667,7 @@ def parent_main():
                 f"id={row.get('id')}"
             )
 
-    if not merged["ok"]:
+    if current_errors or not current_ok:
         print("FAIL")
         return 1
 
