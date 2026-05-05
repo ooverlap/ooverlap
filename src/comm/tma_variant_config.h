@@ -53,6 +53,7 @@ struct TmaPipelineVariant {
  *   100 KiB x depth 2
  */
 #define OOVERLAP_TMA_TWO_GPU_PEER_FOR_EACH_VARIANT(M) \
+    M(2 * 1024, 64)                                   \
     M(4 * 1024, 32)                                   \
     M(8 * 1024, 16)                                   \
     M(16 * 1024, 8)                                   \
