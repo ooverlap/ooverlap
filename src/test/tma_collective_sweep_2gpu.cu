@@ -212,29 +212,11 @@ void add_env_metadata(json& row) {
     const std::string nccl_max_ctas =
         getenv_string("NCCL_MAX_CTAS");
 
-    const std::string nccl_min_ctas =
-        getenv_string("NCCL_MIN_CTAS");
-
-    const std::string nccl_algo =
-        getenv_string("NCCL_ALGO");
-
-    const std::string nccl_proto =
-        getenv_string("NCCL_PROTO");
-
     row["ooverlap_max_ctas_env"] =
         ooverlap_max_ctas.empty() ? json(nullptr) : json(ooverlap_max_ctas);
 
     row["nccl_max_ctas_env"] =
         nccl_max_ctas.empty() ? json(nullptr) : json(nccl_max_ctas);
-
-    row["nccl_min_ctas_env"] =
-        nccl_min_ctas.empty() ? json(nullptr) : json(nccl_min_ctas);
-
-    row["nccl_algo_env"] =
-        nccl_algo.empty() ? json(nullptr) : json(nccl_algo);
-
-    row["nccl_proto_env"] =
-        nccl_proto.empty() ? json(nullptr) : json(nccl_proto);
 }
 
 void add_common_metrics(
@@ -1127,3 +1109,4 @@ std::string benchmark_tma_two_gpu_collective_sweep_json(
 }
 
 } // namespace ooverlap
+
