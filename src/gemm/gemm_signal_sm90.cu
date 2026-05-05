@@ -173,11 +173,6 @@ void cutlass_gemm_signal_sm90(
     reinterpret_cast<cutlass::half_t*>(D),
     reinterpret_cast<cutlass::half_t*>(D),
 
-    int64_t(K),
-    int64_t(K),
-    ld_D_reshaped,
-    ld_D_reshaped,
-
     ElementAccumulator(1.0f),
     ElementAccumulator(0.0f),
 

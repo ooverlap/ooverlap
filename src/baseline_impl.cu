@@ -11,12 +11,7 @@
 #include <torch/extension.h>
 
 #include "baseline_impl.h"
-
-#if __has_include("gemm/gemm_plain_sm90_dispatch.h")
 #include "gemm/gemm_plain_sm90_dispatch.h"
-#else
-#include "overlap/gemm_plain_sm90_dispatch.h"
-#endif
 
 #define DIV_UP(x, y) (((x) + (y) - 1) / (y))
 #define MAX_GROUP_SIZE 16

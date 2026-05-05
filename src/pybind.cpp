@@ -13,15 +13,9 @@
 #include <climits>
 #include <cstring>
 
-#if __has_include("gemm/gemm_signal_sm90_dispatch.h")
 #include "gemm/gemm_signal_sm90_dispatch.h"
 #include "gemm/gemm_plain_sm90_dispatch.h"
 #include "gemm/gemm_scatter_sm90_dispatch.h"
-#else
-#include "overlap/gemm_signal_sm90_dispatch.h"
-#include "overlap/gemm_plain_sm90_dispatch.h"
-#include "overlap/gemm_scatter_sm90_dispatch.h"
-#endif
 
 #include "test/persistent_allreduce_2gpu_sm90.h"
 #include "test/tma_bandwidth_experiment_sm90.h"
@@ -363,31 +357,6 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("iters"),
         py::arg("warmup"),
         py::arg("verify"));
-
-  m.def("benchmark_tma_two_gpu_allreduce_sweep_sm90",
-        &ooverlap::benchmark_tma_two_gpu_allreduce_sweep_sm90,
-        py::arg("numels"),
-        py::arg("kernels"),
-        py::arg("threads"),
-        py::arg("max_ctas"),
-        py::arg("window_chunks"),
-        py::arg("chunk_bytes"),
-        py::arg("stage_depths"),
-        py::arg("iters"),
-        py::arg("warmup"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1);
-
-  m.def("benchmark_public_allreduce_2gpu_sm90",
-        &ooverlap::benchmark_public_allreduce_2gpu_sm90,
-        py::arg("min_bytes"),
-        py::arg("max_bytes"),
-        py::arg("points"),
-        py::arg("iters"),
-        py::arg("warmup"),
-        py::arg("tuning_mode"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1);
 
   py::class_<BaselineImpl>(m, "BaselineImpl")
       .def(py::init<>())

@@ -3,15 +3,9 @@
 #include "nccl_utils.h"
 #include "wait.cuh"
 
-#if __has_include("gemm/gemm_signal_sm90_dispatch.h")
 #include "gemm/gemm_signal_sm90_dispatch.h"
 #include "gemm/gemm_scatter_sm90_dispatch.h"
 #include "gemm/scatter_row_remap_sm90.cuh"
-#else
-#include "overlap/gemm_signal_sm90_dispatch.h"
-#include "overlap/gemm_scatter_sm90_dispatch.h"
-#include "overlap/scatter_row_remap_sm90.cuh"
-#endif
 
 #include <torch/extension.h>
 #include <cuda.h>
