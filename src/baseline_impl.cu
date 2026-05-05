@@ -8,21 +8,53 @@
 #include <stdlib.h>
 #include <cstdio>
 
+#include <torch/extension.h>
+
 #include "baseline_impl.h"
+
+#if __has_include("gemm/gemm_plain_sm90_dispatch.h")
+#include "gemm/gemm_plain_sm90_dispatch.h"
+#else
+#include "overlap/gemm_plain_sm90_dispatch.h"
+#endif
 
 #define DIV_UP(x, y) (((x) + (y) - 1) / (y))
 #define MAX_GROUP_SIZE 16
 
-/// Baseline Implementation: cuBLAS for GEMM and NCCL for AllReduce
+/// Baseline Implementation: cuBLAS/plain SM90 GEMM and NCCL communication.
 BaselineImpl::BaselineImpl(){
     cublasCreate(&this->my_handle);
+    this->comm = nullptr;
     this->my_rank = 0;
     this->my_size = 1;
+    this->my_stream = nullptr;
 }
 
 BaselineImpl::~BaselineImpl(){
     cublasDestroy(this->my_handle);
-    // ncclCommDestroy(this->comm);
+    if (this->comm != nullptr) {
+        ncclCommDestroy(this->comm);
+        this->comm = nullptr;
+    }
+}
+
+void BaselineImpl::PlainGemm(at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo){
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(0);
+
+    this->my_stream = at::cuda::getCurrentCUDAStream().stream();
+
+    bool ok = ooverlap::gemm_plain_sm90_dispatch(
+        static_cast<int>(Algo),
+        M, N, K,
+        static_cast<void*>(A.data_ptr<at::Half>()),
+        static_cast<void*>(B.data_ptr<at::Half>()),
+        static_cast<void*>(C.data_ptr<at::Half>()),
+        this->my_stream);
+
+    TORCH_CHECK(ok, "gemm_plain_sm90_dispatch failed for algo=", Algo);
 }
 
 void BaselineImpl::GemmAllReduce(at::Tensor A, at::Tensor B, at::Tensor C){
@@ -59,6 +91,22 @@ void BaselineImpl::GemmAllReduce(at::Tensor A, at::Tensor B, at::Tensor C){
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     // Launch AllReduce after GEMM
+    NCCL_CHECK(ncclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), ncclFloat16, ncclSum, this->comm, this->my_stream));
+}
+
+void BaselineImpl::GemmPlainAllReduce(at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo){
+
+    if (this->comm == nullptr) {
+        return;
+    }
+
+    int M = A.size(0);
+    int N = B.size(0);
+
+    half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
+
+    PlainGemm(A, B, C, Algo);
+
     NCCL_CHECK(ncclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), ncclFloat16, ncclSum, this->comm, this->my_stream));
 }
 
@@ -101,7 +149,32 @@ void BaselineImpl::GemmReduceScatter(
                     CUBLAS_COMPUTE_16F,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
-    // Launch AllReduce after GEMM
+    // Launch ReduceScatter after GEMM
+    size_t recvcount = (M * N) / this->my_size;
+    NCCL_CHECK(ncclReduceScatter((void *)c_ptr, (void *)d_ptr, recvcount, 
+        ncclFloat16, ncclSum, this->comm, this->my_stream));
+}
+
+void BaselineImpl::GemmPlainReduceScatter(
+        at::Tensor A,
+        at::Tensor B,
+        at::Tensor C,
+        at::Tensor D,
+        int64_t Algo
+        ){
+
+    if (this->comm == nullptr) {
+        return;
+    }
+
+    int M = A.size(0);
+    int N = B.size(0);
+
+    half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
+    half* d_ptr = reinterpret_cast<half *>(D.data_ptr<at::Half>());
+
+    PlainGemm(A, B, C, Algo);
+
     size_t recvcount = (M * N) / this->my_size;
     NCCL_CHECK(ncclReduceScatter((void *)c_ptr, (void *)d_ptr, recvcount, 
         ncclFloat16, ncclSum, this->comm, this->my_stream));
@@ -148,9 +221,41 @@ void BaselineImpl::GemmAll2All(at::Tensor A, at::Tensor B, at::Tensor C,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     // Launch All2All after GEMM
-    // First SEND
     int src_acc_addr = 0;
-    // Then RECV
+    int dst_acc_addr = 0;
+    NCCL_CHECK(ncclGroupStart());
+    for (int i = 0; i < this->my_size; i++){
+        if (i == this->my_rank){continue;}
+        size_t sendcount = mlen_cpu_ptr[this->my_rank * this->my_size + i] * N;
+        NCCL_CHECK(ncclSend((void *)(c_ptr + src_acc_addr), sendcount, ncclFloat16, i, this->comm, this->my_stream));
+        src_acc_addr += sendcount;
+
+        size_t recvcount = mlen_cpu_ptr[i * this->my_size + this->my_rank] * N;
+        NCCL_CHECK(ncclRecv((void *)(d_ptr + dst_acc_addr), recvcount, ncclFloat16, i, this->comm, this->my_stream));
+        dst_acc_addr += recvcount;
+    }
+    NCCL_CHECK(ncclGroupEnd());
+}
+
+void BaselineImpl::GemmPlainAll2All(at::Tensor A, at::Tensor B, at::Tensor C,
+    at::Tensor D, at::Tensor mLen_CPU, int64_t Algo){
+
+    if (this->comm == nullptr) {
+        return;
+    }
+
+    int N = B.size(0);
+
+    assert(mLen_CPU.size(0) == this->my_size);
+    assert(mLen_CPU.size(1) == this->my_size);
+
+    int* mlen_cpu_ptr = mLen_CPU.data_ptr<int>();
+    half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
+    half* d_ptr = reinterpret_cast<half *>(D.data_ptr<at::Half>());
+
+    PlainGemm(A, B, C, Algo);
+
+    int src_acc_addr = 0;
     int dst_acc_addr = 0;
     NCCL_CHECK(ncclGroupStart());
     for (int i = 0; i < this->my_size; i++){
@@ -215,6 +320,10 @@ void BaselineImpl::Gemm(at::Tensor A, at::Tensor B, at::Tensor C){
                     CUDA_R_16F, N,
                     CUBLAS_COMPUTE_16F,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+void BaselineImpl::GemmPlain(at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo){
+    PlainGemm(A, B, C, Algo);
 }
 
 void BaselineImpl::NcclAllReduce(at::Tensor C){

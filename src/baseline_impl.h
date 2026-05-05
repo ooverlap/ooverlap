@@ -20,11 +20,18 @@ class BaselineImpl : public torch::CustomClassHolder {
         void GemmAll2All(at::Tensor A, at::Tensor B, at::Tensor C, at::Tensor D, at::Tensor mLen_CPU);
         void Gemm(at::Tensor A, at::Tensor B, at::Tensor C);
 
+        void GemmPlainAllReduce(at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo);
+        void GemmPlainReduceScatter(at::Tensor A, at::Tensor B, at::Tensor C, at::Tensor D, int64_t Algo);
+        void GemmPlainAll2All(at::Tensor A, at::Tensor B, at::Tensor C, at::Tensor D, at::Tensor mLen_CPU, int64_t Algo);
+        void GemmPlain(at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo);
+
         void NcclAllReduce(at::Tensor C);
         void NcclReduceScatter(at::Tensor C);
         void NcclAll2All(at::Tensor C, at::Tensor D, at::Tensor mLen_CPU);
         
     private:
+        void PlainGemm(at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo);
+
         ncclComm_t comm;
         int64_t my_rank;
         int64_t my_size;
