@@ -216,13 +216,6 @@ public:
     ElementOutput             *ptr_C;
     ElementOutput             *ptr_D;
 
-    // Kept for API compatibility with the old signal path.
-    // The base-epilogue path now uses CUTLASS packed strides instead.
-    int64_t                    ldm_A;
-    int64_t                    ldm_B;
-    int64_t                    ldm_C;
-    int64_t                    ldm_D;
-
     ElementCompute             alpha;
     ElementCompute             beta;
 
@@ -237,10 +230,6 @@ public:
       ElementInputB *ptr_B_,
       ElementOutput *ptr_C_,
       ElementOutput *ptr_D_,
-      int64_t ldm_A_,
-      int64_t ldm_B_,
-      int64_t ldm_C_,
-      int64_t ldm_D_,
       ElementCompute alpha_,
       ElementCompute beta_,
       int *ptr_MM,
@@ -257,10 +246,6 @@ public:
       ptr_B(ptr_B_),
       ptr_C(ptr_C_),
       ptr_D(ptr_D_),
-      ldm_A(ldm_A_),
-      ldm_B(ldm_B_),
-      ldm_C(ldm_C_),
-      ldm_D(ldm_D_),
       alpha(alpha_),
       beta(beta_),
       active_sm_count(activeSmCount)
@@ -274,7 +259,6 @@ public:
       signal_params.ThreadblockM         = ThreadblockShape::kM;
       signal_params.ThreadblockN         = ThreadblockShape::kN;
       signal_params.ptr_D                = static_cast<void*>(ptr_D_);
-      signal_params.ld_D                 = int(ldm_D_);
       signal_params.kEpilogueArrivalsPerTile = 0;
       signal_params.ptr_Debug_Arrivals   = nullptr;
       signal_params.num_segments         = numSegments;
@@ -395,7 +379,7 @@ public:
         cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device_id);
     hw_info.sm_count = physical_sm_count;
 
-    if (args_.active_sm_count > 0 && args_.active_sm_count < physical_sm_count) {
+    if (args_.active_sm_count > 0 && args_.active_sm_count < physical_sm_count) { // This is for allowing some sms for the communication
       hw_info.sm_count = args_.active_sm_count;
     }
 

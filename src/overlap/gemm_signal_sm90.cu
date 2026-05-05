@@ -191,6 +191,8 @@ void cutlass_gemm_signal_sm90(
     active_sm_count
   );
 
+  // TODO: should we consider stream-k problem of inilization here as well?
+
   if (!cached_key.same_as(new_key)) {
     CUTLASS_CHECK_SM90(gemm_op.initialize(arguments, stream));
     cached_key = new_key;
