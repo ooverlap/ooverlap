@@ -183,13 +183,40 @@ def run_two_rank_collective(collective, sizes_bytes, dev0, dev1, iters, warmup,
     return results
 
 
-def combine_rank_rows(rank_rows):
+def per_rank_bandwidth_bytes(collective: str, a, b) -> int:
+    """
+    Return the byte count used for per-rank bandwidth normalization.
+
+    Keep allreduce as full buffer bytes per rank.
+    For reduce_scatter/all_gather, normalize to the local shard size so the
+    bandwidth plot is not accidentally aggregate/full-buffer bandwidth.
+    """
+    full_bytes = int(a["bytes"])
+
+    if collective == "allreduce":
+        return full_bytes
+
+    if collective in ("reduce_scatter", "all_gather"):
+        if "local_shard_bytes" in a and "local_shard_bytes" in b:
+            return int(max(float(a["local_shard_bytes"]), float(b["local_shard_bytes"])))
+
+        world_size = int(round(float(a.get("world_size", 2.0))))
+        if world_size <= 0:
+            world_size = 2
+
+        return full_bytes // world_size
+
+    return full_bytes
+
+
+def combine_rank_rows(collective, rank_rows):
     rows = []
     for a, b in zip(rank_rows[0], rank_rows[1]):
         iters = int(a["iters"])
         rows.append(
             {
                 "bytes": int(a["bytes"]),
+                "bandwidth_bytes_per_rank": per_rank_bandwidth_bytes(collective, a, b),
                 "iters": iters,
                 "oo_latency_ms": max(float(a["oo_total_ms"]), float(b["oo_total_ms"])) / iters,
                 "nccl_latency_ms": max(float(a["nccl_total_ms"]), float(b["nccl_total_ms"])) / iters,
@@ -211,9 +238,9 @@ def metric_values(metric: str, rows):
         )
     if metric == "bandwidth":
         return (
-            [bandwidth_gbps(r["bytes"], r["oo_latency_ms"]) for r in rows],
-            [bandwidth_gbps(r["bytes"], r["nccl_latency_ms"]) for r in rows],
-            "bandwidth (GB/s)",
+            [bandwidth_gbps(r.get("bandwidth_bytes_per_rank", r["bytes"]), r["oo_latency_ms"]) for r in rows],
+            [bandwidth_gbps(r.get("bandwidth_bytes_per_rank", r["bytes"]), r["nccl_latency_ms"]) for r in rows],
+            "per-rank bandwidth (GB/s)",
         )
     if metric == "speedup":
         return (
@@ -253,7 +280,7 @@ def run_metric_suite(metric, sizes_bytes, cta_values, dev0, dev1, iters, warmup,
             rank_rows = run_two_rank_collective(
                 collective, sizes_bytes, dev0, dev1, iters, warmup, verify, ctas
             )
-            all_rows[collective][ctas] = combine_rank_rows(rank_rows)
+            all_rows[collective][ctas] = combine_rank_rows(collective, rank_rows)
 
     if metric == "speedup":
         for ctas in cta_values:

@@ -48,6 +48,7 @@ __host__ __device__ __forceinline__ comm::task::WindowTask make_all_gather_copy_
     }
 
     // TMA copy task direction is encoded as dst first, then src.
+    // Since we are in all gather situation we can do stuff in reverse
     return comm::task::make_copy_tma_task(
         dst,
         const_cast<void*>(src),
