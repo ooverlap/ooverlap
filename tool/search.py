@@ -1,0 +1,2100 @@
+'''
+    Using multiprocessing for distributed running,
+    please specify the GPUs via CUDA_VISIBLE_DEVICES:
+        e.g., CUDA_VISIBLE_DEVICES=0,1 python tool/search.py --m 4096 --n 8192 --k 4096 --comm_op all_reduce
+
+    This version can search against either NCCL segmented communication or
+    ooverlap segmented communication. The actual overlap kernel chooses the
+    segmented communication backend from the initialization path:
+      - nccl:     OverlapImpl.nccl_init(...)
+      - ooverlap: OverlapImpl.ooverlap_ipc_init(...)
+
+    Bandwidth curves are kept separate:
+      - NCCL:     configs/bandwidth_<comm_op>_tp<tp>.pt
+      - ooverlap: configs/bandwidth_ooverlap_<comm_op>_tp<tp>.pt
+
+    Solution JSON files are also kept separate:
+      - configs/solution_nccl_m...json
+      - configs/solution_ooverlap_m...json
+'''
+
+import argparse
+import importlib.util
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.multiprocessing as mp
+
+
+def repo_root():
+    p = Path(__file__).resolve()
+    for q in [p.parent, *p.parents]:
+        if (q / "build" / "lib" / "ooverlap_ext.so").exists():
+            return q
+    return Path(__file__).resolve().parents[1]
+
+
+def load_ooverlap_ext():
+    root = repo_root()
+    so = root / "build" / "lib" / "ooverlap_ext.so"
+
+    if not so.exists():
+        raise FileNotFoundError(f"Could not find {so}. Build first.")
+
+    module_name = "ooverlap_ext"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    spec = importlib.util.spec_from_file_location(module_name, str(so))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ext = load_ooverlap_ext()
+
+
+def div_up(x: int, y: int):
+    return (x + y - 1) // y
+
+
+def effective_compute_sms(sm_count: int, comm_sm_slack: int):
+    assert comm_sm_slack >= 0, "comm_sm_slack must be >= 0"
+    compute_sms = sm_count - comm_sm_slack
+    assert compute_sms > 0, f"Invalid comm_sm_slack={comm_sm_slack} for sm_count={sm_count}"
+    return compute_sms
+
+
+def validate_comm_backend(comm_backend: str, comm_op: str, world_size: int):
+    if comm_backend not in ["nccl", "ooverlap"]:
+        raise ValueError(f"Unsupported comm_backend={comm_backend}")
+
+    if comm_op not in ["all_reduce", "reduce_scatter"]:
+        raise ValueError(f"Unsupported comm_op={comm_op}")
+
+    if comm_backend == "ooverlap":
+        if comm_op != "all_reduce":
+            raise ValueError("ooverlap backend currently supports only --comm_op all_reduce")
+        if world_size != 2:
+            raise ValueError("ooverlap backend currently supports exactly 2 visible GPUs")
+
+
+def make_broker_key(prefix: str = "oo"):
+    """
+    ooverlap IPC Broker uses the key to build a Unix-domain socket name.
+    Keep this very short; long shape/backend prefixes can exceed the socket
+    path limit and cause: "Broker: socket key is too long".
+    """
+    _ = prefix  # keep old call sites compatible, but do not include long prefixes
+    pid_part = format(os.getpid() & 0xffff, "04x")
+    rand_part = uuid.uuid4().hex[:8]
+    return f"oo{pid_part}{rand_part}"
+
+
+def init_overlap_backend(gemm_class, rank: int, world_size: int, nccl_id, broker_key: str,
+                         comm_backend: str, comm_op: str):
+    validate_comm_backend(comm_backend, comm_op, world_size)
+
+    if comm_backend == "nccl":
+        gemm_class.nccl_init(rank, world_size, nccl_id)
+    elif comm_backend == "ooverlap":
+        # Device ids are local CUDA-visible ids. With CUDA_VISIBLE_DEVICES=0,1 this is [0, 1].
+        gemm_class.ooverlap_ipc_init(rank, world_size, list(range(world_size)), broker_key)
+    else:
+        raise ValueError(f"Unsupported comm_backend={comm_backend}")
+
+
+def release_overlap_backend(gemm_class, comm_backend: str):
+    if comm_backend == "ooverlap":
+        gemm_class.ooverlap_release()
+
+
+def algo_attempt_count(total: int, default_limit: int, try_all_algos: bool, algo_limit):
+    if algo_limit is not None:
+        return min(int(algo_limit), total)
+    if try_all_algos:
+        return total
+    return min(default_limit, total)
+
+
+def filter_candidates_by_algo_id(BM_list, BN_list, gemm_dur_list, Algo_list, algo_id):
+    if algo_id is None:
+        return BM_list, BN_list, gemm_dur_list, Algo_list
+
+    algo_id = int(algo_id)
+    out_BM = []
+    out_BN = []
+    out_dur = []
+    out_Algo = []
+
+    for BM, BN, dur, Algo in zip(BM_list, BN_list, gemm_dur_list, Algo_list):
+        if int(Algo) == algo_id:
+            out_BM.append(BM)
+            out_BN.append(BN)
+            out_dur.append(dur)
+            out_Algo.append(Algo)
+
+    if len(out_Algo) == 0:
+        available = ", ".join(str(int(x)) for x in Algo_list)
+        raise ValueError(
+            f"Requested --algo_id {algo_id}, but it was not found in the loaded config. "
+            f"Available algos: {available}"
+        )
+
+    print(f"Using requested algo_id={algo_id}.")
+    return out_BM, out_BN, out_dur, out_Algo
+
+
+def load_algo_dict():
+    file_path = repo_root() / "configs" / "AlgoDictSm90.json"
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    ret = {}
+    for item in data["algorithms"]:
+        ret[int(item["algo"])] = item
+    return ret
+
+
+def is_cooperative_algo(Algo: int):
+    algo_dict = load_algo_dict()
+    item = algo_dict[int(Algo)]
+    return item.get("mainloop", "") == "cooperative"
+
+
+def algo_tile_shape(Algo: int):
+    algo_dict = load_algo_dict()
+    item = algo_dict[int(Algo)]
+    return int(item["tile_m"]), int(item["tile_n"])
+
+
+def normalize_loaded_candidates(BM_list, BN_list, gemm_dur_list, Algo_list):
+    algo_dict = load_algo_dict()
+    out_BM = []
+    out_BN = []
+    out_dur = []
+    out_Algo = []
+
+    for BM, BN, dur, Algo in zip(BM_list, BN_list, gemm_dur_list, Algo_list):
+        Algo = int(Algo)
+
+        if Algo not in algo_dict:
+            print(f"Skip unknown algo={Algo}")
+            continue
+
+        true_BM = int(algo_dict[Algo]["tile_m"])
+        true_BN = int(algo_dict[Algo]["tile_n"])
+
+        if int(BM) != true_BM or int(BN) != true_BN:
+            print(
+                f"Fix config tile mismatch for algo={Algo}: "
+                f"config BM/BN={BM}x{BN}, algo BM/BN={true_BM}x{true_BN}"
+            )
+
+        out_BM.append(true_BM)
+        out_BN.append(true_BN)
+        out_dur.append(float(dur))
+        out_Algo.append(Algo)
+
+    return out_BM, out_BN, out_dur, out_Algo
+
+
+def packed_shape(M: int, N: int, BM: int, BN: int, rLDN: int = 1):
+    TileNum = div_up(M, BM) * div_up(N, BN)
+    packed_tile_rows = div_up(TileNum, rLDN)
+    return packed_tile_rows * BM, rLDN * BN
+
+
+def monitor_size(TileNum: int, seg_size: int, if_monitor: bool):
+    if if_monitor:
+        return seg_size + TileNum + 1 + TileNum
+    return seg_size + TileNum
+
+
+def reset_monitor_matrix(MonitoredMatrix, TileNum: int, seg_size: int, if_monitor: bool):
+    if if_monitor:
+        # Reset segment counters, per-tile epilogue counters, and global monitor counter.
+        # Do NOT reset monitor_order output, matching FlashOverlap behavior.
+        MonitoredMatrix[: seg_size + TileNum + 1] = 0
+    else:
+        # Reset segment counters and per-tile epilogue counters.
+        MonitoredMatrix[: seg_size + TileNum] = 0
+
+
+def count_exact_str(counts, sample_count: int, min_count: int = 2):
+    parts = []
+    for c in range(sample_count, min_count - 1, -1):
+        parts.append(f"{c}/{sample_count}:{int((counts == c).sum().item())}")
+    return " ".join(parts)
+
+
+def count_at_least_str(counts, sample_count: int, min_count: int = 2):
+    parts = []
+    for c in range(sample_count, min_count - 1, -1):
+        parts.append(f">={c}/{sample_count}:{int((counts >= c).sum().item())}")
+    return " ".join(parts)
+
+
+def neighbor_membership_str(count_in_window, prev_count, next_count,
+                            exact_c: int, sample_count: int, max_patterns: int = 12):
+    tiles = torch.where(count_in_window == exact_c)[0]
+    total = int(tiles.numel())
+
+    if total == 0:
+        return ""
+
+    prev_hits = prev_count[tiles]
+    next_hits = next_count[tiles]
+
+    prev_any = int((prev_hits > 0).sum().item())
+    next_any = int((next_hits > 0).sum().item())
+    both_any = int(((prev_hits > 0) & (next_hits > 0)).sum().item())
+    prev_only = int(((prev_hits > 0) & (next_hits == 0)).sum().item())
+    next_only = int(((prev_hits == 0) & (next_hits > 0)).sum().item())
+    neither = int(((prev_hits == 0) & (next_hits == 0)).sum().item())
+
+    pattern_counts = {}
+    for tile in tiles.tolist():
+        p = int(prev_count[tile].item())
+        n = int(next_count[tile].item())
+        other = sample_count - exact_c - p - n
+        key = (p, n, other)
+        pattern_counts[key] = pattern_counts.get(key, 0) + 1
+
+    patterns = sorted(
+        pattern_counts.items(),
+        key=lambda kv: (-kv[1], -kv[0][0], -kv[0][1], kv[0][2]),
+    )
+
+    pattern_str = " | ".join(
+        f"prev={p} next={n} other={o}:{num}"
+        for (p, n, o), num in patterns[:max_patterns]
+    )
+
+    if len(patterns) > max_patterns:
+        pattern_str += f" | ... +{len(patterns) - max_patterns} more"
+
+    return (
+        f"current={exact_c}/{sample_count}: tiles={total} "
+        f"prev_any={prev_any} next_any={next_any} both={both_any} "
+        f"prev_only={prev_only} next_only={next_only} neither_adjacent={neither} "
+        f"patterns[{pattern_str}]"
+    )
+
+
+def debug_hint_samples(samples, TileNum: int, wSize: int, rank: int, Algo: int, BM: int, BN: int, label: str = ""):
+    if rank != 0:
+        return
+
+    samples_cpu = samples.detach().cpu()
+    sample_count = samples_cpu.shape[0]
+    WaveNum = div_up(TileNum, wSize)
+
+    print("")
+    print("========================================")
+    print("DEBUG compute_hint samples")
+    print(f"label={label}")
+    print(f"rank={rank}")
+    print(f"Algo={Algo} BM={BM} BN={BN}")
+    print(f"TileNum={TileNum} wSize={wSize} WaveNum={WaveNum} sample_count={sample_count}")
+    print("========================================")
+
+    for i in range(sample_count):
+        row = samples_cpu[i]
+        min_v = int(row.min().item())
+        max_v = int(row.max().item())
+        unique_count = int(torch.unique(row).numel())
+        missing = TileNum - unique_count
+        print(
+            f"sample[{i}] min={min_v} max={max_v} "
+            f"unique={unique_count}/{TileNum} duplicate_or_missing={missing}"
+        )
+
+    print("----------------------------------------")
+    print("Per-window membership counts:")
+    print("For each window, this shows how many tile ids landed in that window")
+    print("exactly N/N, N-1/N, N-2/N, ... down to 2/N runs.")
+    print("The cumulative line shows >=N/N, >=N-1/N, >=N-2/N, ...")
+
+    total_exact = 0
+    for w in range(WaveNum):
+        lo = w * wSize
+        hi = min((w + 1) * wSize, TileNum)
+
+        in_window_count = ((samples_cpu >= lo) & (samples_cpu < hi)).sum(dim=0)
+        exact = torch.where(in_window_count == sample_count)[0]
+
+        expected = hi - lo
+        total_exact += int(exact.numel())
+
+        print(f"window {w:03d}: range=[{lo}, {hi}) expected={expected}")
+        print(f"  exact:      {count_exact_str(in_window_count, sample_count, min_count=2)}")
+        print(f"  cumulative: {count_at_least_str(in_window_count, sample_count, min_count=2)}")
+
+        prev_count = torch.zeros_like(in_window_count)
+        next_count = torch.zeros_like(in_window_count)
+
+        if w > 0:
+            prev_lo = (w - 1) * wSize
+            prev_hi = w * wSize
+            prev_count = ((samples_cpu >= prev_lo) & (samples_cpu < prev_hi)).sum(dim=0)
+
+        if w + 1 < WaveNum:
+            next_lo = (w + 1) * wSize
+            next_hi = min((w + 2) * wSize, TileNum)
+            next_count = ((samples_cpu >= next_lo) & (samples_cpu < next_hi)).sum(dim=0)
+
+        neighbor_lines = []
+        for exact_c in [4, 3, 2]:
+            line = neighbor_membership_str(in_window_count, prev_count, next_count, exact_c, sample_count)
+            if line:
+                neighbor_lines.append(line)
+
+        if neighbor_lines:
+            print("  neighbor distribution for low-count current-window tiles:")
+            print("  Format: current=x/N means tile landed in this window x times.")
+            print("  prev/next show how the remaining samples split into adjacent windows.")
+            print("  other means not current, not previous, and not next window.")
+            for line in neighbor_lines:
+                print(f"    {line}")
+
+    print(f"total exact-stable tiles collected={total_exact}/{TileNum}")
+
+    print("----------------------------------------")
+    print("Boundary instability check:")
+    print("For each boundary, crossing_tiles are tiles that were sometimes before")
+    print("the boundary and sometimes after/equal to the boundary across samples.")
+    print("The histogram shows, among crossing tiles only, how often they landed")
+    print("on the left side of the boundary.")
+
+    for w in range(1, WaveNum):
+        boundary = w * wSize
+        before_count = (samples_cpu < boundary).sum(dim=0)
+        crosses = torch.where((before_count > 0) & (before_count < sample_count))[0]
+
+        if crosses.numel() > 0:
+            crossing_before_count = before_count[crosses]
+            hist_parts = []
+            for c in range(sample_count - 1, 0, -1):
+                n = int((crossing_before_count == c).sum().item())
+                hist_parts.append(f"left={c}/{sample_count}:right={sample_count-c}/{sample_count}:{n}")
+
+            tile_ids = crosses[:20].tolist()
+            print(f"boundary {w:03d} at order={boundary}: crossing_tiles={int(crosses.numel())}")
+            print("  crossing histogram:", " ".join(hist_parts))
+            print(f"  first20={tile_ids}")
+
+            for tile in tile_ids[:5]:
+                vals = samples_cpu[:, tile].tolist()
+                left_hits = int((samples_cpu[:, tile] < boundary).sum().item())
+                right_hits = sample_count - left_hits
+                print(
+                    f"  tile {tile}: orders={vals} "
+                    f"left={left_hits}/{sample_count} right={right_hits}/{sample_count}"
+                )
+        else:
+            print(f"boundary {w:03d} at order={boundary}: crossing_tiles=0")
+
+    print("----------------------------------------")
+    print("First 64 completion orders per sample:")
+    print("This prints tile ids sorted by completion order for each run.")
+
+    for i in range(sample_count):
+        row = samples_cpu[i]
+        order_to_tile = torch.argsort(row)
+        print(f"sample[{i}] first64 tile_ids:", order_to_tile[:64].tolist())
+
+    print("----------------------------------------")
+    print("Last 64 completion orders per sample:")
+
+    for i in range(sample_count):
+        row = samples_cpu[i]
+        order_to_tile = torch.argsort(row)
+        print(f"sample[{i}] last64 tile_ids:", order_to_tile[-64:].tolist())
+
+    print("========================================")
+    print("")
+
+
+def monitor_order_view(MonitoredMatrix, TileNum: int, seg_size: int):
+    offset = seg_size + TileNum + 1
+    return MonitoredMatrix[offset: offset + TileNum]
+
+
+def gpu_config_name():
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return props.name.lower().replace(" ", "_")
+
+
+def solution_json_path(M: int, N: int, K: int, comm_backend: str):
+    gpu_name = gpu_config_name()
+    return repo_root() / "configs" / f"solution_{comm_backend}_m{M}n{N}k{K}_{gpu_name}_packed_sm90.json"
+
+
+def legacy_solution_json_path(M: int, N: int, K: int):
+    gpu_name = gpu_config_name()
+    return repo_root() / "configs" / f"solution_m{M}n{N}k{K}_{gpu_name}_packed_sm90.json"
+
+
+def shape_json_path(M: int, N: int, K: int, layout: str = "packed"):
+    gpu_name = gpu_config_name()
+    return repo_root() / "configs" / f"m{M}n{N}k{K}_{gpu_name}_{layout}_sm90.json"
+
+
+def bandwidth_curve_path(comm_backend: str, comm_op: str, world_size: int):
+    if comm_backend == "nccl":
+        return repo_root() / "configs" / f"bandwidth_{comm_op}_tp{world_size}.pt"
+    if comm_backend == "ooverlap":
+        return repo_root() / "configs" / f"bandwidth_ooverlap_{comm_op}_tp{world_size}.pt"
+    raise ValueError(f"Unsupported comm_backend={comm_backend}")
+
+
+def load_comm_array(comm_backend: str, comm_op: str, world_size: int, bandwidth_path: str = ""):
+    if bandwidth_path:
+        path = Path(bandwidth_path)
+    else:
+        path = bandwidth_curve_path(comm_backend, comm_op, world_size)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Could not find bandwidth curve for backend={comm_backend}, comm_op={comm_op}:\n"
+            f"  {path}\n"
+            "Generate it first. For NCCL use tool/bandwidth.py. "
+            "For ooverlap use tool/bandwidth_ooverlap.py."
+        )
+
+    comm_array = torch.load(path)
+    print(f"Bandwidth curve captured from: {path}")
+    return comm_array, path
+
+
+def load_json(M: int, N: int, K: int):
+    packed_path = shape_json_path(M, N, K, "packed")
+
+    if not Path(packed_path).exists():
+        raise FileNotFoundError(
+            f"Could not find packed SM90 config file:\n"
+            f"  {packed_path}\n"
+            "Run gen_config_sm90.py with --layout packed first."
+        )
+
+    with open(packed_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    print(f"Loaded shape config: {packed_path}")
+    return normalize_loaded_candidates(data["BM"], data["BN"], data["dur"], data["Algo"])
+
+
+def build_full_order_and_reorder_map(TileNum: int, hint: list):
+    used = [False] * TileNum
+
+    stable_prefix = []
+    for x in hint:
+        x = int(x)
+        if x < 0 or x >= TileNum:
+            raise ValueError(f"Invalid tile id in hint: {x}")
+        if not used[x]:
+            stable_prefix.append(x)
+            used[x] = True
+
+    unstable_tail = [x for x in range(TileNum) if not used[x]]
+    full_tile_order = stable_prefix + unstable_tail
+
+    reorder_map = [-1] * TileNum
+    for new_pos, tile_id in enumerate(full_tile_order):
+        reorder_map[tile_id] = new_pos
+
+    return full_tile_order, reorder_map, unstable_tail
+
+
+def save_solution(
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    gemm_dur: float,
+    Algo: int,
+    hint: list,
+    cSeg: list,
+    comm_sm_slack: int,
+    comm_backend: str,
+    comm_op: str,
+    bandwidth_path: str = "",
+    predicted_latency_ms=None,
+    searched_latency_ms=None,
+    write_legacy_solution: bool = False,
+):
+    out_path = solution_json_path(M, N, K, comm_backend)
+
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    sm_count = props.multi_processor_count
+    compute_sms = effective_compute_sms(sm_count, comm_sm_slack)
+
+    TileNum = div_up(M, BM) * div_up(N, BN)
+    full_tile_order, reorder_map, unstable_tail = build_full_order_and_reorder_map(TileNum, hint)
+
+    data = {
+        "M": int(M),
+        "N": int(N),
+        "K": int(K),
+        "comm_backend": str(comm_backend),
+        "comm_op": str(comm_op),
+        "bandwidth_path": str(bandwidth_path) if bandwidth_path else "",
+        "selected_predicted_latency_ms": None if predicted_latency_ms is None else float(predicted_latency_ms),
+        "searched_latency_ms": None if searched_latency_ms is None else float(searched_latency_ms),
+
+        # Existing field. Stable/assigned tiles only.
+        "hint": [int(x) for x in hint],
+
+        # Explicit reorder fields.
+        "hint_stable_count": int(len(hint)),
+        "unstable_tail_count": int(len(unstable_tail)),
+        "unstable_tail": [int(x) for x in unstable_tail],
+        "full_tile_order": [int(x) for x in full_tile_order],
+        "reorder_map": [int(x) for x in reorder_map],
+
+        "cSeg": [int(x) for x in cSeg],
+        "rLDN": 1,
+        "BM": int(BM),
+        "BN": int(BN),
+        "dur": float(gemm_dur),
+        "Algo": int(Algo),
+        "sm_count": int(sm_count),
+        "comm_sm_slack": int(comm_sm_slack),
+        "compute_sms": int(compute_sms),
+        "source": "tool/search.py",
+        "note": "Generated by SM90 packed overlap search. AlgoDictSm90.json is not modified.",
+    }
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+    print(f"Solution saved to {out_path}")
+
+    if write_legacy_solution:
+        legacy_path = legacy_solution_json_path(M, N, K)
+        with open(legacy_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        print(f"Legacy solution saved to {legacy_path}")
+
+
+def generate_row_remap_array(M, N, BM, BN, S_list, world_size, device="cuda"):
+    total_tiles = (M * N) // (BM * BN)
+    assert sum(S_list) == total_tiles, "sum(S_list) must equal total number of tiles"
+
+    original_row_ids = torch.arange(M * N // BN, dtype=torch.int, device=device)
+    reordered_row_id = torch.empty_like(original_row_ids)
+
+    current_row = 0
+    for S in S_list:
+        chunk_size = S * BM
+        chunk_row_ids = original_row_ids[current_row: current_row + chunk_size]
+        mod_values = chunk_row_ids % world_size
+        _, sorted_indices = torch.sort(mod_values, stable=True)
+        reordered_chunk = chunk_row_ids[sorted_indices]
+        reordered_row_id[current_row: current_row + chunk_size] = reordered_chunk
+        current_row += chunk_size
+
+    remap = torch.empty_like(original_row_ids)
+    remap[reordered_row_id] = torch.arange(len(reordered_row_id), dtype=torch.int, device=device)
+    return remap
+
+
+def collect_monitor_samples(
+    gemm_class,
+    rank: int,
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    Algo: int,
+    TileNum: int,
+    cSeg: list,
+    cSeg_CPU,
+    cSeg_GPU,
+    A,
+    B,
+    C,
+    MonitoredMatrix,
+    ReorderedArray,
+    comm_op: str,
+    sample_count: int,
+    active_sm_count: int,
+    D=None,
+    RowArray=None,
+):
+    samples = torch.empty((sample_count, TileNum), dtype=torch.int, device="cuda")
+
+    if comm_op == "all_reduce":
+        for i in range(sample_count):
+            reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), True)
+            gemm_class.gemm_allreduce_overlap(
+                A,
+                B,
+                C,
+                MonitoredMatrix,
+                ReorderedArray,
+                1,
+                cSeg_CPU,
+                cSeg_GPU,
+                Algo,
+                int(active_sm_count),
+                True,
+            )
+            samples[i, :] = monitor_order_view(MonitoredMatrix, TileNum, len(cSeg))
+
+    elif comm_op == "reduce_scatter":
+        for i in range(sample_count):
+            reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), True)
+            gemm_class.gemm_reducescatter_overlap(
+                A,
+                B,
+                C,
+                D,
+                MonitoredMatrix,
+                ReorderedArray,
+                RowArray,
+                1,
+                cSeg_CPU,
+                cSeg_GPU,
+                Algo,
+                True,
+            )
+            samples[i, :] = monitor_order_view(MonitoredMatrix, TileNum, len(cSeg))
+
+    else:
+        raise ValueError(f"Unknown comm_op={comm_op}")
+
+    return samples
+
+
+def compute_stable_hint_from_rounds(
+    sample_rounds,
+    TileNum: int,
+    wSize: int,
+    compute_sms: int,
+    nominal_min_group_size: int,
+    min_effective_group_size: int,
+    rank: int,
+):
+    """
+    Build a hint using majority-window assignment instead of exact-only stability.
+
+    Policy:
+      1. Start from nominal_min_group_size and only reduce if validation fails.
+      2. In the design round, assign a tile to the window where it appears with
+         high confidence. For 10 samples this means 7, 8, 9, or 10 hits.
+         Ambiguous 4/5/6-style tiles go to the tail.
+      3. Confirmation rounds do not require exact stability. They only count
+         high-confidence movement to a different window as a conflict. Ambiguous
+         4/5/6-style behavior is ignored and left to the tail/straggler margin.
+      4. If a full window has at least one wave worth of high-confidence
+         conflicts in a confirmation round, reduce the effective group and
+         re-build the hint with the smaller candidate group size.
+    """
+    assert len(sample_rounds) > 0
+    device = sample_rounds[0].device
+
+    def majority_threshold(sample_count: int):
+        # For 10 samples: 7. This intentionally treats 4/5/6 as ambiguous.
+        return min(sample_count, max(sample_count // 2 + 1, sample_count - 3))
+
+    def classify_round(samples, candidate_wSize: int):
+        sample_count = int(samples.shape[0])
+        WaveNum = div_up(TileNum, candidate_wSize)
+        threshold = majority_threshold(sample_count)
+
+        counts = torch.empty((WaveNum, TileNum), dtype=torch.int16, device=device)
+        for w in range(WaveNum):
+            lo = w * candidate_wSize
+            hi = min((w + 1) * candidate_wSize, TileNum)
+            counts[w, :] = ((samples >= lo) & (samples < hi)).sum(dim=0).to(torch.int16)
+
+        max_counts, max_windows = counts.max(dim=0)
+        tie_counts = (counts == max_counts.unsqueeze(0)).sum(dim=0)
+        assigned = (max_counts >= threshold) & (tie_counts == 1)
+        return max_windows, max_counts, assigned, threshold
+
+    def sorted_tile_list(tiles, confidence, mean_order):
+        # Prefer high-confidence tiles, then earlier average completion order,
+        # then tile id for deterministic output.
+        items = []
+        for t in tiles.tolist():
+            items.append((-int(confidence[t].item()), float(mean_order[t].item()), int(t)))
+        items.sort()
+        return [t for _, __, t in items]
+
+    if rank == 0:
+        print("")
+        print("----------------------------------------")
+        print("Majority hint stability summary:")
+        print(
+            f"nominal_min_group_size={nominal_min_group_size} "
+            f"nominal_wSize={wSize} compute_sms={compute_sms} "
+            f"min_effective_group_size={min_effective_group_size}"
+        )
+        print(
+            "A tile is assigned from the design round when it lands in one "
+            "window with high confidence. For 10 samples, 7/8/9/10 are "
+            "assigned; 4/5/6 are treated as ambiguous tail candidates."
+        )
+        print(
+            "Confirmation rounds only force a smaller effective group when a "
+            "full window has at least one compute wave worth of high-confidence "
+            "movement into another window. Ambiguous confirmation samples are ignored."
+        )
+
+    first_samples = sample_rounds[0]
+    first_mean_order = first_samples.float().mean(dim=0)
+
+    for candidate_group in range(int(nominal_min_group_size), int(min_effective_group_size) - 1, -1):
+        candidate_wSize = int(candidate_group) * int(compute_sms)
+        WaveNum = div_up(TileNum, candidate_wSize)
+
+        first_window, first_conf, first_assigned, first_threshold = classify_round(first_samples, candidate_wSize)
+
+        chosen_per_window = []
+        window_stats = []
+        candidate_ok = True
+        fail_reason = ""
+
+        for w in range(WaveNum):
+            lo = w * candidate_wSize
+            hi = min((w + 1) * candidate_wSize, TileNum)
+            expected = hi - lo
+            is_full_window = expected == candidate_wSize
+
+            tiles = torch.where(first_assigned & (first_window == w))[0]
+            sorted_tiles = sorted_tile_list(tiles, first_conf, first_mean_order)
+
+            if is_full_window and len(sorted_tiles) < expected:
+                candidate_ok = False
+                fail_reason = f"window {w:03d} assigned_count={len(sorted_tiles)} is below expected={expected}"
+
+            chosen = sorted_tiles[:expected]
+            chosen_per_window.append(chosen)
+            window_stats.append({
+                "w": w,
+                "lo": lo,
+                "hi": hi,
+                "expected": expected,
+                "is_full_window": is_full_window,
+                "assigned_count": len(sorted_tiles),
+                "chosen_count": len(chosen),
+                "tail_from_window": max(0, len(sorted_tiles) - len(chosen)),
+                "max_confirm_conflicts": 0,
+            })
+
+        if candidate_ok and len(sample_rounds) > 1:
+            for round_idx, samples in enumerate(sample_rounds[1:], start=1):
+                round_window, round_conf, round_assigned, round_threshold = classify_round(samples, candidate_wSize)
+
+                for stat in window_stats:
+                    if not stat["is_full_window"]:
+                        continue
+
+                    w = stat["w"]
+                    chosen = chosen_per_window[w]
+                    if len(chosen) == 0:
+                        continue
+
+                    chosen_tensor = torch.tensor(chosen, dtype=torch.long, device=device)
+                    conflict_mask = round_assigned[chosen_tensor] & (round_window[chosen_tensor] != w)
+                    conflict_count = int(conflict_mask.sum().item())
+                    stat["max_confirm_conflicts"] = max(stat["max_confirm_conflicts"], conflict_count)
+
+                    if conflict_count >= compute_sms:
+                        candidate_ok = False
+                        fail_reason = (
+                            f"confirmation round {round_idx} window {w:03d} "
+                            f"has high-confidence conflicts={conflict_count}, "
+                            f"which is >= one compute wave ({compute_sms})"
+                        )
+                        break
+
+                if not candidate_ok:
+                    break
+
+        if rank == 0:
+            print("")
+            print(
+                f"candidate effective_group={candidate_group} "
+                f"candidate_wSize={candidate_wSize} WaveNum={WaveNum} "
+                f"design_threshold={first_threshold}/{int(first_samples.shape[0])}"
+            )
+            for stat in window_stats:
+                print(
+                    f"window {stat['w']:03d}: range=[{stat['lo']}, {stat['hi']}) "
+                    f"expected={stat['expected']} "
+                    f"design_assigned={stat['assigned_count']} "
+                    f"chosen={stat['chosen_count']} "
+                    f"tail_extra={stat['tail_from_window']} "
+                    f"max_confirm_conflicts={stat['max_confirm_conflicts']}"
+                )
+            if candidate_ok:
+                print(f"candidate effective_group={candidate_group} accepted")
+            else:
+                print(f"candidate effective_group={candidate_group} rejected: {fail_reason}")
+
+        if not candidate_ok:
+            continue
+
+        hint = []
+        used = torch.zeros((TileNum,), dtype=torch.bool, device=device)
+
+        duplicate_count = 0
+        for chosen in chosen_per_window:
+            for tile in chosen:
+                tile = int(tile)
+                if bool(used[tile].item()):
+                    duplicate_count += 1
+                    continue
+                hint.append(tile)
+                used[tile] = True
+
+        hint_total = len(hint)
+        tail_total = TileNum - hint_total
+
+        if rank == 0:
+            print(
+                f"chosen effective_min_group_size={candidate_group} "
+                f"(requires >= {min_effective_group_size})"
+            )
+            print(
+                f"hint assigned tiles={hint_total}/{TileNum}; "
+                f"tail tiles left for reorder tail={tail_total}; "
+                f"duplicate_suppressed={duplicate_count}"
+            )
+            print("----------------------------------------")
+            print("")
+
+        return True, hint, candidate_group
+
+    if rank == 0:
+        print(
+            f"compute_hint rejected: no candidate effective group in "
+            f"[{min_effective_group_size}, {nominal_min_group_size}] passed"
+        )
+        print("----------------------------------------")
+        print("")
+
+    return False, [], int(min_effective_group_size) - 1
+
+
+def compute_hint_process(
+    rank,
+    world_size,
+    nccl_id,
+    broker_key,
+    comm_backend,
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    Algo: int,
+    wSize: int,
+    comm_op: str,
+    compute_sms: int,
+    nominal_min_group_size: int,
+    min_effective_group_size: int,
+    effective_hint_confirm: bool,
+    debug_hint: bool,
+    debug_hint_dump: str,
+    barrier,
+    result_dict,
+):
+    torch.cuda.set_device(rank)
+
+    TileNum = div_up(M, BM) * div_up(N, BN)
+    WaveNum = div_up(TileNum, wSize)
+
+    cSeg = []
+    for i in range(WaveNum):
+        this_seg = min(wSize, TileNum - i * wSize)
+        cSeg.append(this_seg)
+
+    cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32)
+    cSeg_GPU = cSeg_CPU.cuda(rank)
+
+    gemm_class = ext.OverlapImpl()
+    init_overlap_backend(gemm_class, rank, world_size, nccl_id, broker_key, comm_backend, comm_op)
+    gemm_class.cutlass_init()
+    gemm_class.overlap_init()
+
+    torch.cuda.synchronize()
+    barrier.wait()
+
+    try:
+        A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
+        B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
+
+        packed_M, packed_N = packed_shape(M, N, BM, BN, 1)
+        C = torch.empty((packed_M, packed_N), dtype=torch.float16, device="cuda")
+
+        MonitoredMatrix = torch.zeros((monitor_size(TileNum, len(cSeg), True),), dtype=torch.int, device="cuda")
+        ReorderedArray = torch.arange(0, TileNum, dtype=torch.int, device="cuda").reshape(
+            ((M + BM - 1) // BM, (N + BN - 1) // BN)
+        )
+
+        D = None
+        RowArray = None
+        if comm_op == "reduce_scatter":
+            D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
+            RowArray = generate_row_remap_array(M, N, BM, BN, cSeg, world_size)
+
+        _warm_up = 100
+        _sample = 10
+
+        if comm_op == "all_reduce":
+            for _ in range(_warm_up):
+                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), True)
+                gemm_class.gemm_allreduce_overlap(
+                    A,
+                    B,
+                    C,
+                    MonitoredMatrix,
+                    ReorderedArray,
+                    1,
+                    cSeg_CPU,
+                    cSeg_GPU,
+                    Algo,
+                    int(compute_sms),
+                    True,
+                )
+        elif comm_op == "reduce_scatter":
+            for _ in range(_warm_up):
+                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), True)
+                gemm_class.gemm_reducescatter_overlap(
+                    A,
+                    B,
+                    C,
+                    D,
+                    MonitoredMatrix,
+                    ReorderedArray,
+                    RowArray,
+                    1,
+                    cSeg_CPU,
+                    cSeg_GPU,
+                    Algo,
+                    True,
+                )
+        else:
+            raise ValueError(f"Unknown comm_op={comm_op}")
+
+        samples_first = collect_monitor_samples(
+            gemm_class,
+            rank,
+            M,
+            N,
+            K,
+            BM,
+            BN,
+            Algo,
+            TileNum,
+            cSeg,
+            cSeg_CPU,
+            cSeg_GPU,
+            A,
+            B,
+            C,
+            MonitoredMatrix,
+            ReorderedArray,
+            comm_op,
+            _sample,
+            int(compute_sms),
+            D=D,
+            RowArray=RowArray,
+        )
+
+        torch.cuda.synchronize()
+        sample_rounds = [samples_first]
+
+        if debug_hint:
+            debug_hint_samples(samples_first, TileNum, wSize, rank, Algo, BM, BN, label=f"M{M}N{N}K{K}_round0")
+
+        if effective_hint_confirm:
+            samples_confirm = collect_monitor_samples(
+                gemm_class,
+                rank,
+                M,
+                N,
+                K,
+                BM,
+                BN,
+                Algo,
+                TileNum,
+                cSeg,
+                cSeg_CPU,
+                cSeg_GPU,
+                A,
+                B,
+                C,
+                MonitoredMatrix,
+                ReorderedArray,
+                comm_op,
+                _sample,
+                int(compute_sms),
+                D=D,
+                RowArray=RowArray,
+            )
+
+            torch.cuda.synchronize()
+            sample_rounds.append(samples_confirm)
+
+            if debug_hint:
+                combined = torch.cat([samples_first, samples_confirm], dim=0)
+                debug_hint_samples(combined, TileNum, wSize, rank, Algo, BM, BN,
+                                   label=f"M{M}N{N}K{K}_combined_confirm")
+
+        if debug_hint_dump and rank == 0:
+            dump_path = Path(debug_hint_dump)
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+
+            dump_data = {
+                "samples": samples_first.detach().cpu(),
+                "sample_rounds": [x.detach().cpu() for x in sample_rounds],
+                "TileNum": TileNum,
+                "WaveNum": WaveNum,
+                "wSize": wSize,
+                "M": M,
+                "N": N,
+                "K": K,
+                "BM": BM,
+                "BN": BN,
+                "Algo": int(Algo),
+                "comm_backend": comm_backend,
+                "comm_op": comm_op,
+                "compute_sms": int(compute_sms),
+                "nominal_min_group_size": int(nominal_min_group_size),
+                "min_effective_group_size": int(min_effective_group_size),
+                "effective_hint_confirm": bool(effective_hint_confirm),
+            }
+
+            torch.save(dump_data, dump_path)
+            print(f"DEBUG hint samples dumped to: {dump_path}")
+
+        is_consistency, hint, effective_min_group_size = compute_stable_hint_from_rounds(
+            sample_rounds,
+            TileNum,
+            wSize,
+            compute_sms,
+            nominal_min_group_size,
+            min_effective_group_size,
+            rank,
+        )
+
+        result_dict[rank] = (is_consistency, hint, effective_min_group_size)
+
+    finally:
+        torch.cuda.synchronize()
+        barrier.wait()
+        release_overlap_backend(gemm_class, comm_backend)
+        torch.cuda.synchronize()
+        barrier.wait()
+
+
+def compute_hint(
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    Algo: int,
+    wSize: int,
+    comm_op: str,
+    compute_sms: int,
+    nominal_min_group_size: int,
+    min_effective_group_size: int,
+    comm_backend: str = "nccl",
+    effective_hint_confirm: bool = False,
+    debug_hint: bool = False,
+    debug_hint_dump: str = "",
+):
+    world_size = torch.cuda.device_count()
+    if world_size < 2:
+        raise RuntimeError("At least 2 GPUs are required for this program.")
+    validate_comm_backend(comm_backend, comm_op, world_size)
+
+    nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
+    broker_key = make_broker_key(f"ooverlap_search_hint_{comm_backend}") if comm_backend == "ooverlap" else ""
+
+    torch.cuda.synchronize()
+
+    manager = mp.Manager()
+    result_dict = manager.dict()
+    barrier = manager.Barrier(world_size)
+
+    mp.spawn(
+        compute_hint_process,
+        args=(
+            world_size,
+            nccl_id,
+            broker_key,
+            comm_backend,
+            M,
+            N,
+            K,
+            BM,
+            BN,
+            Algo,
+            wSize,
+            comm_op,
+            compute_sms,
+            nominal_min_group_size,
+            min_effective_group_size,
+            effective_hint_confirm,
+            debug_hint,
+            debug_hint_dump,
+            barrier,
+            result_dict,
+        ),
+        nprocs=world_size,
+    )
+
+    return result_dict[0]
+
+
+def interpolate_latency(samples, x, comm_op, comm_backend: str = "nccl"):
+    """
+    Convert an element count into communication latency in ms.
+
+    Both NCCL and ooverlap bandwidth files are expected to store flash_bw in
+    GB/s at samples[:, 1], with samples[:, 0] as element count. Therefore the
+    formula is the same; the backend-specific behavior comes from selecting a
+    different bandwidth curve file.
+    """
+    world_size = torch.cuda.device_count()
+
+    if not isinstance(samples, torch.Tensor):
+        samples = torch.tensor(samples, dtype=torch.float32)
+    if not isinstance(x, torch.Tensor):
+        x = torch.tensor(x, dtype=torch.float32)
+
+    data_sizes = samples[:, 0].detach().cpu().numpy()
+    bandwidths = samples[:, 1].detach().cpu().numpy()
+    x_np = x.detach().cpu().numpy()
+
+    y_np = np.interp(x_np, data_sizes, bandwidths)
+    y = torch.tensor(y_np, dtype=torch.float32).item()
+
+    if comm_op == "all_reduce":
+        latency_sec = x * 2 * 2 * (world_size - 1) / y / (1024 ** 3)
+    elif comm_op == "reduce_scatter":
+        if comm_backend == "ooverlap":
+            raise ValueError("ooverlap backend currently does not support reduce_scatter")
+        latency_sec = x * 2 * (world_size - 1) / y / (1024 ** 3)
+    else:
+        raise ValueError(f"Unknown comm_op={comm_op}")
+
+    return latency_sec.item() * 1000.0
+
+
+def predict_lat(M: int, N: int, gemm_dur: float, comm_array: torch.Tensor,
+                gp: list, tile_num: int, comm_op: str, comm_sm_slack: int,
+                comm_backend: str = "nccl"):
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    sm_count = props.multi_processor_count
+    compute_sms = effective_compute_sms(sm_count, comm_sm_slack)
+
+    acc_comm_dur = 0
+    acc_comp_dur = 0
+    iter_num = len(gp)
+
+    if iter_num == 1:
+        return interpolate_latency(comm_array, M * N // tile_num * gp[0], comm_op, comm_backend) + gemm_dur
+
+    old_wave_num = div_up(tile_num, sm_count)
+    new_wave_num = div_up(tile_num, compute_sms)
+    scaled_gemm_dur = gemm_dur / old_wave_num * new_wave_num
+
+    for i in range(iter_num):
+        if i == 0:
+            comm_dur = 0
+        else:
+            comm_dur = interpolate_latency(comm_array, M * N // tile_num * gp[i - 1], comm_op, comm_backend)
+
+        acc_comm_dur = max(acc_comp_dur, acc_comm_dur) + comm_dur
+        acc_comp_dur += scaled_gemm_dur / new_wave_num * div_up(gp[i], compute_sms)
+
+    acc_comm_dur = max(acc_comp_dur, acc_comm_dur) + interpolate_latency(
+        comm_array,
+        M * N // tile_num * gp[-1],
+        comm_op,
+        comm_backend,
+    )
+
+    return acc_comm_dur
+
+
+def reorder_indices(S, hint):
+    original = list(range(S))
+    new_order = [-1] * S
+
+    for i, element in enumerate(hint):
+        new_order[element] = i
+
+    remaining_elements = [x for x in original if x not in hint]
+    for i, element in enumerate(remaining_elements, start=len(hint)):
+        new_order[element] = i
+
+    return torch.tensor(new_order, dtype=torch.int, device="cuda")
+
+
+def perf_running_process(
+    rank,
+    world_size,
+    nccl_id,
+    broker_key,
+    comm_backend,
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    Algo: int,
+    cSeg: list,
+    hint: list,
+    comm_op: str,
+    active_sm_count: int,
+    barrier,
+    result_dict,
+):
+    torch.cuda.set_device(rank)
+
+    cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32)
+    cSeg_GPU = cSeg_CPU.cuda(rank)
+    TileNum = div_up(M, BM) * div_up(N, BN)
+
+    gemm_class = ext.OverlapImpl()
+    init_overlap_backend(gemm_class, rank, world_size, nccl_id, broker_key, comm_backend, comm_op)
+    gemm_class.cutlass_init()
+    gemm_class.overlap_init()
+
+    torch.cuda.synchronize()
+    barrier.wait()
+
+    try:
+        A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
+        B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
+
+        packed_M, packed_N = packed_shape(M, N, BM, BN, 1)
+        C = torch.empty((packed_M, packed_N), dtype=torch.float16, device="cuda")
+
+        MonitoredMatrix = torch.zeros((monitor_size(TileNum, len(cSeg), False),), dtype=torch.int, device="cuda")
+        ReorderedArray = reorder_indices(TileNum, hint).reshape(((M + BM - 1) // BM, (N + BN - 1) // BN))
+
+        D = None
+        RowArray = None
+        if comm_op == "reduce_scatter":
+            D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
+            RowArray = generate_row_remap_array(M, N, BM, BN, cSeg, world_size)
+
+        _warm_up = 20
+        _freq = 200
+
+        if comm_op == "all_reduce":
+            for _ in range(_warm_up):
+                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
+                gemm_class.gemm_allreduce_overlap(
+                    A, B, C, MonitoredMatrix, ReorderedArray, 1,
+                    cSeg_CPU, cSeg_GPU, Algo, int(active_sm_count), False,
+                )
+
+            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(_freq)]
+            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(_freq)]
+            for i in range(_freq):
+                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
+                start_event[i].record()
+                gemm_class.gemm_allreduce_overlap(
+                    A, B, C, MonitoredMatrix, ReorderedArray, 1,
+                    cSeg_CPU, cSeg_GPU, Algo, int(active_sm_count), False,
+                )
+                end_event[i].record()
+            torch.cuda.synchronize()
+            dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
+
+        elif comm_op == "reduce_scatter":
+            for _ in range(_warm_up):
+                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
+                gemm_class.gemm_reducescatter_overlap(
+                    A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray,
+                    1, cSeg_CPU, cSeg_GPU, Algo, False,
+                )
+
+            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(_freq)]
+            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(_freq)]
+            for i in range(_freq):
+                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
+                start_event[i].record()
+                gemm_class.gemm_reducescatter_overlap(
+                    A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray,
+                    1, cSeg_CPU, cSeg_GPU, Algo, False,
+                )
+                end_event[i].record()
+            torch.cuda.synchronize()
+            dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
+
+        else:
+            raise ValueError(f"Unknown comm_op={comm_op}")
+
+        result_dict[rank] = torch.mean(dur).item()
+
+    finally:
+        torch.cuda.synchronize()
+        barrier.wait()
+        release_overlap_backend(gemm_class, comm_backend)
+        torch.cuda.synchronize()
+        barrier.wait()
+
+
+def perf_running(M: int, N: int, K: int, BM: int, BN: int, Algo: int,
+                 cSeg: list, hint: list, comm_op: str, active_sm_count: int = 0,
+                 comm_backend: str = "nccl"):
+    world_size = torch.cuda.device_count()
+    if world_size < 2:
+        raise RuntimeError("At least 2 GPUs are required for this program.")
+    validate_comm_backend(comm_backend, comm_op, world_size)
+
+    nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
+    broker_key = make_broker_key(f"ooverlap_search_perf_{comm_backend}") if comm_backend == "ooverlap" else ""
+    torch.cuda.synchronize()
+
+    manager = mp.Manager()
+    result_dict = manager.dict()
+    barrier = manager.Barrier(world_size)
+
+    mp.spawn(
+        perf_running_process,
+        args=(
+            world_size,
+            nccl_id,
+            broker_key,
+            comm_backend,
+            M,
+            N,
+            K,
+            BM,
+            BN,
+            Algo,
+            cSeg,
+            hint,
+            comm_op,
+            active_sm_count,
+            barrier,
+            result_dict,
+        ),
+        nprocs=world_size,
+    )
+
+    dur = torch.empty((world_size))
+    for i in range(world_size):
+        dur[i] = result_dict[i]
+    return dur.max()
+
+
+def integer_partitions(n):
+    result = []
+
+    def helper(remaining, path):
+        if remaining == 0:
+            result.append(path)
+            return
+        for i in range(1, remaining + 1):
+            helper(remaining - i, path + [i])
+
+    helper(n, [])
+    return result
+
+
+def expand_partition_to_cseg(gp_units, compute_sms: int, search_group_size: int, tile_num: int):
+    gp = list(gp_units)
+    acc = 0
+
+    for j in range(len(gp)):
+        if j < len(gp) - 1:
+            gp[j] = gp[j] * compute_sms * search_group_size
+            acc += gp[j]
+        else:
+            gp[j] = min(gp[j] * compute_sms * search_group_size, tile_num - acc)
+
+    return gp
+
+
+def predict_lat_with_debug(
+    M: int,
+    N: int,
+    gemm_dur: float,
+    comm_array: torch.Tensor,
+    gp: list,
+    tile_num: int,
+    comm_op: str,
+    comm_sm_slack: int,
+    comm_backend: str = "nccl",
+):
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    sm_count = props.multi_processor_count
+    compute_sms = effective_compute_sms(sm_count, comm_sm_slack)
+
+    bytes_or_elems_per_tile = M * N // tile_num
+    iter_num = len(gp)
+
+    lines = []
+    lines.append(
+        f"comm_backend={comm_backend} gp={gp} iter_num={iter_num} tile_num={tile_num} "
+        f"sm_count={sm_count} compute_sms={compute_sms} "
+        f"bytes_or_elems_per_tile={bytes_or_elems_per_tile}"
+    )
+
+    if iter_num == 1:
+        comm_x = bytes_or_elems_per_tile * gp[0]
+        comm_dur = interpolate_latency(comm_array, comm_x, comm_op, comm_backend)
+        total = comm_dur + gemm_dur
+
+        lines.append(
+            "one-segment/no-overlap path: "
+            f"comm_x={comm_x} comm_dur={comm_dur:.6f} "
+            f"gemm_dur={gemm_dur:.6f} total={total:.6f}"
+        )
+        lines.append("NOTE: this path uses the original gemm_dur directly, matching predict_lat().")
+        return total, lines
+
+    old_wave_num = div_up(tile_num, sm_count)
+    new_wave_num = div_up(tile_num, compute_sms)
+    scaled_gemm_dur = gemm_dur / old_wave_num * new_wave_num
+
+    lines.append(
+        "multi-segment/overlap path: "
+        f"old_wave_num={old_wave_num} new_wave_num={new_wave_num} "
+        f"original_gemm_dur={gemm_dur:.6f} scaled_gemm_dur={scaled_gemm_dur:.6f}"
+    )
+
+    acc_comm_dur = 0.0
+    acc_comp_dur = 0.0
+
+    for i in range(iter_num):
+        if i == 0:
+            comm_tiles = 0
+            comm_x = 0
+            comm_dur = 0.0
+        else:
+            comm_tiles = gp[i - 1]
+            comm_x = bytes_or_elems_per_tile * comm_tiles
+            comm_dur = interpolate_latency(comm_array, comm_x, comm_op, comm_backend)
+
+        comp_waves = div_up(gp[i], compute_sms)
+        comp_dur = scaled_gemm_dur / new_wave_num * comp_waves
+
+        prev_acc_comm_dur = acc_comm_dur
+        prev_acc_comp_dur = acc_comp_dur
+
+        acc_comm_dur = max(acc_comp_dur, acc_comm_dur) + comm_dur
+        acc_comp_dur += comp_dur
+
+        lines.append(
+            f"iter={i}: segment_tiles={gp[i]} comp_waves={comp_waves} "
+            f"comp_dur={comp_dur:.6f} "
+            f"prev_acc_comp={prev_acc_comp_dur:.6f} "
+            f"prev_acc_comm={prev_acc_comm_dur:.6f} "
+            f"comm_tiles_from_prev={comm_tiles} comm_x={comm_x} "
+            f"comm_dur={comm_dur:.6f} "
+            f"new_acc_comp={acc_comp_dur:.6f} "
+            f"new_acc_comm={acc_comm_dur:.6f}"
+        )
+
+    final_comm_x = bytes_or_elems_per_tile * gp[-1]
+    final_comm_dur = interpolate_latency(comm_array, final_comm_x, comm_op, comm_backend)
+    total = max(acc_comp_dur, acc_comm_dur) + final_comm_dur
+
+    lines.append(
+        f"final_comm: tiles={gp[-1]} comm_x={final_comm_x} "
+        f"final_comm_dur={final_comm_dur:.6f} "
+        f"max(acc_comp={acc_comp_dur:.6f}, acc_comm={acc_comm_dur:.6f}) "
+        f"total={total:.6f}"
+    )
+
+    return total, lines
+
+
+def exhaustive_search(
+    M: int,
+    N: int,
+    K: int,
+    comm_op: str,
+    comm_sm_slack: int,
+    comm_backend: str = "nccl",
+    debug_hint: bool = False,
+    debug_hint_dump: str = "",
+    try_all_algos: bool = False,
+    algo_limit=None,
+    algo_id=None,
+    write_legacy_solution: bool = False,
+):
+    world_size = torch.cuda.device_count()
+    validate_comm_backend(comm_backend, comm_op, world_size)
+
+    BM_list, BN_list, gemm_dur_list, Algo_list = load_json(M, N, K)
+    BM_list, BN_list, gemm_dur_list, Algo_list = filter_candidates_by_algo_id(
+        BM_list, BN_list, gemm_dur_list, Algo_list, algo_id
+    )
+
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    sm_count = props.multi_processor_count
+    compute_sms = effective_compute_sms(sm_count, comm_sm_slack)
+
+    print(f"comm_backend={comm_backend}")
+    print(f"SM count={sm_count}, comm_sm_slack={comm_sm_slack}, compute_sms={compute_sms}")
+
+    hint = None
+    effective_min_group_size = 1
+    selected = None
+    candidate_count = algo_attempt_count(len(Algo_list), 5, try_all_algos, algo_limit)
+    print(f"Trying {candidate_count}/{len(Algo_list)} candidate algos for exhaustive search.")
+
+    for t in range(candidate_count):
+        BM = BM_list[t]
+        BN = BN_list[t]
+        gemm_dur = gemm_dur_list[t]
+        Algo = Algo_list[t]
+
+        if is_cooperative_algo(Algo):
+            print(f"Skip cooperative algo={Algo}")
+            continue
+
+        tile_num = div_up(M, BM) * div_up(N, BN)
+        wave_num = div_up(tile_num, compute_sms)
+
+        print(
+            f"Try candidate {t + 1}/{candidate_count}: "
+            f"algo={Algo} BM={BM} BN={BN} tile_num={tile_num} wave_num={wave_num}"
+        )
+
+        debug_dump_this_algo = ""
+        if debug_hint_dump:
+            debug_dump_this_algo = debug_hint_dump.replace(".pt", f"_{comm_backend}_algo{Algo}_bm{BM}_bn{BN}.pt")
+
+        try:
+            result = compute_hint(
+                M,
+                N,
+                K,
+                BM,
+                BN,
+                Algo,
+                compute_sms,
+                comm_op,
+                compute_sms=compute_sms,
+                nominal_min_group_size=1,
+                min_effective_group_size=1,
+                comm_backend=comm_backend,
+                effective_hint_confirm=False,
+                debug_hint=debug_hint,
+                debug_hint_dump=debug_dump_this_algo,
+            )
+        except Exception as e:
+            print(f"compute_hint failed for algo={Algo}; trying next candidate.")
+            print(f"  {type(e).__name__}: {e}")
+            continue
+
+        if result[0] is True:
+            hint = result[1]
+            effective_min_group_size = result[2]
+            selected = (BM, BN, gemm_dur, Algo, tile_num, wave_num)
+            print(
+                f"Selected algo={Algo} after successful compute_hint. "
+                f"effective_min_group_size={effective_min_group_size}"
+            )
+            break
+
+        print(f"compute_hint inconsistent for algo={Algo}; trying next candidate.")
+
+    assert hint is not None and selected is not None, "Tuning fails! Try to increase min_group_size manually or use --try_all_algos."
+    BM, BN, gemm_dur, Algo, tile_num, wave_num = selected
+
+    print("Start exhaustive searching.")
+
+    min_dur = 1e5
+    cSeg = None
+
+    group_size_list = integer_partitions(wave_num)
+    for gp in group_size_list:
+        gp = list(gp)
+        iter_num = len(gp)
+        acc = 0
+        for j in range(iter_num):
+            if j < iter_num - 1:
+                gp[j] = gp[j] * compute_sms
+                acc += gp[j]
+            else:
+                gp[j] = min(gp[j] * compute_sms, tile_num - acc)
+
+        dur = perf_running(M, N, K, BM, BN, Algo, gp, hint, comm_op, compute_sms, comm_backend)
+        print(gp, "%.4f" % dur)
+
+        if dur < min_dur:
+            min_dur = float(dur)
+            cSeg = gp
+
+    print("Best solution: ", cSeg)
+    save_solution(
+        M, N, K, BM, BN, gemm_dur, Algo, hint, cSeg, comm_sm_slack,
+        comm_backend=comm_backend,
+        comm_op=comm_op,
+        bandwidth_path="",
+        predicted_latency_ms=None,
+        searched_latency_ms=min_dur,
+        write_legacy_solution=write_legacy_solution,
+    )
+    print("Solution saved.")
+
+
+def fast_search(
+    M: int,
+    N: int,
+    K: int,
+    comm_array: torch.Tensor,
+    comm_op: str,
+    comm_sm_slack: int,
+    min_group_size_override,
+    comm_backend: str = "nccl",
+    bandwidth_path: str = "",
+    debug_hint: bool = False,
+    debug_hint_dump: str = "",
+    try_all_algos: bool = False,
+    algo_limit=None,
+    algo_id=None,
+    min_effective_group_size_override=None,
+    effective_hint_confirm: bool = True,
+    debug_search: bool = False,
+    debug_search_topk: int = 20,
+    write_legacy_solution: bool = False,
+):
+    world_size = torch.cuda.device_count()
+    validate_comm_backend(comm_backend, comm_op, world_size)
+
+    BM_list, BN_list, gemm_dur_list, Algo_list = load_json(M, N, K)
+    BM_list, BN_list, gemm_dur_list, Algo_list = filter_candidates_by_algo_id(
+        BM_list, BN_list, gemm_dur_list, Algo_list, algo_id
+    )
+
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    sm_count = props.multi_processor_count
+    compute_sms = effective_compute_sms(sm_count, comm_sm_slack)
+
+    print(f"comm_backend={comm_backend}")
+    print(f"SM count={sm_count}, comm_sm_slack={comm_sm_slack}, compute_sms={compute_sms}")
+
+    hint = None
+    effective_min_group_size = None
+    selected_min_group_size = None
+    selected = None
+
+    candidate_count = algo_attempt_count(len(Algo_list), 10, try_all_algos, algo_limit)
+    print(f"Trying {candidate_count}/{len(Algo_list)} candidate algos for predictive search.")
+
+    for t in range(candidate_count):
+        BM = BM_list[t]
+        BN = BN_list[t]
+        gemm_dur = gemm_dur_list[t]
+        Algo = Algo_list[t]
+
+        if is_cooperative_algo(Algo):
+            print(f"Skip cooperative algo={Algo}")
+            continue
+
+        tile_num = div_up(M, BM) * div_up(N, BN)
+        wave_num = div_up(tile_num, compute_sms)
+
+        if min_group_size_override is None:
+            min_group_size = div_up(wave_num, 10)
+        else:
+            min_group_size = int(min_group_size_override)
+
+        if min_effective_group_size_override is None:
+            min_effective_group_size = max(1, min_group_size - 3)
+        else:
+            min_effective_group_size = int(min_effective_group_size_override)
+
+        print(
+            f"Try candidate {t + 1}/{candidate_count}: "
+            f"algo={Algo} BM={BM} BN={BN} tile_num={tile_num} "
+            f"wave_num={wave_num} min_group_size={min_group_size} "
+            f"min_effective_group_size={min_effective_group_size}"
+        )
+
+        debug_dump_this_algo = ""
+        if debug_hint_dump:
+            debug_dump_this_algo = debug_hint_dump.replace(".pt", f"_{comm_backend}_algo{Algo}_bm{BM}_bn{BN}.pt")
+
+        try:
+            result = compute_hint(
+                M,
+                N,
+                K,
+                BM,
+                BN,
+                Algo,
+                min_group_size * compute_sms,
+                comm_op,
+                compute_sms=compute_sms,
+                nominal_min_group_size=min_group_size,
+                min_effective_group_size=min_effective_group_size,
+                comm_backend=comm_backend,
+                effective_hint_confirm=effective_hint_confirm,
+                debug_hint=debug_hint,
+                debug_hint_dump=debug_dump_this_algo,
+            )
+        except Exception as e:
+            print(f"compute_hint failed for algo={Algo}; trying next candidate.")
+            print(f"  {type(e).__name__}: {e}")
+            continue
+
+        if result[0] is True:
+            hint = result[1]
+            effective_min_group_size = result[2]
+            selected_min_group_size = min_group_size
+            selected = (BM, BN, gemm_dur, Algo, tile_num, wave_num)
+            print(
+                f"Selected algo={Algo} after successful compute_hint. "
+                f"nominal_min_group_size={selected_min_group_size} "
+                f"effective_min_group_size={effective_min_group_size}"
+            )
+            break
+
+        print(f"compute_hint inconsistent for algo={Algo}; trying next candidate.")
+
+    assert hint is not None and selected is not None, "Tuning fails! Try to increase min_group_size manually or use --try_all_algos."
+    BM, BN, gemm_dur, Algo, tile_num, wave_num = selected
+
+    search_group_size = int(effective_min_group_size)
+    assert search_group_size > 0
+
+    print(
+        "Start predictive searching. "
+        f"backend={comm_backend} "
+        f"Using effective_min_group_size={search_group_size} "
+        f"instead of nominal_min_group_size={selected_min_group_size}."
+    )
+
+    min_dur = 1e5
+    cSeg = None
+
+    normalized_wave_num = div_up(wave_num, search_group_size)
+    group_size_list = integer_partitions(normalized_wave_num)
+
+    print(
+        f"wave_num={wave_num} normalized_wave_num={normalized_wave_num} "
+        f"compute_sms={compute_sms} search_group_size={search_group_size} "
+        f"partition_count={len(group_size_list)}"
+    )
+
+    debug_rows = []
+    skipped_cold_start = 0
+    evaluated_count = 0
+
+    for gp_units in group_size_list:
+        gp_units = list(gp_units)
+        iter_num = len(gp_units)
+
+        # Avoid cold start.
+        if iter_num > 5 and gp_units[0] > 2:
+            skipped_cold_start += 1
+            if debug_search:
+                print(
+                    f"Skip partition due to cold-start rule: "
+                    f"gp_units={gp_units} iter_num={iter_num} first_unit={gp_units[0]}"
+                )
+            continue
+
+        gp = expand_partition_to_cseg(gp_units, compute_sms, search_group_size, tile_num)
+
+        if debug_search:
+            est_dur, trace_lines = predict_lat_with_debug(
+                M,
+                N,
+                gemm_dur,
+                comm_array,
+                gp,
+                tile_num,
+                comm_op,
+                comm_sm_slack,
+                comm_backend,
+            )
+        else:
+            est_dur = predict_lat(
+                M,
+                N,
+                gemm_dur,
+                comm_array,
+                gp,
+                tile_num,
+                comm_op,
+                comm_sm_slack,
+                comm_backend,
+            )
+            trace_lines = []
+
+        evaluated_count += 1
+
+        debug_rows.append({
+            "est_dur": float(est_dur),
+            "gp_units": list(gp_units),
+            "cSeg": list(gp),
+            "iter_num": iter_num,
+            "trace": trace_lines,
+        })
+
+        if est_dur < min_dur:
+            old_min = min_dur
+            min_dur = float(est_dur)
+            cSeg = gp
+
+            if debug_search:
+                if old_min == 1e5:
+                    print(f"New best initial: est={float(est_dur):.6f} gp_units={gp_units} cSeg={gp}")
+                else:
+                    print(
+                        f"New best: est={float(est_dur):.6f} old_best={float(old_min):.6f} "
+                        f"gp_units={gp_units} cSeg={gp}"
+                    )
+
+    assert cSeg is not None, "Predictive search produced no candidate cSeg."
+
+    if debug_search:
+        print("")
+        print("----------------------------------------")
+        print("Predictive search debug summary:")
+        print(
+            f"comm_backend={comm_backend} "
+            f"partition_count={len(group_size_list)} "
+            f"evaluated_count={evaluated_count} "
+            f"skipped_cold_start={skipped_cold_start}"
+        )
+        print(f"selected_cSeg={cSeg} selected_predicted_latency={float(min_dur):.6f}")
+
+        sorted_rows = sorted(debug_rows, key=lambda x: x["est_dur"])
+
+        one_segment_rank = None
+        for idx, row in enumerate(sorted_rows):
+            if len(row["cSeg"]) == 1:
+                one_segment_rank = idx + 1
+                break
+
+        if one_segment_rank is not None:
+            one_seg_row = sorted_rows[one_segment_rank - 1]
+            print(
+                f"one-segment candidate rank={one_segment_rank}/{len(sorted_rows)} "
+                f"est={one_seg_row['est_dur']:.6f} cSeg={one_seg_row['cSeg']}"
+            )
+        else:
+            print("one-segment candidate was not evaluated.")
+
+        print("")
+        print(f"Top {min(debug_search_topk, len(sorted_rows))} predicted candidates:")
+        for idx, row in enumerate(sorted_rows[:debug_search_topk], start=1):
+            print(
+                f"rank={idx:03d} est={row['est_dur']:.6f} "
+                f"iter_num={row['iter_num']} gp_units={row['gp_units']} cSeg={row['cSeg']}"
+            )
+
+        print("")
+        print("Detailed trace for top predicted candidates:")
+        for idx, row in enumerate(sorted_rows[:debug_search_topk], start=1):
+            print(
+                f"--- rank={idx:03d} est={row['est_dur']:.6f} "
+                f"gp_units={row['gp_units']} cSeg={row['cSeg']} ---"
+            )
+            for line in row["trace"]:
+                print(f"  {line}")
+
+        print("----------------------------------------")
+        print("")
+
+    print("Search process finished.")
+
+    searched_lat = perf_running(
+        M,
+        N,
+        K,
+        BM,
+        BN,
+        Algo,
+        cSeg,
+        hint,
+        comm_op,
+        compute_sms,
+        comm_backend,
+    )
+    print("Searched latency: %.4f" % searched_lat)
+    print("Best solution: ", cSeg)
+
+    save_solution(
+        M,
+        N,
+        K,
+        BM,
+        BN,
+        gemm_dur,
+        Algo,
+        hint,
+        cSeg,
+        comm_sm_slack,
+        comm_backend=comm_backend,
+        comm_op=comm_op,
+        bandwidth_path=bandwidth_path,
+        predicted_latency_ms=min_dur,
+        searched_latency_ms=float(searched_lat),
+        write_legacy_solution=write_legacy_solution,
+    )
+    print("Solution saved.")
+
+
+def run_for_backend(args, comm_backend: str):
+    world_size = torch.cuda.device_count()
+    validate_comm_backend(comm_backend, args.comm_op, world_size)
+
+    print("")
+    print("########################################")
+    print(f"# Starting search for comm_backend={comm_backend}")
+    print("########################################")
+    print("")
+
+    bandwidth_path = args.bandwidth_path
+    if args.comm_backend == "both" and bandwidth_path:
+        raise ValueError("--bandwidth_path is ambiguous with --comm_backend both. Run each backend separately or omit it.")
+
+    if args.predictive_search or args.m * args.n > 33554432:
+        comm_array, used_bandwidth_path = load_comm_array(comm_backend, args.comm_op, world_size, bandwidth_path)
+        fast_search(
+            args.m,
+            args.n,
+            args.k,
+            comm_array,
+            args.comm_op,
+            args.comm_sm_slack,
+            args.min_group_size,
+            comm_backend=comm_backend,
+            bandwidth_path=str(used_bandwidth_path),
+            debug_hint=args.debug_hint,
+            debug_hint_dump=args.debug_hint_dump,
+            try_all_algos=args.try_all_algos,
+            algo_limit=args.algo_limit,
+            algo_id=args.algo_id,
+            min_effective_group_size_override=args.min_effective_group_size,
+            effective_hint_confirm=not args.no_effective_hint_confirm,
+            debug_search=args.debug_search,
+            debug_search_topk=args.debug_search_topk,
+            write_legacy_solution=args.write_legacy_solution,
+        )
+    else:
+        exhaustive_search(
+            args.m,
+            args.n,
+            args.k,
+            args.comm_op,
+            args.comm_sm_slack,
+            comm_backend=comm_backend,
+            debug_hint=args.debug_hint,
+            debug_hint_dump=args.debug_hint_dump,
+            try_all_algos=args.try_all_algos,
+            algo_limit=args.algo_limit,
+            algo_id=args.algo_id,
+            write_legacy_solution=args.write_legacy_solution,
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--m", type=int, default=4096)
+    parser.add_argument("--k", type=int, default=8192)
+    parser.add_argument("--n", type=int, default=8192)
+    parser.add_argument("--comm_op", type=str, default="all_reduce", choices=["all_reduce", "reduce_scatter"])
+    parser.add_argument(
+        "--comm_backend",
+        type=str,
+        default="nccl",
+        choices=["nccl", "ooverlap", "both"],
+        help="Communication backend used by segmented overlap and by the predictive bandwidth curve.",
+    )
+    parser.add_argument(
+        "--bandwidth_path",
+        type=str,
+        default="",
+        help="Optional explicit bandwidth .pt file. Only valid when --comm_backend is nccl or ooverlap, not both.",
+    )
+    parser.add_argument("--predictive_search", action="store_true")
+    parser.add_argument(
+        "--comm_sm_slack",
+        type=int,
+        default=2,
+        help="Number of SMs to leave as communication slack in the search model. Original FlashOverlap uses 2.",
+    )
+    parser.add_argument(
+        "--min_group_size",
+        type=int,
+        default=None,
+        help="Override predictive-search nominal min_group_size. If omitted, uses div_up(wave_num, 10).",
+    )
+    parser.add_argument(
+        "--min_effective_group_size",
+        type=int,
+        default=None,
+        help="Minimum accepted effective group size. If omitted, uses max(1, min_group_size - 3).",
+    )
+    parser.add_argument(
+        "--no_effective_hint_confirm",
+        action="store_true",
+        help="Disable the second 10-sample confirmation round for effective hint generation.",
+    )
+    parser.add_argument("--debug_hint", action="store_true", help="Print detailed compute_hint monitor-order diagnostics.")
+    parser.add_argument("--debug_hint_dump", type=str, default="", help="Optional .pt path to dump compute_hint samples for offline inspection.")
+    parser.add_argument(
+        "--try_all_algos",
+        action="store_true",
+        help="Try every loaded non-cooperative algo if earlier candidates fail. Default keeps original top-5/top-10 behavior.",
+    )
+    parser.add_argument(
+        "--algo_limit",
+        type=int,
+        default=None,
+        help="Try at most this many candidates from the loaded config. Overrides --try_all_algos if provided.",
+    )
+    parser.add_argument("--algo_id", type=int, default=None, help="Try only this specific algo id from the loaded config.")
+    parser.add_argument("--debug_search", action="store_true", help="Print predictive-search candidate estimates and why the selected cSeg won.")
+    parser.add_argument("--debug_search_topk", type=int, default=20, help="How many top predictive-search candidates to print when --debug_search is enabled.")
+    parser.add_argument(
+        "--write_legacy_solution",
+        action="store_true",
+        help="Also write the old solution_m...json path for temporary compatibility with old test.py.",
+    )
+    args = parser.parse_args()
+
+    world_size = torch.cuda.device_count()
+    if world_size < 2:
+        raise RuntimeError("At least 2 GPUs are required for this program.")
+
+    if args.comm_backend == "both":
+        backends = ["nccl", "ooverlap"]
+    else:
+        backends = [args.comm_backend]
+
+    for backend in backends:
+        run_for_backend(args, backend)
+
+
+if __name__ == "__main__":
+    main()

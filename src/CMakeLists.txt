@@ -105,7 +105,7 @@ if(OOVERLAP_BUILD_CORE)
   set_property(TARGET ooverlap_comm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
   set_property(TARGET ooverlap_comm PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-  target_include_directories(ooverlap_comm
+   target_include_directories(ooverlap_comm
     PUBLIC
       $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
       $<INSTALL_INTERFACE:include>
@@ -307,8 +307,16 @@ if(OOVERLAP_BUILD_LEGACY_OVERLAP)
     ooverlap_force_sm90a(ooverlap_overlap)
 
     set_property(TARGET ooverlap_overlap PROPERTY POSITION_INDEPENDENT_CODE ON)
-    set_property(TARGET ooverlap_overlap PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-    set_property(TARGET ooverlap_overlap PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  
+    # CUTLASS SM90 WGMMA kernels must not be compiled with RDC/separable compilation.
+    # Otherwise ptxas may emit C7509:
+    #   wgmma.mma_async instructions are serialized due to Extern calls
+    set_property(TARGET ooverlap_overlap PROPERTY CUDA_SEPARABLE_COMPILATION OFF)
+    set_property(TARGET ooverlap_overlap PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+
+    #set_property(TARGET ooverlap_overlap PROPERTY POSITION_INDEPENDENT_CODE ON)
+    #set_property(TARGET ooverlap_overlap PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+    #set_property(TARGET ooverlap_overlap PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
     target_include_directories(ooverlap_overlap PUBLIC
       ${PROJECT_SOURCE_DIR}/include
@@ -319,13 +327,21 @@ if(OOVERLAP_BUILD_LEGACY_OVERLAP)
 
     ooverlap_apply_torch(ooverlap_overlap)
 
+    target_compile_definitions(ooverlap_overlap PRIVATE
+      NDEBUG
+    )
+
+    target_compile_options(ooverlap_overlap PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    )
+
     target_link_libraries(ooverlap_overlap PUBLIC
       cutlass
       CUDA::cudart
       CUDA::cuda_driver
     )
 
-    ooverlap_link_cudadevrt(ooverlap_overlap PUBLIC)
+    #ooverlap_link_cudadevrt(ooverlap_overlap PUBLIC)
   endif()
 endif()
 
@@ -421,6 +437,9 @@ if(OOVERLAP_BUILD_PYTHON AND EXISTS ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
   if(TARGET ooverlap_norm)
     target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_norm)
   endif()
+  if(TARGET ooverlap_comm)
+    target_link_libraries(ooverlap_overlap_impl PUBLIC ooverlap_comm)
+    endif()
 
   target_link_libraries(ooverlap_overlap_impl PUBLIC
     CUDA::cudart
