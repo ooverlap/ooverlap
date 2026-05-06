@@ -91,6 +91,23 @@ def normalize_split_k(x: Any) -> int:
     return int(float(s)) if s else 1
 
 
+def is_supported_combo(mainloop: str, scheduler: str) -> bool:
+    mainloop = str(mainloop).strip().lower()
+    scheduler = normalize_scheduler(scheduler)
+
+    # CUTLASS rejects Stream-K with normal warp-specialized WS:
+    # "TMA warp-specialized kernel does not support specializing the tile scheduler."
+    #
+    # CUTLASS also rejects Stream-K with pingpong:
+    # "Ping-pong kernel does not currently support stream-K scheduler."
+    #
+    # So in this generator, Stream-K should only be emitted for cooperative.
+    if scheduler == "stream_k" and mainloop != "cooperative":
+        return False
+
+    return True
+
+
 def infer_scheduler(row: Dict[str, Any]) -> str:
     if "scheduler" in row:
         return normalize_scheduler(row["scheduler"])
@@ -168,6 +185,8 @@ def canonical_combo(x: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"Unsupported epilogue={epilogue}")
     if scheduler not in SCHEDULER_TYPES:
         raise ValueError(f"Unsupported scheduler={scheduler}")
+    if not is_supported_combo(mainloop, scheduler):
+        raise ValueError(f"Unsupported combo: mainloop={mainloop}, scheduler={scheduler}")
 
     return {
         "tile_m": int(x["tile_m"]),
@@ -210,6 +229,9 @@ def builtin_combos() -> List[Dict[str, Any]]:
     for mainloop, tm, tn, tk, stages in CURATED_SHAPES:
         for cluster in CLUSTERS:
             for scheduler in SCHEDULERS:
+                if not is_supported_combo(mainloop, scheduler):
+                    continue
+
                 combos.append({
                     "tile_m": tm,
                     "tile_n": tn,
@@ -252,15 +274,21 @@ def load_rows_json(path: Path, top_n: int, key: str) -> List[Dict[str, Any]]:
         if "tile_m" not in row or not is_f16_row(row):
             continue
 
+        mainloop = row.get("mainloop", "ws")
+        scheduler = infer_scheduler(row)
+
+        if not is_supported_combo(str(mainloop), scheduler):
+            continue
+
         out.append(canonical_combo({
             "tile_m": row["tile_m"],
             "tile_n": row["tile_n"],
             "tile_k": row["tile_k"],
             "cluster": row["cluster"],
             "stages": row.get("stages", "auto"),
-            "mainloop": row.get("mainloop", "ws"),
+            "mainloop": mainloop,
             "epilogue": row.get("epilogue", "auto"),
-            "scheduler": infer_scheduler(row),
+            "scheduler": scheduler,
             "split_k": row.get("split_k", row.get("split_k_slices", 1)),
         }))
 
@@ -274,7 +302,12 @@ def dedupe(combos: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_key: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
     for c in combos:
-        cc = canonical_combo(c)
+        try:
+            cc = canonical_combo(c)
+        except ValueError as e:
+            print(f"[skip] {e}")
+            continue
+
         by_key[combo_key(cc)] = cc
 
     out = list(by_key.values())
