@@ -1,23 +1,17 @@
-'''
-    Using multiprocessing for distributed running,
-    please specify the GPUs via CUDA_VISIBLE_DEVICES:
-        CUDA_VISIBLE_DEVICES=0,1 python test/test.py --m 4096 --n 8192 --k 4096
+#!/usr/bin/env python3
+"""
+Run overlap tests for NCCL, ooverlap, or both.
 
-    This test can run:
-      - NCCL overlap solution
-      - ooverlap overlap solution
-      - both backends in one run
+Baselines, both enabled by default:
+  - cublas: cuBLAS GEMM + communication
+  - plain:  gemm_plain_sm90 with the same Algo + communication
 
-    It compares each backend overlap result against that backend's own baseline:
-      - default: same SM90 Algo/BM/BN with cSeg=[tile_num], no overlap segmentation
-      - optional: cublas baseline
-
-    CTA env behavior:
-      - --set_nccl_comm_ctas_to_comm_sms applies only to the NCCL overlap run.
-      - --set_ooverlap_comm_ctas_to_comm_sms applies only to the ooverlap overlap run.
-      - Baseline runs always clear OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS before spawning.
-      - Standalone comm timing always clears OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS before spawning.
-'''
+CTA env behavior:
+  - --set_nccl_comm_ctas_to_comm_sms applies only to the NCCL overlap run.
+  - --set_ooverlap_comm_ctas_to_comm_sms applies only to the ooverlap overlap run.
+  - Baselines always clear OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS.
+  - Standalone comm timing always clears OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS.
+"""
 
 import argparse
 import importlib.util
@@ -34,7 +28,6 @@ import torch.multiprocessing as mp
 
 WARM_UP = 20
 REP = 200
-
 COMM_CTA_ENV_KEYS = ("OOVERLAP_MAX_CTAS", "NCCL_MAX_CTAS")
 
 
@@ -47,19 +40,20 @@ def repo_root():
 
 
 def load_ooverlap_ext():
-    root = repo_root()
-    so = root / "build" / "lib" / "ooverlap_ext.so"
-
+    so = repo_root() / "build" / "lib" / "ooverlap_ext.so"
     if not so.exists():
         raise FileNotFoundError(f"Could not find {so}. Build first.")
 
-    module_name = "ooverlap_ext"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
+    name = "ooverlap_ext"
+    if name in sys.modules:
+        return sys.modules[name]
 
-    spec = importlib.util.spec_from_file_location(module_name, str(so))
+    spec = importlib.util.spec_from_file_location(name, str(so))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load extension from {so}")
+
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -72,46 +66,43 @@ def scoped_env(set_values=None, unset_keys=None):
     set_values = dict(set_values or {})
     unset_keys = set(unset_keys or [])
 
-    touched_keys = set(unset_keys) | set(set_values.keys())
-    old_present = {}
-    old_values = {}
+    touched = set(set_values.keys()) | set(unset_keys)
+    old_present = {k: k in os.environ for k in touched}
+    old_values = {k: os.environ.get(k) for k in touched}
 
-    for key in touched_keys:
-        old_present[key] = key in os.environ
-        old_values[key] = os.environ.get(key)
+    for k in unset_keys:
+        os.environ.pop(k, None)
 
-    for key in unset_keys:
-        os.environ.pop(key, None)
-
-    for key, value in set_values.items():
-        os.environ[key] = str(value)
+    for k, v in set_values.items():
+        os.environ[k] = str(v)
 
     try:
         yield
     finally:
-        for key in touched_keys:
-            if old_present[key]:
-                os.environ[key] = old_values[key]
+        for k in touched:
+            if old_present[k]:
+                os.environ[k] = old_values[k]
             else:
-                os.environ.pop(key, None)
-
-
-def comm_cta_env_values(comm_sm_slack: int):
-    value = str(int(comm_sm_slack))
-    return {
-        "OOVERLAP_MAX_CTAS": value,
-        "NCCL_MAX_CTAS": value,
-    }
+                os.environ.pop(k, None)
 
 
 def clear_comm_cta_env_in_child():
-    for key in COMM_CTA_ENV_KEYS:
-        os.environ.pop(key, None)
+    for k in COMM_CTA_ENV_KEYS:
+        os.environ.pop(k, None)
 
 
 def set_comm_cta_env_in_child(comm_sm_slack: int):
-    for key, value in comm_cta_env_values(comm_sm_slack).items():
-        os.environ[key] = value
+    v = str(int(comm_sm_slack))
+    os.environ["OOVERLAP_MAX_CTAS"] = v
+    os.environ["NCCL_MAX_CTAS"] = v
+
+
+def comm_cta_env_values(comm_sm_slack: int):
+    v = str(int(comm_sm_slack))
+    return {
+        "OOVERLAP_MAX_CTAS": v,
+        "NCCL_MAX_CTAS": v,
+    }
 
 
 def div_up(x: int, y: int):
@@ -119,58 +110,69 @@ def div_up(x: int, y: int):
 
 
 def gpu_config_name():
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
     return props.name.lower().replace(" ", "_")
 
 
-def make_broker_key(prefix: str = "oo"):
-    # Broker key is used in a Unix-domain socket path. Keep it short.
-    _ = prefix
+def make_broker_key():
+    # Broker key becomes part of a Unix-domain socket path. Keep it short.
     pid_part = format(os.getpid() & 0xffff, "04x")
     rand_part = uuid.uuid4().hex[:8]
     return f"oo{pid_part}{rand_part}"
 
 
-def validate_comm_backend(comm_backend: str, comm_op: str, world_size: int):
-    if comm_backend not in ["nccl", "ooverlap"]:
+def validate_backend(comm_backend: str, comm_op: str, world_size: int):
+    if comm_backend not in ("nccl", "ooverlap"):
         raise ValueError(f"Unsupported comm_backend={comm_backend}")
 
-    if comm_op not in ["all_reduce", "reduce_scatter"]:
+    if comm_op not in ("all_reduce", "reduce_scatter"):
         raise ValueError(f"Unsupported comm_op={comm_op}")
 
     if comm_backend == "ooverlap":
         if comm_op != "all_reduce":
-            raise ValueError("ooverlap backend currently supports only --comm_op all_reduce")
+            raise ValueError("ooverlap backend currently supports only all_reduce")
         if world_size != 2:
             raise ValueError("ooverlap backend currently supports exactly 2 visible GPUs")
 
 
-def init_overlap_backend(gemm_class, rank: int, world_size: int, nccl_id, broker_key: str,
-                         comm_backend: str, comm_op: str):
-    validate_comm_backend(comm_backend, comm_op, world_size)
+def method(obj, names):
+    for name in names:
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    raise AttributeError(
+        f"{type(obj).__name__} has none of these methods: {', '.join(names)}"
+    )
+
+
+def init_overlap_backend(obj, rank, world_size, nccl_id, broker_key, comm_backend, comm_op):
+    validate_backend(comm_backend, comm_op, world_size)
 
     if comm_backend == "nccl":
-        gemm_class.nccl_init(rank, world_size, nccl_id)
-    elif comm_backend == "ooverlap":
-        gemm_class.ooverlap_ipc_init(rank, world_size, list(range(world_size)), broker_key)
+        method(obj, ("nccl_init",))(rank, world_size, nccl_id)
     else:
-        raise ValueError(f"Unsupported comm_backend={comm_backend}")
+        method(obj, ("ooverlap_ipc_init",))(rank, world_size, list(range(world_size)), broker_key)
 
 
-def release_overlap_backend(gemm_class, comm_backend: str):
-    if comm_backend == "ooverlap":
-        gemm_class.ooverlap_release()
+def release_overlap_backend(obj, comm_backend: str):
+    if comm_backend == "ooverlap" and hasattr(obj, "ooverlap_release"):
+        obj.ooverlap_release()
+
+
+def init_baseline_nccl(obj, rank, world_size, nccl_id):
+    method(obj, ("nccl_init",))(rank, world_size, nccl_id)
+
+    if hasattr(obj, "cublas_init"):
+        obj.cublas_init()
 
 
 def solution_json_path(M: int, N: int, K: int, comm_backend: str):
-    gpu_name = gpu_config_name()
-    return repo_root() / "configs" / f"solution_{comm_backend}_m{M}n{N}k{K}_{gpu_name}_packed_sm90.json"
+    gpu = gpu_config_name()
+    return repo_root() / "configs" / f"solution_{comm_backend}_m{M}n{N}k{K}_{gpu}_packed_sm90.json"
 
 
 def legacy_solution_json_path(M: int, N: int, K: int):
-    gpu_name = gpu_config_name()
-    return repo_root() / "configs" / f"solution_m{M}n{N}k{K}_{gpu_name}_packed_sm90.json"
+    gpu = gpu_config_name()
+    return repo_root() / "configs" / f"solution_m{M}n{N}k{K}_{gpu}_packed_sm90.json"
 
 
 def find_solution_json(M: int, N: int, K: int, comm_backend: str):
@@ -186,117 +188,290 @@ def find_solution_json(M: int, N: int, K: int, comm_backend: str):
     raise FileNotFoundError(
         f"Could not find solution JSON for backend={comm_backend}:\n"
         f"  {path}\n"
-        "Run tool/search.py for this backend first."
+        "Run tool/search.py first."
     )
 
 
+def load_solution(M: int, N: int, K: int, comm_backend: str):
+    path = find_solution_json(M, N, K, comm_backend)
+    data = json.loads(path.read_text())
+
+    json_backend = data.get("comm_backend")
+    if json_backend is not None and json_backend != comm_backend:
+        print(f"WARNING: loaded solution has comm_backend={json_backend}, requested={comm_backend}")
+
+    return path, data
+
+
 def packed_shape(M: int, N: int, BM: int, BN: int, rLDN: int = 1):
-    TileNum = div_up(M, BM) * div_up(N, BN)
-    packed_tile_rows = div_up(TileNum, rLDN)
+    tile_num = div_up(M, BM) * div_up(N, BN)
+    packed_tile_rows = div_up(tile_num, rLDN)
     return packed_tile_rows * BM, rLDN * BN
 
 
-def monitor_size(TileNum: int, seg_size: int, if_monitor: bool):
-    if if_monitor:
-        return seg_size + TileNum + 1 + TileNum
-    return seg_size + TileNum
+def monitor_size(tile_num: int, seg_size: int, monitor: bool):
+    if monitor:
+        return seg_size + tile_num + 1 + tile_num
+    return seg_size + tile_num
 
 
-def reset_monitor_matrix(MonitoredMatrix, TileNum: int, seg_size: int, if_monitor: bool):
-    if if_monitor:
-        MonitoredMatrix[: seg_size + TileNum + 1] = 0
+def reset_monitor_matrix(mm, tile_num: int, seg_size: int, monitor: bool):
+    if monitor:
+        mm[: seg_size + tile_num + 1] = 0
     else:
-        MonitoredMatrix[: seg_size + TileNum] = 0
+        mm[: seg_size + tile_num] = 0
 
 
-def reorder_indices(S, hint):
-    original = list(range(S))
-    new_order = [-1] * S
+def reorder_indices(tile_num: int, hint):
+    new_order = [-1] * tile_num
 
-    for i, element in enumerate(hint):
-        new_order[int(element)] = i
+    for i, x in enumerate(hint):
+        new_order[int(x)] = i
 
-    hint_set = set(int(x) for x in hint)
-    remaining_elements = [x for x in original if x not in hint_set]
-    for i, element in enumerate(remaining_elements, start=len(hint)):
-        new_order[element] = i
+    used = set(int(x) for x in hint)
+    tail = [x for x in range(tile_num) if x not in used]
+
+    for i, x in enumerate(tail, start=len(hint)):
+        new_order[x] = i
 
     return torch.tensor(new_order, dtype=torch.int, device="cuda")
 
 
-def make_reordered_array(TileNum: int, hint: list, reorder_map=None):
+def make_reordered_array(tile_num: int, hint, reorder_map=None):
     if reorder_map is not None:
-        if len(reorder_map) != TileNum:
-            raise ValueError(
-                f"reorder_map length mismatch: got {len(reorder_map)}, expected {TileNum}"
-            )
+        if len(reorder_map) != tile_num:
+            raise ValueError(f"reorder_map length={len(reorder_map)}, expected={tile_num}")
         return torch.tensor([int(x) for x in reorder_map], dtype=torch.int, device="cuda")
 
-    return reorder_indices(TileNum, hint)
+    return reorder_indices(tile_num, hint)
 
 
-def generate_row_remap_array(M, N, BM, BN, S_list, world_size, device="cuda"):
+def generate_row_remap_array(M, N, BM, BN, cSeg, world_size, device="cuda"):
     total_tiles = (M * N) // (BM * BN)
-    assert sum(S_list) == total_tiles, "sum(S_list) must equal total number of tiles"
+    assert sum(cSeg) == total_tiles, "sum(cSeg) must equal total number of tiles"
 
-    original_row_ids = torch.arange(M * N // BN, dtype=torch.int, device=device)
-    reordered_row_id = torch.empty_like(original_row_ids)
+    original = torch.arange(M * N // BN, dtype=torch.int, device=device)
+    reordered = torch.empty_like(original)
 
-    current_row = 0
-    for S in S_list:
-        chunk_size = S * BM
-        chunk_row_ids = original_row_ids[current_row: current_row + chunk_size]
+    cur = 0
+    for S in cSeg:
+        chunk_size = int(S) * BM
+        chunk = original[cur: cur + chunk_size]
+        _, idx = torch.sort(chunk % world_size, stable=True)
+        reordered[cur: cur + chunk_size] = chunk[idx]
+        cur += chunk_size
 
-        mod_values = chunk_row_ids % world_size
-        _, sorted_indices = torch.sort(mod_values, stable=True)
-        reordered_chunk = chunk_row_ids[sorted_indices]
-
-        reordered_row_id[current_row: current_row + chunk_size] = reordered_chunk
-        current_row += chunk_size
-
-    remap = torch.empty_like(original_row_ids)
-    remap[reordered_row_id] = torch.arange(len(reordered_row_id), dtype=torch.int, device=device)
-
+    remap = torch.empty_like(original)
+    remap[reordered] = torch.arange(len(reordered), dtype=torch.int, device=device)
     return remap
 
 
-def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
-    M: int, N: int, K: int,
-    BM: int, BN: int, Algo: int, cSeg: list, hint: list, reorder_map,
-    comm_op: str,
-    active_sm_count: int,
-    set_overlap_comm_ctas: bool,
-    overlap_comm_ctas: int,
-    result_dict):
+def mean_timed(fn):
+    for _ in range(WARM_UP):
+        fn()
 
+    torch.cuda.synchronize()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
+
+    for i in range(REP):
+        starts[i].record()
+        fn()
+        ends[i].record()
+
+    torch.cuda.synchronize()
+
+    vals = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    return float(sum(vals)) / float(len(vals))
+
+
+def call_nccl_allreduce(obj, C):
+    method(obj, ("nccl_allreduce",))(C)
+
+
+def call_nccl_reducescatter(obj, C, D):
+    fn = method(obj, ("nccl_reducescatter",))
+    try:
+        fn(C, D)
+    except TypeError:
+        fn(C)
+
+
+def call_ooverlap_allreduce(obj, C):
+    method(obj, ("ooverlap_allreduce",))(C)
+
+
+def call_module_cublas_gemm(A, B, C_col):
+    fn = getattr(ext, "baseline_gemm_col", None)
+    if fn is None:
+        raise RuntimeError("ooverlap_ext.baseline_gemm_col was not found")
+    fn(A, B, C_col)
+
+
+def call_module_plain_gemm(A, B, C_col, Algo):
+    fn = getattr(ext, "gemm_plain_sm90", None)
+    if fn is None:
+        raise RuntimeError("ooverlap_ext.gemm_plain_sm90 was not found")
+    fn(A, B, C_col, int(Algo))
+
+
+def call_overlap_allreduce(obj, A, B, C, MM, RA, cSeg_CPU, cSeg_GPU, Algo, active_sm_count):
+    fn = method(obj, ("gemm_allreduce_overlap",))
+    try:
+        fn(
+            A,
+            B,
+            C,
+            MM,
+            RA,
+            1,
+            cSeg_CPU,
+            cSeg_GPU,
+            int(Algo),
+            int(active_sm_count),
+            False,
+        )
+    except TypeError:
+        fn(
+            A,
+            B,
+            C,
+            MM,
+            RA,
+            1,
+            cSeg_CPU,
+            cSeg_GPU,
+            int(Algo),
+            False,
+        )
+
+
+def call_overlap_reducescatter(obj, A, B, C, D, MM, RA, RowArray, cSeg_CPU, cSeg_GPU, Algo):
+    fn = method(obj, ("gemm_reducescatter_overlap",))
+    fn(
+        A,
+        B,
+        C,
+        D,
+        MM,
+        RA,
+        RowArray,
+        1,
+        cSeg_CPU,
+        cSeg_GPU,
+        int(Algo),
+        False,
+    )
+
+
+def call_baseline_cublas_allreduce(obj, A, B, C):
+    method(obj, ("gemm_allreduce",))(A, B, C)
+
+
+def call_baseline_cublas_reducescatter(obj, A, B, C, D):
+    method(obj, ("gemm_reducescatter",))(A, B, C, D)
+
+
+def call_baseline_plain_allreduce(obj, A, B, C, Algo):
+    method(obj, ("gemm_plain_allreduce",))(A, B, C, int(Algo))
+
+
+def call_baseline_plain_reducescatter(obj, A, B, C, D, Algo):
+    method(obj, ("gemm_plain_reducescatter",))(A, B, C, D, int(Algo))
+
+
+def perf_comm_process(rank, world_size, nccl_id, broker_key, comm_backend, M, N, comm_op, result_dict):
     torch.cuda.set_device(rank)
-    validate_comm_backend(comm_backend, comm_op, world_size)
+    validate_backend(comm_backend, comm_op, world_size)
+    clear_comm_cta_env_in_child()
+
+    if comm_backend == "nccl":
+        obj = ext.BaselineImpl()
+        init_baseline_nccl(obj, rank, world_size, nccl_id)
+
+        C = torch.empty((M, N), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
+        D = torch.empty((C.numel() // world_size,), dtype=torch.float16, device="cuda")
+
+        if comm_op == "all_reduce":
+            result_dict[rank] = mean_timed(lambda: call_nccl_allreduce(obj, C))
+        elif comm_op == "reduce_scatter":
+            result_dict[rank] = mean_timed(lambda: call_nccl_reducescatter(obj, C, D))
+        else:
+            raise ValueError(f"Unknown comm_op={comm_op}")
+
+    else:
+        obj = ext.OverlapImpl()
+        try:
+            init_overlap_backend(obj, rank, world_size, nccl_id, broker_key, comm_backend, comm_op)
+            obj.cutlass_init()
+
+            C = torch.empty((M, N), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
+            result_dict[rank] = mean_timed(lambda: call_ooverlap_allreduce(obj, C))
+
+        finally:
+            release_overlap_backend(obj, comm_backend)
+
+
+def perf_comm(M, N, comm_op, comm_backend):
+    world_size = torch.cuda.device_count()
+    validate_backend(comm_backend, comm_op, world_size)
+
+    nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
+    broker_key = make_broker_key() if comm_backend == "ooverlap" else ""
+
+    manager = mp.Manager()
+    result_dict = manager.dict()
+
+    with scoped_env(unset_keys=COMM_CTA_ENV_KEYS):
+        mp.spawn(
+            perf_comm_process,
+            args=(world_size, nccl_id, broker_key, comm_backend, M, N, comm_op, result_dict),
+            nprocs=world_size,
+        )
+
+    return max(float(result_dict[r]) for r in range(world_size))
+
+
+def perf_overlap_process(
+    rank,
+    world_size,
+    nccl_id,
+    broker_key,
+    comm_backend,
+    M,
+    N,
+    K,
+    BM,
+    BN,
+    Algo,
+    cSeg,
+    hint,
+    reorder_map,
+    comm_op,
+    active_sm_count,
+    set_overlap_comm_ctas,
+    overlap_comm_ctas,
+    result_dict,
+):
+    torch.cuda.set_device(rank)
+    validate_backend(comm_backend, comm_op, world_size)
 
     if set_overlap_comm_ctas:
         set_comm_cta_env_in_child(overlap_comm_ctas)
     else:
         clear_comm_cta_env_in_child()
 
-    cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32)
-    cSeg_GPU = cSeg_CPU.cuda(rank)
-
-    TileNum = div_up(M, BM) * div_up(N, BN)
-
-    gemm_class = ext.OverlapImpl()
+    obj = ext.OverlapImpl()
 
     try:
-        init_overlap_backend(
-            gemm_class,
-            rank,
-            world_size,
-            nccl_id,
-            broker_key,
-            comm_backend,
-            comm_op,
-        )
+        init_overlap_backend(obj, rank, world_size, nccl_id, broker_key, comm_backend, comm_op)
+        obj.cutlass_init()
+        obj.overlap_init()
 
-        gemm_class.cutlass_init()
-        gemm_class.overlap_init()
+        tile_num = div_up(M, BM) * div_up(N, BN)
+        cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32)
+        cSeg_GPU = cSeg_CPU.cuda(rank)
 
         A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
         B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
@@ -304,14 +479,14 @@ def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
         packed_M, packed_N = packed_shape(M, N, BM, BN, 1)
         C = torch.empty((packed_M, packed_N), dtype=torch.float16, device="cuda")
 
-        MonitoredMatrix = torch.zeros(
-            (monitor_size(TileNum, len(cSeg), False),),
+        MM = torch.zeros(
+            (monitor_size(tile_num, len(cSeg), False),),
             dtype=torch.int,
             device="cuda",
         )
 
-        ReorderedArray = make_reordered_array(TileNum, hint, reorder_map).reshape(
-            ((M + BM - 1) // BM, (N + BN - 1) // BN)
+        RA = make_reordered_array(tile_num, hint, reorder_map).reshape(
+            (div_up(M, BM), div_up(N, BN))
         )
 
         D = None
@@ -320,126 +495,69 @@ def perf_running_process(rank, world_size, nccl_id, broker_key, comm_backend,
             D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
             RowArray = generate_row_remap_array(M, N, BM, BN, cSeg, world_size)
 
-        if comm_op == "all_reduce":
-            for _ in range(WARM_UP):
-                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
-                gemm_class.gemm_allreduce_overlap(
+        def run():
+            reset_monitor_matrix(MM, tile_num, len(cSeg), False)
+
+            if comm_op == "all_reduce":
+                call_overlap_allreduce(
+                    obj,
                     A,
                     B,
                     C,
-                    MonitoredMatrix,
-                    ReorderedArray,
-                    1,
+                    MM,
+                    RA,
                     cSeg_CPU,
                     cSeg_GPU,
                     Algo,
-                    int(active_sm_count),
-                    False,
+                    active_sm_count,
                 )
-
-            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-
-            for i in range(REP):
-                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
-                start_event[i].record()
-                gemm_class.gemm_allreduce_overlap(
-                    A,
-                    B,
-                    C,
-                    MonitoredMatrix,
-                    ReorderedArray,
-                    1,
-                    cSeg_CPU,
-                    cSeg_GPU,
-                    Algo,
-                    int(active_sm_count),
-                    False,
-                )
-                end_event[i].record()
-
-            torch.cuda.synchronize()
-            dur = torch.tensor(
-                [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
-                dtype=torch.float,
-            )
-
-        elif comm_op == "reduce_scatter":
-            for _ in range(WARM_UP):
-                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
-                gemm_class.gemm_reducescatter_overlap(
+            elif comm_op == "reduce_scatter":
+                call_overlap_reducescatter(
+                    obj,
                     A,
                     B,
                     C,
                     D,
-                    MonitoredMatrix,
-                    ReorderedArray,
+                    MM,
+                    RA,
                     RowArray,
-                    1,
                     cSeg_CPU,
                     cSeg_GPU,
                     Algo,
-                    False,
                 )
+            else:
+                raise ValueError(f"Unknown comm_op={comm_op}")
 
-            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-
-            for i in range(REP):
-                reset_monitor_matrix(MonitoredMatrix, TileNum, len(cSeg), False)
-                start_event[i].record()
-                gemm_class.gemm_reducescatter_overlap(
-                    A,
-                    B,
-                    C,
-                    D,
-                    MonitoredMatrix,
-                    ReorderedArray,
-                    RowArray,
-                    1,
-                    cSeg_CPU,
-                    cSeg_GPU,
-                    Algo,
-                    False,
-                )
-                end_event[i].record()
-
-            torch.cuda.synchronize()
-            dur = torch.tensor(
-                [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
-                dtype=torch.float,
-            )
-
-        else:
-            raise ValueError(f"Unknown comm_op={comm_op}")
-
-        result_dict[rank] = torch.mean(dur).item()
+        result_dict[rank] = mean_timed(run)
 
     finally:
-        release_overlap_backend(gemm_class, comm_backend)
+        release_overlap_backend(obj, comm_backend)
 
 
-def perf_running(M: int, N: int, K: int,
-    BM: int, BN: int, Algo: int,
-    cSeg: list, hint: list, comm_op: str,
-    comm_backend: str,
-    active_sm_count: int,
+def perf_overlap(
+    M,
+    N,
+    K,
+    BM,
+    BN,
+    Algo,
+    cSeg,
+    hint,
+    comm_op,
+    comm_backend,
+    active_sm_count,
     reorder_map=None,
-    set_overlap_comm_ctas: bool = False,
-    overlap_comm_ctas: int = 0):
-
+    set_overlap_comm_ctas=False,
+    overlap_comm_ctas=0,
+):
     world_size = torch.cuda.device_count()
-    if world_size < 2:
-        raise RuntimeError("At least 2 GPUs are required for this program.")
-
-    validate_comm_backend(comm_backend, comm_op, world_size)
+    validate_backend(comm_backend, comm_op, world_size)
 
     if set_overlap_comm_ctas and int(overlap_comm_ctas) <= 0:
         raise ValueError(f"overlap_comm_ctas must be > 0, got {overlap_comm_ctas}")
 
-    nccl_id = ext.generate_nccl_id()
-    broker_key = make_broker_key(f"test_{comm_backend}")
-    torch.cuda.synchronize()
+    nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
+    broker_key = make_broker_key() if comm_backend == "ooverlap" else ""
 
     manager = mp.Manager()
     result_dict = manager.dict()
@@ -453,7 +571,7 @@ def perf_running(M: int, N: int, K: int,
 
     with scoped_env(set_values=set_values, unset_keys=unset_keys):
         mp.spawn(
-            perf_running_process,
+            perf_overlap_process,
             args=(
                 world_size,
                 nccl_id,
@@ -477,255 +595,116 @@ def perf_running(M: int, N: int, K: int,
             nprocs=world_size,
         )
 
-    dur = torch.empty((world_size))
-    for i in range(world_size):
-        dur[i] = result_dict[i]
-
-    return dur.max().item()
+    return max(float(result_dict[r]) for r in range(world_size))
 
 
-def perf_comm_process(rank, world_size, nccl_id, broker_key, comm_backend,
-                      M, N, comm_op, result_dict):
+def perf_baseline_process(
+    rank,
+    world_size,
+    nccl_id,
+    broker_key,
+    comm_backend,
+    baseline_kind,
+    M,
+    N,
+    K,
+    Algo,
+    comm_op,
+    result_dict,
+):
     torch.cuda.set_device(rank)
-    validate_comm_backend(comm_backend, comm_op, world_size)
-
-    clear_comm_cta_env_in_child()
-
-    comm_class = ext.OverlapImpl()
-
-    try:
-        init_overlap_backend(
-            comm_class,
-            rank,
-            world_size,
-            nccl_id,
-            broker_key,
-            comm_backend,
-            comm_op,
-        )
-
-        comm_class.cutlass_init()
-        comm_class.overlap_init()
-
-        C = torch.empty((M, N), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
-
-        if comm_op == "reduce_scatter":
-            D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
-        else:
-            D = None
-
-        if comm_op == "all_reduce":
-            if comm_backend == "nccl":
-                for _ in range(WARM_UP):
-                    comm_class.nccl_allreduce(C)
-
-                start_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-                end_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-
-                for i in range(REP):
-                    start_event[i].record()
-                    comm_class.nccl_allreduce(C)
-                    end_event[i].record()
-
-            elif comm_backend == "ooverlap":
-                for _ in range(WARM_UP):
-                    comm_class.ooverlap_allreduce(C)
-
-                start_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-                end_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-
-                for i in range(REP):
-                    start_event[i].record()
-                    comm_class.ooverlap_allreduce(C)
-                    end_event[i].record()
-
-            else:
-                raise ValueError(f"Unknown comm_backend={comm_backend}")
-
-        elif comm_op == "reduce_scatter":
-            for _ in range(WARM_UP):
-                comm_class.nccl_reducescatter(C, D)
-
-            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-
-            for i in range(REP):
-                start_event[i].record()
-                comm_class.nccl_reducescatter(C, D)
-                end_event[i].record()
-
-        else:
-            raise ValueError(f"Unknown comm_op={comm_op}")
-
-        torch.cuda.synchronize()
-        dur = torch.tensor(
-            [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
-            dtype=torch.float,
-        )
-        result_dict[rank] = torch.mean(dur).item()
-
-    finally:
-        release_overlap_backend(comm_class, comm_backend)
-
-
-def perf_comm(M: int, N: int, comm_op: str, comm_backend: str):
-    world_size = torch.cuda.device_count()
-    if world_size < 2:
-        raise RuntimeError("At least 2 GPUs are required.")
-
-    validate_comm_backend(comm_backend, comm_op, world_size)
-
-    nccl_id = ext.generate_nccl_id()
-    broker_key = make_broker_key(f"comm_{comm_backend}")
-    torch.cuda.synchronize()
-
-    manager = mp.Manager()
-    result_dict = manager.dict()
-
-    with scoped_env(unset_keys=COMM_CTA_ENV_KEYS):
-        mp.spawn(
-            perf_comm_process,
-            args=(world_size, nccl_id, broker_key, comm_backend, M, N, comm_op, result_dict),
-            nprocs=world_size,
-        )
-
-    dur = torch.empty((world_size))
-    for i in range(world_size):
-        dur[i] = result_dict[i]
-
-    return dur.max().item()
-
-
-def perf_cublas_baseline_process(rank, world_size, nccl_id, broker_key, comm_backend,
-                                 M, N, K, comm_op, result_dict):
-    torch.cuda.set_device(rank)
-    validate_comm_backend(comm_backend, comm_op, world_size)
-
+    validate_backend(comm_backend, comm_op, world_size)
     clear_comm_cta_env_in_child()
 
     A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
     B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0.0, std=0.5)
 
     if comm_backend == "nccl":
-        C = torch.empty((M, N), dtype=torch.float16, device="cuda")
+        obj = ext.BaselineImpl()
+        init_baseline_nccl(obj, rank, world_size, nccl_id)
 
-        if comm_op == "reduce_scatter":
+        if baseline_kind == "cublas":
+            # BaselineImpl::GemmAllReduce/GemmReduceScatter uses its original C layout.
+            C = torch.empty((M, N), dtype=torch.float16, device="cuda")
             D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
-        else:
-            D = None
 
-        gemm_comm = ext.BaselineImpl()
-        gemm_comm.nccl_init(rank, world_size, nccl_id)
-        gemm_comm.cublas_init()
+            if comm_op == "all_reduce":
+                result_dict[rank] = mean_timed(lambda: call_baseline_cublas_allreduce(obj, A, B, C))
+            elif comm_op == "reduce_scatter":
+                result_dict[rank] = mean_timed(lambda: call_baseline_cublas_reducescatter(obj, A, B, C, D))
+            else:
+                raise ValueError(f"Unknown comm_op={comm_op}")
 
-        if comm_op == "all_reduce":
-            for _ in range(WARM_UP):
-                gemm_comm.gemm_allreduce(A, B, C)
+        elif baseline_kind == "plain":
+            # Plain SM90 path uses the module/plain physical D_col convention [N, M].
+            C = torch.empty((N, M), dtype=torch.float16, device="cuda")
+            D = torch.empty((C.numel() // world_size,), dtype=torch.float16, device="cuda")
 
-            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-
-            for i in range(REP):
-                start_event[i].record()
-                gemm_comm.gemm_allreduce(A, B, C)
-                end_event[i].record()
-
-        elif comm_op == "reduce_scatter":
-            for _ in range(WARM_UP):
-                gemm_comm.gemm_reducescatter(A, B, C, D)
-
-            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-
-            for i in range(REP):
-                start_event[i].record()
-                gemm_comm.gemm_reducescatter(A, B, C, D)
-                end_event[i].record()
+            if comm_op == "all_reduce":
+                result_dict[rank] = mean_timed(lambda: call_baseline_plain_allreduce(obj, A, B, C, Algo))
+            elif comm_op == "reduce_scatter":
+                result_dict[rank] = mean_timed(lambda: call_baseline_plain_reducescatter(obj, A, B, C, D, Algo))
+            else:
+                raise ValueError(f"Unknown comm_op={comm_op}")
 
         else:
-            raise ValueError(f"Unknown comm_op={comm_op}")
-
-    elif comm_backend == "ooverlap":
-        if comm_op != "all_reduce":
-            raise ValueError("ooverlap cublas baseline supports only all_reduce")
-
-        # baseline_gemm_col expects physical C shape [N, M].
-        C = torch.empty((N, M), dtype=torch.float16, device="cuda")
-
-        comm_class = ext.OverlapImpl()
-        try:
-            comm_class.ooverlap_ipc_init(rank, world_size, list(range(world_size)), broker_key)
-            comm_class.cutlass_init()
-
-            for _ in range(WARM_UP):
-                ext.baseline_gemm_col(A, B, C)
-                comm_class.ooverlap_allreduce(C)
-
-            start_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-            end_event = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-
-            for i in range(REP):
-                start_event[i].record()
-                ext.baseline_gemm_col(A, B, C)
-                comm_class.ooverlap_allreduce(C)
-                end_event[i].record()
-
-        finally:
-            comm_class.ooverlap_release()
+            raise ValueError(f"Unknown baseline_kind={baseline_kind}")
 
     else:
-        raise ValueError(f"Unknown comm_backend={comm_backend}")
+        obj = ext.OverlapImpl()
+        try:
+            init_overlap_backend(obj, rank, world_size, nccl_id, broker_key, comm_backend, comm_op)
+            obj.cutlass_init()
 
-    torch.cuda.synchronize()
-    dur = torch.tensor(
-        [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
-        dtype=torch.float,
-    )
-    result_dict[rank] = torch.mean(dur).item()
+            # Module-level baseline_gemm_col/gemm_plain_sm90 both use D_col [N, M].
+            C = torch.empty((N, M), dtype=torch.float16, device="cuda")
+
+            def run():
+                if baseline_kind == "cublas":
+                    call_module_cublas_gemm(A, B, C)
+                elif baseline_kind == "plain":
+                    call_module_plain_gemm(A, B, C, Algo)
+                else:
+                    raise ValueError(f"Unknown baseline_kind={baseline_kind}")
+
+                call_ooverlap_allreduce(obj, C)
+
+            result_dict[rank] = mean_timed(run)
+
+        finally:
+            release_overlap_backend(obj, comm_backend)
 
 
-def perf_cublas_baseline(M: int, N: int, K: int, comm_op: str, comm_backend: str):
+def perf_baseline(M, N, K, Algo, comm_op, comm_backend, baseline_kind):
     world_size = torch.cuda.device_count()
-    if world_size < 2:
-        raise RuntimeError("At least 2 GPUs are required.")
+    validate_backend(comm_backend, comm_op, world_size)
 
-    validate_comm_backend(comm_backend, comm_op, world_size)
-
-    nccl_id = ext.generate_nccl_id()
-    broker_key = make_broker_key(f"cublas_{comm_backend}")
-    torch.cuda.synchronize()
+    nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
+    broker_key = make_broker_key() if comm_backend == "ooverlap" else ""
 
     manager = mp.Manager()
     result_dict = manager.dict()
 
     with scoped_env(unset_keys=COMM_CTA_ENV_KEYS):
         mp.spawn(
-            perf_cublas_baseline_process,
-            args=(world_size, nccl_id, broker_key, comm_backend, M, N, K, comm_op, result_dict),
+            perf_baseline_process,
+            args=(
+                world_size,
+                nccl_id,
+                broker_key,
+                comm_backend,
+                baseline_kind,
+                M,
+                N,
+                K,
+                Algo,
+                comm_op,
+                result_dict,
+            ),
             nprocs=world_size,
         )
 
-    dur = torch.empty((world_size))
-    for i in range(world_size):
-        dur[i] = result_dict[i]
-
-    return dur.max().item()
-
-
-def load_solution(m: int, n: int, k: int, comm_backend: str):
-    file_path = find_solution_json(m, n, k, comm_backend)
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    json_backend = data.get("comm_backend")
-    if json_backend is not None and json_backend != comm_backend:
-        print(
-            f"WARNING: loaded solution has comm_backend={json_backend}, "
-            f"but requested backend={comm_backend}"
-        )
-
-    return file_path, data
+    return max(float(result_dict[r]) for r in range(world_size))
 
 
 def should_set_overlap_comm_ctas(args, comm_backend: str):
@@ -738,64 +717,61 @@ def should_set_overlap_comm_ctas(args, comm_backend: str):
 
 def run_backend(args, comm_backend: str):
     world_size = torch.cuda.device_count()
-    validate_comm_backend(comm_backend, args.comm_op, world_size)
+    validate_backend(comm_backend, args.comm_op, world_size)
 
-    m, n, k = args.m, args.n, args.k
-
+    M, N, K = args.m, args.n, args.k
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     sm_count = props.multi_processor_count
 
-    file_path, data = load_solution(m, n, k, comm_backend)
+    path, data = load_solution(M, N, K, comm_backend)
 
     BM = int(data["BM"])
     BN = int(data["BN"])
     Algo = int(data["Algo"])
 
-    tile_num = div_up(m, BM) * div_up(n, BN)
+    tile_num = div_up(M, BM) * div_up(N, BN)
     cSeg = [int(x) for x in data["cSeg"]]
     hint = [int(x) for x in data["hint"]]
     reorder_map = data.get("reorder_map")
 
     active_sm_count = int(data.get("compute_sms", sm_count))
     comm_sm_slack = int(data.get("comm_sm_slack", sm_count - active_sm_count))
+    config_gemm_dur = float(data["dur"])
+
     cseg_sum = int(sum(cSeg))
+    if cseg_sum != tile_num:
+        raise RuntimeError(f"sum(cSeg)={cseg_sum} must equal tile_num={tile_num}")
 
-    assert cseg_sum == tile_num, f"sum(cSeg)={cseg_sum} must equal tile_num={tile_num}"
-
-    set_overlap_comm_ctas = should_set_overlap_comm_ctas(args, comm_backend)
+    set_overlap_ctas = should_set_overlap_comm_ctas(args, comm_backend)
 
     print("")
     print("########################################")
-    print(f"# Running test for comm_backend={comm_backend}")
+    print(f"# Running backend={comm_backend}")
     print("########################################")
-    print(f"Loaded solution: {file_path}")
-    print("Solution debug:")
-    print(f"  Algo={Algo} BM={BM} BN={BN}")
-    print(f"  sm_count={sm_count} json_sm_count={data.get('sm_count')}")
-    print(f"  comm_sm_slack={comm_sm_slack} active_sm_count={active_sm_count}")
-    print(f"  cSeg={cSeg}")
-    print(f"  len(cSeg)={len(cSeg)} sum(cSeg)={cseg_sum} tile_num={tile_num}")
-    print(f"  hint_len={len(hint)}")
-    print(f"  has_reorder_map={'reorder_map' in data} reorder_map_len={len(reorder_map or [])}")
-    print(f"  baseline_impl={args.baseline_impl}")
-    if set_overlap_comm_ctas:
-        print(
-            f"  {comm_backend} overlap env override: "
-            f"OOVERLAP_MAX_CTAS={comm_sm_slack} NCCL_MAX_CTAS={comm_sm_slack}"
-        )
+    print(f"solution:          {path}")
+    print(f"shape:             M={M} N={N} K={K}")
+    print(f"algo:              {Algo}")
+    print(f"tile:              BM={BM} BN={BN}")
+    print(f"tile_num:          {tile_num}")
+    print(f"cSeg:              {cSeg}")
+    print(f"hint_len:          {len(hint)}")
+    print(f"reorder_map:       {'yes' if reorder_map is not None else 'no'}")
+    print(f"sm_count:          {sm_count}")
+    print(f"active_sm_count:   {active_sm_count}")
+    print(f"comm_sm_slack:     {comm_sm_slack}")
+    print(f"config_gemm_dur:   {config_gemm_dur:.4f} ms")
+
+    if set_overlap_ctas:
+        print(f"overlap CTA env:   OOVERLAP_MAX_CTAS=NCCL_MAX_CTAS={comm_sm_slack}")
     else:
-        print(f"  {comm_backend} overlap env override: off; CTA env vars are cleared for spawned overlap run")
+        print("overlap CTA env:   cleared")
 
-    config_gemm_dur = float(data["dur"])
+    comm_dur = perf_comm(M, N, args.comm_op, comm_backend)
 
-    # Standalone comm timing is uncapped.
-    comm_dur = perf_comm(m, n, args.comm_op, comm_backend)
-
-    # Real overlap run. CTA caps are applied only if the backend-specific flag was passed.
-    overlap_dur = perf_running(
-        m,
-        n,
-        k,
+    overlap_dur = perf_overlap(
+        M,
+        N,
+        K,
         BM,
         BN,
         Algo,
@@ -804,105 +780,78 @@ def run_backend(args, comm_backend: str):
         args.comm_op,
         comm_backend,
         active_sm_count,
-        reorder_map,
-        set_overlap_comm_ctas=set_overlap_comm_ctas,
+        reorder_map=reorder_map,
+        set_overlap_comm_ctas=set_overlap_ctas,
         overlap_comm_ctas=comm_sm_slack,
     )
 
-    if args.baseline_impl == "same_algo":
-        baseline_cSeg = [tile_num]
-        baseline_active_sm_count = (
-            sm_count if args.baseline_same_algo_active_sms == "all" else active_sm_count
-        )
+    baselines = {}
 
-        # Baseline always clears OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS.
-        baseline_dur = perf_running(
-            m,
-            n,
-            k,
-            BM,
-            BN,
+    if args.run_cublas_baseline:
+        baselines["cublas"] = perf_baseline(
+            M,
+            N,
+            K,
             Algo,
-            baseline_cSeg,
-            hint,
             args.comm_op,
             comm_backend,
-            baseline_active_sm_count,
-            reorder_map,
-            set_overlap_comm_ctas=False,
-            overlap_comm_ctas=0,
+            "cublas",
         )
 
-        baseline_desc = "same_algo_full_segment"
-        baseline_sms = str(baseline_active_sm_count)
+    if args.run_plain_baseline:
+        baselines["plain"] = perf_baseline(
+            M,
+            N,
+            K,
+            Algo,
+            args.comm_op,
+            comm_backend,
+            "plain",
+        )
 
-    elif args.baseline_impl == "cublas":
-        baseline_cSeg = ["cublas"]
-        baseline_dur = perf_cublas_baseline(m, n, k, args.comm_op, comm_backend)
-        baseline_desc = "cublas"
-        baseline_sms = "cublas"
+    speedups = {
+        name: float(dur) / float(overlap_dur)
+        for name, dur in baselines.items()
+    }
 
-    else:
-        raise ValueError(f"Unknown baseline_impl={args.baseline_impl}")
+    print("")
+    print(f"{'Item':<30} {'Value':>18}")
+    print(f"{'----':<30} {'-----':>18}")
+    print(f"{'backend':<30} {comm_backend:>18}")
+    print(f"{'comm_op':<30} {args.comm_op:>18}")
+    print(f"{'comm_dur_ms':<30} {comm_dur:>18.4f}")
+    print(f"{'overlap_dur_ms':<30} {overlap_dur:>18.4f}")
 
-    speedup = baseline_dur / overlap_dur
-
-    env_override_desc = (
-        f"OOVERLAP_MAX_CTAS=NCCL_MAX_CTAS={comm_sm_slack}"
-        if set_overlap_comm_ctas
-        else "off/cleared"
-    )
-
-    print(f"""
-        {'Item':<28} {'Value':>18}
-        {'-----':<28} {'-----':>18}
-        {'comm_backend':<28} {comm_backend:>18}
-        {'comm_op':<28} {args.comm_op:>18}
-        {'m':<28} {m:>18}
-        {'n':<28} {n:>18}
-        {'k':<28} {k:>18}
-        {'tile_num':<28} {tile_num:>18}
-        {'Algo':<28} {Algo:>18}
-        {'BM':<28} {BM:>18}
-        {'BN':<28} {BN:>18}
-        {'cSeg':<28} {str(cSeg):>18}
-        {'cSeg_len':<28} {len(cSeg):>18}
-        {'active_sm_count':<28} {active_sm_count:>18}
-        {'comm_sm_slack':<28} {comm_sm_slack:>18}
-        {'overlap_comm_ctas_env':<28} {env_override_desc:>18}
-        {'baseline_backend':<28} {comm_backend:>18}
-        {'baseline_impl':<28} {baseline_desc:>18}
-        {'baseline_cSeg':<28} {str(baseline_cSeg):>18}
-        {'baseline_sms':<28} {baseline_sms:>18}
-        {'baseline_ctas_env':<28} {'cleared':>18}
-        {'comm_timing_ctas_env':<28} {'cleared':>18}
-        {'config_gemm_dur (ms)':<28} {config_gemm_dur:>18.4f}
-        {'comm_dur (ms)':<28} {comm_dur:>18.4f}
-        {'baseline_dur (ms)':<28} {baseline_dur:>18.4f}
-        {'overlap_dur (ms)':<28} {overlap_dur:>18.4f}
-        {'speedup_vs_own_baseline':<28} {speedup:>18.4f}
-    """)
+    for name in ("cublas", "plain"):
+        if name in baselines:
+            print(f"{name + '_baseline_ms':<30} {baselines[name]:>18.4f}")
+            print(f"{'speedup_vs_' + name:<30} {speedups[name]:>18.4f}")
 
     return {
         "comm_backend": comm_backend,
         "comm_op": args.comm_op,
-        "baseline_impl": baseline_desc,
-        "baseline_dur_ms": float(baseline_dur),
-        "overlap_dur_ms": float(overlap_dur),
-        "speedup": float(speedup),
-        "comm_dur_ms": float(comm_dur),
-        "config_gemm_dur_ms": float(config_gemm_dur),
+        "solution": str(path),
+        "Algo": int(Algo),
+        "BM": int(BM),
+        "BN": int(BN),
         "cSeg": cSeg,
         "active_sm_count": int(active_sm_count),
         "comm_sm_slack": int(comm_sm_slack),
-        "overlap_comm_ctas_env": env_override_desc,
-        "baseline_ctas_env": "cleared",
-        "solution": str(file_path),
+        "comm_dur_ms": float(comm_dur),
+        "overlap_dur_ms": float(overlap_dur),
+        "config_gemm_dur_ms": float(config_gemm_dur),
+        "baselines": {k: float(v) for k, v in baselines.items()},
+        "speedups": speedups,
+        "overlap_cta_env": (
+            f"OOVERLAP_MAX_CTAS=NCCL_MAX_CTAS={comm_sm_slack}"
+            if set_overlap_ctas
+            else "cleared"
+        ),
     }
 
 
 def print_summary(results):
-    if len(results) <= 1:
+    if not results:
         return
 
     print("")
@@ -910,111 +859,162 @@ def print_summary(results):
     print("# Summary")
     print("########################################")
     print(
-        f"{'backend':<12} {'baseline(ms)':>14} {'overlap(ms)':>14} "
-        f"{'own_speedup':>12} {'comm(ms)':>12} {'ctas_env':>28} {'cSeg':>24}"
+        f"{'backend':<10} "
+        f"{'overlap(ms)':>12} "
+        f"{'comm(ms)':>10} "
+        f"{'cublas_base':>12} "
+        f"{'x_cublas':>9} "
+        f"{'plain_base':>12} "
+        f"{'x_plain':>9} "
+        f"{'CTA env':>26} "
+        f"{'cSeg':>24}"
     )
     print(
-        f"{'-------':<12} {'------------':>14} {'-----------':>14} "
-        f"{'-----------':>12} {'--------':>12} {'--------':>28} {'----':>24}"
+        f"{'-------':<10} "
+        f"{'-----------':>12} "
+        f"{'--------':>10} "
+        f"{'-----------':>12} "
+        f"{'--------':>9} "
+        f"{'----------':>12} "
+        f"{'-------':>9} "
+        f"{'-------':>26} "
+        f"{'----':>24}"
     )
 
-    for row in results:
+    for r in results:
+        cublas = r["baselines"].get("cublas")
+        plain = r["baselines"].get("plain")
+
         print(
-            f"{row['comm_backend']:<12} "
-            f"{row['baseline_dur_ms']:>14.4f} "
-            f"{row['overlap_dur_ms']:>14.4f} "
-            f"{row['speedup']:>12.4f} "
-            f"{row['comm_dur_ms']:>12.4f} "
-            f"{row['overlap_comm_ctas_env']:>28} "
-            f"{str(row['cSeg']):>24}"
+            f"{r['comm_backend']:<10} "
+            f"{r['overlap_dur_ms']:>12.4f} "
+            f"{r['comm_dur_ms']:>10.4f} "
+            f"{(cublas if cublas is not None else float('nan')):>12.4f} "
+            f"{r['speedups'].get('cublas', float('nan')):>9.4f} "
+            f"{(plain if plain is not None else float('nan')):>12.4f} "
+            f"{r['speedups'].get('plain', float('nan')):>9.4f} "
+            f"{r['overlap_cta_env']:>26} "
+            f"{str(r['cSeg']):>24}"
         )
 
-    by_backend = {row["comm_backend"]: row for row in results}
+    by_backend = {r["comm_backend"]: r for r in results}
 
-    if "nccl" in by_backend and "ooverlap" in by_backend:
-        nccl = by_backend["nccl"]
-        oo = by_backend["ooverlap"]
+    if "nccl" not in by_backend or "ooverlap" not in by_backend:
+        return
 
-        nccl_overlap_vs_ooverlap_baseline = oo["baseline_dur_ms"] / nccl["overlap_dur_ms"]
-        ooverlap_overlap_vs_nccl_baseline = nccl["baseline_dur_ms"] / oo["overlap_dur_ms"]
+    nccl = by_backend["nccl"]
+    oo = by_backend["ooverlap"]
 
-        print("")
-        print("########################################")
-        print("# Cross-baseline speedups")
-        print("########################################")
-        print(
-            f"{'comparison':<44} {'baseline(ms)':>14} {'overlap(ms)':>14} {'speedup':>10}"
-        )
-        print(
-            f"{'----------':<44} {'------------':>14} {'-----------':>14} {'-------':>10}"
-        )
-        print(
-            f"{'nccl overlap vs ooverlap baseline':<44} "
-            f"{oo['baseline_dur_ms']:>14.4f} "
-            f"{nccl['overlap_dur_ms']:>14.4f} "
-            f"{nccl_overlap_vs_ooverlap_baseline:>10.4f}"
-        )
-        print(
-            f"{'ooverlap overlap vs nccl baseline':<44} "
-            f"{nccl['baseline_dur_ms']:>14.4f} "
-            f"{oo['overlap_dur_ms']:>14.4f} "
-            f"{ooverlap_overlap_vs_nccl_baseline:>10.4f}"
-        )
+    print("")
+    print("########################################")
+    print("# Cross-backend speedups")
+    print("########################################")
+    print(
+        f"{'comparison':<52} "
+        f"{'baseline(ms)':>14} "
+        f"{'overlap(ms)':>14} "
+        f"{'speedup':>10}"
+    )
+    print(
+        f"{'----------':<52} "
+        f"{'------------':>14} "
+        f"{'-----------':>14} "
+        f"{'-------':>10}"
+    )
+
+    for base_name in ("cublas", "plain"):
+        if base_name in oo["baselines"]:
+            speedup = oo["baselines"][base_name] / nccl["overlap_dur_ms"]
+            print(
+                f"{'nccl overlap vs ooverlap ' + base_name + ' baseline':<52} "
+                f"{oo['baselines'][base_name]:>14.4f} "
+                f"{nccl['overlap_dur_ms']:>14.4f} "
+                f"{speedup:>10.4f}"
+            )
+
+        if base_name in nccl["baselines"]:
+            speedup = nccl["baselines"][base_name] / oo["overlap_dur_ms"]
+            print(
+                f"{'ooverlap overlap vs nccl ' + base_name + ' baseline':<52} "
+                f"{nccl['baselines'][base_name]:>14.4f} "
+                f"{oo['overlap_dur_ms']:>14.4f} "
+                f"{speedup:>10.4f}"
+            )
+
+    print("")
+    print("########################################")
+    print("# Overlap-to-overlap")
+    print("########################################")
+    print(
+        f"{'comparison':<52} "
+        f"{'reference(ms)':>14} "
+        f"{'target(ms)':>14} "
+        f"{'ratio':>10}"
+    )
+    print(
+        f"{'ooverlap overlap vs nccl overlap':<52} "
+        f"{nccl['overlap_dur_ms']:>14.4f} "
+        f"{oo['overlap_dur_ms']:>14.4f} "
+        f"{nccl['overlap_dur_ms'] / oo['overlap_dur_ms']:>10.4f}"
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--m", type=int, default=4096)
-    parser.add_argument("--k", type=int, default=8192)
-    parser.add_argument("--n", type=int, default=8192)
-    parser.add_argument("--comm_op", type=str, default="all_reduce", choices=["all_reduce", "reduce_scatter"])
-    parser.add_argument(
+def parse_args():
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--m", type=int, default=4096)
+    p.add_argument("--n", type=int, default=8192)
+    p.add_argument("--k", type=int, default=8192)
+
+    p.add_argument(
+        "--comm_op",
+        type=str,
+        default="all_reduce",
+        choices=["all_reduce", "reduce_scatter"],
+    )
+
+    p.add_argument(
         "--comm_backend",
         type=str,
         default="both",
         choices=["both", "nccl", "ooverlap"],
-        help="Run one backend or both. ooverlap currently supports all_reduce only.",
-    )
-    parser.add_argument(
-        "--baseline_impl",
-        type=str,
-        default="same_algo",
-        choices=["same_algo", "cublas"],
-        help=(
-            "same_algo uses the same SM90 CUTLASS Algo/BM/BN as overlap with "
-            "cSeg=[tile_num]. cublas uses the older cuBLAS GEMM baseline."
-        ),
-    )
-    parser.add_argument(
-        "--baseline_same_algo_active_sms",
-        type=str,
-        default="all",
-        choices=["all", "solution"],
-        help=(
-            "For --baseline_impl same_algo: use all physical SMs for the "
-            "one-segment baseline, or use the solution compute_sms."
-        ),
-    )
-    parser.add_argument(
-        "--set_nccl_comm_ctas_to_comm_sms",
-        action="store_true",
-        help=(
-            "For the NCCL overlap run only, set both OOVERLAP_MAX_CTAS and "
-            "NCCL_MAX_CTAS to comm_sm_slack before spawning workers. Baselines "
-            "and standalone comm timing always clear these env vars."
-        ),
-    )
-    parser.add_argument(
-        "--set_ooverlap_comm_ctas_to_comm_sms",
-        action="store_true",
-        help=(
-            "For the ooverlap overlap run only, set both OOVERLAP_MAX_CTAS and "
-            "NCCL_MAX_CTAS to comm_sm_slack before spawning workers. Baselines "
-            "and standalone comm timing always clear these env vars."
-        ),
     )
 
-    args = parser.parse_args()
+    p.add_argument(
+        "--no_cublas_baseline",
+        dest="run_cublas_baseline",
+        action="store_false",
+        help="Disable cuBLAS GEMM + communication baseline.",
+    )
+
+    p.add_argument(
+        "--no_plain_baseline",
+        dest="run_plain_baseline",
+        action="store_false",
+        help="Disable gemm_plain_sm90 + communication baseline.",
+    )
+
+    p.add_argument(
+        "--set_nccl_comm_ctas_to_comm_sms",
+        action="store_true",
+        help="For NCCL overlap only, set OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS to comm_sm_slack.",
+    )
+
+    p.add_argument(
+        "--set_ooverlap_comm_ctas_to_comm_sms",
+        action="store_true",
+        help="For ooverlap overlap only, set OOVERLAP_MAX_CTAS and NCCL_MAX_CTAS to comm_sm_slack.",
+    )
+
+    p.set_defaults(run_cublas_baseline=True, run_plain_baseline=True)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if not args.run_cublas_baseline and not args.run_plain_baseline:
+        raise RuntimeError("Both baselines are disabled. Keep at least one baseline enabled.")
 
     world_size = torch.cuda.device_count()
     if world_size < 2:
