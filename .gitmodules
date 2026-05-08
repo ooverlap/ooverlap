@@ -4,3 +4,6 @@
 [submodule "src/third-party/nlohmann_json"]
 	path = src/third-party/nlohmann_json
 	url = https://github.com/nlohmann/json.git
+[submodule "src/third-party/nccl"]
+	path = src/third-party/nccl
+	url = https://github.com/NVIDIA/nccl.git
