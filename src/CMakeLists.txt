@@ -135,22 +135,6 @@ if(OOVERLAP_NEED_TORCH)
   endfunction()
 endif()
 
-if(OOVERLAP_NEED_NCCL)
-  find_path(NCCL_INCLUDE_DIR nccl.h
-    HINTS ENV NCCL_ROOT
-    PATH_SUFFIXES include
-  )
-
-  find_library(NCCL_LIBRARY nccl
-    HINTS ENV NCCL_ROOT
-    PATH_SUFFIXES lib lib64
-  )
-
-  if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
-    message(FATAL_ERROR "NCCL not found. Set NCCL_ROOT to your NCCL install.")
-  endif()
-endif()
-
 if(OOVERLAP_NEED_CUTLASS AND NOT TARGET cutlass)
   add_library(cutlass INTERFACE)
   target_include_directories(cutlass INTERFACE
@@ -327,7 +311,7 @@ if(OOVERLAP_BUILD_TESTS OR OOVERLAP_BUILD_PYTHON)
     ooverlap_comm
     CUDA::cudart
     CUDA::cuda_driver
-    ${NCCL_LIBRARY}
+    NCCL::NCCL
   )
 
   if(TARGET nlohmann_json::nlohmann_json)
@@ -392,7 +376,7 @@ if(OOVERLAP_BUILD_PYTHON)
     CUDA::cudart
     CUDA::cuda_driver
     CUDA::cublas
-    ${NCCL_LIBRARY}
+    NCCL::NCCL
   )
 
   if(NOT EXISTS ${OOVERLAP_SRC_DIR}/overlap_impl.cu)
@@ -416,7 +400,7 @@ if(OOVERLAP_BUILD_PYTHON)
     ooverlap_gemm
     CUDA::cudart
     CUDA::cuda_driver
-    ${NCCL_LIBRARY}
+    NCCL::NCCL
   )
 
   ooverlap_link_cudadevrt(ooverlap_overlap_impl PUBLIC)
@@ -437,7 +421,7 @@ if(OOVERLAP_BUILD_PYTHON)
   target_link_libraries(ooverlap_nccl_tool PUBLIC
     CUDA::cudart
     CUDA::cuda_driver
-    ${NCCL_LIBRARY}
+    NCCL::NCCL
   )
 endif()
 
@@ -495,7 +479,7 @@ if(OOVERLAP_BUILD_PYTHON)
     CUDA::cudart
     CUDA::cuda_driver
     CUDA::cublas
-    ${NCCL_LIBRARY}
+    NCCL::NCCL
   )
 
   if(TARGET ooverlap_norm)

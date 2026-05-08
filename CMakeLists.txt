@@ -27,6 +27,7 @@ option(OOVERLAP_BUILD_TESTS "Build benchmark/test helper translation units" ${OO
 option(OOVERLAP_BUILD_GEMM "Build GEMM/CUTLASS helper libraries" ${OOVERLAP_BUILD_PYTHON})
 option(OOVERLAP_BUILD_LEGACY_OVERLAP "Build legacy overlap/NCCL/Torch integration" ${OOVERLAP_BUILD_PYTHON})
 option(OOVERLAP_BUILD_RMSNORM "Build RMSNorm helpers" ${OOVERLAP_BUILD_PYTHON})
+option(OOVERLAP_USE_BUNDLED_NCCL "Build and link NCCL from src/third-party/nccl" ON)
 
 unset(CMAKE_CUDA_ARCHITECTURES CACHE)
 set(CMAKE_CUDA_ARCHITECTURES OFF CACHE STRING "Disable default CUDA arch flags" FORCE)
@@ -72,15 +73,26 @@ if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_LEGACY_OVERLAP)
 endif()
 
 if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_TESTS OR OOVERLAP_BUILD_LEGACY_OVERLAP)
-  find_path(NCCL_INCLUDE_DIR nccl.h
-    HINTS ENV NCCL_ROOT
-    PATH_SUFFIXES include)
-  find_library(NCCL_LIBRARY nccl
-    HINTS ENV NCCL_ROOT
-    PATH_SUFFIXES lib lib64)
+  if(OOVERLAP_USE_BUNDLED_NCCL)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/third_party/nccl.cmake)
+  else()
+    find_path(NCCL_INCLUDE_DIR nccl.h
+      HINTS ENV NCCL_ROOT
+      PATH_SUFFIXES include)
+    find_library(NCCL_LIBRARY nccl
+      HINTS ENV NCCL_ROOT
+      PATH_SUFFIXES lib lib64)
 
-  if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
-    message(FATAL_ERROR "NCCL not found. Set NCCL_ROOT to your NCCL install.")
+    if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+      message(FATAL_ERROR "NCCL not found. Set NCCL_ROOT to your NCCL install.")
+    endif()
+
+    add_library(ooverlap_nccl SHARED IMPORTED GLOBAL)
+    add_library(NCCL::NCCL ALIAS ooverlap_nccl)
+    set_target_properties(ooverlap_nccl PROPERTIES
+      IMPORTED_LOCATION ${NCCL_LIBRARY}
+      INTERFACE_INCLUDE_DIRECTORIES ${NCCL_INCLUDE_DIR}
+    )
   endif()
 endif()
 
