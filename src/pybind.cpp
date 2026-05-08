@@ -21,6 +21,7 @@
 #include "test/tma_bandwidth_experiment_sm90.h"
 #include "test/ipc_collective_sm90.h"
 #include "test/tma_collective_sweep_2gpu.h"
+#include "test/tma_efficiency_vs_best_2gpu.h"
 
 namespace py = pybind11;
 
@@ -371,6 +372,10 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("iters"),
         py::arg("warmup"),
         py::arg("verify"));
+
+  m.def(
+    "benchmark_tma_efficiency_vs_best_2gpu_json",
+    &ooverlap::benchmark_tma_efficiency_vs_best_2gpu_json);
 
   py::class_<BaselineImpl>(m, "BaselineImpl")
       .def(py::init<>())
