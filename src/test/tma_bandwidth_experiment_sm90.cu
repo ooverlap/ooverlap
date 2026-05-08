@@ -31,8 +31,8 @@ constexpr int kTmaThreads = TMA_TWO_GPU_PEER_DEFAULT_THREADS;
 constexpr int kFastThreads = 1024;
 
 constexpr int kChunkBytes = TMA_TWO_GPU_PEER_CHUNK_BYTES;
-constexpr int kStageDepth = TMA_TWO_GPU_PEER_COPY_STAGE_DEPTH;
-constexpr int kFillDepth = TMA_TWO_GPU_PEER_COPY_STAGE_GAP;
+constexpr int kStageDepth = TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH;
+constexpr int kFillDepth = TMA_TWO_GPU_PEER_DEFAULT_STAGE_GAP;
 constexpr int kBarrierCount = TMA_TWO_GPU_PEER_BARRIER_COUNT;
 
 constexpr size_t kTmaSmemBytes =

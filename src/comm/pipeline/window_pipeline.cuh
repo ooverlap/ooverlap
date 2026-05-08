@@ -346,6 +346,7 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
     const int total_range_chunks =
         end_chunk - begin_chunk;
 
+    #pragma unroll 16
     for (int warm = 0; warm < FillDepth; ++warm) {
         if (warm >= total_range_chunks) {
             break;
@@ -367,6 +368,7 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
         load.issue(&stage);
     }
 
+    #pragma unroll 8
     for (int iter = 0; iter < total_range_chunks; ++iter) {
         const int abs_chunk =
             begin_chunk + iter;
