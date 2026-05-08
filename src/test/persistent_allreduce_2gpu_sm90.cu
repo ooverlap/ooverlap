@@ -557,6 +557,97 @@ void bench_ooverlap_variant(
         total_ms / static_cast<double>(iters);
 }
 
+
+void nccl_mem_alloc_half_on_device(
+    int device,
+    half** ptr,
+    size_t bytes,
+    const char* label) {
+    if (ptr == nullptr) {
+        throw std::invalid_argument(
+            "nccl_mem_alloc_half_on_device: ptr must not be null");
+    }
+
+    *ptr = nullptr;
+
+    system::runtime::set_device(device);
+
+    void* raw = nullptr;
+
+    OOVERLAP_TEST_NCCL_CHECK(
+        ncclMemAlloc(&raw, bytes));
+
+    if (raw == nullptr) {
+        throw std::runtime_error(
+            std::string(label) + ": ncclMemAlloc returned nullptr");
+    }
+
+    *ptr =
+        reinterpret_cast<half*>(raw);
+}
+
+void nccl_mem_free_on_device(
+    int device,
+    half*& ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+
+    // Cleanup path should not throw. Best effort free.
+    (void)cudaSetDevice(device);
+    (void)ncclMemFree(static_cast<void*>(ptr));
+
+    ptr = nullptr;
+}
+
+void register_nccl_symmetric_windows(
+    ncclComm_t* comms,
+    half* nccl_rank0_buf,
+    half* nccl_rank1_buf,
+    size_t bytes,
+    ncclWindow_t& nccl_rank0_win,
+    ncclWindow_t& nccl_rank1_win) {
+    nccl_rank0_win = nullptr;
+    nccl_rank1_win = nullptr;
+
+#ifndef NCCL_WIN_COLL_SYMMETRIC
+    throw std::runtime_error(
+        "NCCL_WIN_COLL_SYMMETRIC is not available in this NCCL header. "
+        "Make sure the bundled NCCL 2.27+ headers are used at compile time.");
+#else
+    OOVERLAP_TEST_NCCL_CHECK(ncclGroupStart());
+
+    OOVERLAP_TEST_NCCL_CHECK(
+        ncclCommWindowRegister(
+            comms[0],
+            nccl_rank0_buf,
+            bytes,
+            &nccl_rank0_win,
+            NCCL_WIN_COLL_SYMMETRIC));
+
+    OOVERLAP_TEST_NCCL_CHECK(
+        ncclCommWindowRegister(
+            comms[1],
+            nccl_rank1_buf,
+            bytes,
+            &nccl_rank1_win,
+            NCCL_WIN_COLL_SYMMETRIC));
+
+    OOVERLAP_TEST_NCCL_CHECK(ncclGroupEnd());
+#endif
+}
+
+void deregister_nccl_window_best_effort(
+    ncclComm_t comm,
+    ncclWindow_t& win) {
+    if (comm == nullptr || win == nullptr) {
+        return;
+    }
+
+    (void)ncclCommWindowDeregister(comm, win);
+    win = nullptr;
+}
+
 void cleanup(
     int dev0,
     int dev1,
@@ -564,6 +655,8 @@ void cleanup(
     half*& rank1_src,
     half*& nccl_rank0_buf,
     half*& nccl_rank1_buf,
+    ncclWindow_t& nccl_rank0_win,
+    ncclWindow_t& nccl_rank1_win,
     oo_buffer_t*& normal_rank0_buf,
     oo_buffer_t*& normal_rank1_buf,
     oo_buffer_t*& seq_rank0_buf,
@@ -576,12 +669,15 @@ void cleanup(
     cudaStream_t& stream0,
     cudaStream_t& stream1,
     ncclComm_t* comms) {
+    deregister_nccl_window_best_effort(comms[0], nccl_rank0_win);
+    deregister_nccl_window_best_effort(comms[1], nccl_rank1_win);
+
     testing::destroy_nccl_comms(comms, 2);
 
     testing::cuda_free_on_device(dev0, rank0_src);
     testing::cuda_free_on_device(dev1, rank1_src);
-    testing::cuda_free_on_device(dev0, nccl_rank0_buf);
-    testing::cuda_free_on_device(dev1, nccl_rank1_buf);
+    nccl_mem_free_on_device(dev0, nccl_rank0_buf);
+    nccl_mem_free_on_device(dev1, nccl_rank1_buf);
 
     testing::destroy_oo_buffer(normal_rank0_buf);
     testing::destroy_oo_buffer(normal_rank1_buf);
@@ -675,6 +771,9 @@ std::map<std::string, double> benchmark_persistent_two_gpu_collective_sm90(
     half* nccl_rank0_buf = nullptr;
     half* nccl_rank1_buf = nullptr;
 
+    ncclWindow_t nccl_rank0_win = nullptr;
+    ncclWindow_t nccl_rank1_win = nullptr;
+
     cudaStream_t stream0 = nullptr;
     cudaStream_t stream1 = nullptr;
 
@@ -754,17 +853,17 @@ std::map<std::string, double> benchmark_persistent_two_gpu_collective_sm90(
             bytes,
             "cudaMalloc(rank1_src)");
 
-        testing::cuda_malloc_half_on_device(
+        nccl_mem_alloc_half_on_device(
             node0_dev,
             &nccl_rank0_buf,
             bytes,
-            "cudaMalloc(nccl_rank0_buf)");
+            "ncclMemAlloc(nccl_rank0_buf)");
 
-        testing::cuda_malloc_half_on_device(
+        nccl_mem_alloc_half_on_device(
             node1_dev,
             &nccl_rank1_buf,
             bytes,
-            "cudaMalloc(nccl_rank1_buf)");
+            "ncclMemAlloc(nccl_rank1_buf)");
 
         testing::fill_two_rank_sources_fp16(
             rank0_src,
@@ -777,6 +876,14 @@ std::map<std::string, double> benchmark_persistent_two_gpu_collective_sm90(
 
         OOVERLAP_TEST_NCCL_CHECK(
             ncclCommInitAll(comms, 2, devices));
+
+        register_nccl_symmetric_windows(
+            comms,
+            nccl_rank0_buf,
+            nccl_rank1_buf,
+            bytes,
+            nccl_rank0_win,
+            nccl_rank1_win);
 
         std::map<std::string, double> results;
 
@@ -924,6 +1031,8 @@ std::map<std::string, double> benchmark_persistent_two_gpu_collective_sm90(
             rank1_src,
             nccl_rank0_buf,
             nccl_rank1_buf,
+            nccl_rank0_win,
+            nccl_rank1_win,
             normal_rank0_buf,
             normal_rank1_buf,
             seq_rank0_buf,
@@ -952,6 +1061,8 @@ std::map<std::string, double> benchmark_persistent_two_gpu_collective_sm90(
             rank1_src,
             nccl_rank0_buf,
             nccl_rank1_buf,
+            nccl_rank0_win,
+            nccl_rank1_win,
             normal_rank0_buf,
             normal_rank1_buf,
             seq_rank0_buf,

@@ -305,7 +305,7 @@ if(OOVERLAP_BUILD_TESTS OR OOVERLAP_BUILD_PYTHON)
   set_property(TARGET ooverlap_tests PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
   ooverlap_public_include_dirs(ooverlap_tests)
-  target_include_directories(ooverlap_tests PUBLIC ${NCCL_INCLUDE_DIR})
+  target_include_directories(ooverlap_tests BEFORE PUBLIC ${NCCL_INCLUDE_DIR})
 
   target_link_libraries(ooverlap_tests PUBLIC
     ooverlap_comm
