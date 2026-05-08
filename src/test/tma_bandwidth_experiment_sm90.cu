@@ -41,6 +41,7 @@ constexpr size_t kTmaSmemBytes =
 static_assert(kStageDepth > 0, "stage depth must be positive");
 static_assert(kFillDepth > 0, "fill depth must be positive");
 static_assert(kFillDepth <= kStageDepth, "fill depth must be <= stage depth");
+static_assert((kChunkBytes % sizeof(uint4)) == 0, "chunk bytes must be 16B aligned");
 
 enum ExperimentId {
     kExperimentCopy = 0,
@@ -115,20 +116,104 @@ __host__ __device__ __forceinline__ ChunkRange make_block_chunk_range(
     return range;
 }
 
-__device__ __forceinline__ unsigned char* stage_ptr(
-    unsigned char* shared_raw,
-    int stage) {
-    return shared_raw + static_cast<size_t>(stage) * kChunkBytes;
+__host__ __forceinline__ bool is_aligned_16_host(
+    const void* ptr) {
+    return (
+        (reinterpret_cast<uintptr_t>(ptr) &
+         static_cast<uintptr_t>(sizeof(uint4) - 1)) == 0);
 }
 
-template <int StageDepth, int FillDepth, typename Apply>
-__device__ void run_tma_range(
+__host__ __forceinline__ bool is_aligned_16_size_host(
+    size_t x) {
+    return ((x & static_cast<size_t>(sizeof(uint4) - 1)) == 0);
+}
+
+__host__ __forceinline__ cudaError_t validate_tma_thread0_args(
+    const void* src,
+    const void* dst,
+    size_t bytes) {
+    if (bytes == 0) {
+        return cudaSuccess;
+    }
+
+    if (src == nullptr || dst == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    if (!is_aligned_16_host(src) ||
+        !is_aligned_16_host(dst) ||
+        !is_aligned_16_size_host(bytes)) {
+        return cudaErrorInvalidValue;
+    }
+
+    return cudaSuccess;
+}
+
+template <size_t ChunkBytes>
+__device__ __forceinline__ size_t chunk_offset_bytes(
+    int chunk) {
+    return static_cast<size_t>(chunk) * ChunkBytes;
+}
+
+template <size_t ChunkBytes>
+__device__ __forceinline__ comm::pipeline::PipelineStage make_stage_for_abs_chunk(
     const unsigned char* src_bytes,
     unsigned char* dst_bytes,
-    ChunkRange range,
     size_t total_bytes,
+    int abs_chunk,
+    int slot,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
+    const size_t offset =
+        chunk_offset_bytes<ChunkBytes>(abs_chunk);
+
+    const size_t remaining =
+        total_bytes > offset ? total_bytes - offset : 0;
+
+    const size_t bytes =
+        remaining < ChunkBytes ? remaining : ChunkBytes;
+
+    return comm::pipeline::make_pipeline_stage(
+        comm::pipeline::make_pipeline_chunk(
+            src_bytes + offset,
+            dst_bytes + offset,
+            bytes),
+        shared_raw + static_cast<size_t>(slot) * ChunkBytes,
+        &barriers[slot]);
+}
+
+template <
+    int StageDepth,
+    int FillDepth,
+    size_t ChunkBytes,
+    typename Apply>
+__device__ __forceinline__ void run_tma_range_thread0_only(
+    const void* src_base,
+    void* dst_base,
+    size_t total_bytes,
+    ChunkRange range,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    static_assert(StageDepth > 0, "StageDepth must be > 0");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+    static_assert((ChunkBytes % sizeof(uint4)) == 0, "ChunkBytes must be 16B aligned");
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    if (range.chunk_count <= 0 || total_bytes == 0) {
+        return;
+    }
+
+    const unsigned char* src_bytes =
+        reinterpret_cast<const unsigned char*>(src_base);
+
+    unsigned char* dst_bytes =
+        reinterpret_cast<unsigned char*>(dst_base);
+
     comm::pipeline::PipelineTMALoad load{};
     Apply apply{};
 
@@ -137,106 +222,73 @@ __device__ void run_tma_range(
             break;
         }
 
-        const int chunk = range.start_chunk + warm;
-        const int slot = warm;
-
-        const size_t offset =
-            static_cast<size_t>(chunk) * static_cast<size_t>(kChunkBytes);
-
-        const size_t bytes =
-            min_size(static_cast<size_t>(kChunkBytes), total_bytes - offset);
+        const int abs_chunk =
+            range.start_chunk + warm;
 
         comm::pipeline::PipelineStage stage =
-            comm::pipeline::make_pipeline_stage(
-                comm::pipeline::make_pipeline_chunk(
-                    src_bytes + offset,
-                    dst_bytes + offset,
-                    bytes),
-                stage_ptr(shared_raw, slot),
-                &barriers[slot]);
+            make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                abs_chunk,
+                warm,
+                shared_raw,
+                barriers);
 
-        if (threadIdx.x == 0) {
-            load.issue(&stage);
-        }
-
-        __syncthreads();
+        load.issue(&stage);
     }
 
     for (int iter = 0; iter < range.chunk_count; ++iter) {
-        const int chunk = range.start_chunk + iter;
-        const int cur_slot = iter % StageDepth;
+        const int abs_chunk =
+            range.start_chunk + iter;
 
-        const size_t offset =
-            static_cast<size_t>(chunk) * static_cast<size_t>(kChunkBytes);
-
-        const size_t bytes =
-            min_size(static_cast<size_t>(kChunkBytes), total_bytes - offset);
+        const int cur_slot =
+            iter % StageDepth;
 
         comm::pipeline::PipelineStage cur_stage =
-            comm::pipeline::make_pipeline_stage(
-                comm::pipeline::make_pipeline_chunk(
-                    src_bytes + offset,
-                    dst_bytes + offset,
-                    bytes),
-                stage_ptr(shared_raw, cur_slot),
-                &barriers[cur_slot]);
+            make_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                dst_bytes,
+                total_bytes,
+                abs_chunk,
+                cur_slot,
+                shared_raw,
+                barriers);
 
-        if (threadIdx.x == 0) {
-            load.wait_ready(&cur_stage);
-        }
+        load.wait_ready(&cur_stage);
 
-        __syncthreads();
-
-        const int future_iter = iter + FillDepth;
+        const int future_iter =
+            iter + FillDepth;
 
         if (future_iter < range.chunk_count) {
-            const int future_chunk = range.start_chunk + future_iter;
-            const int future_slot = future_iter % StageDepth;
+            const int future_abs_chunk =
+                range.start_chunk + future_iter;
 
-            const size_t future_offset =
-                static_cast<size_t>(future_chunk) *
-                static_cast<size_t>(kChunkBytes);
-
-            const size_t future_bytes =
-                min_size(
-                    static_cast<size_t>(kChunkBytes),
-                    total_bytes - future_offset);
+            const int future_slot =
+                future_iter % StageDepth;
 
             comm::pipeline::PipelineStage future_stage =
-                comm::pipeline::make_pipeline_stage(
-                    comm::pipeline::make_pipeline_chunk(
-                        src_bytes + future_offset,
-                        dst_bytes + future_offset,
-                        future_bytes),
-                    stage_ptr(shared_raw, future_slot),
-                    &barriers[future_slot]);
+                make_stage_for_abs_chunk<ChunkBytes>(
+                    src_bytes,
+                    dst_bytes,
+                    total_bytes,
+                    future_abs_chunk,
+                    future_slot,
+                    shared_raw,
+                    barriers);
 
-            if (threadIdx.x == 0) {
-                if (iter >= FillDepth) {
-                    apply.wait_before_stage_reuse();
-                }
-
-                load.issue(&future_stage);
+            if (iter >= FillDepth) {
+                apply.wait_before_stage_reuse();
             }
+
+            load.issue(&future_stage);
         }
 
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            apply.issue_bulk(&cur_stage);
-        }
-
-        apply.finish_tail(&cur_stage);
-
-        __syncthreads();
+        apply.issue_bulk(&cur_stage);
     }
 
-    if (threadIdx.x == 0) {
-        apply.wait_complete();
-        __threadfence_system();
-    }
-
-    __syncthreads();
+    apply.wait_complete();
+    __threadfence_system();
 }
 
 __global__ void tma_copy_kernel(
@@ -264,13 +316,17 @@ __global__ void tma_copy_kernel(
     using CopyApply =
         comm::pipeline::PipelineTMACopy<kStageDepth, kFillDepth>;
 
-    run_tma_range<kStageDepth, kFillDepth, CopyApply>(
-        reinterpret_cast<const unsigned char*>(src),
-        reinterpret_cast<unsigned char*>(dst),
-        range,
-        total_bytes,
-        shared_raw,
-        barriers);
+    run_tma_range_thread0_only<
+        kStageDepth,
+        kFillDepth,
+        static_cast<size_t>(kChunkBytes),
+        CopyApply>(
+            src,
+            dst,
+            total_bytes,
+            range,
+            shared_raw,
+            barriers);
 }
 
 __global__ void tma_reduce_add_f16_kernel(
@@ -301,13 +357,17 @@ __global__ void tma_reduce_add_f16_kernel(
             kFillDepth,
             comm::pipeline::PipelineReduceAddNoFtzF16>;
 
-    run_tma_range<kStageDepth, kFillDepth, ReduceApply>(
-        reinterpret_cast<const unsigned char*>(src),
-        reinterpret_cast<unsigned char*>(dst),
-        range,
-        total_bytes,
-        shared_raw,
-        barriers);
+    run_tma_range_thread0_only<
+        kStageDepth,
+        kFillDepth,
+        static_cast<size_t>(kChunkBytes),
+        ReduceApply>(
+            src,
+            dst,
+            total_bytes,
+            range,
+            shared_raw,
+            barriers);
 }
 
 void configure_one_kernel(
@@ -398,6 +458,16 @@ cudaError_t launch_tma_copy(
     size_t bytes,
     int num_blocks,
     cudaStream_t stream) {
+    cudaError_t valid =
+        validate_tma_thread0_args(
+            src,
+            dst,
+            bytes);
+
+    if (valid != cudaSuccess) {
+        return valid;
+    }
+
     const int num_chunks =
         ceil_div_size_to_int(bytes, static_cast<size_t>(kChunkBytes));
 
@@ -420,6 +490,16 @@ cudaError_t launch_tma_reduce_add_f16(
     size_t bytes,
     int num_blocks,
     cudaStream_t stream) {
+    cudaError_t valid =
+        validate_tma_thread0_args(
+            src,
+            dst,
+            bytes);
+
+    if (valid != cudaSuccess) {
+        return valid;
+    }
+
     const int num_chunks =
         ceil_div_size_to_int(bytes, static_cast<size_t>(kChunkBytes));
 
@@ -1025,6 +1105,10 @@ void validate_sweep_args(
     for (int64_t bytes : sizes_bytes) {
         if (bytes <= 0) {
             throw std::invalid_argument("all sizes must be positive");
+        }
+
+        if (!is_aligned_16_size_host(static_cast<size_t>(bytes))) {
+            throw std::invalid_argument("all sizes must be 16-byte aligned");
         }
     }
 
