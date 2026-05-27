@@ -4,11 +4,23 @@ import argparse
 import csv
 import importlib
 import json
-import math
 import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+
+
+MODE_LABEL = {
+    "best_performance": "Best performance",
+    "best_efficiency": "Best efficiency",
+}
+
+COLLECTIVE_LABEL = {
+    "allreduce": "All-reduce",
+    "all_reduce": "All-reduce",
+    "reduce_scatter": "Reduce-scatter",
+    "all_gather": "All-gather",
+}
 
 
 def parse_int_list(s):
@@ -39,7 +51,8 @@ def make_request(args):
         "warmup": args.warmup,
         "dev0": args.dev0,
         "dev1": args.dev1,
-        "include_nccl": not args.no_nccl,
+        # NCCL is not useful for this specific plot. Keep it off by default.
+        "include_nccl": bool(args.include_nccl and not args.no_nccl),
     }
 
     if args.ctas:
@@ -81,10 +94,6 @@ def ooverlap_rows(rows):
     ]
 
 
-def nccl_rows(rows):
-    return [r for r in ok_rows(rows) if row_backend(r) == "nccl"]
-
-
 def available_ctas(rows, requested_ctas):
     if requested_ctas:
         return requested_ctas
@@ -99,22 +108,65 @@ def format_cta(cta):
     return "ambient" if cta is None else str(cta)
 
 
+def format_size(nbytes):
+    n = int(nbytes)
+    for scale, suffix in ((1024**3, "GiB"), (1024**2, "MiB"), (1024, "KiB")):
+        if n >= scale:
+            value = n / scale
+            return f"{int(value)} {suffix}" if value.is_integer() else f"{value:.1f} {suffix}"
+    return f"{n} B"
+
+
+def collective_label(name):
+    return COLLECTIVE_LABEL.get(name, name.replace("_", "-"))
+
+
+def mode_label(name):
+    return MODE_LABEL.get(name, name or "unknown")
+
+
 def label_for_row(row):
-    collective = row_collective(row)
-    backend = row_backend(row)
+    return f"{collective_label(row_collective(row))}: {mode_label(row_mode(row))}"
 
-    if backend == "nccl":
-        return f"{collective}:nccl"
 
-    mode = row_mode(row) or "unknown_mode"
-    return f"{collective}:{mode}"
+def line_style_for_mode(mode):
+    if mode == "best_performance":
+        return {
+            "linestyle": "-",
+            "marker": "o",
+            "linewidth": 1.8,
+            "alpha": 0.90,
+        }
+
+    if mode == "best_efficiency":
+        return {
+            "linestyle": "--",
+            "marker": "s",
+            "linewidth": 2.2,
+            "alpha": 0.95,
+        }
+
+    return {
+        "linestyle": "-",
+        "marker": "o",
+        "linewidth": 1.8,
+        "alpha": 0.90,
+    }
 
 
 def metric_value(row, metric):
     return float(row[metric])
 
 
-def group_series(rows, metric, cta=None, include_nccl=False, nccl_by_collective=None):
+def x_value_bytes(row):
+    if "bytes_per_rank" in row:
+        return int(row["bytes_per_rank"])
+
+    # Fallback for older result files.
+    return int(row["numel"]) * 2
+
+
+def group_series(rows, metric, cta=None):
     series = {}
 
     for row in ooverlap_rows(rows):
@@ -123,13 +175,12 @@ def group_series(rows, metric, cta=None, include_nccl=False, nccl_by_collective=
 
         label = label_for_row(row)
         series.setdefault(label, []).append(
-            (int(row["numel"]), metric_value(row, metric))
+            (
+                x_value_bytes(row),
+                metric_value(row, metric),
+                row_mode(row),
+            )
         )
-
-    if include_nccl and nccl_by_collective:
-        for collective, points in nccl_by_collective.items():
-            label = f"{collective}:nccl"
-            series[label] = [(int(x), float(y[metric])) for x, y in points.items()]
 
     for label in series:
         series[label].sort(key=lambda p: p[0])
@@ -137,145 +188,69 @@ def group_series(rows, metric, cta=None, include_nccl=False, nccl_by_collective=
     return series
 
 
-def make_nccl_lookup(rows):
-    lookup = {}
-
-    for row in nccl_rows(rows):
-        collective = row_collective(row)
-        numel = int(row["numel"])
-        lookup.setdefault(collective, {})[numel] = row
-
-    return lookup
-
-
-def plot_metric(rows, ctas, metric, ylabel, title, out_path, include_nccl=True):
-    nccl_lookup = make_nccl_lookup(rows)
-
+def plot_metric(rows, ctas, metric, ylabel, title, out_path):
     fig, axes = plt.subplots(
         1,
         len(ctas),
-        figsize=(5.8 * len(ctas), 4.4),
+        figsize=(5.8 * len(ctas), 4.5),
         squeeze=False,
         sharey=False,
     )
     axes = axes[0]
 
+    legend = {}
+
     for ax, cta in zip(axes, ctas):
-        series = group_series(
-            rows,
-            metric,
-            cta=cta,
-            include_nccl=include_nccl,
-            nccl_by_collective=nccl_lookup,
-        )
+        series = group_series(rows, metric, cta=cta)
+
+        xticks = set()
 
         for label, points in sorted(series.items()):
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
-            ax.plot(xs, ys, marker="o", label=label)
+            mode = points[0][2] if points else None
+            xticks.update(xs)
 
-        ax.set_xscale("log", base=2)
-        ax.set_title(f"max_ctas={format_cta(cta)}")
-        ax.set_xlabel("numel")
-        ax.set_ylabel(ylabel)
-        ax.grid(True, which="both", alpha=0.3)
-
-    handles, labels = axes[-1].get_legend_handles_labels()
-    if handles:
-        fig.legend(
-            handles,
-            labels,
-            loc="lower center",
-            ncol=min(4, max(1, len(labels))),
-            fontsize=9,
-        )
-
-    fig.suptitle(title)
-    fig.tight_layout(rect=(0, 0.15, 1, 0.92))
-    fig.savefig(out_path, dpi=180)
-    print(f"[plot] wrote {out_path}")
-
-
-def speedup_rows(rows):
-    nccl = make_nccl_lookup(rows)
-    out = []
-
-    for row in ooverlap_rows(rows):
-        collective = row_collective(row)
-        numel = int(row["numel"])
-
-        nccl_row = nccl.get(collective, {}).get(numel)
-        if not nccl_row:
-            continue
-
-        nccl_ms = float(nccl_row["avg_ms"])
-        row_ms = float(row["avg_ms"])
-        speedup = nccl_ms / row_ms if row_ms > 0.0 else 0.0
-
-        r = dict(row)
-        r["speedup_over_nccl"] = speedup
-        r["nccl_avg_ms"] = nccl_ms
-        r["nccl_latency_us"] = float(nccl_row["latency_us"])
-        r["nccl_effective_gbps_aggregate_2gpu"] = float(
-            nccl_row["effective_gbps_aggregate_2gpu"]
-        )
-        out.append(r)
-
-    return out
-
-
-def plot_speedup(rows, ctas, out_path):
-    rows = speedup_rows(rows)
-
-    fig, axes = plt.subplots(
-        1,
-        len(ctas),
-        figsize=(5.8 * len(ctas), 4.4),
-        squeeze=False,
-        sharey=False,
-    )
-    axes = axes[0]
-
-    for ax, cta in zip(axes, ctas):
-        series = {}
-
-        for row in rows:
-            if row_cta(row) != cta:
-                continue
-
-            label = label_for_row(row)
-            series.setdefault(label, []).append(
-                (int(row["numel"]), float(row["speedup_over_nccl"]))
+            line, = ax.plot(
+                xs,
+                ys,
+                label=label,
+                **line_style_for_mode(mode),
             )
 
-        for label in series:
-            series[label].sort(key=lambda p: p[0])
+            if label not in legend:
+                legend[label] = line
 
-        for label, points in sorted(series.items()):
-            xs = [p[0] for p in points]
-            ys = [p[1] for p in points]
-            ax.plot(xs, ys, marker="o", label=label)
-
-        ax.axhline(1.0, linestyle="--", linewidth=1)
         ax.set_xscale("log", base=2)
-        ax.set_title(f"max_ctas={format_cta(cta)}")
-        ax.set_xlabel("numel")
-        ax.set_ylabel("speedup over NCCL")
-        ax.grid(True, which="both", alpha=0.3)
 
-    handles, labels = axes[-1].get_legend_handles_labels()
-    if handles:
+        xticks = sorted(xticks)
+        if xticks:
+            ax.set_xticks(xticks)
+            ax.set_xticklabels(
+                [format_size(x) for x in xticks],
+                rotation=30,
+                ha="right",
+            )
+
+        ax.set_title(f"CTA limit = {format_cta(cta)}", fontsize=12)
+        ax.set_xlabel("Message size per rank")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, which="both", linestyle="--", alpha=0.35)
+
+    if legend:
         fig.legend(
-            handles,
-            labels,
-            loc="lower center",
-            ncol=min(4, max(1, len(labels))),
+            list(legend.values()),
+            list(legend.keys()),
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.93),
+            ncol=min(3, max(1, len(legend))),
             fontsize=9,
+            frameon=False,
         )
 
-    fig.suptitle("Speedup over NCCL vs size by CTA constraint")
-    fig.tight_layout(rect=(0, 0.15, 1, 0.92))
-    fig.savefig(out_path, dpi=180)
+    fig.suptitle(title, fontsize=14, y=1.02)
+    fig.tight_layout(rect=(0, 0, 1, 0.84))
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
     print(f"[plot] wrote {out_path}")
 
 
@@ -339,7 +314,6 @@ def write_csv(rows, path):
 
 def print_summary(rows):
     rows = ooverlap_rows(rows)
-    nccl = make_nccl_lookup(rows)
 
     by_key = {}
     for row in rows:
@@ -357,30 +331,30 @@ def print_summary(rows):
         if not perf and not eff:
             continue
 
-        print(f"{collective} numel={numel} max_ctas={format_cta(cta)}")
+        print(
+            f"{collective_label(collective)} "
+            f"size={format_size((perf or eff).get('bytes_per_rank', int(numel) * 2))} "
+            f"max_ctas={format_cta(cta)}"
+        )
 
-        for name, row in [("perf", perf), ("eff ", eff)]:
+        for name, row in [("performance", perf), ("efficiency ", eff)]:
             if not row:
                 continue
 
-            speedup_text = ""
-            nccl_row = make_nccl_lookup(ok_rows_global).get(collective, {}).get(numel)
-            if nccl_row:
-                speedup = float(nccl_row["avg_ms"]) / float(row["avg_ms"])
-                speedup_text = f" speedup_vs_nccl={speedup:.3f}x"
-
             print(
                 f"  {name}: "
-                f"{float(row['effective_gbps_aggregate_2gpu']):8.2f} GB/s "
+                f"{float(row['effective_gbps_per_rank']):8.2f} GB/s/rank "
                 f"{float(row['latency_us']):8.2f} us"
-                f"{speedup_text}"
             )
 
         if perf and eff:
-            perf_bw = float(perf["effective_gbps_aggregate_2gpu"])
-            eff_bw = float(eff["effective_gbps_aggregate_2gpu"])
+            perf_bw = float(perf["effective_gbps_per_rank"])
+            eff_bw = float(eff["effective_gbps_per_rank"])
             ratio = eff_bw / perf_bw if perf_bw > 0.0 else 0.0
-            print(f"  eff/perf bandwidth ratio: {ratio:.3f}")
+            print(f"  efficiency/performance bandwidth ratio: {ratio:.3f}")
+
+            if abs(1.0 - ratio) < 0.005:
+                print("  note: curves may overlap; selected configs are effectively identical")
 
 
 def main():
@@ -415,6 +389,9 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--dev0", type=int, default=0)
     parser.add_argument("--dev1", type=int, default=1)
+
+    # Default: no NCCL. It is not useful for this comparison figure.
+    parser.add_argument("--include-nccl", action="store_true")
     parser.add_argument("--no-nccl", action="store_true")
 
     args = parser.parse_args()
@@ -444,9 +421,6 @@ def main():
 
     rows = result.get("raw_results", result.get("results", []))
 
-    global ok_rows_global
-    ok_rows_global = ok_rows(rows)
-
     csv_path = out_dir / "tma_efficiency_vs_best.csv"
     write_csv(rows, csv_path)
 
@@ -457,31 +431,21 @@ def main():
     plot_metric(
         rows,
         ctas,
-        "effective_gbps_aggregate_2gpu",
-        "aggregate bandwidth, 2 GPU (GB/s)",
-        "Public tuned bandwidth vs size by CTA constraint",
+        "effective_gbps_per_rank",
+        "Effective bandwidth per rank (GB/s)",
+        "Public Tuning Policy: Bandwidth vs. Message Size",
         out_dir / "bandwidth_by_cta.png",
-        include_nccl=not args.no_nccl,
     )
 
     plot_metric(
         rows,
         ctas,
         "latency_us",
-        "latency (us)",
-        "Public tuned latency vs size by CTA constraint",
+        "Latency (us)",
+        "Public Tuning Policy: Latency vs. Message Size",
         out_dir / "latency_by_cta.png",
-        include_nccl=not args.no_nccl,
     )
-
-    if not args.no_nccl:
-        plot_speedup(
-            rows,
-            ctas,
-            out_dir / "speedup_over_nccl_by_cta.png",
-        )
 
 
 if __name__ == "__main__":
-    ok_rows_global = []
     main()

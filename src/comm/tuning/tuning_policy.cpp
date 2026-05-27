@@ -197,7 +197,7 @@ double tolerance_fraction_from_ppm(long long tolerance_ppm) {
 }
 
 long long runtime_tolerance_ppm() {
-    double value = 0.05;
+    double value = 0.10;
     double env_value = 0.0;
 
     if (parse_double_env("OOVERLAP_TUNING_TOLERANCE", &env_value)) {
