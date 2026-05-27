@@ -2,10 +2,14 @@
 
 import argparse
 import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import torch
 
 
 EXPERIMENT = {
@@ -19,8 +23,8 @@ SCENARIO = {
 }
 
 SCENARIO_TITLE = {
-    "local_to_peer": "local -> peer",
-    "peer_to_local": "peer -> local",
+    "local_to_peer": "Local-to-Remote Transfer",
+    "peer_to_local": "Remote-to-Local Transfer",
 }
 
 METHOD = {
@@ -29,6 +33,14 @@ METHOD = {
     2: "nccl_sendrecv",
     3: "tma_reduce_add_f16",
     4: "fast_add_f16_u128",
+}
+
+METHOD_TITLE = {
+    "tma_copy": "TMA Copy",
+    "fast_copy_u128": "Vectorized Copy (128-bit)",
+    "nccl_sendrecv": "NCCL Send/Recv",
+    "tma_reduce_add_f16": "TMA FP16 Reduction",
+    "fast_add_f16_u128": "Vectorized FP16 Reduction (128-bit)",
 }
 
 COPY_METHODS = [
@@ -92,14 +104,14 @@ def parse_ints(s: str) -> list[int]:
 
 def format_size(n: int) -> str:
     n = int(n)
-    for scale, suffix in ((1024**3, "G"), (1024**2, "M"), (1024, "K")):
+    for scale, suffix in ((1024**3, "GiB"), (1024**2, "MiB"), (1024, "KiB")):
         if n >= scale:
             value = n / scale
-            return f"{int(value)}{suffix}" if value.is_integer() else f"{value:.1f}{suffix}"
-    return f"{n}B"
+            return f"{int(value)} {suffix}" if value.is_integer() else f"{value:.1f} {suffix}"
+    return f"{n} B"
 
 
-def normalize_rows(rows):
+def normalize_rows(rows, requested_cta=None):
     out = []
 
     for row in rows:
@@ -109,6 +121,7 @@ def normalize_rows(rows):
         r["method_name"] = METHOD[int(r["method"])]
         r["bytes"] = int(r["bytes"])
         r["num_blocks"] = int(r["num_blocks"])
+        r["requested_cta"] = int(requested_cta if requested_cta is not None else r["num_blocks"])
         r["gbps"] = float(r["gbps"])
         r["latency_ms"] = float(r["latency_ms"])
         out.append(r)
@@ -127,9 +140,8 @@ def benchmark(ext, sizes, ctas, iters, warmup, dev0, dev1, include_nccl):
             int(dev1),
             bool(include_nccl),
         )
-        return normalize_rows(rows)
+        return rows
 
-    # Fallback for the current binding if only the old wrapper is exposed.
     rows = []
     for cta in ctas:
         for size in sizes:
@@ -146,50 +158,131 @@ def benchmark(ext, sizes, ctas, iters, warmup, dev0, dev1, include_nccl):
             )
             rows.extend(part)
 
-    return normalize_rows(rows)
+    return rows
+
+
+def run_worker(args):
+    import torch
+
+    assert torch.cuda.is_available(), "torch.cuda.is_available() is False"
+    assert torch.cuda.device_count() >= 2, "Need at least 2 GPUs"
+    if args.dev0 == args.dev1:
+        raise ValueError("--dev0 and --dev1 must be different")
+
+    sizes = parse_sizes(args.bytes)
+    cta = int(args.worker_cta)
+
+    print(f"[worker] NCCL_MAX_CTAS={os.environ.get('NCCL_MAX_CTAS')}")
+    print(f"[worker] benchmark CTA={cta}")
+
+    ext = load_ooverlap_ext()
+    rows = benchmark(
+        ext=ext,
+        sizes=sizes,
+        ctas=[cta],
+        iters=args.iters,
+        warmup=args.warmup,
+        dev0=args.dev0,
+        dev1=args.dev1,
+        include_nccl=not args.no_nccl,
+    )
+
+    rows = normalize_rows(rows, requested_cta=cta)
+
+    out_path = Path(args.worker_out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(rows, indent=2))
+
+    torch.cuda.synchronize(args.dev0)
+    torch.cuda.synchronize(args.dev1)
+
+
+def run_cta_in_child(args, cta, out_dir):
+    out_path = out_dir / f"rows_cta_{cta}.json"
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker-cta",
+        str(cta),
+        "--worker-out",
+        str(out_path),
+        "--bytes",
+        args.bytes,
+        "--ctas",
+        str(cta),
+        "--iters",
+        str(args.iters),
+        "--warmup",
+        str(args.warmup),
+        "--dev0",
+        str(args.dev0),
+        "--dev1",
+        str(args.dev1),
+    ]
+
+    if args.no_nccl:
+        cmd.append("--no-nccl")
+
+    env = os.environ.copy()
+    env["NCCL_MAX_CTAS"] = str(cta)
+
+    print(f"[run] CTA={cta}: NCCL_MAX_CTAS={cta}")
+    subprocess.run(cmd, check=True, env=env)
+
+    return json.loads(out_path.read_text())
 
 
 def print_table(rows):
     print(
-        f"{'experiment':>15} "
-        f"{'scenario':>15} "
-        f"{'method':>22} "
-        f"{'size':>8} "
-        f"{'ctas':>6} "
+        f"{'experiment':>18} "
+        f"{'direction':>24} "
+        f"{'method':>34} "
+        f"{'size':>10} "
+        f"{'CTA limit':>10} "
         f"{'GB/s':>10} "
-        f"{'us':>10}"
+        f"{'latency us':>12}"
     )
 
     for r in rows:
         print(
-            f"{r['experiment_name']:>15} "
-            f"{r['scenario_name']:>15} "
-            f"{r['method_name']:>22} "
-            f"{format_size(r['bytes']):>8} "
-            f"{r['num_blocks']:6d} "
+            f"{r['experiment_name']:>18} "
+            f"{SCENARIO_TITLE[r['scenario_name']]:>24} "
+            f"{METHOD_TITLE[r['method_name']]:>34} "
+            f"{format_size(r['bytes']):>10} "
+            f"{r['requested_cta']:10d} "
             f"{r['gbps']:10.2f} "
-            f"{r['latency_ms'] * 1000.0:10.2f}"
+            f"{r['latency_ms'] * 1000.0:12.2f}"
         )
 
 
-def plot_group(rows, experiment_name, methods, out_path):
-    fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(13, 4), sharex=True)
-    legend_handles, legend_labels = None, None
+def plot_group(rows, experiment_name, methods, ctas, out_path):
+    fig, axes = plt.subplots(
+        nrows=2,
+        ncols=len(ctas),
+        figsize=(5.2 * len(ctas), 7.0),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
 
-    for ax, scenario in zip(axes, ("local_to_peer", "peer_to_local")):
-        subset = [
-            r for r in rows
-            if r["experiment_name"] == experiment_name
-            and r["scenario_name"] == scenario
-        ]
+    legend_handles = []
+    legend_labels = []
 
-        for method in methods:
-            method_rows = [r for r in subset if r["method_name"] == method]
-            ctas = sorted({r["num_blocks"] for r in method_rows})
+    for col, cta in enumerate(ctas):
+        for row_idx, scenario in enumerate(("local_to_peer", "peer_to_local")):
+            ax = axes[row_idx][col]
 
-            for cta in ctas:
+            subset = [
+                r for r in rows
+                if r["experiment_name"] == experiment_name
+                and r["scenario_name"] == scenario
+                and r["requested_cta"] == cta
+            ]
+
+            for method in methods:
                 data = sorted(
-                    [r for r in method_rows if r["num_blocks"] == cta],
+                    [r for r in subset if r["method_name"] == method],
                     key=lambda x: x["bytes"],
                 )
                 if not data:
@@ -197,32 +290,57 @@ def plot_group(rows, experiment_name, methods, out_path):
 
                 x = [r["bytes"] for r in data]
                 y = [r["gbps"] for r in data]
-                ax.plot(x, y, marker="o", label=f"{method}, {cta} CTAs")
+                line, = ax.plot(
+                    x,
+                    y,
+                    marker="o",
+                    label=METHOD_TITLE[method],
+                )
 
-        if legend_handles is None:
-            legend_handles, legend_labels = ax.get_legend_handles_labels()
+                if col == 0 and row_idx == 0:
+                    legend_handles.append(line)
+                    legend_labels.append(METHOD_TITLE[method])
 
-        xticks = sorted({r["bytes"] for r in subset})
-        ax.set_xscale("log", base=2)
-        ax.set_xticks(xticks)
-        ax.set_xticklabels([format_size(v) for v in xticks], rotation=30, ha="right")
-        ax.set_title(SCENARIO_TITLE[scenario])
-        ax.grid(True, which="both", linestyle="--", alpha=0.35)
+            xticks = sorted({r["bytes"] for r in subset})
+            ax.set_xscale("log", base=2)
+            if xticks:
+                ax.set_xticks(xticks)
+                ax.set_xticklabels(
+                    [format_size(v) for v in xticks],
+                    rotation=30,
+                    ha="right",
+                )
 
-    title = "TMA copy experiment" if experiment_name == "copy" else "TMA reduce/add experiment"
-    fig.suptitle(title, y=1.08)
-    fig.supylabel("bandwidth (GB/s)")
-    fig.supxlabel("buffer size")
-    fig.legend(
-        legend_handles,
-        legend_labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.01),
-        ncol=min(len(legend_labels or []), 4),
-        frameon=False,
-    )
-    fig.tight_layout(rect=(0.02, 0.02, 1.0, 0.88))
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+            if row_idx == 0:
+                ax.set_title(f"NCCL_MAX_CTAS = {cta}", fontsize=12)
+
+            if col == 0:
+                ax.set_ylabel(
+                    f"{SCENARIO_TITLE[scenario]}\nEffective Bandwidth (GB/s)"
+                )
+
+            ax.grid(True, which="both", linestyle="--", alpha=0.35)
+
+    if experiment_name == "copy":
+        title = "Two-GPU Copy Bandwidth under CTA Limits"
+    else:
+        title = "Two-GPU FP16 Reduction Bandwidth under CTA Limits"
+
+    fig.suptitle(title, fontsize=14)
+    fig.supxlabel("Message Size")
+
+    if legend_handles:
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.955),
+            ncol=min(len(legend_labels), 3),
+            frameon=False,
+        )
+
+    fig.tight_layout(rect=(0.02, 0.02, 1.0, 0.90))
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
     print(f"[plot] wrote {out_path}")
@@ -239,7 +357,19 @@ def main():
     parser.add_argument("--no-nccl", action="store_true")
     parser.add_argument("--print-table", action="store_true")
     parser.add_argument("--out-prefix", default="tma_bandwidth")
+
+    parser.add_argument("--worker-cta", type=int, default=None)
+    parser.add_argument("--worker-out", default=None)
+
     args = parser.parse_args()
+
+    if args.worker_cta is not None:
+        if args.worker_out is None:
+            raise ValueError("--worker-out is required with --worker-cta")
+        run_worker(args)
+        return
+
+    import torch
 
     assert torch.cuda.is_available(), "torch.cuda.is_available() is False"
     assert torch.cuda.device_count() >= 2, "Need at least 2 GPUs"
@@ -255,35 +385,38 @@ def main():
     print(f"[info] ctas={ctas}")
     print(f"[info] iters={args.iters} warmup={args.warmup}")
     print(f"[info] include_nccl={not args.no_nccl}")
+    print("[info] running one child process per CTA so NCCL_MAX_CTAS is isolated")
 
-    ext = load_ooverlap_ext()
+    all_rows = []
+    out_prefix = Path(args.out_prefix)
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = benchmark(
-        ext=ext,
-        sizes=sizes,
-        ctas=ctas,
-        iters=args.iters,
-        warmup=args.warmup,
-        dev0=args.dev0,
-        dev1=args.dev1,
-        include_nccl=not args.no_nccl,
-    )
+    with tempfile.TemporaryDirectory(prefix="tma_bandwidth_") as tmp:
+        tmp_dir = Path(tmp)
+        for cta in ctas:
+            all_rows.extend(run_cta_in_child(args, cta, tmp_dir))
+
+    json_path = out_prefix.with_suffix(".json")
+    json_path.write_text(json.dumps(all_rows, indent=2))
+    print(f"[json] wrote {json_path}")
 
     if args.print_table:
-        print_table(rows)
+        print_table(all_rows)
 
     plot_group(
-        rows,
+        all_rows,
         experiment_name="copy",
         methods=COPY_METHODS if not args.no_nccl else COPY_METHODS[:2],
-        out_path=Path(f"{args.out_prefix}_copy.png"),
+        ctas=ctas,
+        out_path=out_prefix.parent / f"{out_prefix.name}_copy.png",
     )
 
     plot_group(
-        rows,
+        all_rows,
         experiment_name="reduce_add_f16",
         methods=REDUCE_METHODS,
-        out_path=Path(f"{args.out_prefix}_reduce.png"),
+        ctas=ctas,
+        out_path=out_prefix.parent / f"{out_prefix.name}_reduce.png",
     )
 
     torch.cuda.synchronize(args.dev0)
