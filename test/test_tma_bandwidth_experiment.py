@@ -37,10 +37,10 @@ METHOD = {
 
 METHOD_TITLE = {
     "tma_copy": "TMA Copy",
-    "fast_copy_u128": "Vectorized Copy (128-bit)",
+    "fast_copy_u128": "Vectorized Copy",
     "nccl_sendrecv": "NCCL Send/Recv",
     "tma_reduce_add_f16": "TMA FP16 Reduction",
-    "fast_add_f16_u128": "Vectorized FP16 Reduction (128-bit)",
+    "fast_add_f16_u128": "Vectorized FP16 Reduction",
 }
 
 COPY_METHODS = [
@@ -312,7 +312,7 @@ def plot_group(rows, experiment_name, methods, ctas, out_path):
                 )
 
             if row_idx == 0:
-                ax.set_title(f"NCCL_MAX_CTAS = {cta}", fontsize=12)
+                ax.set_title(f"Maximum CTAs = {cta}", fontsize=12)
 
             if col == 0:
                 ax.set_ylabel(

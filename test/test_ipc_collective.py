@@ -234,13 +234,13 @@ def metric_values(metric: str, rows):
         return (
             [r["oo_latency_ms"] * 1000.0 for r in rows],
             [r["nccl_latency_ms"] * 1000.0 for r in rows],
-            "latency (us)",
+            "Latency (µs)",
         )
     if metric == "bandwidth":
         return (
             [bandwidth_gbps(r.get("bandwidth_bytes_per_rank", r["bytes"]), r["oo_latency_ms"]) for r in rows],
             [bandwidth_gbps(r.get("bandwidth_bytes_per_rank", r["bytes"]), r["nccl_latency_ms"]) for r in rows],
-            "per-rank bandwidth (GB/s)",
+            "Per-rank bandwidth (GB/s)",
         )
     if metric == "speedup":
         return (
@@ -250,7 +250,7 @@ def metric_values(metric: str, rows):
                 for r in rows
             ],
             None,
-            "speedup vs NCCL (x)",
+            "Speedup relative to NCCL (×)",
         )
     raise ValueError(f"unknown metric: {metric}")
 
@@ -294,11 +294,19 @@ def run_metric_suite(metric, sizes_bytes, cta_values, dev0, dev1, iters, warmup,
 
 
 def plot_metric(metric, all_rows, out_path: Path):
+    COLLECTIVE_TITLES = {
+        "allreduce": "All-Reduce",
+        "reduce_scatter": "Reduce-Scatter",
+        "all_gather": "All-Gather",
+    }
+    
     fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(15, 4), sharex=True)
     legend_handles, legend_labels, ylabel = None, None, ""
 
     cta_values = list(next(iter(all_rows.values())).keys())
-    only_cta = cta_values[0] if len(cta_values) == 1 else None
+    single_cta_setting = len(cta_values) == 1
+    only_cta = cta_values[0] if single_cta_setting else None
+    has_cta_limit = any(c is not None for c in cta_values)
 
     for ax, collective in zip(axes, COLLECTIVES):
         for ctas, rows in all_rows[collective].items():
@@ -306,13 +314,13 @@ def plot_metric(metric, all_rows, out_path: Path):
             y_oo, y_nccl, ylabel = metric_values(metric, rows)
 
             if metric == "speedup":
-                ax.plot(x, y_oo, marker="o", label="ooverlap / nccl")
+                ax.plot(x, y_oo, marker="o", label="OOverlap / NCCL")
             else:
-                ax.plot(x, y_oo, marker="o", label=label_with_cta("ooverlap", ctas))
-                ax.plot(x, y_nccl, marker="s", linestyle="--", label=label_with_cta("nccl", ctas))
+                ax.plot(x, y_oo, marker="o", label=label_with_cta("OOverlap", ctas))
+                ax.plot(x, y_nccl, marker="s", linestyle="--", label=label_with_cta("NCCL", ctas))
 
         if metric == "speedup":
-            ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.0, label="nccl baseline")
+            ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.0, label="NCCL baseline")
 
         if legend_handles is None:
             legend_handles, legend_labels = ax.get_legend_handles_labels()
@@ -321,26 +329,56 @@ def plot_metric(metric, all_rows, out_path: Path):
         ax.set_xscale("log", base=2)
         ax.set_xticks(xticks)
         ax.set_xticklabels([format_size_bytes(v) for v in xticks], rotation=30, ha="right")
-        ax.set_title(collective)
+        ax.set_title(COLLECTIVE_TITLES.get(collective, collective), fontsize=12)
         ax.grid(True, which="both", linestyle="--", alpha=0.35)
 
-    if metric == "speedup":
-        fig.suptitle(
-            "Unrestricted CTAs" if only_cta is None else f"{only_cta} CTAs",
-            y=1.13,
-        )
+    def figure_title(metric: str, only_cta, single_cta_setting: bool, has_cta_limit: bool):
+        metric_titles = {
+            "bandwidth": "Two-GPU Collective Bandwidth",
+            "latency": "Two-GPU Collective Latency",
+            "speedup": "Two-GPU Collective Speedup Relative to NCCL",
+        }
+    
+        base = metric_titles[metric]
+    
+        if single_cta_setting:
+            if only_cta is None:
+                return f"{base}\nNo CTA Limit"
+            return f"{base}\nCTA Limit: {only_cta}"
+    
+        if has_cta_limit:
+            return f"{base}\nUnder CTA Limits"
+    
+        return f"{base}\nNo CTA Limit"
 
+    if metric == "speedup":
+        title_y = 1.12
+        legend_y = 1.02
+        layout_top = 0.84
+    else:
+        title_y = 1.08
+        legend_y = 1.00
+        layout_top = 0.88
+
+    fig.suptitle(
+        figure_title(metric, only_cta, single_cta_setting, has_cta_limit),
+        y=title_y,
+        fontsize=14,
+    )
+    
     fig.supylabel(ylabel)
-    fig.supxlabel("buffer size")
+    fig.supxlabel("Buffer size")
+    
     fig.legend(
         legend_handles,
         legend_labels,
         loc="upper center",
         ncol=min(len(legend_labels), 6),
-        bbox_to_anchor=(0.5, 1.08 if metric != "speedup" else 1.02),
+        bbox_to_anchor=(0.5, legend_y),
         frameon=False,
     )
-    fig.tight_layout(rect=(0.02, 0.02, 1.0, 0.88 if metric != "speedup" else 0.84))
+    
+    fig.tight_layout(rect=(0.02, 0.02, 1.0, layout_top))
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
     print(f"[plot] wrote {out_path}")
 

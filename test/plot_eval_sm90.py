@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-Plot Figure-11-style normalized speedup bars from eval_sm90/evaluation_result.json.
+Plot SM90 operator-level normalized speedup from eval_sm90/evaluation_result.json.
 
-For each ShapePlot(M, N, "x"):
-  - collect all measured K values for that M,N
-  - for each K, scan all scenarios/slacks/test modes
-  - choose:
-      baseline_ms        = best plain GEMM + NCCL baseline by default
-      nccl_overlap_ms    = best NCCL overlap time
-      ooverlap_overlap_ms= best ooverlap overlap time
-  - plot:
-      Non-overlap baseline speedup = 1.0
-      NCCL overlap speedup         = baseline_ms / nccl_overlap_ms
-      ooverlap overlap speedup     = baseline_ms / ooverlap_overlap_ms
+Layout:
+  - rows: unique M values
+  - columns: unique N values
+  - x-axis inside each panel: K values
+  - bars: non-overlap baseline, NCCL overlap, ooverlap overlap
 
 Outputs:
-  - PNG/PDF figure
-  - plot_data.json
-  - plot_data.csv
+  - sm90_operator_speedup_by_shape.png
+  - sm90_operator_speedup_by_shape.pdf
+  - sm90_operator_speedup_by_shape_data.json
+  - sm90_operator_speedup_by_shape_data.csv
 """
 
 from __future__ import annotations
@@ -36,10 +31,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-# =============================================================================
-# Edit these.
-# =============================================================================
-
 @dataclass(frozen=True)
 class ShapePlot:
     m: int
@@ -48,46 +39,24 @@ class ShapePlot:
     label: str = ""
 
 
-# Put one ShapePlot per M,N panel. Use k="x" to plot all measured K values.
+# Keep this list for explicit report figures.
+# Use --all-shapes to ignore this and plot every measured M,N in the JSON.
 PLOT_SHAPES: List[ShapePlot] = [
-    # ShapePlot(8192, 2048, "x"),
-    # ShapePlot(8192, 4096, "x"),
-    # ShapePlot(8192, 8192, "x"),
-
-    # Add more, for example:
-    # ShapePlot(16384, 2048, "x"),
     ShapePlot(16384, 4096, "x"),
     ShapePlot(16384, 8192, "x"),
-    # ShapePlot(32768, 2048, "x"),
     ShapePlot(32768, 4096, "x"),
     ShapePlot(32768, 8192, "x"),
-
     ShapePlot(49152, 4096, "x"),
     ShapePlot(49152, 8192, "x"),
 ]
 
 DEFAULT_JSON = "results/eval_sm90/evaluation_result.json"
-DEFAULT_OUT_DIR = "results/eval_sm90/plots"
-DEFAULT_PLOT_NAME = "figure11_style_operator_speedup"
+DEFAULT_OUT_DIR = "results/eval_sm90/operator_speedup"
+DEFAULT_PLOT_NAME = "operator_overlap_speedup_by_shape"
 
-# Default matches what you asked: plain GEMM + NCCL baseline.
-# Choices:
-#   nccl_plain
-#   best_plain_any_backend
-#   nccl_cublas
-#   best_cublas_any_backend
 DEFAULT_BASELINE_SOURCE = "nccl_plain"
-
-# Choices:
-#   both
-#   uncapped
-#   capped
 DEFAULT_TEST_MODE = "both"
 
-
-# =============================================================================
-# Data extraction.
-# =============================================================================
 
 @dataclass
 class MetricPick:
@@ -128,10 +97,6 @@ def load_eval_json(path: Path) -> Dict[str, Any]:
     return data
 
 
-def shape_id(m: int, n: int, k: int) -> str:
-    return f"m{m}n{n}k{k}"
-
-
 def get_in(d: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
     cur: Any = d
     for key in keys:
@@ -151,6 +116,12 @@ def as_float(x: Any) -> Optional[float]:
         return y
     except Exception:
         return None
+
+
+def parse_int_list(text: str) -> List[int]:
+    if text is None or str(text).strip() == "":
+        return []
+    return [int(x) for x in str(text).replace(",", " ").split() if x.strip()]
 
 
 def cseg_for_backend(scenario: Dict[str, Any], backend: str) -> Optional[List[int]]:
@@ -192,11 +163,7 @@ def iter_test_modes(scenario: Dict[str, Any], test_mode_filter: str):
     if not isinstance(tests, dict):
         return
 
-    modes: List[str]
-    if test_mode_filter == "both":
-        modes = ["uncapped", "capped"]
-    else:
-        modes = [test_mode_filter]
+    modes = ["uncapped", "capped"] if test_mode_filter == "both" else [test_mode_filter]
 
     for mode in modes:
         test = tests.get(mode)
@@ -237,6 +204,25 @@ def baseline_candidates(
     return out
 
 
+def measured_shape_pairs(scenarios: List[Dict[str, Any]]) -> List[ShapePlot]:
+    pairs = set()
+
+    for scenario in scenarios:
+        if scenario.get("status") != "ok":
+            continue
+
+        shape = scenario.get("shape", {})
+        try:
+            m = int(shape["m"])
+            n = int(shape["n"])
+        except Exception:
+            continue
+
+        pairs.add((m, n))
+
+    return [ShapePlot(m, n, "x") for m, n in sorted(pairs)]
+
+
 def collect_measured_ks(
     scenarios: List[Dict[str, Any]],
     m: int,
@@ -244,16 +230,20 @@ def collect_measured_ks(
 ) -> List[int]:
     ks = set()
 
-    for s in scenarios:
-        if s.get("status") != "ok":
+    for scenario in scenarios:
+        if scenario.get("status") != "ok":
             continue
 
-        shape = s.get("shape", {})
-        if int(shape.get("m", -1)) == int(m) and int(shape.get("n", -1)) == int(n):
-            try:
-                ks.add(int(shape["k"]))
-            except Exception:
-                pass
+        shape = scenario.get("shape", {})
+        try:
+            sm = int(shape.get("m", -1))
+            sn = int(shape.get("n", -1))
+            sk = int(shape.get("k", -1))
+        except Exception:
+            continue
+
+        if sm == int(m) and sn == int(n):
+            ks.add(sk)
 
     return sorted(ks)
 
@@ -290,11 +280,14 @@ def collect_best_for_shape_k(
             continue
 
         shape = scenario.get("shape", {})
-        if (
-            int(shape.get("m", -1)) != int(m)
-            or int(shape.get("n", -1)) != int(n)
-            or int(shape.get("k", -1)) != int(k)
-        ):
+        try:
+            sm = int(shape.get("m", -1))
+            sn = int(shape.get("n", -1))
+            sk = int(shape.get("k", -1))
+        except Exception:
+            continue
+
+        if sm != int(m) or sn != int(n) or sk != int(k):
             continue
 
         for mode, by_backend in iter_test_modes(scenario, test_mode_filter):
@@ -340,6 +333,22 @@ def collect_best_for_shape_k(
     )
 
 
+def valid_for_plot(r: ShapeKResult) -> bool:
+    return (
+        r.baseline_speedup is not None
+        and r.nccl_speedup is not None
+        and r.ooverlap_speedup is not None
+    )
+
+
+def fmt_dim(x: int) -> str:
+    return str(x)
+
+
+def fmt_k(k: int) -> str:
+    return f"K = {int(k)}"
+
+
 def metric_pick_to_dict(x: Optional[MetricPick]) -> Optional[Dict[str, Any]]:
     if x is None:
         return None
@@ -371,164 +380,185 @@ def result_to_dict(x: ShapeKResult) -> Dict[str, Any]:
     }
 
 
-# =============================================================================
-# Plotting.
-# =============================================================================
+def build_results(
+    scenarios: List[Dict[str, Any]],
+    shape_plots: List[ShapePlot],
+    baseline_source: str,
+    test_mode: str,
+) -> Tuple[Dict[Tuple[int, int], List[ShapeKResult]], List[ShapeKResult]]:
+    by_shape: Dict[Tuple[int, int], List[ShapeKResult]] = {}
+    all_rows: List[ShapeKResult] = []
 
-def fmt_k(k: int) -> str:
-    if k % 1024 == 0:
-        return f"{k // 1024}K"
-    return str(k)
+    for sp in shape_plots:
+        ks = ks_for_shape_plot(scenarios, sp)
+        rows = []
+
+        for k in ks:
+            r = collect_best_for_shape_k(
+                scenarios=scenarios,
+                m=sp.m,
+                n=sp.n,
+                k=k,
+                baseline_source=baseline_source,
+                test_mode_filter=test_mode,
+            )
+            rows.append(r)
+            all_rows.append(r)
+
+        by_shape[(sp.m, sp.n)] = rows
+
+    return by_shape, all_rows
 
 
-def shape_label(sp: ShapePlot) -> str:
-    if sp.label:
-        return sp.label
-    return f"{sp.m}x{sp.n}"
+def global_ymax(rows: List[ShapeKResult]) -> float:
+    vals = []
+    for r in rows:
+        if not valid_for_plot(r):
+            continue
+        vals.extend([
+            float(r.baseline_speedup),
+            float(r.nccl_speedup),
+            float(r.ooverlap_speedup),
+        ])
+
+    if not vals:
+        return 1.2
+
+    ymax = max(vals)
+    return max(1.2, ymax * 1.18)
 
 
-def valid_for_plot(r: ShapeKResult) -> bool:
-    return (
-        r.baseline_speedup is not None
-        and r.nccl_speedup is not None
-        and r.ooverlap_speedup is not None
-    )
-
-
-def plot_results(
-    grouped: List[Tuple[ShapePlot, List[ShapeKResult]]],
+def plot_results_grid(
+    by_shape: Dict[Tuple[int, int], List[ShapeKResult]],
     out_png: Path,
     out_pdf: Optional[Path],
     title: str,
     annotate: bool,
 ) -> None:
-    flat_count = sum(len([r for r in rows if valid_for_plot(r)]) for _, rows in grouped)
-    if flat_count <= 0:
+    valid_count = sum(
+        1
+        for rows in by_shape.values()
+        for r in rows
+        if valid_for_plot(r)
+    )
+    if valid_count <= 0:
         raise RuntimeError("No valid shape/K rows to plot.")
 
-    fig_width = max(12.0, 1.05 * flat_count + 2.0)
-    fig_height = 4.8
+    ms = sorted({m for m, _ in by_shape.keys()})
+    ns = sorted({n for _, n in by_shape.keys()})
 
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    nrows = len(ms)
+    ncols = len(ns)
 
-    bar_width = 0.24
-    intra_group_gap = 1.0
-    inter_shape_gap = 0.9
+    fig_width = max(10.0, 4.2 * ncols)
+    fig_height = max(4.0, 3.25 * nrows)
 
-    x_positions: List[float] = []
-    x_labels: List[str] = []
-    group_centers: List[Tuple[float, str]] = []
-
-    baseline_vals: List[float] = []
-    nccl_vals: List[float] = []
-    oo_vals: List[float] = []
-
-    x = 0.0
-
-    for sp, rows in grouped:
-        rows = [r for r in rows if valid_for_plot(r)]
-        if not rows:
-            continue
-
-        start_x = x
-
-        for r in rows:
-            x_positions.append(x)
-            x_labels.append(fmt_k(r.k))
-
-            baseline_vals.append(float(r.baseline_speedup))
-            nccl_vals.append(float(r.nccl_speedup))
-            oo_vals.append(float(r.ooverlap_speedup))
-
-            x += intra_group_gap
-
-        end_x = x - intra_group_gap
-        center = (start_x + end_x) / 2.0
-        group_centers.append((center, shape_label(sp)))
-
-        x += inter_shape_gap
-
-    xs = x_positions
-
-    bars0 = ax.bar(
-        [v - bar_width for v in xs],
-        baseline_vals,
-        width=bar_width,
-        label="Non-overlap baseline",
-    )
-    bars1 = ax.bar(
-        xs,
-        nccl_vals,
-        width=bar_width,
-        label="NCCL overlap",
-    )
-    bars2 = ax.bar(
-        [v + bar_width for v in xs],
-        oo_vals,
-        width=bar_width,
-        label="ooverlap overlap",
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+        sharey=True,
     )
 
-    ax.axhline(1.0, linewidth=1.0, linestyle="--")
+    ymax = global_ymax([r for rows in by_shape.values() for r in rows])
 
-    ax.set_xticks(xs)
-    ax.set_xticklabels(x_labels, rotation=0)
-    ax.set_ylabel("Normalized speedup")
-    ax.set_xlabel("K")
-    ax.set_title(title)
-    ax.legend(ncols=3, loc="upper center", bbox_to_anchor=(0.5, 1.18), frameon=False)
+    legend_handles = None
+    legend_labels = None
 
-    ymin = min(0.0, min(baseline_vals + nccl_vals + oo_vals) - 0.08)
-    ymax = max(1.05, max(baseline_vals + nccl_vals + oo_vals) + 0.12)
-    ax.set_ylim(ymin, ymax)
+    bar_width = 0.25
 
-    # MxN group labels under K ticks.
-    trans = ax.get_xaxis_transform()
-    for center, label in group_centers:
-        ax.text(
-            center,
-            -0.17,
-            label,
-            ha="center",
-            va="top",
-            transform=trans,
+    for row_idx, m in enumerate(ms):
+        for col_idx, n in enumerate(ns):
+            ax = axes[row_idx][col_idx]
+            rows = [r for r in by_shape.get((m, n), []) if valid_for_plot(r)]
+            rows.sort(key=lambda r: r.k)
+
+            if not rows:
+                ax.axis("off")
+                continue
+
+            xs = list(range(len(rows)))
+            k_labels = [fmt_k(r.k) for r in rows]
+
+            baseline_vals = [float(r.baseline_speedup) for r in rows]
+            nccl_vals = [float(r.nccl_speedup) for r in rows]
+            oo_vals = [float(r.ooverlap_speedup) for r in rows]
+
+            bars0 = ax.bar(
+                [x - bar_width for x in xs],
+                baseline_vals,
+                width=bar_width,
+                label="Baseline (No Overlap)",
+                hatch="",
+            )
+            bars1 = ax.bar(
+                xs,
+                nccl_vals,
+                width=bar_width,
+                label="NCCL-Based Overlap",
+                hatch="//",
+            )
+            bars2 = ax.bar(
+                [x + bar_width for x in xs],
+                oo_vals,
+                width=bar_width,
+                label="OOverlap-Based Overlap",
+                hatch="xx",
+            )
+
+            if legend_handles is None:
+                legend_handles, legend_labels = ax.get_legend_handles_labels()
+
+            ax.axhline(1.0, linewidth=1.0, linestyle="--", alpha=0.75)
+            ax.set_ylim(0.0, ymax)
+            ax.set_xticks(xs)
+            ax.set_xticklabels(k_labels, rotation=0)
+            ax.set_title(f"M = {fmt_dim(m)}, N = {fmt_dim(n)}", fontsize=11)
+            ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.45)
+
+            if row_idx == nrows - 1:
+                ax.set_xlabel("K dimension")
+
+            if col_idx == 0:
+                ax.set_ylabel("Normalized speedup")
+
+            if annotate:
+                for bars in (bars0, bars1, bars2):
+                    for b in bars:
+                        h = b.get_height()
+                        ax.text(
+                            b.get_x() + b.get_width() / 2.0,
+                            h + 0.015 * ymax,
+                            f"{h:.2f}",
+                            ha="center",
+                            va="bottom",
+                            fontsize=7,
+                            rotation=90,
+                        )
+
+    if legend_handles is not None:
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.965),
+            ncols=3,
+            frameon=False,
+            fontsize=10,
         )
 
-    # Vertical separators between ShapePlot groups.
-    last_end = None
-    for idx, (center, label) in enumerate(group_centers[:-1]):
-        next_center = group_centers[idx + 1][0]
-        sep = (center + next_center) / 2.0
-        ax.axvline(sep, linewidth=0.6, alpha=0.35)
-
-    if annotate:
-        for bars in (bars0, bars1, bars2):
-            for b in bars:
-                h = b.get_height()
-                ax.text(
-                    b.get_x() + b.get_width() / 2.0,
-                    h + 0.015,
-                    f"{h:.2f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                    rotation=90,
-                )
-
-    fig.subplots_adjust(bottom=0.24, top=0.82, left=0.08, right=0.99)
+    fig.suptitle(title, fontsize=15, y=0.995)
+    fig.tight_layout(rect=(0.02, 0.02, 0.98, 0.925))
 
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=220)
+    fig.savefig(out_png, dpi=240, bbox_inches="tight")
 
     if out_pdf is not None:
-        fig.savefig(out_pdf)
+        fig.savefig(out_pdf, bbox_inches="tight")
 
     plt.close(fig)
 
-
-# =============================================================================
-# Output data.
-# =============================================================================
 
 def write_summary_json(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -588,31 +618,85 @@ def write_summary_csv(path: Path, rows: List[ShapeKResult]) -> None:
             })
 
 
-# =============================================================================
-# CLI.
-# =============================================================================
+def write_summary_txt(path: Path, rows: List[ShapeKResult]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def fmt_ms(x: Optional[float]) -> str:
+        return "NA" if x is None else f"{x:.4f}"
+
+    def fmt_speedup(x: Optional[float]) -> str:
+        return "NA" if x is None else f"{x:.4f}x"
+
+    ordered = sorted(rows, key=lambda r: (r.m, r.n, r.k))
+
+    table_rows = []
+    for r in ordered:
+        oo_vs_nccl = None
+        if (
+            r.nccl_overlap_ms is not None
+            and r.ooverlap_overlap_ms is not None
+            and r.ooverlap_overlap_ms > 0.0
+        ):
+            oo_vs_nccl = r.nccl_overlap_ms / r.ooverlap_overlap_ms
+
+        table_rows.append([
+            str(r.m),
+            str(r.n),
+            str(r.k),
+            fmt_ms(r.baseline_ms),
+            fmt_ms(r.nccl_overlap_ms),
+            fmt_ms(r.ooverlap_overlap_ms),
+            fmt_speedup(r.nccl_speedup),
+            fmt_speedup(r.ooverlap_speedup),
+            fmt_speedup(oo_vs_nccl),
+        ])
+
+    headers = [
+        "M",
+        "N",
+        "K",
+        "Baseline ms",
+        "NCCL ms",
+        "OOverLap ms",
+        "NCCL vs baseline",
+        "OOverLap vs baseline",
+        "OOverLap vs NCCL",
+    ]
+
+    widths = [len(h) for h in headers]
+    for row in table_rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def line(cells: List[str]) -> str:
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
+
+    out = []
+    out.append("Operator-Level Communication-Computation Overlap Summary")
+    out.append("")
+    out.append(
+        "Speedups are normalized to the non-overlap baseline for the same M, N, K shape."
+    )
+    out.append(
+        "OOverLap vs NCCL is computed as NCCL overlap time divided by OOverLap overlap time."
+    )
+    out.append("")
+    out.append(line(headers))
+    out.append(line(["-" * w for w in widths]))
+
+    for row in table_rows:
+        out.append(line(row))
+
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
 
-    p.add_argument(
-        "--json",
-        type=str,
-        default=DEFAULT_JSON,
-        help="Path to evaluation_result.json.",
-    )
-    p.add_argument(
-        "--out-dir",
-        type=str,
-        default=DEFAULT_OUT_DIR,
-        help="Output directory.",
-    )
-    p.add_argument(
-        "--name",
-        type=str,
-        default=DEFAULT_PLOT_NAME,
-        help="Base output filename without extension.",
-    )
+    p.add_argument("--json", type=str, default=DEFAULT_JSON)
+    p.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
+    p.add_argument("--name", type=str, default=DEFAULT_PLOT_NAME)
+
     p.add_argument(
         "--baseline-source",
         type=str,
@@ -623,32 +707,65 @@ def parse_args() -> argparse.Namespace:
             "nccl_cublas",
             "best_cublas_any_backend",
         ],
-        help="Which non-overlap baseline to normalize against.",
     )
     p.add_argument(
         "--test-mode",
         type=str,
         default=DEFAULT_TEST_MODE,
         choices=["both", "uncapped", "capped"],
-        help="Which test.py result set to consider.",
+    )
+
+    p.add_argument(
+        "--all-shapes",
+        action="store_true",
+        help="Plot every measured M,N pair in the JSON instead of PLOT_SHAPES.",
     )
     p.add_argument(
-        "--annotate",
-        action="store_true",
-        help="Write numeric values above bars.",
+        "--ms",
+        type=parse_int_list,
+        default=[],
+        help="Optional M filter, for example: --ms 16384,32768",
     )
     p.add_argument(
-        "--no-pdf",
-        action="store_true",
-        help="Only write PNG, not PDF.",
+        "--ns",
+        type=parse_int_list,
+        default=[],
+        help="Optional N filter, for example: --ns 4096,8192",
     )
+
+    p.add_argument("--annotate", action="store_true")
+    p.add_argument("--no-pdf", action="store_true")
     p.add_argument(
         "--title",
         type=str,
-        default="Operator-level normalized speedup",
+        default="End-to-End Operator Speedup from Communication-Computation Overlap",
     )
 
     return p.parse_args()
+
+
+def choose_shape_plots(
+    scenarios: List[Dict[str, Any]],
+    use_all_shapes: bool,
+    ms_filter: List[int],
+    ns_filter: List[int],
+) -> List[ShapePlot]:
+    shapes = measured_shape_pairs(scenarios) if use_all_shapes else list(PLOT_SHAPES)
+
+    if ms_filter:
+        mset = set(int(x) for x in ms_filter)
+        shapes = [s for s in shapes if int(s.m) in mset]
+
+    if ns_filter:
+        nset = set(int(x) for x in ns_filter)
+        shapes = [s for s in shapes if int(s.n) in nset]
+
+    shapes = sorted(shapes, key=lambda s: (s.m, s.n))
+
+    if not shapes:
+        raise SystemExit("No shapes selected. Check PLOT_SHAPES, --all-shapes, --ms, or --ns.")
+
+    return shapes
 
 
 def main() -> int:
@@ -660,39 +777,31 @@ def main() -> int:
     data = load_eval_json(in_path)
     scenarios = data["scenarios"]
 
-    if not PLOT_SHAPES:
-        raise SystemExit("PLOT_SHAPES is empty. Add ShapePlot entries near the top.")
+    shape_plots = choose_shape_plots(
+        scenarios=scenarios,
+        use_all_shapes=bool(args.all_shapes),
+        ms_filter=args.ms,
+        ns_filter=args.ns,
+    )
 
-    grouped: List[Tuple[ShapePlot, List[ShapeKResult]]] = []
-    all_rows: List[ShapeKResult] = []
-
-    for sp in PLOT_SHAPES:
-        ks = ks_for_shape_plot(scenarios, sp)
-        rows: List[ShapeKResult] = []
-
-        for k in ks:
-            r = collect_best_for_shape_k(
-                scenarios=scenarios,
-                m=sp.m,
-                n=sp.n,
-                k=k,
-                baseline_source=args.baseline_source,
-                test_mode_filter=args.test_mode,
-            )
-            rows.append(r)
-            all_rows.append(r)
-
-        grouped.append((sp, rows))
+    by_shape, all_rows = build_results(
+        scenarios=scenarios,
+        shape_plots=shape_plots,
+        baseline_source=args.baseline_source,
+        test_mode=args.test_mode,
+    )
 
     out_png = out_dir / f"{args.name}.png"
     out_pdf = None if args.no_pdf else out_dir / f"{args.name}.pdf"
-    out_json = out_dir / f"{args.name}_plot_data.json"
-    out_csv = out_dir / f"{args.name}_plot_data.csv"
+    out_json = out_dir / f"{args.name}_data.json"
+    out_csv = out_dir / f"{args.name}_data.csv"
+    out_txt = out_dir / f"{args.name}_summary.txt"
 
     summary = {
         "input_json": str(in_path),
         "baseline_source": args.baseline_source,
         "test_mode": args.test_mode,
+        "plot_layout": "rows=M, columns=N, x-axis=K",
         "plot_shapes": [
             {
                 "m": sp.m,
@@ -700,16 +809,17 @@ def main() -> int:
                 "k": sp.k,
                 "label": sp.label,
             }
-            for sp in PLOT_SHAPES
+            for sp in shape_plots
         ],
         "rows": [result_to_dict(r) for r in all_rows],
     }
 
     write_summary_json(out_json, summary)
     write_summary_csv(out_csv, all_rows)
+    write_summary_txt(out_txt, all_rows)
 
-    plot_results(
-        grouped=grouped,
+    plot_results_grid(
+        by_shape=by_shape,
         out_png=out_png,
         out_pdf=out_pdf,
         title=args.title,
@@ -721,6 +831,7 @@ def main() -> int:
         print(f"wrote: {out_pdf}")
     print(f"wrote: {out_json}")
     print(f"wrote: {out_csv}")
+    print(f"wrote: {out_txt}")
 
     missing = [r for r in all_rows if not valid_for_plot(r)]
     if missing:
