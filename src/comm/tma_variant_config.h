@@ -7,16 +7,32 @@
 namespace ooverlap {
 namespace comm {
 
-template <int ChunkBytes, int StageDepth>
+template <
+    int ChunkBytes,
+    int StageDepth,
+    int FillDepth = StageDepth / 2,
+    int LoadFillDepth = FillDepth>
 struct TmaPipelineVariant {
     static_assert(ChunkBytes >= 16, "ChunkBytes must be >= 16");
     static_assert((ChunkBytes % 16) == 0, "ChunkBytes must be 16-byte aligned");
     static_assert(StageDepth >= 2, "StageDepth must be >= 2");
     static_assert((StageDepth % 2) == 0, "StageDepth must be even");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
+    static_assert(FillDepth + LoadFillDepth <= StageDepth,
+                  "FillDepth + LoadFillDepth must be <= StageDepth");
 
     static constexpr int chunk_bytes = ChunkBytes;
     static constexpr int stage_depth = StageDepth;
-    static constexpr int stage_gap = StageDepth / 2;
+
+    /*
+     * stage_gap is kept as the old name for compatibility. It is now the
+     * apply-side depth used by store/reduce waits.
+     */
+    static constexpr int stage_gap = FillDepth;
+    static constexpr int fill_depth = FillDepth;
+    static constexpr int load_fill_depth = LoadFillDepth;
+
     static constexpr int barrier_count = StageDepth;
 
     static constexpr size_t reduce_shared_bytes =
@@ -42,21 +58,29 @@ struct TmaPipelineVariant {
 } // namespace ooverlap
 
 /*
- * Supported runtime-selectable pipeline variants.
- *
- * Add/remove pairs here.
- *
- * Current candidates:
- *   16 KiB x depth 8  = current default shape
- *   32 KiB x depth 4
- *   64 KiB x depth 2
- *   100 KiB x depth 2
+ * Old two-argument macro kept for compatibility with any code that only cares
+ * about chunk/stage pairs.
  */
 #define OOVERLAP_TMA_TWO_GPU_PEER_FOR_EACH_VARIANT(M) \
     M(2 * 1024, 64)                                   \
     M(4 * 1024, 32)                                   \
     M(8 * 1024, 16)                                   \
+    M(8 * 1024, 24)                                   \
     M(16 * 1024, 8)                                   \
     M(32 * 1024, 4)                                   \
     M(64 * 1024, 2)                                   \
     M(100 * 1024, 2)
+
+/*
+ * New four-argument macro for the asymmetric pipeline.
+ * Arguments are: chunk bytes, stage depth, store/reduce fill depth, load fill depth.
+ */
+#define OOVERLAP_TMA_TWO_GPU_PEER_FOR_EACH_VARIANT_WITH_DEPTH(M) \
+    M(2 * 1024, 64, 32, 32)                                      \
+    M(4 * 1024, 32, 16, 16)                                      \
+    M(8 * 1024, 16, 8, 8)                                        \
+    M(8 * 1024, 28, 8, 20)                                       \
+    M(16 * 1024, 8, 4, 4)                                        \
+    M(32 * 1024, 4, 2, 2)                                        \
+    M(64 * 1024, 2, 1, 1)                                        \
+    M(100 * 1024, 2, 1, 1)

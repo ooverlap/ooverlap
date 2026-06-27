@@ -22,12 +22,13 @@
 
 namespace ooverlap {
 namespace {
-
 template <
     typename DummyReduceOp,
     int ElemBytes,
     int ChunkBytes,
-    int StageDepth>
+    int StageDepth,
+    int FillDepth = StageDepth / 2,
+    int LoadFillDepth = FillDepth>
 cudaError_t launch_all_gather_rank_variant_sm90(
     const void* local_in,
     void* local_buf,
@@ -42,12 +43,19 @@ cudaError_t launch_all_gather_rank_variant_sm90(
     const int* const* peer_ready_signals,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
-    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+    using Variant = comm::TmaPipelineVariant<
+        ChunkBytes,
+        StageDepth,
+        FillDepth,
+        LoadFillDepth>;
 
-    // The generic task executor needs a ReduceApply type even for copy-only all-gather.
+    /*
+     * The generic task executor needs a ReduceApply type even for copy-only
+     * all-gather. The reduce path is not used for all-gather.
+     */
     using ReduceApply = comm::pipeline::PipelineTMAReduce<
         Variant::stage_depth,
-        Variant::stage_gap,
+        Variant::fill_depth,
         DummyReduceOp>;
 
     constexpr int MaxTasks =
@@ -163,7 +171,9 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         ChunkBytes,
         StageDepth,
         MaxTasks,
-        MaxPeers>(
+        MaxPeers,
+        Variant::fill_depth,
+        Variant::load_fill_depth>(
             local_device,
             "tma_multi_gpu_all_gather: requested shared memory exceeds opt-in limit");
 
@@ -174,7 +184,9 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         ChunkBytes,
         StageDepth,
         MaxTasks,
-        MaxPeers><<<
+        MaxPeers,
+        Variant::fill_depth,
+        Variant::load_fill_depth><<<
             num_blocks,
             launch_config.threads,
             Variant::dynamic_shared_bytes,
@@ -191,12 +203,19 @@ template <
     typename DummyReduceOp,
     int ElemBytes,
     int ChunkBytes,
-    int StageDepth>
+    int StageDepth,
+    int FillDepth = StageDepth / 2,
+    int LoadFillDepth = FillDepth>
 void configure_all_gather_variant_sm90(int device) {
-    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+    using Variant = comm::TmaPipelineVariant<
+        ChunkBytes,
+        StageDepth,
+        FillDepth,
+        LoadFillDepth>;
+
     using ReduceApply = comm::pipeline::PipelineTMAReduce<
         Variant::stage_depth,
-        Variant::stage_gap,
+        Variant::fill_depth,
         DummyReduceOp>;
 
     comm::kernels::configure_multi_gpu_window_task_executor_once<
@@ -204,12 +223,18 @@ void configure_all_gather_variant_sm90(int device) {
         ChunkBytes,
         StageDepth,
         comm::plan::kTmaMultiGpuAllGatherMaxWindowTasks,
-        comm::plan::kTmaMultiGpuAllGatherMaxPeers>(
+        comm::plan::kTmaMultiGpuAllGatherMaxPeers,
+        Variant::fill_depth,
+        Variant::load_fill_depth>(
             device,
             "tma_multi_gpu_all_gather: requested shared memory exceeds opt-in limit");
 }
 
-template <int ChunkBytes, int StageDepth>
+template <
+    int ChunkBytes,
+    int StageDepth,
+    int FillDepth = StageDepth / 2,
+    int LoadFillDepth = FillDepth>
 cudaError_t dispatch_all_gather_dtype_sm90(
     const void* local_in,
     void* local_buf,
@@ -230,7 +255,9 @@ cudaError_t dispatch_all_gather_dtype_sm90(
             comm::pipeline::PipelineReduceAddNoFtzF16,
             static_cast<int>(sizeof(half)),
             ChunkBytes,
-            StageDepth>(
+            StageDepth,
+            FillDepth,
+            LoadFillDepth>(
                 local_in,
                 local_buf,
                 peer_bufs,
@@ -251,7 +278,9 @@ cudaError_t dispatch_all_gather_dtype_sm90(
             comm::pipeline::PipelineReduceAddBF16,
             static_cast<int>(sizeof(__nv_bfloat16)),
             ChunkBytes,
-            StageDepth>(
+            StageDepth,
+            FillDepth,
+            LoadFillDepth>(
                 local_in,
                 local_buf,
                 peer_bufs,
@@ -272,7 +301,9 @@ cudaError_t dispatch_all_gather_dtype_sm90(
             comm::pipeline::PipelineReduceAddF32,
             static_cast<int>(sizeof(float)),
             ChunkBytes,
-            StageDepth>(
+            StageDepth,
+            FillDepth,
+            LoadFillDepth>(
                 local_in,
                 local_buf,
                 peer_bufs,
@@ -306,36 +337,42 @@ cudaError_t dispatch_all_gather_variant_sm90(
     const int* const* peer_ready_signals,
     int collective_epoch,
     comm::LaunchConfig launch_config) {
-#define OO_TRY_VARIANT(CHUNK_BYTES_VALUE, STAGE_DEPTH_VALUE)                 \
-    if (launch_config.chunk_bytes == (CHUNK_BYTES_VALUE) &&                  \
-        launch_config.stage_depth == (STAGE_DEPTH_VALUE)) {                  \
-        return dispatch_all_gather_dtype_sm90<                               \
-            (CHUNK_BYTES_VALUE),                                             \
-            (STAGE_DEPTH_VALUE)>(                                            \
-                local_in,                                                    \
-                local_buf,                                                   \
-                peer_bufs,                                                   \
-                peer_count,                                                  \
-                count,                                                       \
-                dtype,                                                       \
-                rank,                                                        \
-                world_size,                                                  \
-                local_device,                                                \
-                stream,                                                      \
-                local_ready_signal,                                          \
-                peer_ready_signals,                                          \
-                collective_epoch,                                            \
-                launch_config);                                              \
+#define OO_TRY_VARIANT(CHUNK_BYTES_VALUE, STAGE_DEPTH_VALUE, FILL_DEPTH_VALUE, LOAD_FILL_DEPTH_VALUE) \
+    if (launch_config.chunk_bytes == (CHUNK_BYTES_VALUE) &&                                      \
+        launch_config.stage_depth == (STAGE_DEPTH_VALUE)) {                                      \
+        return dispatch_all_gather_dtype_sm90<                                                   \
+            (CHUNK_BYTES_VALUE),                                                                 \
+            (STAGE_DEPTH_VALUE),                                                                 \
+            (FILL_DEPTH_VALUE),                                                                  \
+            (LOAD_FILL_DEPTH_VALUE)>(                                                           \
+                local_in,                                                                        \
+                local_buf,                                                                       \
+                peer_bufs,                                                                       \
+                peer_count,                                                                      \
+                count,                                                                           \
+                dtype,                                                                           \
+                rank,                                                                            \
+                world_size,                                                                      \
+                local_device,                                                                    \
+                stream,                                                                          \
+                local_ready_signal,                                                              \
+                peer_ready_signals,                                                              \
+                collective_epoch,                                                                \
+                launch_config);                                                                  \
     }
 
-    OOVERLAP_TMA_TWO_GPU_PEER_FOR_EACH_VARIANT(OO_TRY_VARIANT)
+    OOVERLAP_TMA_TWO_GPU_PEER_FOR_EACH_VARIANT_WITH_DEPTH(OO_TRY_VARIANT)
 
 #undef OO_TRY_VARIANT
 
     return cudaErrorInvalidValue;
 }
 
-template <int ChunkBytes, int StageDepth>
+template <
+    int ChunkBytes,
+    int StageDepth,
+    int FillDepth = StageDepth / 2,
+    int LoadFillDepth = FillDepth>
 void configure_all_gather_dtype_sm90(
     oo_dtype_t dtype,
     int device) {
@@ -344,7 +381,9 @@ void configure_all_gather_dtype_sm90(
             comm::pipeline::PipelineReduceAddNoFtzF16,
             static_cast<int>(sizeof(half)),
             ChunkBytes,
-            StageDepth>(device);
+            StageDepth,
+            FillDepth,
+            LoadFillDepth>(device);
         return;
     }
 
@@ -353,7 +392,9 @@ void configure_all_gather_dtype_sm90(
             comm::pipeline::PipelineReduceAddBF16,
             static_cast<int>(sizeof(__nv_bfloat16)),
             ChunkBytes,
-            StageDepth>(device);
+            StageDepth,
+            FillDepth,
+            LoadFillDepth>(device);
         return;
     }
 
@@ -362,7 +403,9 @@ void configure_all_gather_dtype_sm90(
             comm::pipeline::PipelineReduceAddF32,
             static_cast<int>(sizeof(float)),
             ChunkBytes,
-            StageDepth>(device);
+            StageDepth,
+            FillDepth,
+            LoadFillDepth>(device);
         return;
     }
 

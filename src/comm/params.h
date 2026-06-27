@@ -12,11 +12,17 @@
 // -----------------------------------------------------------------------------
 
 #define TMA_TWO_GPU_PEER_DEFAULT_THREADS 32
-#define TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS 16
+#define TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS 4
 #define TMA_TWO_GPU_PEER_DEFAULT_WINDOW_CHUNKS 128
 
 #define TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES (8 * 1024)
 #define TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH 16
+
+// Store/reduce side depth.
+#define TMA_TWO_GPU_PEER_DEFAULT_FILL_DEPTH 8
+
+// Load side depth.
+#define TMA_TWO_GPU_PEER_DEFAULT_LOAD_FILL_DEPTH 8
 
 // Fast global-memory copy path remains compile-time for now.
 #define TMA_TWO_GPU_PEER_FAST_COPY_UNROLL 16
@@ -42,7 +48,17 @@ static_assert(TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH >= 2,
 static_assert((TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH % 2) == 0,
               "default stage depth must be even");
 
-#define TMA_TWO_GPU_PEER_DEFAULT_STAGE_GAP TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH / 2
+static_assert(TMA_TWO_GPU_PEER_DEFAULT_FILL_DEPTH > 0,
+              "default fill depth must be > 0");
+static_assert(TMA_TWO_GPU_PEER_DEFAULT_LOAD_FILL_DEPTH > 0,
+              "default load fill depth must be > 0");
+static_assert(TMA_TWO_GPU_PEER_DEFAULT_FILL_DEPTH +
+                  TMA_TWO_GPU_PEER_DEFAULT_LOAD_FILL_DEPTH <=
+              TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH,
+              "default fill depths must fit in stage depth");
+
+// Compatibility name: this is the store/reduce side fill depth.
+#define TMA_TWO_GPU_PEER_DEFAULT_STAGE_GAP TMA_TWO_GPU_PEER_DEFAULT_FILL_DEPTH
 
 #define TMA_TWO_GPU_PEER_CHUNK_BYTES TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES
 

@@ -308,11 +308,18 @@ __host__ __device__ __forceinline__ bool chunk_range_is_16b_bulk_aligned(
            ((end_byte & static_cast<size_t>(15)) == 0);
 }
 
+/*
+ * FillDepth stays as the apply-side async depth for compatibility.
+ * LoadFillDepth is the load-side warm-ahead depth.
+ * Safe slot reuse requires LoadFillDepth + FillDepth <= StageDepth.
+ */
+
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    typename Apply>
+    typename Apply,
+    int LoadFillDepth = FillDepth>
 __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
     const void* src_base,
     void* dst_base,
@@ -323,7 +330,9 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
     sync::semaphore* barriers) {
     static_assert(StageDepth > 0, "StageDepth must be > 0");
     static_assert(FillDepth > 0, "FillDepth must be > 0");
-    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
+    static_assert(LoadFillDepth + FillDepth <= StageDepth,
+                  "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
 
     if (threadIdx.x != 0) {
@@ -347,7 +356,7 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
         end_chunk - begin_chunk;
 
     #pragma unroll 16
-    for (int warm = 0; warm < FillDepth; ++warm) {
+    for (int warm = 0; warm < LoadFillDepth; ++warm) {
         if (warm >= total_range_chunks) {
             break;
         }
@@ -389,7 +398,7 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
         load.wait_ready(&cur_stage);
 
         const int future_iter =
-            iter + FillDepth;
+            iter + LoadFillDepth;
 
         if (future_iter < total_range_chunks) {
             const int future_abs_chunk =
@@ -408,7 +417,7 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
                     shared_raw,
                     barriers);
 
-            if (iter >= FillDepth) {
+            if (future_iter >= StageDepth) {
                 apply.wait_before_stage_reuse();
             }
 
@@ -425,7 +434,8 @@ template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    typename Apply>
+    typename Apply,
+    int LoadFillDepth = FillDepth>
 __device__ void run_chunk_range(
     const void* src_base,
     void* dst_base,
@@ -436,7 +446,9 @@ __device__ void run_chunk_range(
     sync::semaphore* barriers) {
     static_assert(StageDepth > 0, "StageDepth must be > 0");
     static_assert(FillDepth > 0, "FillDepth must be > 0");
-    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
+    static_assert(LoadFillDepth + FillDepth <= StageDepth,
+                  "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
 
     if (begin_chunk >= end_chunk || total_bytes == 0) {
@@ -451,7 +463,8 @@ __device__ void run_chunk_range(
             StageDepth,
             FillDepth,
             ChunkBytes,
-            Apply>(
+            Apply,
+            LoadFillDepth>(
                 src_base,
                 dst_base,
                 total_bytes,
@@ -474,7 +487,7 @@ __device__ void run_chunk_range(
     const int total_range_chunks =
         end_chunk - begin_chunk;
 
-    for (int warm = 0; warm < FillDepth; ++warm) {
+    for (int warm = 0; warm < LoadFillDepth; ++warm) {
         if (warm >= total_range_chunks) {
             break;
         }
@@ -523,7 +536,7 @@ __device__ void run_chunk_range(
         __syncthreads();
 
         const int future_iter =
-            iter + FillDepth;
+            iter + LoadFillDepth;
 
         if (future_iter < total_range_chunks) {
             const int future_abs_chunk =
@@ -543,7 +556,7 @@ __device__ void run_chunk_range(
                     barriers);
 
             if (threadIdx.x == 0) {
-                if (iter >= FillDepth) {
+                if (future_iter >= StageDepth) {
                     apply.wait_before_stage_reuse();
                 }
 
@@ -573,7 +586,8 @@ template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    typename Apply>
+    typename Apply,
+    int LoadFillDepth = FillDepth>
 __device__ void run_window_range(
     const void* src_base,
     void* dst_base,
@@ -597,7 +611,8 @@ __device__ void run_window_range(
         StageDepth,
         FillDepth,
         ChunkBytes,
-        Apply>(
+        Apply,
+        LoadFillDepth>(
             src_base,
             dst_base,
             total_bytes,
@@ -611,7 +626,8 @@ template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    typename ReduceApply>
+    typename ReduceApply,
+    int LoadFillDepth = FillDepth>
 __device__ void run_window_range_signal(
     const void* src_base,
     void* dst_base,
@@ -625,7 +641,9 @@ __device__ void run_window_range_signal(
     sync::semaphore* barriers) {
     static_assert(StageDepth > 0, "StageDepth must be > 0");
     static_assert(FillDepth > 0, "FillDepth must be > 0");
-    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
+    static_assert(LoadFillDepth + FillDepth <= StageDepth,
+                  "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
 
     if (begin_window >= end_window ||
@@ -669,7 +687,7 @@ __device__ void run_window_range_signal(
             window_ready_flags,
             ready_window_base);
 
-    for (int warm = 0; warm < FillDepth; ++warm) {
+    for (int warm = 0; warm < LoadFillDepth; ++warm) {
         if (warm >= total_range_chunks) {
             break;
         }
@@ -718,7 +736,7 @@ __device__ void run_window_range_signal(
         __syncthreads();
 
         const int future_iter =
-            iter + FillDepth;
+            iter + LoadFillDepth;
 
         if (future_iter < total_range_chunks) {
             const int future_abs_chunk =
@@ -738,7 +756,7 @@ __device__ void run_window_range_signal(
                     barriers);
 
             if (threadIdx.x == 0) {
-                if (iter >= FillDepth) {
+                if (future_iter >= StageDepth) {
                     apply.wait_before_stage_reuse();
 
                     const int safe_completed_chunk_exclusive =
@@ -797,7 +815,8 @@ template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    typename Apply>
+    typename Apply,
+    int LoadFillDepth = FillDepth>
 __device__ void run_window_range_after_ready(
     const void* src_base,
     void* dst_base,
@@ -811,7 +830,9 @@ __device__ void run_window_range_after_ready(
     sync::semaphore* barriers) {
     static_assert(StageDepth > 0, "StageDepth must be > 0");
     static_assert(FillDepth > 0, "FillDepth must be > 0");
-    static_assert(FillDepth <= StageDepth, "FillDepth must be <= StageDepth");
+    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
+    static_assert(LoadFillDepth + FillDepth <= StageDepth,
+                  "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
 
     if (begin_window >= end_window ||
@@ -848,7 +869,7 @@ __device__ void run_window_range_after_ready(
 
     int last_waited_window = -1;
 
-    for (int warm = 0; warm < FillDepth; ++warm) {
+    for (int warm = 0; warm < LoadFillDepth; ++warm) {
         if (warm >= total_range_chunks) {
             break;
         }
@@ -909,7 +930,7 @@ __device__ void run_window_range_after_ready(
         __syncthreads();
 
         const int future_iter =
-            iter + FillDepth;
+            iter + LoadFillDepth;
 
         if (future_iter < total_range_chunks) {
             const int future_abs_chunk =
@@ -941,7 +962,7 @@ __device__ void run_window_range_after_ready(
                     barriers);
 
             if (threadIdx.x == 0) {
-                if (iter >= FillDepth) {
+                if (future_iter >= StageDepth) {
                     apply.wait_before_stage_reuse();
                 }
 
@@ -970,7 +991,8 @@ __device__ void run_window_range_after_ready(
 template <
     int StageDepth,
     int FillDepth,
-    size_t ChunkBytes>
+    size_t ChunkBytes,
+    int LoadFillDepth = FillDepth>
 __device__ void copy_window_range_tma_signal(
     const void* src_base,
     void* dst_base,
@@ -989,7 +1011,8 @@ __device__ void copy_window_range_tma_signal(
         StageDepth,
         FillDepth,
         ChunkBytes,
-        CopyApply>(
+        CopyApply,
+        LoadFillDepth>(
             src_base,
             dst_base,
             total_bytes,
@@ -1006,7 +1029,8 @@ template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    typename ReduceApply>
+    typename ReduceApply,
+    int LoadFillDepth = FillDepth>
 __device__ void reduce_window_range_tma_after_ready(
     const void* src_base,
     void* dst_base,
@@ -1022,7 +1046,8 @@ __device__ void reduce_window_range_tma_after_ready(
         StageDepth,
         FillDepth,
         ChunkBytes,
-        ReduceApply>(
+        ReduceApply,
+        LoadFillDepth>(
             src_base,
             dst_base,
             total_bytes,
@@ -1038,7 +1063,8 @@ __device__ void reduce_window_range_tma_after_ready(
 template <
     int StageDepth,
     int FillDepth,
-    size_t ChunkBytes>
+    size_t ChunkBytes,
+    int LoadFillDepth = FillDepth>
 __device__ void copy_window_range_tma(
     const void* src_base,
     void* dst_base,
@@ -1055,7 +1081,8 @@ __device__ void copy_window_range_tma(
         StageDepth,
         FillDepth,
         ChunkBytes,
-        CopyApply>(
+        CopyApply,
+        LoadFillDepth>(
             src_base,
             dst_base,
             total_bytes,
