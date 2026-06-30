@@ -25,16 +25,6 @@ __device__ __forceinline__ uint32_t cvta_to_shared_u32(const void* ptr) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
 
-// -----------------------------------------------------------------------------
-// LOAD-SIDE HELPERS (global -> shared)
-// -----------------------------------------------------------------------------
-//
-// IMPORTANT:
-// Hopper bulk-TMA load uses shared::cluster on the destination side.
-// Using shared::cta here causes the "State space incorrect for instruction
-// 'cp.async.bulk'" ptxas error you just hit.
-// -----------------------------------------------------------------------------
-
 __device__ __forceinline__ void expect_bytes(sync::semaphore& bar, uint32_t bytes) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     const uint32_t bar_ptr = cvta_to_shared_u32(&bar);
@@ -60,7 +50,7 @@ __device__ __forceinline__ void load_async(
     const uint64_t src_gmem_addr = cvta_to_global_u64(src_gmem);
 
     asm volatile(
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
         "[%0], [%1], %2, [%3];\n"
         :
         : "r"(dst_smem_addr),
@@ -70,8 +60,13 @@ __device__ __forceinline__ void load_async(
         : "memory");
 #else
     (void)bar;
-    char* d = reinterpret_cast<char*>(dst_smem);
-    const char* s = reinterpret_cast<const char*>(src_gmem);
+
+    char* d =
+        reinterpret_cast<char*>(dst_smem);
+
+    const char* s =
+        reinterpret_cast<const char*>(src_gmem);
+
     for (uint32_t i = 0; i < size_bytes; ++i) {
         d[i] = s[i];
     }

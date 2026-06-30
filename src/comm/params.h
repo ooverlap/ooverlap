@@ -12,17 +12,17 @@
 // -----------------------------------------------------------------------------
 
 #define TMA_TWO_GPU_PEER_DEFAULT_THREADS 32
-#define TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS 1
+#define TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS 8
 #define TMA_TWO_GPU_PEER_DEFAULT_WINDOW_CHUNKS 128
 
-#define TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES (100 * 1024)
-#define TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH 2
+#define TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES (8 * 1024)
+#define TMA_TWO_GPU_PEER_DEFAULT_STAGE_DEPTH 16
 
 // Store/reduce side depth.
-#define TMA_TWO_GPU_PEER_DEFAULT_FILL_DEPTH 1
+#define TMA_TWO_GPU_PEER_DEFAULT_FILL_DEPTH 8
 
 // Load side depth.
-#define TMA_TWO_GPU_PEER_DEFAULT_LOAD_FILL_DEPTH 1
+#define TMA_TWO_GPU_PEER_DEFAULT_LOAD_FILL_DEPTH 8
 
 // Fast global-memory copy path remains compile-time for now.
 #define TMA_TWO_GPU_PEER_FAST_COPY_UNROLL 16

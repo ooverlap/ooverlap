@@ -396,7 +396,7 @@ __device__ __forceinline__ void run_byte_range_single_tma_16b_aligned_thread0(
     size_t byte_count,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    return;
+    
     if (threadIdx.x != 0) {
         return;
     }
@@ -793,7 +793,6 @@ __device__ void run_window_range(
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
     static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
-    return;
 
     if (SmallTaskBytes > 0) {
         const ByteRange byte_range =

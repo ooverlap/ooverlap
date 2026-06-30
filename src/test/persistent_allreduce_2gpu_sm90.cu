@@ -45,7 +45,11 @@ bool plan_supported(
         return true;
     }
 
-    return collective == TestCollective::AllReduce;
+    if (collective != TestCollective::AllReduce) {
+        return false;
+    }
+
+    return TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS >= 2;
 }
 
 comm::LaunchConfig launch_config_for(
