@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cuda_runtime_api.h>
 #include <stdexcept>
 
 namespace ooverlap {
@@ -58,6 +59,7 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
         comm::plan::kTmaMultiGpuReduceScatterMaxWindowTasks;
     constexpr int MaxPeers =
         comm::plan::kTmaMultiGpuReduceScatterMaxPeers;
+
 
     if (launch_config.plan_for != comm::CollectivePlanFor::ReduceScatter ||
         !comm::launch_config_valid(launch_config)) {
@@ -116,6 +118,7 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
         peer_slices[peer_idx] =
             comm::utils::offset_ptr(peer_bufs[peer_idx], slice_begin_bytes);
     }
+    
 
     const int num_chunks =
         comm::utils::ceil_div_int64_to_int(

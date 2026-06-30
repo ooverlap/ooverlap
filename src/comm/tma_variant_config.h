@@ -2,6 +2,8 @@
 
 #include "ooverlap/sync/sync.cuh"
 
+#include "comm/params.h"
+
 #include <cstddef>
 
 namespace ooverlap {
@@ -11,7 +13,8 @@ template <
     int ChunkBytes,
     int StageDepth,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth>
+    int LoadFillDepth = FillDepth,
+    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
 struct TmaPipelineVariant {
     static_assert(ChunkBytes >= 16, "ChunkBytes must be >= 16");
     static_assert((ChunkBytes % 16) == 0, "ChunkBytes must be 16-byte aligned");
@@ -21,6 +24,7 @@ struct TmaPipelineVariant {
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
     static_assert(FillDepth + LoadFillDepth <= StageDepth,
                   "FillDepth + LoadFillDepth must be <= StageDepth");
+    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     static constexpr int chunk_bytes = ChunkBytes;
     static constexpr int stage_depth = StageDepth;
@@ -32,6 +36,7 @@ struct TmaPipelineVariant {
     static constexpr int stage_gap = FillDepth;
     static constexpr int fill_depth = FillDepth;
     static constexpr int load_fill_depth = LoadFillDepth;
+    static constexpr int small_task_bytes = SmallTaskBytes;
 
     static constexpr int barrier_count = StageDepth;
 
@@ -41,10 +46,18 @@ struct TmaPipelineVariant {
     static constexpr size_t copy_shared_bytes =
         static_cast<size_t>(StageDepth) * static_cast<size_t>(ChunkBytes);
 
-    static constexpr size_t dynamic_shared_bytes =
+    static constexpr size_t pipeline_shared_bytes =
         (reduce_shared_bytes > copy_shared_bytes)
             ? reduce_shared_bytes
             : copy_shared_bytes;
+
+    static constexpr size_t small_task_shared_bytes =
+        static_cast<size_t>(SmallTaskBytes);
+
+    static constexpr size_t dynamic_shared_bytes =
+        (pipeline_shared_bytes > small_task_shared_bytes)
+            ? pipeline_shared_bytes
+            : small_task_shared_bytes;
 
     static constexpr size_t static_shared_bytes =
         static_cast<size_t>(barrier_count) *
@@ -79,7 +92,7 @@ struct TmaPipelineVariant {
     M(2 * 1024, 64, 32, 32)                                      \
     M(4 * 1024, 32, 16, 16)                                      \
     M(8 * 1024, 16, 8, 8)                                        \
-    M(8 * 1024, 28, 8, 20)                                       \
+    M(8 * 1024, 24, 8, 16)                                       \
     M(16 * 1024, 8, 4, 4)                                        \
     M(32 * 1024, 4, 2, 2)                                        \
     M(64 * 1024, 2, 1, 1)                                        \

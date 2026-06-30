@@ -6,6 +6,7 @@
 #include "comm/kernels/window_task_executor.cuh"
 #include "comm/plan/window_plan.cuh"
 #include "comm/tma_variant_config.h"
+#include "comm/params.h"
 
 #include <cuda_runtime.h>
 
@@ -25,18 +26,26 @@ template <
     int MaxTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth>
+    int LoadFillDepth = FillDepth,
+    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
 __global__ void multi_gpu_window_task_executor_kernel_sm90(
     comm::plan::WindowTaskExecutorPlan<MaxTasks> plan,
     int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch) {
-    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+
+    using Variant = comm::TmaPipelineVariant<
+        ChunkBytes,
+        StageDepth,
+        FillDepth,
+        LoadFillDepth,
+        SmallTaskBytes>;
 
     static_assert(FillDepth > 0, "FillDepth must be > 0");
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
+
 
     wait_for_multi_gpu_collective_ready(
         local_ready_signal,
@@ -61,7 +70,8 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         ReduceApply,
         uint4,
         TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-        LoadFillDepth>(
+        LoadFillDepth,
+        SmallTaskBytes>(
             plan.tasks,
             plan.total_tasks,
             plan.tasks_per_cta,
@@ -77,16 +87,23 @@ template <
     int MaxTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth>
+    int LoadFillDepth = FillDepth,
+    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
 void configure_multi_gpu_window_task_executor_once(
     int device,
     const char* error_prefix) {
-    using Variant = comm::TmaPipelineVariant<ChunkBytes, StageDepth>;
+    using Variant = comm::TmaPipelineVariant<
+        ChunkBytes,
+        StageDepth,
+        FillDepth,
+        LoadFillDepth,
+        SmallTaskBytes>;
 
     static_assert(FillDepth > 0, "FillDepth must be > 0");
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
+    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     struct CacheEntry {
         bool configured = false;
@@ -136,7 +153,8 @@ void configure_multi_gpu_window_task_executor_once(
                     MaxTasks,
                     MaxPeers,
                     FillDepth,
-                    LoadFillDepth>,
+                    LoadFillDepth,
+                    SmallTaskBytes>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(dynamic_smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
@@ -151,7 +169,8 @@ void configure_multi_gpu_window_task_executor_once(
                 MaxTasks,
                 MaxPeers,
                 FillDepth,
-                LoadFillDepth>,
+                LoadFillDepth,
+                SmallTaskBytes>,
             cudaFuncAttributePreferredSharedMemoryCarveout,
             100),
         "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");

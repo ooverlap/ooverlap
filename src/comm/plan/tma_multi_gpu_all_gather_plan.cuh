@@ -75,7 +75,15 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
         return false;
     }
 
-    window_task_executor_plan_clear(plan);
+    /*
+     * Do not clear plan->tasks here.
+     *
+     * The executor only reads tasks[0..total_tasks), and this builder
+     * overwrites every used slot before publishing total_tasks. Clearing all
+     * MaxTasks slots is expensive on the enqueue path.
+     */
+    plan->total_tasks = 0;
+    plan->tasks_per_cta = 0;
     *out_num_blocks = 0;
 
     if (launch_config.plan_for != comm::CollectivePlanFor::AllGather) {
@@ -101,7 +109,8 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
     const comm::AllGatherPlanKind plan_kind =
         comm::all_gather_plan(launch_config);
 
-    const bool out_of_place = (local_in != local_buf);
+    const bool out_of_place =
+        (local_in != local_buf);
 
     const int tasks_per_cta =
         naive_multi_gpu_all_gather_tasks_per_cta(
@@ -120,7 +129,8 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
         return false;
     }
 
-    const int max_ctas_by_plan = MaxTasks / tasks_per_cta;
+    const int max_ctas_by_plan =
+        MaxTasks / tasks_per_cta;
 
     if (max_ctas_by_plan <= 0) {
         return false;
@@ -131,7 +141,10 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
             num_windows,
             launch_config.max_ctas);
 
-    cta_count = comm::utils::min_int(cta_count, max_ctas_by_plan);
+    cta_count =
+        comm::utils::min_int(
+            cta_count,
+            max_ctas_by_plan);
 
     if (cta_count <= 0) {
         if (needs_rendezvous) {
@@ -141,16 +154,14 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
         return true;
     }
 
-    plan->tasks_per_cta = tasks_per_cta;
-    plan->total_tasks = cta_count * tasks_per_cta;
+    const int total_tasks =
+        cta_count * tasks_per_cta;
 
-    if (plan->total_tasks > MaxTasks) {
+    if (total_tasks > MaxTasks) {
         return false;
     }
 
-    comm::utils::WindowRange full_range{};
-    full_range.begin = 0;
-    full_range.end = num_windows;
+    const comm::utils::WindowRange full_range{0, num_windows};
 
     for (int cta_idx = 0; cta_idx < cta_count; ++cta_idx) {
         const comm::utils::WindowRange cta_range =
@@ -159,10 +170,12 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
                 cta_count,
                 full_range);
 
-        int task_idx = cta_idx * tasks_per_cta;
+        int task_idx =
+            cta_idx * tasks_per_cta;
 
         if (out_of_place) {
-            const bool terminal = (peer_count == 0);
+            const bool terminal =
+                (peer_count == 0);
 
             plan->tasks[task_idx++] =
                 make_all_gather_copy_task(
@@ -177,17 +190,24 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
         }
 
         for (int peer_idx = 0; peer_idx < peer_count; ++peer_idx) {
-            if (peer_bufs[peer_idx] == nullptr) {
+            void* const peer_buf =
+                peer_bufs[peer_idx];
+
+            if (peer_buf == nullptr) {
+                plan->total_tasks = 0;
+                plan->tasks_per_cta = 0;
+                *out_num_blocks = 0;
                 return false;
             }
 
-            const bool terminal = (peer_idx == peer_count - 1);
+            const bool terminal =
+                (peer_idx == peer_count - 1);
 
             plan->tasks[task_idx++] =
                 make_all_gather_copy_task(
                     plan_kind,
                     local_buf,
-                    peer_bufs[peer_idx],
+                    peer_buf,
                     slice_bytes,
                     cta_range.begin,
                     cta_range.end,
@@ -196,7 +216,14 @@ bool build_tma_multi_gpu_all_gather_naive_plan(
         }
     }
 
+    /*
+     * Publish metadata after task slots are written. This keeps the plan in a
+     * safe empty state if validation fails before the end.
+     */
+    plan->tasks_per_cta = tasks_per_cta;
+    plan->total_tasks = total_tasks;
     *out_num_blocks = cta_count;
+
     return true;
 }
 
