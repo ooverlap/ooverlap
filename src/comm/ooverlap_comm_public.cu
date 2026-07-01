@@ -1,6 +1,7 @@
 #include "comm/ooverlap_comm_private.h"
 
 #include "ooverlap/system/runtime_utils.cuh"
+#include "ooverlap/system/p2p.cuh"
 
 #include "comm/utils/collective_utils.h"
 
@@ -16,6 +17,53 @@ namespace {
 
 bool valid_group_size(int num_devices) {
     return num_devices > 0 && num_devices <= kOoMaxLocalDevices;
+}
+
+oo_status_t enable_group_peer_access_all_to_all(oo_group_t* group) {
+    if (group == nullptr || !valid_group_size(group->num_devices)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    for (int i = 0; i < group->num_devices; ++i) {
+        const int src_device = group->devices[i];
+
+        if (src_device < 0) {
+            return OO_ERROR_INVALID_DEVICE;
+        }
+
+        for (int j = 0; j < group->num_devices; ++j) {
+            const int dst_device = group->devices[j];
+
+            if (dst_device < 0) {
+                return OO_ERROR_INVALID_DEVICE;
+            }
+
+            if (i == j) {
+                group->peer_access_enabled[i][j] = true;
+                continue;
+            }
+
+            bool enabled = false;
+
+            const oo_status_t status =
+                ooverlap::system::p2p::enable_peer_access_one_way_status(
+                    src_device,
+                    dst_device,
+                    &enabled);
+
+            if (status != OO_SUCCESS) {
+                return status;
+            }
+
+            if (!enabled) {
+                return OO_ERROR_UNSUPPORTED;
+            }
+
+            group->peer_access_enabled[i][j] = true;
+        }
+    }
+
+    return OO_SUCCESS;
 }
 
 std::vector<int> devices_vector(const int* devices, int num_devices) {
@@ -59,38 +107,70 @@ void destroy_group_ready_signals(oo_group_t* group) {
     }
 }
 
-oo_status_t allocate_same_process_ready_signals(oo_group_t* group) {
+oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
     if (group == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    const std::vector<int> access_devices =
-        devices_vector(group->devices, group->num_devices);
-
     for (int rank = 0; rank < group->num_devices; ++rank) {
         const int device = group->devices[rank];
 
-        auto mapped =
-            ooverlap::system::alloc_peer_visible_buffer(
-                sizeof(int),
-                device,
-                access_devices);
+        if (device < 0) {
+            destroy_group_ready_signals(group);
+            return OO_ERROR_INVALID_DEVICE;
+        }
 
-        ooverlap::system::runtime::set_device(device);
-        ooverlap::system::runtime::check_cuda(
-            cudaMemset(mapped.ptr, 0, sizeof(int)),
-            "cudaMemset(ready signal)");
+        cudaError_t err =
+            cudaSetDevice(device);
 
-        oo_ready_signal& slot = group->ready_signal_slots[rank];
-        slot.ptr = mapped.ptr;
+        if (err != cudaSuccess) {
+            destroy_group_ready_signals(group);
+            return ooverlap::comm::api::cuda_to_status(err);
+        }
+
+        void* signal = nullptr;
+
+        err =
+            cudaMalloc(
+                &signal,
+                sizeof(int));
+
+        if (err != cudaSuccess) {
+            destroy_group_ready_signals(group);
+            return ooverlap::comm::api::cuda_to_status(err);
+        }
+
+        err =
+            cudaMemset(
+                signal,
+                0,
+                sizeof(int));
+
+        if (err != cudaSuccess) {
+            cudaFree(signal);
+            destroy_group_ready_signals(group);
+            return ooverlap::comm::api::cuda_to_status(err);
+        }
+
+        oo_ready_signal& slot =
+            group->ready_signal_slots[rank];
+
+        slot.ptr = signal;
         slot.bytes = sizeof(int);
-        slot.mapped_bytes = mapped.mapped_size;
+        slot.mapped_bytes = sizeof(int);
         slot.owner_rank = rank;
         slot.owner_device = device;
-        slot.kind = oo_ready_signal_kind::owned_vmm;
-        slot.owned_vmm = mapped;
+        slot.kind = oo_ready_signal_kind::owned_legacy;
+        slot.owned_legacy_ptr = signal;
 
-        group->ready_signals[rank] = mapped;
+        /*
+         * Compatibility mirror. Do not free through this mirror.
+         * destroy_group_ready_signals() frees via ready_signal_slots.
+         */
+        group->ready_signals[rank].ptr = signal;
+        group->ready_signals[rank].mapped_size = sizeof(int);
+        group->ready_signals[rank].requested_size = sizeof(int);
+        group->ready_signals[rank].owner_device = device;
     }
 
     return OO_SUCCESS;
@@ -275,6 +355,7 @@ oo_status_t oo_group_create(
 
         group->num_devices = num_devices;
         group->bootstrap_kind = oo_group_bootstrap_kind::same_process;
+        group->memory_kind = oo_group_memory_kind::same_process_vmm;
 
         for (int i = 0; i < num_devices; ++i) {
             if (devices[i] < 0) {
@@ -285,9 +366,70 @@ oo_status_t oo_group_create(
         }
 
         const oo_status_t status =
-            allocate_same_process_ready_signals(group.get());
+            allocate_same_process_cuda_ready_signals(group.get());
 
         if (status != OO_SUCCESS) {
+            return status;
+        }
+
+        *out_group = group.release();
+        return OO_SUCCESS;
+    } catch (...) {
+        return ooverlap::comm::api::exception_to_status();
+    }
+}
+
+oo_status_t oo_group_create_p2p(
+    const int* devices,
+    int num_devices,
+    oo_group_t** out_group) {
+    if (out_group == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_group = nullptr;
+
+    if (devices == nullptr || !valid_group_size(num_devices)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::unique_ptr<oo_group_t> group(new oo_group_t{});
+
+        group->num_devices = num_devices;
+        group->bootstrap_kind = oo_group_bootstrap_kind::same_process;
+        group->memory_kind = oo_group_memory_kind::same_process_cuda_p2p;
+
+        for (int i = 0; i < num_devices; ++i) {
+            if (devices[i] < 0) {
+                return OO_ERROR_INVALID_DEVICE;
+            }
+
+            group->devices[i] = devices[i];
+        }
+
+        /*
+         * Must happen before ready-signal allocation/use.
+         *
+         * This also makes external cudaMalloc / PyTorch allocations on peer
+         * devices directly addressable by kernels in this process.
+         */
+        oo_status_t status =
+            enable_group_peer_access_all_to_all(group.get());
+
+        if (status != OO_SUCCESS) {
+            return status;
+        }
+
+        /*
+         * Internal synchronization flags. These are not user buffers.
+         * They deliberately use cudaMalloc, not VMM.
+         */
+        status =
+            allocate_same_process_cuda_ready_signals(group.get());
+
+        if (status != OO_SUCCESS) {
+            destroy_group_ready_signals(group.get());
             return status;
         }
 
@@ -323,6 +465,7 @@ oo_status_t oo_group_create_ipc(
 
         group->num_devices = num_devices;
         group->bootstrap_kind = oo_group_bootstrap_kind::multiprocess_ipc;
+        group->memory_kind = oo_group_memory_kind::multiprocess_legacy_ipc;
         group->local_rank = local_rank;
         group->local_world_size = num_devices;
         group->broker.reset(
@@ -488,6 +631,36 @@ oo_status_t oo_buffer_wrap(
     }
 
     try {
+        cudaPointerAttributes attr{};
+
+        cudaError_t attr_err =
+            cudaPointerGetAttributes(
+                &attr,
+                ptr);
+        
+        if (attr_err != cudaSuccess) {
+            /*
+             * Clear sticky runtime error state before returning.
+             */
+            (void)cudaGetLastError();
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+        
+        #if CUDART_VERSION >= 10000
+        if (attr.type != cudaMemoryTypeDevice &&
+            attr.type != cudaMemoryTypeManaged) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+        #else
+        if (attr.memoryType != cudaMemoryTypeDevice) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+        #endif
+        
+        if (attr.device >= 0 && attr.device != node->device) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
         std::unique_ptr<oo_buffer_t> buffer(new oo_buffer_t{});
         buffer->ptr = ptr;
         buffer->bytes = bytes;

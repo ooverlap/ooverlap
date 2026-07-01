@@ -74,6 +74,11 @@ int oo_all_gather_supported(
     oo_dtype_t dtype);
 
 /* Group */
+oo_status_t oo_group_create_p2p(
+    const int* devices,
+    int num_devices,
+    oo_group_t** out_group);
+
 oo_status_t oo_group_create(
     const int* devices,
     int num_devices,

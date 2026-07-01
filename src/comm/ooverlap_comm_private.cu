@@ -17,6 +17,51 @@ bool valid_group_size(int num_devices) {
     return num_devices > 0 && num_devices <= kOoMaxLocalDevices;
 }
 
+bool peer_buffer_allowed_for_group(
+    const oo_group_t* group,
+    const oo_buffer_t* peer) {
+    if (group == nullptr || peer == nullptr) {
+        return false;
+    }
+
+    using ooverlap::system::peer_buffer_kind;
+
+    switch (group->memory_kind) {
+        case oo_group_memory_kind::same_process_vmm:
+            /*
+             * Keep this permissive for backwards compatibility.
+             *
+             * VMM-owned buffers are expected here, but wrapped buffers may work
+             * if the caller manually enabled peer access.
+             */
+            return peer->system_kind == peer_buffer_kind::owned_vmm ||
+                   peer->system_kind == peer_buffer_kind::wrapped ||
+                   peer->system_kind == peer_buffer_kind::imported_legacy ||
+                   peer->system_kind == peer_buffer_kind::imported_vmm;
+
+        case oo_group_memory_kind::same_process_cuda_p2p:
+            /*
+             * Main external-buffer path:
+             *   external allocator -> oo_buffer_wrap()
+             *
+             * VMM-owned is also allowed so mixed tests do not fail.
+             */
+            return peer->system_kind == peer_buffer_kind::wrapped ||
+                   peer->system_kind == peer_buffer_kind::owned_vmm;
+
+        case oo_group_memory_kind::multiprocess_legacy_ipc:
+            /*
+             * In multiprocess mode a peer pointer must be an imported mapping,
+             * not another local wrapped pointer.
+             */
+            return peer->system_kind == peer_buffer_kind::imported_legacy ||
+                   peer->system_kind == peer_buffer_kind::imported_vmm;
+
+        default:
+            return false;
+    }
+}
+
 } // namespace
 
 namespace ooverlap {
@@ -325,6 +370,11 @@ oo_status_t prepare_collective_launch(
             peer->owner_rank == node->rank) {
             return OO_ERROR_INVALID_ARGUMENT;
         }
+
+        if (!peer_buffer_allowed_for_group(group, peer)) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
 
         if (offset_bytes > peer->bytes ||
             bytes > peer->bytes - offset_bytes) {

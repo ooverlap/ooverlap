@@ -15,6 +15,26 @@
 
 constexpr int kOoMaxLocalDevices = 16;
 
+enum class oo_group_memory_kind {
+    /*
+     * Same-process VMM allocations with cuMemSetAccess.
+     * This is the current oo_group_create() behavior.
+     */
+    same_process_vmm = 0,
+
+    /*
+     * Same-process normal CUDA allocations / external wrapped pointers.
+     * Peer visibility comes from cudaDeviceEnablePeerAccess.
+     */
+    same_process_cuda_p2p = 1,
+
+    /*
+     * Multiprocess legacy CUDA IPC.
+     * Peer buffers are imported with cudaIpcOpenMemHandle.
+     */
+    multiprocess_legacy_ipc = 2
+};
+
 enum class oo_group_bootstrap_kind {
     same_process = 0,
     multiprocess_ipc = 1
@@ -88,6 +108,17 @@ struct oo_group {
      * free through ready_signal_slots.
      */
     ooverlap::system::mapped_peer_buffer ready_signals[kOoMaxLocalDevices] = {};
+
+    oo_group_memory_kind memory_kind =
+                oo_group_memory_kind::same_process_vmm;
+    
+    /*
+     * Meaningful for same_process_cuda_p2p.
+     *
+     * peer_access_enabled[src_rank][dst_rank] means the CUDA context for
+     * devices[src_rank] enabled access to allocations owned by devices[dst_rank].
+     */
+    bool peer_access_enabled[kOoMaxLocalDevices][kOoMaxLocalDevices] = {};
 };
 
 struct oo_node {
