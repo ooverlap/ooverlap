@@ -22,6 +22,7 @@
 #include "test/ipc_collective_sm90.h"
 #include "test/tma_collective_sweep_2gpu.h"
 #include "test/tma_efficiency_vs_best_2gpu.h"
+#include "test/persistent_external_p2p_collective_2gpu_sm90.h"
 
 namespace py = pybind11;
 
@@ -372,6 +373,36 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("iters"),
         py::arg("warmup"),
         py::arg("verify"));
+
+  m.def("external_p2p_two_gpu_collective_smoke_test",
+        &ooverlap::external_p2p_two_gpu_collective_smoke_test,
+        py::arg("collective"),
+        py::arg("numel"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1);
+
+  m.def("external_p2p_two_gpu_allreduce_smoke_test",
+        &ooverlap::external_p2p_two_gpu_allreduce_smoke_test,
+        py::arg("numel"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1);
+
+  m.def("benchmark_external_p2p_two_gpu_collective_sm90",
+        &ooverlap::benchmark_external_p2p_two_gpu_collective_sm90,
+        py::arg("collective"),
+        py::arg("numel"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1);
+
+  m.def("benchmark_external_p2p_two_gpu_allreduce_sm90",
+        &ooverlap::benchmark_external_p2p_two_gpu_allreduce_sm90,
+        py::arg("numel"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1);
 
   m.def(
     "benchmark_tma_efficiency_vs_best_2gpu_json",
