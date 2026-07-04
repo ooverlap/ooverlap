@@ -10,6 +10,11 @@
 #include <string>
 #include <vector>
 
+#ifndef OOVERLAP_TOPOLOGY_TRACE
+#define OOVERLAP_TOPOLOGY_TRACE 0
+#endif
+
+#if OOVERLAP_TOPOLOGY_TRACE
 #define TOPO_TRACE(fmt, ...)                                                   \
     do {                                                                       \
         std::fprintf(                                                          \
@@ -20,6 +25,11 @@
             ##__VA_ARGS__);                                                    \
         std::fflush(stderr);                                                   \
     } while (0)
+#else
+#define TOPO_TRACE(...)                                                        \
+    do {                                                                       \
+    } while (0)
+#endif
 
 namespace ooverlap {
 namespace topology {
@@ -37,6 +47,8 @@ int get_device_attr_or_default(
     int attr,
     int device,
     int default_value = 0) {
+    TOPO_TRACE("enter get_device_attr_or_default attr=%d device=%d", attr, device);
+
     int value = default_value;
 
     cudaError_t err =
@@ -44,6 +56,13 @@ int get_device_attr_or_default(
             &value,
             static_cast<cudaDeviceAttr>(attr),
             device);
+
+    TOPO_TRACE(
+        "after cudaDeviceGetAttribute attr=%d device=%d err=%d value=%d",
+        attr,
+        device,
+        static_cast<int>(err),
+        value);
 
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
@@ -58,6 +77,12 @@ int get_p2p_attr_or_default(
     int src_device,
     int dst_device,
     int default_value = 0) {
+    TOPO_TRACE(
+        "enter get_p2p_attr_or_default attr=%d %d -> %d",
+        static_cast<int>(attr),
+        src_device,
+        dst_device);
+
     int value = default_value;
 
     cudaError_t err =
@@ -66,6 +91,14 @@ int get_p2p_attr_or_default(
             attr,
             src_device,
             dst_device);
+
+    TOPO_TRACE(
+        "after cudaDeviceGetP2PAttribute attr=%d %d -> %d err=%d value=%d",
+        static_cast<int>(attr),
+        src_device,
+        dst_device,
+        static_cast<int>(err),
+        value);
 
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
@@ -78,38 +111,59 @@ int get_p2p_attr_or_default(
 bool enable_peer_access_one_way(
     int src_device,
     int dst_device) {
+    TOPO_TRACE("enter enable_peer_access_one_way %d -> %d", src_device, dst_device);
+
     if (src_device == dst_device) {
+        TOPO_TRACE("self peer access %d -> %d", src_device, dst_device);
         return true;
     }
 
     int can_access = 0;
 
+    TOPO_TRACE("before cudaDeviceCanAccessPeer %d -> %d", src_device, dst_device);
     check_cuda(
         cudaDeviceCanAccessPeer(
             &can_access,
             src_device,
             dst_device),
         "cudaDeviceCanAccessPeer");
+    TOPO_TRACE(
+        "after cudaDeviceCanAccessPeer %d -> %d can_access=%d",
+        src_device,
+        dst_device,
+        can_access);
 
     if (!can_access) {
+        TOPO_TRACE("peer access unsupported %d -> %d", src_device, dst_device);
         return false;
     }
 
+    TOPO_TRACE("before cudaSetDevice(src) src=%d", src_device);
     check_cuda(
         cudaSetDevice(src_device),
         "cudaSetDevice(src_device)");
+    TOPO_TRACE("after cudaSetDevice(src) src=%d", src_device);
 
+    TOPO_TRACE("before cudaDeviceEnablePeerAccess src=%d dst=%d", src_device, dst_device);
     cudaError_t err =
         cudaDeviceEnablePeerAccess(
             dst_device,
             0);
+    TOPO_TRACE(
+        "after cudaDeviceEnablePeerAccess src=%d dst=%d err=%d",
+        src_device,
+        dst_device,
+        static_cast<int>(err));
 
     if (err == cudaErrorPeerAccessAlreadyEnabled) {
         (void)cudaGetLastError();
+        TOPO_TRACE("peer access already enabled %d -> %d", src_device, dst_device);
         return true;
     }
 
     check_cuda(err, "cudaDeviceEnablePeerAccess");
+
+    TOPO_TRACE("leave enable_peer_access_one_way %d -> %d", src_device, dst_device);
     return true;
 }
 
@@ -128,8 +182,11 @@ int query_numa_node_from_pci(
         pci_bus_id,
         pci_device_id);
 
+    TOPO_TRACE("query numa path=%s", path);
+
     FILE* f = std::fopen(path, "r");
     if (f == nullptr) {
+        TOPO_TRACE("numa fopen failed path=%s", path);
         return -1;
     }
 
@@ -140,9 +197,11 @@ int query_numa_node_from_pci(
     std::fclose(f);
 
     if (scanned != 1) {
+        TOPO_TRACE("numa fscanf failed path=%s scanned=%d", path, scanned);
         return -1;
     }
 
+    TOPO_TRACE("numa path=%s value=%d", path, numa);
     return numa;
 #else
     (void)pci_domain_id;
@@ -185,10 +244,6 @@ const char* bool_text(bool value) {
     return value ? "true" : "false";
 }
 
-ProbeResult not_attempted_result() {
-    return ProbeResult{};
-}
-
 AtomicCapability direct_atomic_capability_from_results(
     bool direct_copy_ok,
     bool native_atomic_supported,
@@ -197,15 +252,17 @@ AtomicCapability direct_atomic_capability_from_results(
     const ProbeResult& tma_load_probe,
     const ProbeResult& tma_store_probe,
     const ProbeResult& tma_reduce_probe) {
+    TOPO_TRACE(
+        "enter direct_atomic_capability_from_results copy_ok=%d native=%d partial=%d",
+        static_cast<int>(direct_copy_ok),
+        static_cast<int>(native_atomic_supported),
+        static_cast<int>(partial_native_atomic_supported));
+
     AtomicCapability caps{};
 
     caps.signal32 = direct_copy_ok;
     caps.global_load_store = direct_copy_ok;
 
-    /*
-     * Attribute says all native atomics, or partial native atomics. The actual
-     * atomic32 probe decides the 32-bit flag when it was attempted.
-     */
     caps.global_atomic_32 =
         atomic32_probe.attempted
             ? atomic32_probe.passed
@@ -229,13 +286,10 @@ AtomicCapability direct_atomic_capability_from_results(
     caps.tma_reduce_f16 =
         tma_reduce_probe.attempted && tma_reduce_probe.passed;
 
-    /*
-     * These are not probed in this first pass. Keep false until a BF16/F32
-     * probe is added.
-     */
     caps.tma_reduce_bf16 = false;
     caps.tma_reduce_f32 = false;
 
+    TOPO_TRACE("leave direct_atomic_capability_from_results");
     return caps;
 }
 
@@ -245,6 +299,8 @@ AtomicCapability shm_atomic_capability_from_results(
     const ProbeResult& tma_load_probe,
     const ProbeResult& tma_store_probe,
     const ProbeResult& tma_reduce_probe) {
+    TOPO_TRACE("enter shm_atomic_capability_from_results");
+
     AtomicCapability caps{};
 
     const bool copy_ok =
@@ -268,6 +324,7 @@ AtomicCapability shm_atomic_capability_from_results(
     caps.tma_reduce_bf16 = false;
     caps.tma_reduce_f32 = false;
 
+    TOPO_TRACE("leave shm_atomic_capability_from_results");
     return caps;
 }
 
@@ -275,6 +332,12 @@ LinkKind infer_direct_link_kind(
     bool peer_access_supported,
     bool native_atomic_supported,
     int performance_rank) {
+    TOPO_TRACE(
+        "infer_direct_link_kind access=%d native=%d perfRank=%d",
+        static_cast<int>(peer_access_supported),
+        static_cast<int>(native_atomic_supported),
+        performance_rank);
+
     if (!peer_access_supported) {
         return LinkKind::Unsupported;
     }
@@ -342,80 +405,235 @@ Node discover_node(
 void run_direct_probes(
     Link* link,
     const DiscoverOptions& options) {
-    if (link == nullptr ||
-        !options.run_validation_probes ||
-        !link->cuda_peer_access_supported ||
-        (options.enable_peer_access && !link->cuda_peer_access_enabled)) {
+    TOPO_TRACE("ENTER run_direct_probes link=%p", static_cast<void*>(link));
+
+    if (link == nullptr) {
+        TOPO_TRACE("SKIP run_direct_probes: null link");
         return;
     }
+
+    TOPO_TRACE(
+        "run_direct_probes options validation=%d atomic=%d tma=%d access=%d enabled=%d src=%d dst=%d",
+        static_cast<int>(options.run_validation_probes),
+        static_cast<int>(options.run_atomic_probes),
+        static_cast<int>(options.run_tma_probes),
+        static_cast<int>(link->cuda_peer_access_supported),
+        static_cast<int>(link->cuda_peer_access_enabled),
+        link->src_device,
+        link->dst_device);
+
+    if (!options.run_validation_probes ||
+        !link->cuda_peer_access_supported ||
+        (options.enable_peer_access && !link->cuda_peer_access_enabled)) {
+        TOPO_TRACE("SKIP run_direct_probes");
+        return;
+    }
+
+    TOPO_TRACE(
+        "before probe_direct_load_store %d -> %d",
+        link->src_device,
+        link->dst_device);
 
     link->direct_copy_probe =
         detail::probe_direct_load_store(
             link->src_device,
             link->dst_device);
 
+    TOPO_TRACE(
+        "after probe_direct_load_store attempted=%d passed=%d err=%s",
+        int(link->direct_copy_probe.attempted),
+        int(link->direct_copy_probe.passed),
+        link->direct_copy_probe.error);
+
     if (options.run_atomic_probes) {
+        TOPO_TRACE(
+            "before probe_direct_atomic_add_i32 %d -> %d",
+            link->src_device,
+            link->dst_device);
+
         link->direct_atomic32_probe =
             detail::probe_direct_atomic_add_i32(
                 link->src_device,
                 link->dst_device);
+
+        TOPO_TRACE(
+            "after probe_direct_atomic_add_i32 attempted=%d passed=%d err=%s",
+            int(link->direct_atomic32_probe.attempted),
+            int(link->direct_atomic32_probe.passed),
+            link->direct_atomic32_probe.error);
+    } else {
+        TOPO_TRACE("skip direct atomic32 probe by option");
     }
 
     if (options.run_tma_probes) {
+        TOPO_TRACE(
+            "before probe_direct_tma_load_f16 %d -> %d",
+            link->src_device,
+            link->dst_device);
+
         link->direct_tma_load_f16_probe =
             detail::probe_direct_tma_load_f16(
                 link->src_device,
                 link->dst_device);
+
+        TOPO_TRACE(
+            "after probe_direct_tma_load_f16 attempted=%d passed=%d err=%s",
+            int(link->direct_tma_load_f16_probe.attempted),
+            int(link->direct_tma_load_f16_probe.passed),
+            link->direct_tma_load_f16_probe.error);
+
+        TOPO_TRACE(
+            "before probe_direct_tma_store_f16 %d -> %d",
+            link->src_device,
+            link->dst_device);
 
         link->direct_tma_store_f16_probe =
             detail::probe_direct_tma_store_f16(
                 link->src_device,
                 link->dst_device);
 
+        TOPO_TRACE(
+            "after probe_direct_tma_store_f16 attempted=%d passed=%d err=%s",
+            int(link->direct_tma_store_f16_probe.attempted),
+            int(link->direct_tma_store_f16_probe.passed),
+            link->direct_tma_store_f16_probe.error);
+
+        TOPO_TRACE(
+            "before probe_direct_tma_reduce_f16 %d -> %d",
+            link->src_device,
+            link->dst_device);
+
         link->direct_tma_reduce_f16_probe =
             detail::probe_direct_tma_reduce_f16(
                 link->src_device,
                 link->dst_device);
+
+        TOPO_TRACE(
+            "after probe_direct_tma_reduce_f16 attempted=%d passed=%d err=%s",
+            int(link->direct_tma_reduce_f16_probe.attempted),
+            int(link->direct_tma_reduce_f16_probe.passed),
+            link->direct_tma_reduce_f16_probe.error);
+    } else {
+        TOPO_TRACE("skip direct tma probes by option");
     }
+
+    TOPO_TRACE("LEAVE run_direct_probes");
 }
 
 void run_shm_probes(
     Link* link,
     const DiscoverOptions& options) {
-    if (link == nullptr ||
-        !options.include_shm_fallback ||
-        !options.run_validation_probes) {
+    TOPO_TRACE("ENTER run_shm_probes link=%p", static_cast<void*>(link));
+
+    if (link == nullptr) {
+        TOPO_TRACE("SKIP run_shm_probes: null link");
         return;
     }
+
+    TOPO_TRACE(
+        "run_shm_probes options include_shm=%d validation=%d atomic=%d tma=%d src=%d dst=%d",
+        static_cast<int>(options.include_shm_fallback),
+        static_cast<int>(options.run_validation_probes),
+        static_cast<int>(options.run_atomic_probes),
+        static_cast<int>(options.run_tma_probes),
+        link->src_device,
+        link->dst_device);
+
+    if (!options.include_shm_fallback ||
+        !options.run_validation_probes) {
+        TOPO_TRACE("SKIP run_shm_probes");
+        return;
+    }
+
+    TOPO_TRACE(
+        "before probe_shm_load_store %d -> %d",
+        link->src_device,
+        link->dst_device);
 
     link->shm_copy_probe =
         detail::probe_shm_load_store(
             link->src_device,
             link->dst_device);
 
+    TOPO_TRACE(
+        "after probe_shm_load_store attempted=%d passed=%d err=%s",
+        int(link->shm_copy_probe.attempted),
+        int(link->shm_copy_probe.passed),
+        link->shm_copy_probe.error);
+
     if (options.run_atomic_probes) {
+        TOPO_TRACE(
+            "before probe_shm_atomic_add_i32 %d -> %d",
+            link->src_device,
+            link->dst_device);
+
         link->shm_atomic32_probe =
             detail::probe_shm_atomic_add_i32(
                 link->src_device,
                 link->dst_device);
+
+        TOPO_TRACE(
+            "after probe_shm_atomic_add_i32 attempted=%d passed=%d err=%s",
+            int(link->shm_atomic32_probe.attempted),
+            int(link->shm_atomic32_probe.passed),
+            link->shm_atomic32_probe.error);
+    } else {
+        TOPO_TRACE("skip shm atomic32 probe by option");
     }
 
     if (options.run_tma_probes) {
+        TOPO_TRACE(
+            "before probe_shm_tma_load_f16 %d -> %d",
+            link->src_device,
+            link->dst_device);
+
         link->shm_tma_load_f16_probe =
             detail::probe_shm_tma_load_f16(
                 link->src_device,
                 link->dst_device);
+
+        TOPO_TRACE(
+            "after probe_shm_tma_load_f16 attempted=%d passed=%d err=%s",
+            int(link->shm_tma_load_f16_probe.attempted),
+            int(link->shm_tma_load_f16_probe.passed),
+            link->shm_tma_load_f16_probe.error);
+
+        TOPO_TRACE(
+            "before probe_shm_tma_store_f16 %d -> %d",
+            link->src_device,
+            link->dst_device);
 
         link->shm_tma_store_f16_probe =
             detail::probe_shm_tma_store_f16(
                 link->src_device,
                 link->dst_device);
 
+        TOPO_TRACE(
+            "after probe_shm_tma_store_f16 attempted=%d passed=%d err=%s",
+            int(link->shm_tma_store_f16_probe.attempted),
+            int(link->shm_tma_store_f16_probe.passed),
+            link->shm_tma_store_f16_probe.error);
+
+        TOPO_TRACE(
+            "before probe_shm_tma_reduce_f16 %d -> %d",
+            link->src_device,
+            link->dst_device);
+
         link->shm_tma_reduce_f16_probe =
             detail::probe_shm_tma_reduce_f16(
                 link->src_device,
                 link->dst_device);
+
+        TOPO_TRACE(
+            "after probe_shm_tma_reduce_f16 attempted=%d passed=%d err=%s",
+            int(link->shm_tma_reduce_f16_probe.attempted),
+            int(link->shm_tma_reduce_f16_probe.passed),
+            link->shm_tma_reduce_f16_probe.error);
+    } else {
+        TOPO_TRACE("skip shm tma probes by option");
     }
+
+    TOPO_TRACE("LEAVE run_shm_probes");
 }
 
 Link discover_link(
@@ -424,13 +642,27 @@ Link discover_link(
     int src_device,
     int dst_device,
     const DiscoverOptions& options) {
+    TOPO_TRACE(
+        "ENTER discover_link src_ord=%d dst_ord=%d src_dev=%d dst_dev=%d",
+        src_ordinal,
+        dst_ordinal,
+        src_device,
+        dst_device);
+
+    TOPO_TRACE("before Link link{}");
     Link link{};
+    TOPO_TRACE("after Link link{}");
+
     link.src_ordinal = src_ordinal;
     link.dst_ordinal = dst_ordinal;
     link.src_device = src_device;
     link.dst_device = dst_device;
 
+    TOPO_TRACE("after link field initialization src=%d dst=%d", src_device, dst_device);
+
     if (src_device == dst_device) {
+        TOPO_TRACE("self link begin src_dev=%d dst_dev=%d", src_device, dst_device);
+
         link.preferred_kind = LinkKind::Self;
         link.cuda_peer_access_supported = true;
         link.cuda_peer_access_enabled = true;
@@ -440,21 +672,31 @@ Link discover_link(
         link.performance_rank = 0;
         link.safe_for_tma_reduce = true;
         link.safe_for_direct_copy = true;
+
+        TOPO_TRACE("LEAVE discover_link self src=%d dst=%d", src_device, dst_device);
         return link;
     }
 
     int can_access = 0;
 
+    TOPO_TRACE("before cudaDeviceCanAccessPeer %d -> %d", src_device, dst_device);
     check_cuda(
         cudaDeviceCanAccessPeer(
             &can_access,
             src_device,
             dst_device),
         "cudaDeviceCanAccessPeer");
+    TOPO_TRACE(
+        "after cudaDeviceCanAccessPeer %d -> %d can_access=%d",
+        src_device,
+        dst_device,
+        can_access);
 
     link.cuda_peer_access_supported = (can_access != 0);
 
     if (!link.cuda_peer_access_supported) {
+        TOPO_TRACE("peer access unsupported %d -> %d", src_device, dst_device);
+
         link.preferred_kind = LinkKind::Unsupported;
 
         if (options.require_cuda_peer_access) {
@@ -468,44 +710,80 @@ Link discover_link(
     }
 
     if (link.cuda_peer_access_supported) {
+        TOPO_TRACE("before nativeAtomic attr %d -> %d", src_device, dst_device);
         link.native_atomic_supported =
             get_p2p_attr_or_default(
                 cudaDevP2PAttrNativeAtomicSupported,
                 src_device,
                 dst_device,
                 0) != 0;
+        TOPO_TRACE(
+            "after nativeAtomic attr %d -> %d nativeAtomic=%d",
+            src_device,
+            dst_device,
+            int(link.native_atomic_supported));
 
 #if defined(cudaDevP2PAttrOnlyPartialNativeAtomicSupported)
+        TOPO_TRACE("before partialAtomic attr %d -> %d", src_device, dst_device);
         link.partial_native_atomic_supported =
             get_p2p_attr_or_default(
                 cudaDevP2PAttrOnlyPartialNativeAtomicSupported,
                 src_device,
                 dst_device,
                 0) != 0;
+        TOPO_TRACE(
+            "after partialAtomic attr %d -> %d partialAtomic=%d",
+            src_device,
+            dst_device,
+            int(link.partial_native_atomic_supported));
+#else
+        TOPO_TRACE("partialAtomic attr not available at compile time");
 #endif
 
+        TOPO_TRACE("before perfRank attr %d -> %d", src_device, dst_device);
         link.performance_rank =
             get_p2p_attr_or_default(
                 cudaDevP2PAttrPerformanceRank,
                 src_device,
                 dst_device,
                 -1);
+        TOPO_TRACE(
+            "after perfRank attr %d -> %d perfRank=%d",
+            src_device,
+            dst_device,
+            link.performance_rank);
 
+        TOPO_TRACE("before arrayAccess attr %d -> %d", src_device, dst_device);
         link.cuda_array_peer_access_supported =
             get_p2p_attr_or_default(
                 cudaDevP2PAttrCudaArrayAccessSupported,
                 src_device,
                 dst_device,
                 0) != 0;
+        TOPO_TRACE(
+            "after arrayAccess attr %d -> %d arrayAccess=%d",
+            src_device,
+            dst_device,
+            int(link.cuda_array_peer_access_supported));
 
         if (options.enable_peer_access) {
+            TOPO_TRACE("before enable_peer_access_one_way %d -> %d", src_device, dst_device);
             link.cuda_peer_access_enabled =
                 enable_peer_access_one_way(
                     src_device,
                     dst_device);
+            TOPO_TRACE(
+                "after enable_peer_access_one_way %d -> %d enabled=%d",
+                src_device,
+                dst_device,
+                int(link.cuda_peer_access_enabled));
+        } else {
+            TOPO_TRACE("skip enable_peer_access_one_way by option %d -> %d", src_device, dst_device);
         }
 
+        TOPO_TRACE("before run_direct_probes %d -> %d", src_device, dst_device);
         run_direct_probes(&link, options);
+        TOPO_TRACE("after run_direct_probes %d -> %d", src_device, dst_device);
 
         const bool direct_copy_ok =
             options.run_validation_probes
@@ -516,6 +794,8 @@ Link discover_link(
                         ? link.cuda_peer_access_enabled
                         : true));
 
+        TOPO_TRACE("computed direct_copy_ok=%d %d -> %d", int(direct_copy_ok), src_device, dst_device);
+
         link.safe_for_direct_copy = direct_copy_ok;
 
         link.safe_for_tma_reduce =
@@ -523,13 +803,25 @@ Link discover_link(
                 ? link.direct_tma_reduce_f16_probe.passed
                 : (direct_copy_ok && link.native_atomic_supported);
 
+        TOPO_TRACE(
+            "computed safe flags directCopy=%d tmaReduce=%d %d -> %d",
+            int(link.safe_for_direct_copy),
+            int(link.safe_for_tma_reduce),
+            src_device,
+            dst_device);
+
+        TOPO_TRACE("before infer_direct_link_kind %d -> %d", src_device, dst_device);
         link.preferred_kind =
             infer_direct_link_kind(
                 link.cuda_peer_access_supported,
                 link.native_atomic_supported,
                 link.performance_rank);
+        TOPO_TRACE("after infer_direct_link_kind %d -> %d", src_device, dst_device);
 
+        TOPO_TRACE("before TransportInfo direct{} %d -> %d", src_device, dst_device);
         TransportInfo direct{};
+        TOPO_TRACE("after TransportInfo direct{} %d -> %d", src_device, dst_device);
+
         direct.kind =
             link.preferred_kind == LinkKind::Nvlink
                 ? TransportKind::DirectNvlink
@@ -540,6 +832,8 @@ Link discover_link(
         direct.tma_load_f16_probe = link.direct_tma_load_f16_probe;
         direct.tma_store_f16_probe = link.direct_tma_store_f16_probe;
         direct.tma_reduce_f16_probe = link.direct_tma_reduce_f16_probe;
+
+        TOPO_TRACE("before direct_atomic_capability_from_results %d -> %d", src_device, dst_device);
         direct.atomics =
             direct_atomic_capability_from_results(
                 direct_copy_ok,
@@ -549,17 +843,27 @@ Link discover_link(
                 link.direct_tma_load_f16_probe,
                 link.direct_tma_store_f16_probe,
                 link.direct_tma_reduce_f16_probe);
+        TOPO_TRACE("after direct_atomic_capability_from_results %d -> %d", src_device, dst_device);
+
         direct.performance_rank = link.performance_rank;
         direct.description =
             link.preferred_kind == LinkKind::Nvlink
                 ? "direct CUDA peer access, inferred NVLink-class link"
                 : "direct CUDA peer access over PCIe/SYS-class link";
 
+        TOPO_TRACE("before direct transport push %d -> %d", src_device, dst_device);
         link.transports.push_back(direct);
+        TOPO_TRACE(
+            "after direct transport push %d -> %d transports=%zu",
+            src_device,
+            dst_device,
+            link.transports.size());
     }
 
     if (options.include_shm_fallback) {
+        TOPO_TRACE("before run_shm_probes %d -> %d", src_device, dst_device);
         run_shm_probes(&link, options);
+        TOPO_TRACE("after run_shm_probes %d -> %d", src_device, dst_device);
 
         const bool shm_available =
             options.run_validation_probes
@@ -567,7 +871,12 @@ Link discover_link(
                    link.shm_copy_probe.passed)
                 : true;
 
+        TOPO_TRACE("computed shm_available=%d %d -> %d", int(shm_available), src_device, dst_device);
+
+        TOPO_TRACE("before TransportInfo shm{} %d -> %d", src_device, dst_device);
         TransportInfo shm{};
+        TOPO_TRACE("after TransportInfo shm{} %d -> %d", src_device, dst_device);
+
         shm.kind = TransportKind::Shm;
         shm.available = shm_available;
         shm.copy_probe = link.shm_copy_probe;
@@ -575,6 +884,8 @@ Link discover_link(
         shm.tma_load_f16_probe = link.shm_tma_load_f16_probe;
         shm.tma_store_f16_probe = link.shm_tma_store_f16_probe;
         shm.tma_reduce_f16_probe = link.shm_tma_reduce_f16_probe;
+
+        TOPO_TRACE("before shm_atomic_capability_from_results %d -> %d", src_device, dst_device);
         shm.atomics =
             shm_atomic_capability_from_results(
                 link.shm_copy_probe,
@@ -582,18 +893,34 @@ Link discover_link(
                 link.shm_tma_load_f16_probe,
                 link.shm_tma_store_f16_probe,
                 link.shm_tma_reduce_f16_probe);
+        TOPO_TRACE("after shm_atomic_capability_from_results %d -> %d", src_device, dst_device);
+
         shm.performance_rank = -1;
         shm.description =
             "host shared-memory fallback transport using cudaHostAllocMapped probe";
 
+        TOPO_TRACE("before shm transport push %d -> %d", src_device, dst_device);
         link.transports.push_back(shm);
+        TOPO_TRACE(
+            "after shm transport push %d -> %d transports=%zu",
+            src_device,
+            dst_device,
+            link.transports.size());
 
         if (link.preferred_kind == LinkKind::Unsupported ||
             link.preferred_kind == LinkKind::Unknown) {
             link.preferred_kind =
                 shm_available ? LinkKind::Shm : LinkKind::Unsupported;
         }
+    } else {
+        TOPO_TRACE("skip shm fallback by option %d -> %d", src_device, dst_device);
     }
+
+    TOPO_TRACE(
+        "LEAVE discover_link src_dev=%d dst_dev=%d transports=%zu",
+        src_device,
+        dst_device,
+        link.transports.size());
 
     return link;
 }
@@ -621,7 +948,7 @@ void append_probe_text(
 
     out << " " << name << "=" << (probe.passed ? 1 : 0);
 
-    if (!probe.passed && !probe.error.empty()) {
+    if (!probe.passed && probe.error[0] != '\0') {
         out << "(" << probe.error << ")";
     }
 }
@@ -745,8 +1072,14 @@ Topology discover_current_process_topology(
     const std::vector<int>& devices,
     const DiscoverOptions& options) {
     TOPO_TRACE(
-        "enter discover_current_process_topology num_devices=%zu",
-        devices.size());
+        "enter discover_current_process_topology num_devices=%zu options enable_peer=%d include_shm=%d require_peer=%d validation=%d tma=%d atomic=%d",
+        devices.size(),
+        int(options.enable_peer_access),
+        int(options.include_shm_fallback),
+        int(options.require_cuda_peer_access),
+        int(options.run_validation_probes),
+        int(options.run_tma_probes),
+        int(options.run_atomic_probes));
 
     if (devices.empty()) {
         throw std::invalid_argument("discover_current_process_topology: no devices");
@@ -799,9 +1132,10 @@ Topology discover_current_process_topology(
                 devices[i]));
 
         TOPO_TRACE(
-            "after discover_node ordinal=%zu device=%d",
+            "after discover_node ordinal=%zu device=%d nodes_size=%zu",
             i,
-            devices[i]);
+            devices[i],
+            topology.nodes.size());
     }
 
     TOPO_TRACE("reserve links");
@@ -816,20 +1150,31 @@ Topology discover_current_process_topology(
                 devices[i],
                 devices[j]);
 
-            topology.links.push_back(
+            Link link =
                 discover_link(
                     static_cast<int>(i),
                     static_cast<int>(j),
                     devices[i],
                     devices[j],
-                    options));
+                    options);
 
             TOPO_TRACE(
-                "after discover_link src_ord=%zu dst_ord=%zu src_dev=%d dst_dev=%d",
+                "after discover_link before push src_ord=%zu dst_ord=%zu src_dev=%d dst_dev=%d link_transports=%zu",
                 i,
                 j,
                 devices[i],
-                devices[j]);
+                devices[j],
+                link.transports.size());
+
+            topology.links.push_back(link);
+
+            TOPO_TRACE(
+                "after link push src_ord=%zu dst_ord=%zu src_dev=%d dst_dev=%d links_size=%zu",
+                i,
+                j,
+                devices[i],
+                devices[j],
+                topology.links.size());
         }
     }
 
@@ -843,7 +1188,14 @@ Topology discover_current_process_topology(
 
 Topology discover_all_cuda_devices_topology(
     const DiscoverOptions& options) {
-    TOPO_TRACE("enter discover_all_cuda_devices_topology");
+    TOPO_TRACE(
+        "enter discover_all_cuda_devices_topology options enable_peer=%d include_shm=%d require_peer=%d validation=%d tma=%d atomic=%d",
+        int(options.enable_peer_access),
+        int(options.include_shm_fallback),
+        int(options.require_cuda_peer_access),
+        int(options.run_validation_probes),
+        int(options.run_tma_probes),
+        int(options.run_atomic_probes));
 
     int device_count = 0;
 
@@ -872,12 +1224,19 @@ Topology discover_all_cuda_devices_topology(
 }
 
 std::string topology_to_string(const Topology& topology) {
+    TOPO_TRACE(
+        "enter topology_to_string nodes=%zu links=%zu",
+        topology.nodes.size(),
+        topology.links.size());
+
     std::ostringstream out;
 
     out << "ooverlap topology\n";
     out << "nodes:\n";
 
     for (const Node& node : topology.nodes) {
+        TOPO_TRACE("format node ordinal=%d device=%d", node.ordinal, node.device);
+
         out << "  ordinal=" << node.ordinal
             << " device=" << node.device
             << " name=\"" << node.name << "\""
@@ -890,6 +1249,12 @@ std::string topology_to_string(const Topology& topology) {
     out << "links:\n";
 
     for (const Link& link : topology.links) {
+        TOPO_TRACE(
+            "format link src=%d dst=%d transports=%zu",
+            link.src_device,
+            link.dst_device,
+            link.transports.size());
+
         if (link.src_ordinal == link.dst_ordinal) {
             continue;
         }
@@ -941,10 +1306,16 @@ std::string topology_to_string(const Topology& topology) {
         }
     }
 
+    TOPO_TRACE("leave topology_to_string");
     return out.str();
 }
 
 std::string topology_to_json(const Topology& topology) {
+    TOPO_TRACE(
+        "enter topology_to_json nodes=%zu links=%zu",
+        topology.nodes.size(),
+        topology.links.size());
+
     std::ostringstream out;
 
     out << "{";
@@ -1054,6 +1425,7 @@ std::string topology_to_json(const Topology& topology) {
     out << "]";
     out << "}";
 
+    TOPO_TRACE("leave topology_to_json");
     return out.str();
 }
 

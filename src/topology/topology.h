@@ -42,7 +42,7 @@ enum class AtomicOperationKind : int {
 struct ProbeResult {
     bool attempted = false;
     bool passed = false;
-    std::string error;
+    char error[256] = {};
 };
 
 struct AtomicCapability {
