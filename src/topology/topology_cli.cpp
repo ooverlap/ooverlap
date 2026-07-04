@@ -9,12 +9,14 @@ namespace {
 
 void usage(const char* argv0) {
     std::cerr
-        << "usage: " << argv0 << " [--json] [--no-enable-peer] [--no-shm] [--require-peer] [devices...]\n"
+        << "usage: " << argv0
+        << " [--json] [--no-enable-peer] [--no-shm] [--require-peer]"
+        << " [--no-probe] [--no-tma-probe] [--no-atomic-probe] [devices...]\n"
         << "\n"
         << "examples:\n"
         << "  " << argv0 << "\n"
         << "  " << argv0 << " --json 0 1 2 3\n"
-        << "  " << argv0 << " --no-enable-peer 0 2\n";
+        << "  " << argv0 << " --no-tma-probe 0 2\n";
 }
 
 } // namespace
@@ -26,6 +28,9 @@ int main(int argc, char** argv) {
     options.enable_peer_access = true;
     options.include_shm_fallback = true;
     options.require_cuda_peer_access = false;
+    options.run_validation_probes = true;
+    options.run_tma_probes = true;
+    options.run_atomic_probes = true;
 
     std::vector<int> devices;
 
@@ -49,6 +54,23 @@ int main(int argc, char** argv) {
 
         if (arg == "--require-peer") {
             options.require_cuda_peer_access = true;
+            continue;
+        }
+
+        if (arg == "--no-probe") {
+            options.run_validation_probes = false;
+            options.run_tma_probes = false;
+            options.run_atomic_probes = false;
+            continue;
+        }
+
+        if (arg == "--no-tma-probe") {
+            options.run_tma_probes = false;
+            continue;
+        }
+
+        if (arg == "--no-atomic-probe") {
+            options.run_atomic_probes = false;
             continue;
         }
 

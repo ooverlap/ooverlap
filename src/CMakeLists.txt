@@ -149,11 +149,16 @@ endif()
 
 add_library(ooverlap_topology STATIC
   ${OOVERLAP_SRC_DIR}/topology/topology.cpp
+  ${OOVERLAP_SRC_DIR}/topology/topology_probe.cu
 )
 
 add_library(ooverlap::topology ALIAS ooverlap_topology)
 
+ooverlap_force_sm90a(ooverlap_topology)
 ooverlap_enable_pic(ooverlap_topology)
+
+set_property(TARGET ooverlap_topology PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+set_property(TARGET ooverlap_topology PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 target_include_directories(ooverlap_topology
   PUBLIC
@@ -166,6 +171,9 @@ target_link_libraries(ooverlap_topology
   PUBLIC
     CUDA::cudart
 )
+
+ooverlap_link_cudadevrt(ooverlap_topology PRIVATE)
+
 
 add_library(ooverlap_system STATIC
   ${OOVERLAP_SRC_DIR}/system/broker.cpp

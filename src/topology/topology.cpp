@@ -1,13 +1,25 @@
 #include "topology/topology.h"
+#include "topology/topology_probe.h"
 
 #include <cuda_runtime.h>
 
-#include <cstdio>
 #include <algorithm>
+#include <cstdio>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#define TOPO_TRACE(fmt, ...)                                                   \
+    do {                                                                       \
+        std::fprintf(                                                          \
+            stderr,                                                            \
+            "[topo] %s:%d " fmt "\n",                                          \
+            __func__,                                                          \
+            __LINE__,                                                          \
+            ##__VA_ARGS__);                                                    \
+        std::fflush(stderr);                                                   \
+    } while (0)
 
 namespace ooverlap {
 namespace topology {
@@ -26,6 +38,7 @@ int get_device_attr_or_default(
     int device,
     int default_value = 0) {
     int value = default_value;
+
     cudaError_t err =
         cudaDeviceGetAttribute(
             &value,
@@ -46,6 +59,7 @@ int get_p2p_attr_or_default(
     int dst_device,
     int default_value = 0) {
     int value = default_value;
+
     cudaError_t err =
         cudaDeviceGetP2PAttribute(
             &value,
@@ -69,6 +83,7 @@ bool enable_peer_access_one_way(
     }
 
     int can_access = 0;
+
     check_cuda(
         cudaDeviceCanAccessPeer(
             &can_access,
@@ -166,56 +181,92 @@ std::string escape_json(const std::string& value) {
     return out.str();
 }
 
-AtomicCapability direct_atomic_capability_from_p2p(
-    bool peer_access_supported,
-    bool native_atomic_supported) {
+const char* bool_text(bool value) {
+    return value ? "true" : "false";
+}
+
+ProbeResult not_attempted_result() {
+    return ProbeResult{};
+}
+
+AtomicCapability direct_atomic_capability_from_results(
+    bool direct_copy_ok,
+    bool native_atomic_supported,
+    bool partial_native_atomic_supported,
+    const ProbeResult& atomic32_probe,
+    const ProbeResult& tma_load_probe,
+    const ProbeResult& tma_store_probe,
+    const ProbeResult& tma_reduce_probe) {
     AtomicCapability caps{};
 
-    caps.signal32 = peer_access_supported;
-    caps.global_load_store = peer_access_supported;
+    caps.signal32 = direct_copy_ok;
+    caps.global_load_store = direct_copy_ok;
 
-    if (peer_access_supported && native_atomic_supported) {
-        caps.global_atomic_32 = true;
-        caps.global_atomic_64 = true;
-        caps.global_atomic_f32 = true;
-        caps.global_atomic_f16 = false;
-        caps.tma_reduce_f16 = true;
-        caps.tma_reduce_bf16 = true;
-        caps.tma_reduce_f32 = true;
-    }
+    /*
+     * Attribute says all native atomics, or partial native atomics. The actual
+     * atomic32 probe decides the 32-bit flag when it was attempted.
+     */
+    caps.global_atomic_32 =
+        atomic32_probe.attempted
+            ? atomic32_probe.passed
+            : (direct_copy_ok &&
+               (native_atomic_supported || partial_native_atomic_supported));
+
+    caps.global_atomic_64 =
+        direct_copy_ok && native_atomic_supported;
+
+    caps.global_atomic_f32 =
+        direct_copy_ok && native_atomic_supported;
+
+    caps.global_atomic_f16 = false;
+
+    caps.tma_load_f16 =
+        tma_load_probe.attempted && tma_load_probe.passed;
+
+    caps.tma_store_f16 =
+        tma_store_probe.attempted && tma_store_probe.passed;
+
+    caps.tma_reduce_f16 =
+        tma_reduce_probe.attempted && tma_reduce_probe.passed;
+
+    /*
+     * These are not probed in this first pass. Keep false until a BF16/F32
+     * probe is added.
+     */
+    caps.tma_reduce_bf16 = false;
+    caps.tma_reduce_f32 = false;
 
     return caps;
 }
 
-AtomicCapability shm_atomic_capability_for_device_pair(
-    int src_device,
-    int dst_device) {
+AtomicCapability shm_atomic_capability_from_results(
+    const ProbeResult& copy_probe,
+    const ProbeResult& atomic32_probe,
+    const ProbeResult& tma_load_probe,
+    const ProbeResult& tma_store_probe,
+    const ProbeResult& tma_reduce_probe) {
     AtomicCapability caps{};
 
-    caps.signal32 = true;
-    caps.global_load_store = true;
+    const bool copy_ok =
+        copy_probe.attempted && copy_probe.passed;
 
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 8000
-    const int src_host_native_atomic =
-        get_device_attr_or_default(
-            cudaDevAttrHostNativeAtomicSupported,
-            src_device,
-            0);
+    caps.signal32 = copy_ok;
+    caps.global_load_store = copy_ok;
+    caps.global_atomic_32 =
+        atomic32_probe.attempted && atomic32_probe.passed;
+    caps.global_atomic_64 = false;
+    caps.global_atomic_f32 = false;
+    caps.global_atomic_f16 = false;
 
-    const int dst_host_native_atomic =
-        get_device_attr_or_default(
-            cudaDevAttrHostNativeAtomicSupported,
-            dst_device,
-            0);
+    caps.tma_load_f16 =
+        tma_load_probe.attempted && tma_load_probe.passed;
+    caps.tma_store_f16 =
+        tma_store_probe.attempted && tma_store_probe.passed;
+    caps.tma_reduce_f16 =
+        tma_reduce_probe.attempted && tma_reduce_probe.passed;
 
-    if (src_host_native_atomic && dst_host_native_atomic) {
-        caps.global_atomic_32 = true;
-        caps.global_atomic_64 = true;
-    }
-#else
-    (void)src_device;
-    (void)dst_device;
-#endif
+    caps.tma_reduce_bf16 = false;
+    caps.tma_reduce_f32 = false;
 
     return caps;
 }
@@ -228,13 +279,6 @@ LinkKind infer_direct_link_kind(
         return LinkKind::Unsupported;
     }
 
-    /*
-     * CUDA runtime does not expose "NVLink vs SYS/PCIe" directly.
-     *
-     * On the Hopper systems we are targeting, NVLink island pairs report
-     * native peer atomics and best performance rank, while SYS/PCIe pairs can
-     * still report access=1 but nativeAtomic=0/perfRank=1.
-     */
     if (native_atomic_supported && performance_rank == 0) {
         return LinkKind::Nvlink;
     }
@@ -245,12 +289,17 @@ LinkKind infer_direct_link_kind(
 Node discover_node(
     int ordinal,
     int device) {
+    TOPO_TRACE("enter discover_node ordinal=%d device=%d", ordinal, device);
+
     cudaDeviceProp prop{};
+
+    TOPO_TRACE("before cudaGetDeviceProperties device=%d", device);
     check_cuda(
         cudaGetDeviceProperties(
             &prop,
             device),
         "cudaGetDeviceProperties");
+    TOPO_TRACE("after cudaGetDeviceProperties device=%d name=%s", device, prop.name);
 
     Node node{};
     node.ordinal = ordinal;
@@ -263,11 +312,14 @@ Node discover_node(
     node.pci_device_id = prop.pciDeviceID;
 
     char pci_bus_id[64] = {};
+
+    TOPO_TRACE("before cudaDeviceGetPCIBusId device=%d", device);
     cudaError_t bus_err =
         cudaDeviceGetPCIBusId(
             pci_bus_id,
             static_cast<int>(sizeof(pci_bus_id)),
             device);
+    TOPO_TRACE("after cudaDeviceGetPCIBusId device=%d err=%d", device, int(bus_err));
 
     if (bus_err == cudaSuccess) {
         node.pci_bus_id_string = pci_bus_id;
@@ -275,13 +327,95 @@ Node discover_node(
         (void)cudaGetLastError();
     }
 
+    TOPO_TRACE("before query_numa_node_from_pci device=%d", device);
     node.numa_node =
         query_numa_node_from_pci(
             node.pci_domain_id,
             node.pci_bus_id,
             node.pci_device_id);
+    TOPO_TRACE("after query_numa_node_from_pci device=%d numa=%d", device, node.numa_node);
 
+    TOPO_TRACE("leave discover_node ordinal=%d device=%d", ordinal, device);
     return node;
+}
+
+void run_direct_probes(
+    Link* link,
+    const DiscoverOptions& options) {
+    if (link == nullptr ||
+        !options.run_validation_probes ||
+        !link->cuda_peer_access_supported ||
+        (options.enable_peer_access && !link->cuda_peer_access_enabled)) {
+        return;
+    }
+
+    link->direct_copy_probe =
+        detail::probe_direct_load_store(
+            link->src_device,
+            link->dst_device);
+
+    if (options.run_atomic_probes) {
+        link->direct_atomic32_probe =
+            detail::probe_direct_atomic_add_i32(
+                link->src_device,
+                link->dst_device);
+    }
+
+    if (options.run_tma_probes) {
+        link->direct_tma_load_f16_probe =
+            detail::probe_direct_tma_load_f16(
+                link->src_device,
+                link->dst_device);
+
+        link->direct_tma_store_f16_probe =
+            detail::probe_direct_tma_store_f16(
+                link->src_device,
+                link->dst_device);
+
+        link->direct_tma_reduce_f16_probe =
+            detail::probe_direct_tma_reduce_f16(
+                link->src_device,
+                link->dst_device);
+    }
+}
+
+void run_shm_probes(
+    Link* link,
+    const DiscoverOptions& options) {
+    if (link == nullptr ||
+        !options.include_shm_fallback ||
+        !options.run_validation_probes) {
+        return;
+    }
+
+    link->shm_copy_probe =
+        detail::probe_shm_load_store(
+            link->src_device,
+            link->dst_device);
+
+    if (options.run_atomic_probes) {
+        link->shm_atomic32_probe =
+            detail::probe_shm_atomic_add_i32(
+                link->src_device,
+                link->dst_device);
+    }
+
+    if (options.run_tma_probes) {
+        link->shm_tma_load_f16_probe =
+            detail::probe_shm_tma_load_f16(
+                link->src_device,
+                link->dst_device);
+
+        link->shm_tma_store_f16_probe =
+            detail::probe_shm_tma_store_f16(
+                link->src_device,
+                link->dst_device);
+
+        link->shm_tma_reduce_f16_probe =
+            detail::probe_shm_tma_reduce_f16(
+                link->src_device,
+                link->dst_device);
+    }
 }
 
 Link discover_link(
@@ -302,6 +436,7 @@ Link discover_link(
         link.cuda_peer_access_enabled = true;
         link.cuda_array_peer_access_supported = true;
         link.native_atomic_supported = true;
+        link.partial_native_atomic_supported = true;
         link.performance_rank = 0;
         link.safe_for_tma_reduce = true;
         link.safe_for_direct_copy = true;
@@ -309,6 +444,7 @@ Link discover_link(
     }
 
     int can_access = 0;
+
     check_cuda(
         cudaDeviceCanAccessPeer(
             &can_access,
@@ -339,6 +475,15 @@ Link discover_link(
                 dst_device,
                 0) != 0;
 
+#if defined(cudaDevP2PAttrOnlyPartialNativeAtomicSupported)
+        link.partial_native_atomic_supported =
+            get_p2p_attr_or_default(
+                cudaDevP2PAttrOnlyPartialNativeAtomicSupported,
+                src_device,
+                dst_device,
+                0) != 0;
+#endif
+
         link.performance_rank =
             get_p2p_attr_or_default(
                 cudaDevP2PAttrPerformanceRank,
@@ -353,20 +498,30 @@ Link discover_link(
                 dst_device,
                 0) != 0;
 
-        if (options.enable_peer_access && link.cuda_peer_access_supported) {
+        if (options.enable_peer_access) {
             link.cuda_peer_access_enabled =
                 enable_peer_access_one_way(
                     src_device,
                     dst_device);
         }
 
-        link.safe_for_direct_copy =
-            link.cuda_peer_access_supported &&
-            (options.enable_peer_access ? link.cuda_peer_access_enabled : true);
+        run_direct_probes(&link, options);
+
+        const bool direct_copy_ok =
+            options.run_validation_probes
+                ? (link.direct_copy_probe.attempted &&
+                   link.direct_copy_probe.passed)
+                : (link.cuda_peer_access_supported &&
+                   (options.enable_peer_access
+                        ? link.cuda_peer_access_enabled
+                        : true));
+
+        link.safe_for_direct_copy = direct_copy_ok;
 
         link.safe_for_tma_reduce =
-            link.safe_for_direct_copy &&
-            link.native_atomic_supported;
+            link.direct_tma_reduce_f16_probe.attempted
+                ? link.direct_tma_reduce_f16_probe.passed
+                : (direct_copy_ok && link.native_atomic_supported);
 
         link.preferred_kind =
             infer_direct_link_kind(
@@ -379,11 +534,21 @@ Link discover_link(
             link.preferred_kind == LinkKind::Nvlink
                 ? TransportKind::DirectNvlink
                 : TransportKind::DirectPcie;
-        direct.available = link.safe_for_direct_copy;
+        direct.available = direct_copy_ok;
+        direct.copy_probe = link.direct_copy_probe;
+        direct.atomic32_probe = link.direct_atomic32_probe;
+        direct.tma_load_f16_probe = link.direct_tma_load_f16_probe;
+        direct.tma_store_f16_probe = link.direct_tma_store_f16_probe;
+        direct.tma_reduce_f16_probe = link.direct_tma_reduce_f16_probe;
         direct.atomics =
-            direct_atomic_capability_from_p2p(
-                link.safe_for_direct_copy,
-                link.native_atomic_supported);
+            direct_atomic_capability_from_results(
+                direct_copy_ok,
+                link.native_atomic_supported,
+                link.partial_native_atomic_supported,
+                link.direct_atomic32_probe,
+                link.direct_tma_load_f16_probe,
+                link.direct_tma_store_f16_probe,
+                link.direct_tma_reduce_f16_probe);
         direct.performance_rank = link.performance_rank;
         direct.description =
             link.preferred_kind == LinkKind::Nvlink
@@ -394,22 +559,39 @@ Link discover_link(
     }
 
     if (options.include_shm_fallback) {
+        run_shm_probes(&link, options);
+
+        const bool shm_available =
+            options.run_validation_probes
+                ? (link.shm_copy_probe.attempted &&
+                   link.shm_copy_probe.passed)
+                : true;
+
         TransportInfo shm{};
         shm.kind = TransportKind::Shm;
-        shm.available = true;
+        shm.available = shm_available;
+        shm.copy_probe = link.shm_copy_probe;
+        shm.atomic32_probe = link.shm_atomic32_probe;
+        shm.tma_load_f16_probe = link.shm_tma_load_f16_probe;
+        shm.tma_store_f16_probe = link.shm_tma_store_f16_probe;
+        shm.tma_reduce_f16_probe = link.shm_tma_reduce_f16_probe;
         shm.atomics =
-            shm_atomic_capability_for_device_pair(
-                src_device,
-                dst_device);
+            shm_atomic_capability_from_results(
+                link.shm_copy_probe,
+                link.shm_atomic32_probe,
+                link.shm_tma_load_f16_probe,
+                link.shm_tma_store_f16_probe,
+                link.shm_tma_reduce_f16_probe);
         shm.performance_rank = -1;
         shm.description =
-            "host shared-memory fallback transport; no CUDA bandwidth estimate";
+            "host shared-memory fallback transport using cudaHostAllocMapped probe";
 
         link.transports.push_back(shm);
 
         if (link.preferred_kind == LinkKind::Unsupported ||
             link.preferred_kind == LinkKind::Unknown) {
-            link.preferred_kind = LinkKind::Shm;
+            link.preferred_kind =
+                shm_available ? LinkKind::Shm : LinkKind::Unsupported;
         }
     }
 
@@ -426,6 +608,38 @@ const TransportInfo* find_transport(
     }
 
     return nullptr;
+}
+
+void append_probe_text(
+    std::ostringstream& out,
+    const char* name,
+    const ProbeResult& probe) {
+    if (!probe.attempted) {
+        out << " " << name << "=na";
+        return;
+    }
+
+    out << " " << name << "=" << (probe.passed ? 1 : 0);
+
+    if (!probe.passed && !probe.error.empty()) {
+        out << "(" << probe.error << ")";
+    }
+}
+
+void append_probe_json(
+    std::ostringstream& out,
+    const char* name,
+    const ProbeResult& probe,
+    bool leading_comma = true) {
+    if (leading_comma) {
+        out << ",";
+    }
+
+    out << "\"" << name << "\":{"
+        << "\"attempted\":" << bool_text(probe.attempted) << ","
+        << "\"passed\":" << bool_text(probe.passed) << ","
+        << "\"error\":\"" << escape_json(probe.error) << "\""
+        << "}";
 }
 
 } // namespace
@@ -512,6 +726,10 @@ bool link_supports_atomic_operation(
             return caps.global_atomic_f32;
         case AtomicOperationKind::GlobalAtomicF16:
             return caps.global_atomic_f16;
+        case AtomicOperationKind::TmaLoadF16:
+            return caps.tma_load_f16;
+        case AtomicOperationKind::TmaStoreF16:
+            return caps.tma_store_f16;
         case AtomicOperationKind::TmaReduceF16:
             return caps.tma_reduce_f16;
         case AtomicOperationKind::TmaReduceBf16:
@@ -526,44 +744,78 @@ bool link_supports_atomic_operation(
 Topology discover_current_process_topology(
     const std::vector<int>& devices,
     const DiscoverOptions& options) {
+    TOPO_TRACE(
+        "enter discover_current_process_topology num_devices=%zu",
+        devices.size());
+
     if (devices.empty()) {
         throw std::invalid_argument("discover_current_process_topology: no devices");
     }
 
     int device_count = 0;
+
+    TOPO_TRACE("before cudaGetDeviceCount");
     check_cuda(
         cudaGetDeviceCount(&device_count),
         "cudaGetDeviceCount");
+    TOPO_TRACE("after cudaGetDeviceCount device_count=%d", device_count);
 
     for (int device : devices) {
+        TOPO_TRACE("validate device=%d", device);
+
         if (device < 0 || device >= device_count) {
             std::ostringstream oss;
             oss << "invalid CUDA device ordinal " << device;
             throw std::invalid_argument(oss.str());
         }
 
+        TOPO_TRACE("before cudaSetDevice device=%d", device);
         check_cuda(
             cudaSetDevice(device),
             "cudaSetDevice");
+        TOPO_TRACE("after cudaSetDevice device=%d", device);
+
+        TOPO_TRACE("before cudaFree(nullptr) device=%d", device);
         check_cuda(
             cudaFree(nullptr),
             "cudaFree(nullptr)");
+        TOPO_TRACE("after cudaFree(nullptr) device=%d", device);
     }
 
     Topology topology{};
 
+    TOPO_TRACE("reserve nodes");
     topology.nodes.reserve(devices.size());
+
     for (size_t i = 0; i < devices.size(); ++i) {
+        TOPO_TRACE(
+            "before discover_node ordinal=%zu device=%d",
+            i,
+            devices[i]);
+
         topology.nodes.push_back(
             discover_node(
                 static_cast<int>(i),
                 devices[i]));
+
+        TOPO_TRACE(
+            "after discover_node ordinal=%zu device=%d",
+            i,
+            devices[i]);
     }
 
+    TOPO_TRACE("reserve links");
     topology.links.reserve(devices.size() * devices.size());
 
     for (size_t i = 0; i < devices.size(); ++i) {
         for (size_t j = 0; j < devices.size(); ++j) {
+            TOPO_TRACE(
+                "before discover_link src_ord=%zu dst_ord=%zu src_dev=%d dst_dev=%d",
+                i,
+                j,
+                devices[i],
+                devices[j]);
+
             topology.links.push_back(
                 discover_link(
                     static_cast<int>(i),
@@ -571,29 +823,52 @@ Topology discover_current_process_topology(
                     devices[i],
                     devices[j],
                     options));
+
+            TOPO_TRACE(
+                "after discover_link src_ord=%zu dst_ord=%zu src_dev=%d dst_dev=%d",
+                i,
+                j,
+                devices[i],
+                devices[j]);
         }
     }
+
+    TOPO_TRACE(
+        "return topology nodes=%zu links=%zu",
+        topology.nodes.size(),
+        topology.links.size());
 
     return topology;
 }
 
 Topology discover_all_cuda_devices_topology(
     const DiscoverOptions& options) {
+    TOPO_TRACE("enter discover_all_cuda_devices_topology");
+
     int device_count = 0;
+
+    TOPO_TRACE("before cudaGetDeviceCount");
     check_cuda(
         cudaGetDeviceCount(&device_count),
         "cudaGetDeviceCount");
+    TOPO_TRACE("after cudaGetDeviceCount device_count=%d", device_count);
 
     std::vector<int> devices;
     devices.reserve(static_cast<size_t>(device_count));
 
     for (int device = 0; device < device_count; ++device) {
+        TOPO_TRACE("push device=%d", device);
         devices.push_back(device);
     }
 
-    return discover_current_process_topology(
-        devices,
-        options);
+    TOPO_TRACE("before discover_current_process_topology");
+    Topology topo =
+        discover_current_process_topology(
+            devices,
+            options);
+    TOPO_TRACE("after discover_current_process_topology");
+
+    return topo;
 }
 
 std::string topology_to_string(const Topology& topology) {
@@ -625,11 +900,19 @@ std::string topology_to_string(const Topology& topology) {
             << " access=" << (link.cuda_peer_access_supported ? 1 : 0)
             << " enabled=" << (link.cuda_peer_access_enabled ? 1 : 0)
             << " nativeAtomic=" << (link.native_atomic_supported ? 1 : 0)
+            << " partialAtomic=" << (link.partial_native_atomic_supported ? 1 : 0)
             << " perfRank=" << link.performance_rank
             << " arrayAccess=" << (link.cuda_array_peer_access_supported ? 1 : 0)
             << " directCopy=" << (link.safe_for_direct_copy ? 1 : 0)
-            << " tmaReduce=" << (link.safe_for_tma_reduce ? 1 : 0)
-            << "\n";
+            << " tmaReduce=" << (link.safe_for_tma_reduce ? 1 : 0);
+
+        append_probe_text(out, "directProbe", link.direct_copy_probe);
+        append_probe_text(out, "directAtomic32Probe", link.direct_atomic32_probe);
+        append_probe_text(out, "directTmaLoadF16Probe", link.direct_tma_load_f16_probe);
+        append_probe_text(out, "directTmaStoreF16Probe", link.direct_tma_store_f16_probe);
+        append_probe_text(out, "directTmaReduceF16Probe", link.direct_tma_reduce_f16_probe);
+
+        out << "\n";
 
         for (const TransportInfo& transport : link.transports) {
             out << "    transport=" << transport_kind_name(transport.kind)
@@ -640,12 +923,21 @@ std::string topology_to_string(const Topology& topology) {
                 << " atomic64=" << (transport.atomics.global_atomic_64 ? 1 : 0)
                 << " atomicF32=" << (transport.atomics.global_atomic_f32 ? 1 : 0)
                 << " atomicF16=" << (transport.atomics.global_atomic_f16 ? 1 : 0)
+                << " tmaLoadF16=" << (transport.atomics.tma_load_f16 ? 1 : 0)
+                << " tmaStoreF16=" << (transport.atomics.tma_store_f16 ? 1 : 0)
                 << " tmaF16=" << (transport.atomics.tma_reduce_f16 ? 1 : 0)
                 << " tmaBf16=" << (transport.atomics.tma_reduce_bf16 ? 1 : 0)
                 << " tmaF32=" << (transport.atomics.tma_reduce_f32 ? 1 : 0)
                 << " perfRank=" << transport.performance_rank
-                << " estGBps=" << transport.estimated_bandwidth_gbps
-                << "\n";
+                << " estGBps=" << transport.estimated_bandwidth_gbps;
+
+            append_probe_text(out, "copyProbe", transport.copy_probe);
+            append_probe_text(out, "atomic32Probe", transport.atomic32_probe);
+            append_probe_text(out, "tmaLoadF16Probe", transport.tma_load_f16_probe);
+            append_probe_text(out, "tmaStoreF16Probe", transport.tma_store_f16_probe);
+            append_probe_text(out, "tmaReduceF16Probe", transport.tma_reduce_f16_probe);
+
+            out << "\n";
         }
     }
 
@@ -668,13 +960,13 @@ std::string topology_to_json(const Topology& topology) {
         out << "{"
             << "\"ordinal\":" << node.ordinal << ","
             << "\"device\":" << node.device << ","
-            << "\"name\":\"" << escape_json(node.name) << "\"," 
+            << "\"name\":\"" << escape_json(node.name) << "\","
             << "\"compute_major\":" << node.compute_major << ","
             << "\"compute_minor\":" << node.compute_minor << ","
             << "\"pci_domain_id\":" << node.pci_domain_id << ","
             << "\"pci_bus_id\":" << node.pci_bus_id << ","
             << "\"pci_device_id\":" << node.pci_device_id << ","
-            << "\"pci_bus_id_string\":\"" << escape_json(node.pci_bus_id_string) << "\"," 
+            << "\"pci_bus_id_string\":\"" << escape_json(node.pci_bus_id_string) << "\","
             << "\"numa_node\":" << node.numa_node
             << "}";
     }
@@ -694,15 +986,28 @@ std::string topology_to_json(const Topology& topology) {
             << "\"dst_ordinal\":" << link.dst_ordinal << ","
             << "\"src_device\":" << link.src_device << ","
             << "\"dst_device\":" << link.dst_device << ","
-            << "\"preferred_kind\":\"" << link_kind_name(link.preferred_kind) << "\"," 
-            << "\"cuda_peer_access_supported\":" << (link.cuda_peer_access_supported ? "true" : "false") << ","
-            << "\"cuda_peer_access_enabled\":" << (link.cuda_peer_access_enabled ? "true" : "false") << ","
-            << "\"cuda_array_peer_access_supported\":" << (link.cuda_array_peer_access_supported ? "true" : "false") << ","
-            << "\"native_atomic_supported\":" << (link.native_atomic_supported ? "true" : "false") << ","
+            << "\"preferred_kind\":\"" << link_kind_name(link.preferred_kind) << "\","
+            << "\"cuda_peer_access_supported\":" << bool_text(link.cuda_peer_access_supported) << ","
+            << "\"cuda_peer_access_enabled\":" << bool_text(link.cuda_peer_access_enabled) << ","
+            << "\"cuda_array_peer_access_supported\":" << bool_text(link.cuda_array_peer_access_supported) << ","
+            << "\"native_atomic_supported\":" << bool_text(link.native_atomic_supported) << ","
+            << "\"partial_native_atomic_supported\":" << bool_text(link.partial_native_atomic_supported) << ","
             << "\"performance_rank\":" << link.performance_rank << ","
-            << "\"safe_for_tma_reduce\":" << (link.safe_for_tma_reduce ? "true" : "false") << ","
-            << "\"safe_for_direct_copy\":" << (link.safe_for_direct_copy ? "true" : "false") << ","
-            << "\"transports\":[";
+            << "\"safe_for_tma_reduce\":" << bool_text(link.safe_for_tma_reduce) << ","
+            << "\"safe_for_direct_copy\":" << bool_text(link.safe_for_direct_copy);
+
+        append_probe_json(out, "direct_copy_probe", link.direct_copy_probe);
+        append_probe_json(out, "direct_atomic32_probe", link.direct_atomic32_probe);
+        append_probe_json(out, "direct_tma_load_f16_probe", link.direct_tma_load_f16_probe);
+        append_probe_json(out, "direct_tma_store_f16_probe", link.direct_tma_store_f16_probe);
+        append_probe_json(out, "direct_tma_reduce_f16_probe", link.direct_tma_reduce_f16_probe);
+        append_probe_json(out, "shm_copy_probe", link.shm_copy_probe);
+        append_probe_json(out, "shm_atomic32_probe", link.shm_atomic32_probe);
+        append_probe_json(out, "shm_tma_load_f16_probe", link.shm_tma_load_f16_probe);
+        append_probe_json(out, "shm_tma_store_f16_probe", link.shm_tma_store_f16_probe);
+        append_probe_json(out, "shm_tma_reduce_f16_probe", link.shm_tma_reduce_f16_probe);
+
+        out << ",\"transports\":[";
 
         for (size_t t = 0; t < link.transports.size(); ++t) {
             const TransportInfo& transport = link.transports[t];
@@ -714,23 +1019,32 @@ std::string topology_to_json(const Topology& topology) {
             const AtomicCapability& a = transport.atomics;
 
             out << "{"
-                << "\"kind\":\"" << transport_kind_name(transport.kind) << "\"," 
-                << "\"available\":" << (transport.available ? "true" : "false") << ","
+                << "\"kind\":\"" << transport_kind_name(transport.kind) << "\","
+                << "\"available\":" << bool_text(transport.available) << ","
                 << "\"performance_rank\":" << transport.performance_rank << ","
                 << "\"estimated_bandwidth_gbps\":" << transport.estimated_bandwidth_gbps << ","
-                << "\"description\":\"" << escape_json(transport.description) << "\"," 
+                << "\"description\":\"" << escape_json(transport.description) << "\","
                 << "\"atomics\":{"
-                << "\"signal32\":" << (a.signal32 ? "true" : "false") << ","
-                << "\"global_load_store\":" << (a.global_load_store ? "true" : "false") << ","
-                << "\"global_atomic_32\":" << (a.global_atomic_32 ? "true" : "false") << ","
-                << "\"global_atomic_64\":" << (a.global_atomic_64 ? "true" : "false") << ","
-                << "\"global_atomic_f32\":" << (a.global_atomic_f32 ? "true" : "false") << ","
-                << "\"global_atomic_f16\":" << (a.global_atomic_f16 ? "true" : "false") << ","
-                << "\"tma_reduce_f16\":" << (a.tma_reduce_f16 ? "true" : "false") << ","
-                << "\"tma_reduce_bf16\":" << (a.tma_reduce_bf16 ? "true" : "false") << ","
-                << "\"tma_reduce_f32\":" << (a.tma_reduce_f32 ? "true" : "false")
-                << "}"
+                << "\"signal32\":" << bool_text(a.signal32) << ","
+                << "\"global_load_store\":" << bool_text(a.global_load_store) << ","
+                << "\"global_atomic_32\":" << bool_text(a.global_atomic_32) << ","
+                << "\"global_atomic_64\":" << bool_text(a.global_atomic_64) << ","
+                << "\"global_atomic_f32\":" << bool_text(a.global_atomic_f32) << ","
+                << "\"global_atomic_f16\":" << bool_text(a.global_atomic_f16) << ","
+                << "\"tma_load_f16\":" << bool_text(a.tma_load_f16) << ","
+                << "\"tma_store_f16\":" << bool_text(a.tma_store_f16) << ","
+                << "\"tma_reduce_f16\":" << bool_text(a.tma_reduce_f16) << ","
+                << "\"tma_reduce_bf16\":" << bool_text(a.tma_reduce_bf16) << ","
+                << "\"tma_reduce_f32\":" << bool_text(a.tma_reduce_f32)
                 << "}";
+
+            append_probe_json(out, "copy_probe", transport.copy_probe);
+            append_probe_json(out, "atomic32_probe", transport.atomic32_probe);
+            append_probe_json(out, "tma_load_f16_probe", transport.tma_load_f16_probe);
+            append_probe_json(out, "tma_store_f16_probe", transport.tma_store_f16_probe);
+            append_probe_json(out, "tma_reduce_f16_probe", transport.tma_reduce_f16_probe);
+
+            out << "}";
         }
 
         out << "]"
