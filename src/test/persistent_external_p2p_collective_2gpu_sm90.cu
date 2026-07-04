@@ -19,7 +19,7 @@
 #include <string>
 
 #ifndef OOVERLAP_BENCH_VERIFY_RESULTS
-#define OOVERLAP_BENCH_VERIFY_RESULTS 0
+#define OOVERLAP_BENCH_VERIFY_RESULTS 1
 #endif
 
 namespace ooverlap {

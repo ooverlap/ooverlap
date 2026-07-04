@@ -147,6 +147,26 @@ endif()
 # System utilities
 # -------------------------
 
+add_library(ooverlap_topology STATIC
+  ${OOVERLAP_SRC_DIR}/topology/topology.cpp
+)
+
+add_library(ooverlap::topology ALIAS ooverlap_topology)
+
+ooverlap_enable_pic(ooverlap_topology)
+
+target_include_directories(ooverlap_topology
+  PUBLIC
+    $<BUILD_INTERFACE:${OOVERLAP_SRC_DIR}>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(ooverlap_topology
+  PUBLIC
+    CUDA::cudart
+)
+
 add_library(ooverlap_system STATIC
   ${OOVERLAP_SRC_DIR}/system/broker.cpp
 )
@@ -206,6 +226,7 @@ if(OOVERLAP_NEED_CORE)
   target_link_libraries(ooverlap_comm
     PUBLIC
       ooverlap_system
+      ooverlap_topology
       CUDA::cudart
     PRIVATE
       CUDA::cuda_driver
@@ -426,6 +447,23 @@ if(OOVERLAP_BUILD_PYTHON)
     NCCL::NCCL
   )
 endif()
+
+# -------------------------
+# Cli for topology
+# -------------------------
+add_executable(ooverlap_topology_cli
+  ${OOVERLAP_SRC_DIR}/topology/topology_cli.cpp
+)
+
+target_include_directories(ooverlap_topology_cli PRIVATE
+  ${OOVERLAP_SRC_DIR}
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(ooverlap_topology_cli PRIVATE
+  ooverlap_topology
+  CUDA::cudart
+)
 
 # -------------------------
 # Python extension module
