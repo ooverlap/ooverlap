@@ -4,6 +4,7 @@
 #include "ooverlap/system/p2p.cuh"
 
 #include "comm/utils/collective_utils.h"
+#include "topology/topology.h"
 
 #include <cuda_runtime.h>
 
@@ -75,6 +76,40 @@ std::vector<int> devices_vector(const int* devices, int num_devices) {
     }
 
     return out;
+}
+
+oo_status_t initialize_group_topology(
+    oo_group_t* group,
+    bool enable_peer_access_in_discovery,
+    bool run_validation_probes,
+    bool run_tma_probes) {
+    if (group == nullptr || !valid_group_size(group->num_devices)) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    try {
+        ooverlap::topology::DiscoverOptions options{};
+        options.enable_peer_access = enable_peer_access_in_discovery;
+        options.include_shm_fallback = true;
+        options.require_cuda_peer_access = false;
+        options.run_validation_probes = run_validation_probes;
+        options.run_tma_probes = run_tma_probes;
+        options.run_atomic_probes = run_validation_probes;
+
+        group->topology =
+            ooverlap::topology::discover_current_process_topology(
+                devices_vector(
+                    group->devices,
+                    group->num_devices),
+                options);
+
+        group->topology_valid = true;
+        return OO_SUCCESS;
+    } catch (...) {
+        group->topology_valid = false;
+        group->topology = ooverlap::topology::Topology{};
+        return ooverlap::comm::api::exception_to_status();
+    }
 }
 
 void clear_ready_signal(oo_ready_signal& slot) {
@@ -365,7 +400,23 @@ oo_status_t oo_group_create(
             group->devices[i] = devices[i];
         }
 
-        const oo_status_t status =
+        /*
+         * VMM groups do not require cudaDeviceEnablePeerAccess for user buffers,
+         * so do not run runtime validation probes here. This records static
+         * topology/link information without changing peer-access state.
+         */
+        oo_status_t status =
+            initialize_group_topology(
+                group.get(),
+                false,
+                false,
+                false);
+
+        if (status != OO_SUCCESS) {
+            return status;
+        }
+
+        status =
             allocate_same_process_cuda_ready_signals(group.get());
 
         if (status != OO_SUCCESS) {
@@ -416,6 +467,26 @@ oo_status_t oo_group_create_p2p(
          */
         oo_status_t status =
             enable_group_peer_access_all_to_all(group.get());
+
+        if (status != OO_SUCCESS) {
+            return status;
+        }
+
+        /*
+         * Same-process P2P groups are the first topology-aware execution target.
+         * Peer access is already enabled above; discovery may call enable again
+         * and will treat cudaErrorPeerAccessAlreadyEnabled as success.
+         *
+         * Keep TMA probes off during group creation for now. We use direct copy
+         * and atomic probes here, then make TMA transport decisions stricter in
+         * the transfer planner/lowerer before wiring real collectives.
+         */
+        status =
+            initialize_group_topology(
+                group.get(),
+                true,
+                true,
+                false);
 
         if (status != OO_SUCCESS) {
             return status;
@@ -481,6 +552,17 @@ oo_status_t oo_group_create_ipc(
 
             group->devices[i] = devices[i];
         }
+
+        /*
+         * Do not build IPC topology here yet.
+         *
+         * Rank 0 will build the logical transfer plan and distribute it in the
+         * next patch. Some IPC deployments restrict CUDA_VISIBLE_DEVICES per
+         * process, so discovering all devices during every rank's group creation
+         * would be unsafe.
+         */
+        group->topology_valid = false;
+        group->topology = ooverlap::topology::Topology{};
 
         const oo_status_t status =
             allocate_ipc_ready_signals(group.get());

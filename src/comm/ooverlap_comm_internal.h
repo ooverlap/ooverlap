@@ -2,6 +2,7 @@
 
 #include "ooverlap/comm.h"
 #include "ooverlap/system/peer_buffer.cuh"
+#include "topology/topology.h"
 
 /*
  * Include <type_traits> before broker.cuh because broker.cuh uses
@@ -119,6 +120,9 @@ struct oo_group {
      * devices[src_rank] enabled access to allocations owned by devices[dst_rank].
      */
     bool peer_access_enabled[kOoMaxLocalDevices][kOoMaxLocalDevices] = {};
+
+    bool topology_valid = false;
+    ooverlap::topology::Topology topology{};
 };
 
 struct oo_node {

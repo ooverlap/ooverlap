@@ -18,6 +18,8 @@ struct CollectiveLaunchState {
     void* local_ptr = nullptr;
 
     void* peer_ptrs[kMaxPublicPeers] = {};
+    int peer_ranks[kMaxPublicPeers] = {};
+    int peer_devices[kMaxPublicPeers] = {};
     int peer_count = 0;
 
     int* local_ready_signal = nullptr;
