@@ -136,6 +136,19 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
         binding.rank_output[peer_rank] = launch.peer_ptrs[peer_idx];
     }
 
+    const auto ready_plan =
+        comm::kernels::make_multi_gpu_ready_signal_plan<MaxPeers>(
+            launch.peer_count,
+            launch.peer_ready_signals);
+
+    const bool use_ready_tasks =
+        launch.local_ready_signal != nullptr &&
+        launch.collective_epoch > 0 &&
+        ready_plan.protocol !=
+            comm::kernels::MultiGpuReadySignalProtocol::Disabled;
+
+    const int ready_prefix_tasks_per_cta =
+        use_ready_tasks ? (1 + ready_plan.peer_count) : 0;
 
     comm::plan::WindowTaskExecutorPlan<MaxTasks> window_plan{};
     int num_blocks = 0;
@@ -150,7 +163,8 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
                 binding,
                 launch_config,
                 &window_plan,
-                &num_blocks);
+                &num_blocks,
+                ready_prefix_tasks_per_cta);
 
     if (!plan_ok) {
         return cudaErrorInvalidValue;
@@ -160,10 +174,19 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
         return cudaSuccess;
     }
 
-    const auto ready_plan =
-        comm::kernels::make_multi_gpu_ready_signal_plan<MaxPeers>(
-            launch.peer_count,
-            launch.peer_ready_signals);
+    if (use_ready_tasks) {
+        if (!comm::plan::prepend_ready_tasks_to_each_cta(
+                &window_plan,
+                num_blocks,
+                launch.local_ready_signal,
+                launch.peer_ready_signals,
+                ready_plan.peer_count,
+                launch.collective_epoch,
+                static_cast<int>(ready_plan.protocol),
+                ready_plan.poll_sleep_cycles)) {
+            return cudaErrorInvalidValue;
+        }
+    }
 
     system::runtime::set_device(launch.local_device);
 
