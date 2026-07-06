@@ -17,10 +17,9 @@
 #include "gemm/gemm_plain_sm90_dispatch.h"
 #include "gemm/gemm_scatter_sm90_dispatch.h"
 
-#include "test/persistent_allreduce_2gpu_sm90.h"
 #include "test/tma_bandwidth_experiment_sm90.h"
 #include "test/ipc_collective_sm90.h"
-#include "test/tma_collective_sweep_2gpu.h"
+//#include "test/tma_collective_sweep_2gpu.h"
 #include "test/tma_efficiency_vs_best_2gpu.h"
 #include "test/persistent_external_p2p_collective_2gpu_sm90.h"
 
@@ -310,30 +309,6 @@ PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("gemm_signal_sm90_algo_info", &gemm_signal_sm90_algo_info);
   m.def("gemm_plain_sm90_algo_info", &gemm_plain_sm90_algo_info);
 
-
-  m.def("tma_persistent_two_gpu_allreduce_smoke_test",
-        &ooverlap::tma_persistent_two_gpu_allreduce_smoke_test,
-        py::arg("numel"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1);
-
-  m.def("benchmark_persistent_two_gpu_allreduce_sm90",
-        &ooverlap::benchmark_persistent_two_gpu_allreduce_sm90,
-        py::arg("numel"),
-        py::arg("iters"),
-        py::arg("warmup"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1);
-
-  m.def("benchmark_persistent_two_gpu_collective_sm90",
-        &ooverlap::benchmark_persistent_two_gpu_collective_sm90,
-        py::arg("collective"),
-        py::arg("numel"),
-        py::arg("iters"),
-        py::arg("warmup"),
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1);
-
   m.def("benchmark_tma_bandwidth_experiment_sm90",
         &ooverlap::benchmark_tma_bandwidth_experiment_sm90,
         py::arg("min_bytes") = 512 * 1024,
@@ -346,9 +321,9 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("include_mem_async") = false,
         py::arg("include_nccl") = false);
 
-  m.def("benchmark_tma_two_gpu_collective_sweep_json",
-        &ooverlap::benchmark_tma_two_gpu_collective_sweep_json,
-        py::arg("request_json"));
+  /*m.def("benchmark_tma_two_gpu_collective_sweep_json",*/
+        /*&ooverlap::benchmark_tma_two_gpu_collective_sweep_json,*/
+        /*py::arg("request_json"));*/
 
   m.def("smoke_ipc_collective_rank_sm90",
         &ooverlap::smoke_ipc_collective_rank_sm90,
