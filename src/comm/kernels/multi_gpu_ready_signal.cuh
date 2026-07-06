@@ -6,20 +6,81 @@ namespace ooverlap {
 namespace comm {
 namespace kernels {
 
+/*
+ * Ready-signal protocols.
+ *
+ * DeviceMemoryStoreRelease:
+ *   Fast path for one-writer-per-rank ready slots in peer-visible device
+ *   memory.  The owner GPU stores its epoch into its own slot; peers poll.
+ *
+ * DeviceMemoryAtomicMax:
+ *   Compatibility/debug path.  More robust if the same rank can publish epochs
+ *   out of order from multiple streams, but slower than single-writer store.
+ *
+ * HostMappedStoreRelease:
+ *   SYS / cross-island fallback.  Ready slots live in mapped pinned host memory.
+ *   Do not use GPU atomic RMW operations on host mapped memory for multi-GPU
+ *   synchronization.  Use one writer per slot plus plain store/poll.
+ */
+enum class MultiGpuReadySignalProtocol : int {
+    DeviceMemoryStoreRelease = 0,
+    DeviceMemoryAtomicMax = 1,
+    HostMappedStoreRelease = 2,
+    Disabled = 3,
+};
+
+__host__ __device__ __forceinline__ int default_ready_signal_poll_sleep_cycles(
+    MultiGpuReadySignalProtocol protocol) {
+    switch (protocol) {
+        case MultiGpuReadySignalProtocol::HostMappedStoreRelease:
+            return 256;
+
+        case MultiGpuReadySignalProtocol::DeviceMemoryStoreRelease:
+        case MultiGpuReadySignalProtocol::DeviceMemoryAtomicMax:
+            return 64;
+
+        case MultiGpuReadySignalProtocol::Disabled:
+        default:
+            return 0;
+    }
+}
+
 template <int MaxPeers>
 struct MultiGpuReadySignalPlan {
     int peer_count = 0;
     const int* peer_ready_signals[MaxPeers] = {};
+
+    MultiGpuReadySignalProtocol protocol =
+        MultiGpuReadySignalProtocol::DeviceMemoryStoreRelease;
+
+    int poll_sleep_cycles = 64;
 };
 
 template <int MaxPeers>
 inline MultiGpuReadySignalPlan<MaxPeers> make_multi_gpu_ready_signal_plan(
     int peer_count,
-    const int* const* peer_ready_signals) {
+    const int* const* peer_ready_signals,
+    MultiGpuReadySignalProtocol protocol =
+        MultiGpuReadySignalProtocol::DeviceMemoryStoreRelease,
+    int poll_sleep_cycles = 0) {
     MultiGpuReadySignalPlan<MaxPeers> plan{};
-    plan.peer_count = peer_count;
 
-    for (int i = 0; i < peer_count && i < MaxPeers; ++i) {
+    if (peer_count < 0) {
+        peer_count = 0;
+    }
+
+    if (peer_count > MaxPeers) {
+        peer_count = MaxPeers;
+    }
+
+    plan.peer_count = peer_count;
+    plan.protocol = protocol;
+    plan.poll_sleep_cycles =
+        poll_sleep_cycles > 0
+            ? poll_sleep_cycles
+            : default_ready_signal_poll_sleep_cycles(protocol);
+
+    for (int i = 0; i < peer_count; ++i) {
         plan.peer_ready_signals[i] =
             peer_ready_signals != nullptr ? peer_ready_signals[i] : nullptr;
     }
@@ -27,35 +88,127 @@ inline MultiGpuReadySignalPlan<MaxPeers> make_multi_gpu_ready_signal_plan(
     return plan;
 }
 
+__device__ __forceinline__ void publish_ready_signal_store_release(
+    int* ready_signal,
+    int collective_epoch) {
+    if (ready_signal == nullptr) {
+        return;
+    }
+
+    /*
+     * Single-writer slot protocol:
+     *   owner rank writes ready[owner_rank]
+     *   all peers only read that slot
+     *
+     * This avoids atomic RMW on the fast path.  The system fence after the
+     * volatile store keeps the published epoch visible outside the writer GPU.
+     */
+    volatile int* ready =
+        reinterpret_cast<volatile int*>(ready_signal);
+
+    ready[0] = collective_epoch;
+
+#if defined(__CUDA_ARCH__)
+    __threadfence_system();
+#endif
+}
+
+__device__ __forceinline__ void publish_ready_signal_atomic_max(
+    int* ready_signal,
+    int collective_epoch) {
+    if (ready_signal == nullptr) {
+        return;
+    }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
+    atomicMax_system(ready_signal, collective_epoch);
+#else
+    atomicMax(ready_signal, collective_epoch);
+#endif
+
+#if defined(__CUDA_ARCH__)
+    __threadfence_system();
+#endif
+}
+
+__device__ __forceinline__ void publish_ready_signal(
+    int* ready_signal,
+    int collective_epoch,
+    MultiGpuReadySignalProtocol protocol) {
+    switch (protocol) {
+        case MultiGpuReadySignalProtocol::DeviceMemoryAtomicMax:
+            publish_ready_signal_atomic_max(
+                ready_signal,
+                collective_epoch);
+            return;
+
+        case MultiGpuReadySignalProtocol::DeviceMemoryStoreRelease:
+        case MultiGpuReadySignalProtocol::HostMappedStoreRelease:
+            publish_ready_signal_store_release(
+                ready_signal,
+                collective_epoch);
+            return;
+
+        case MultiGpuReadySignalProtocol::Disabled:
+        default:
+            return;
+    }
+}
+
+__device__ __forceinline__ int load_ready_signal(
+    const int* ready_signal) {
+    if (ready_signal == nullptr) {
+        return 0;
+    }
+
+    const volatile int* ready =
+        reinterpret_cast<const volatile int*>(ready_signal);
+
+    return ready[0];
+}
+
+__device__ __forceinline__ void wait_until_ready_signal_at_least(
+    const int* ready_signal,
+    int collective_epoch,
+    int poll_sleep_cycles) {
+    if (ready_signal == nullptr || collective_epoch <= 0) {
+        return;
+    }
+
+    while (load_ready_signal(ready_signal) < collective_epoch) {
+#if defined(__CUDA_ARCH__)
+        if (poll_sleep_cycles > 0) {
+            __nanosleep(static_cast<unsigned int>(poll_sleep_cycles));
+        }
+#endif
+    }
+}
+
 template <int MaxPeers>
 __device__ __forceinline__ void wait_for_multi_gpu_collective_ready(
     int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch) {
-    if (local_ready_signal == nullptr || collective_epoch <= 0) {
+    if (collective_epoch <= 0 ||
+        ready_plan.protocol == MultiGpuReadySignalProtocol::Disabled) {
+        return;
+    }
+
+    if (local_ready_signal == nullptr) {
         return;
     }
 
     if (threadIdx.x == 0) {
-        atomicMax(local_ready_signal, collective_epoch);
-        __threadfence_system();
+        publish_ready_signal(
+            local_ready_signal,
+            collective_epoch,
+            ready_plan.protocol);
 
         for (int peer_idx = 0; peer_idx < ready_plan.peer_count; ++peer_idx) {
-            const int* peer_ready_signal =
-                ready_plan.peer_ready_signals[peer_idx];
-
-            if (peer_ready_signal == nullptr) {
-                continue;
-            }
-
-            const volatile int* peer_ready =
-                reinterpret_cast<const volatile int*>(peer_ready_signal);
-
-            while (peer_ready[0] < collective_epoch) {
-#if defined(__CUDA_ARCH__)
-                __nanosleep(64);
-#endif
-            }
+            wait_until_ready_signal_at_least(
+                ready_plan.peer_ready_signals[peer_idx],
+                collective_epoch,
+                ready_plan.poll_sleep_cycles);
         }
     }
 
