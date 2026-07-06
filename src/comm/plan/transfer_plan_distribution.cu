@@ -25,13 +25,190 @@ bool same_launch_config(
     switch (a.plan_for) {
         case CollectivePlanFor::AllReduce:
             return a.plan.allreduce == b.plan.allreduce;
+
         case CollectivePlanFor::ReduceScatter:
             return a.plan.reduce_scatter == b.plan.reduce_scatter;
+
         case CollectivePlanFor::AllGather:
             return a.plan.all_gather == b.plan.all_gather;
+
         default:
             return false;
     }
+}
+
+struct TransferPlanRequestKey {
+    CollectivePlanFor collective = CollectivePlanFor::AllReduce;
+    int epoch = 0;
+    int world_size = 0;
+
+    size_t count = 0;
+    size_t dtype_size = 0;
+
+    oo_dtype_t dtype = OO_DTYPE_FLOAT16;
+    oo_reduce_op_t op = OO_REDUCE_ADD;
+
+    LaunchConfig config{};
+};
+
+bool same_request_key(
+    const TransferPlanRequestKey& a,
+    const TransferPlanRequestKey& b) {
+    return a.collective == b.collective &&
+           a.epoch == b.epoch &&
+           a.world_size == b.world_size &&
+           a.count == b.count &&
+           a.dtype_size == b.dtype_size &&
+           a.dtype == b.dtype &&
+           a.op == b.op &&
+           same_launch_config(a.config, b.config);
+}
+
+TransferPlanRequestKey make_request_key(
+    CollectivePlanFor collective,
+    const ooverlap::comm::api::CollectiveLaunchState& launch,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    const LaunchConfig& config) {
+    TransferPlanRequestKey key{};
+    key.collective = collective;
+    key.epoch = launch.collective_epoch;
+    key.world_size = launch.world_size;
+    key.count = count;
+    key.dtype_size = launch.dtype_size;
+    key.dtype = dtype;
+    key.op = op;
+    key.config = config;
+    return key;
+}
+
+TransferPlanBuildInput make_build_input(
+    oo_group_t* group,
+    const ooverlap::comm::api::CollectiveLaunchState& launch,
+    size_t count,
+    const LaunchConfig& config,
+    CollectivePlanFor collective) {
+    TransferPlanBuildInput input{};
+    input.topo.topology =
+        (group != nullptr && group->topology_valid) ? &group->topology : nullptr;
+    input.topo.rank_devices = group != nullptr ? group->devices : nullptr;
+    input.topo.world_size = group != nullptr ? group->num_devices : 0;
+
+    input.collective = collective;
+    input.launch_config = config;
+    input.world_size = launch.world_size;
+    input.count = count;
+    input.dtype_size = launch.dtype_size;
+
+    /*
+     * Current public collectives are in-place over full logical buffers.
+     * If/when compact input/output buffers are added, this is the bit that
+     * should become collective-call metadata instead of a hardcoded false.
+     */
+    input.out_of_place = false;
+    return input;
+}
+
+template <int MaxTransferTasks>
+struct SameProcessPlanSlot {
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    bool active = false;
+    bool ready = false;
+    bool failed = false;
+
+    int copied = 0;
+    oo_status_t status = OO_SUCCESS;
+
+    TransferPlanRequestKey key{};
+    TransferPlan<MaxTransferTasks> plan{};
+};
+
+template <int MaxTransferTasks>
+void reset_slot_locked(
+    SameProcessPlanSlot<MaxTransferTasks>* slot) {
+    if (slot == nullptr) {
+        return;
+    }
+
+    slot->active = false;
+    slot->ready = false;
+    slot->failed = false;
+    slot->copied = 0;
+    slot->status = OO_SUCCESS;
+    slot->key = TransferPlanRequestKey{};
+    transfer_plan_clear(&slot->plan);
+}
+
+template <int MaxTransferTasks, typename Builder>
+oo_status_t get_or_build_same_process_plan(
+    SameProcessPlanSlot<MaxTransferTasks>* slot,
+    oo_node_t* node,
+    const ooverlap::comm::api::CollectiveLaunchState& launch,
+    const TransferPlanRequestKey& key,
+    TransferPlan<MaxTransferTasks>* out_plan,
+    Builder&& builder) {
+    if (slot == nullptr ||
+        node == nullptr ||
+        node->group == nullptr ||
+        out_plan == nullptr ||
+        launch.world_size <= 0) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    std::unique_lock<std::mutex> lock(slot->mutex);
+
+    if (!slot->active) {
+        slot->active = true;
+        slot->ready = false;
+        slot->failed = false;
+        slot->copied = 0;
+        slot->status = OO_SUCCESS;
+        slot->key = key;
+
+        const oo_status_t status =
+            builder(&slot->plan);
+
+        if (status != OO_SUCCESS) {
+            slot->failed = true;
+            slot->status = status;
+        }
+
+        slot->ready = true;
+        slot->cv.notify_all();
+    } else {
+        if (!same_request_key(slot->key, key)) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        slot->cv.wait(lock, [slot]() {
+            return slot->ready;
+        });
+    }
+
+    if (slot->failed) {
+        const oo_status_t status = slot->status;
+
+        slot->copied += 1;
+
+        if (slot->copied == slot->key.world_size) {
+            reset_slot_locked(slot);
+        }
+
+        return status;
+    }
+
+    *out_plan = slot->plan;
+
+    slot->copied += 1;
+
+    if (slot->copied == slot->key.world_size) {
+        reset_slot_locked(slot);
+    }
+
+    return OO_SUCCESS;
 }
 
 class SameProcessTransferPlanDistributionBackend final
@@ -48,15 +225,15 @@ public:
         if (node == nullptr ||
             node->group == nullptr ||
             out_plan == nullptr ||
-            launch.world_size <= 0) {
+            launch.dtype_size == 0 ||
+            config.plan_for != CollectivePlanFor::AllReduce) {
             return OO_ERROR_INVALID_ARGUMENT;
         }
 
         oo_group_t* group = node->group;
-        std::unique_lock<std::mutex> lock(mutex_);
 
-        if (!active_) {
-            begin_locked(
+        const TransferPlanRequestKey key =
+            make_request_key(
                 CollectivePlanFor::AllReduce,
                 launch,
                 count,
@@ -64,45 +241,87 @@ public:
                 op,
                 config);
 
-            const oo_status_t status =
-                build_allreduce_plan_locked(
-                    group,
-                    launch,
-                    count,
-                    config);
+        return get_or_build_same_process_plan(
+            &allreduce_,
+            node,
+            launch,
+            key,
+            out_plan,
+            [group, &launch, count, &config](AllreduceTransferPlan* plan) {
+                if (group == nullptr ||
+                    group->num_devices != launch.world_size) {
+                    return OO_ERROR_INVALID_ARGUMENT;
+                }
 
-            if (status != OO_SUCCESS) {
-                reset_locked();
-                return status;
-            }
+                const TransferPlanBuildInput input =
+                    make_build_input(
+                        group,
+                        launch,
+                        count,
+                        config,
+                        CollectivePlanFor::AllReduce);
 
-            status_ = OO_SUCCESS;
-            ready_ = true;
-            cv_.notify_all();
-        } else {
-            oo_status_t status =
-                validate_locked(
-                    CollectivePlanFor::AllReduce,
-                    launch,
-                    count,
-                    dtype,
-                    op,
-                    config);
+                if (!build_allreduce_transfer_plan(plan, input)) {
+                    return OO_ERROR_UNSUPPORTED;
+                }
 
-            if (status != OO_SUCCESS) {
-                return status;
-            }
+                return OO_SUCCESS;
+            });
+    }
 
-            cv_.wait(lock, [this]() { return ready_; });
-
-            if (failed_) {
-                return status_;
-            }
+    oo_status_t get_reduce_scatter_transfer_plan(
+        oo_node_t* node,
+        const ooverlap::comm::api::CollectiveLaunchState& launch,
+        size_t count,
+        oo_dtype_t dtype,
+        oo_reduce_op_t op,
+        const ooverlap::comm::LaunchConfig& config,
+        ReduceScatterTransferPlan* out_plan) override {
+        if (node == nullptr ||
+            node->group == nullptr ||
+            out_plan == nullptr ||
+            launch.dtype_size == 0 ||
+            config.plan_for != CollectivePlanFor::ReduceScatter) {
+            return OO_ERROR_INVALID_ARGUMENT;
         }
 
-        *out_plan = allreduce_plan_;
-        finish_copy_locked();
-        return OO_SUCCESS;
+        oo_group_t* group = node->group;
+
+        const TransferPlanRequestKey key =
+            make_request_key(
+                CollectivePlanFor::ReduceScatter,
+                launch,
+                count,
+                dtype,
+                op,
+                config);
+
+        return get_or_build_same_process_plan(
+            &reduce_scatter_,
+            node,
+            launch,
+            key,
+            out_plan,
+            [group, &launch, count, &config](ReduceScatterTransferPlan* plan) {
+                if (group == nullptr ||
+                    group->num_devices != launch.world_size) {
+                    return OO_ERROR_INVALID_ARGUMENT;
+                }
+
+                const TransferPlanBuildInput input =
+                    make_build_input(
+                        group,
+                        launch,
+                        count,
+                        config,
+                        CollectivePlanFor::ReduceScatter);
+
+                if (!build_reduce_scatter_transfer_plan(plan, input)) {
+                    return OO_ERROR_UNSUPPORTED;
+                }
+
+                return OO_SUCCESS;
+            });
     }
 
     oo_status_t get_all_gather_transfer_plan(
@@ -115,15 +334,15 @@ public:
         if (node == nullptr ||
             node->group == nullptr ||
             out_plan == nullptr ||
-            launch.world_size <= 0) {
+            launch.dtype_size == 0 ||
+            config.plan_for != CollectivePlanFor::AllGather) {
             return OO_ERROR_INVALID_ARGUMENT;
         }
 
         oo_group_t* group = node->group;
-        std::unique_lock<std::mutex> lock(mutex_);
 
-        if (!active_) {
-            begin_locked(
+        const TransferPlanRequestKey key =
+            make_request_key(
                 CollectivePlanFor::AllGather,
                 launch,
                 count,
@@ -131,233 +350,38 @@ public:
                 OO_REDUCE_ADD,
                 config);
 
-            const oo_status_t status =
-                build_all_gather_plan_locked(
-                    group,
-                    launch,
-                    count,
-                    config);
+        return get_or_build_same_process_plan(
+            &all_gather_,
+            node,
+            launch,
+            key,
+            out_plan,
+            [group, &launch, count, &config](AllGatherTransferPlan* plan) {
+                if (group == nullptr ||
+                    group->num_devices != launch.world_size) {
+                    return OO_ERROR_INVALID_ARGUMENT;
+                }
 
-            if (status != OO_SUCCESS) {
-                reset_locked();
-                return status;
-            }
+                const TransferPlanBuildInput input =
+                    make_build_input(
+                        group,
+                        launch,
+                        count,
+                        config,
+                        CollectivePlanFor::AllGather);
 
-            status_ = OO_SUCCESS;
-            ready_ = true;
-            cv_.notify_all();
-        } else {
-            oo_status_t status =
-                validate_locked(
-                    CollectivePlanFor::AllGather,
-                    launch,
-                    count,
-                    dtype,
-                    OO_REDUCE_ADD,
-                    config);
+                if (!build_all_gather_transfer_plan(plan, input)) {
+                    return OO_ERROR_UNSUPPORTED;
+                }
 
-            if (status != OO_SUCCESS) {
-                return status;
-            }
-
-            cv_.wait(lock, [this]() { return ready_; });
-
-            if (failed_) {
-                return status_;
-            }
-        }
-
-        *out_plan = all_gather_plan_;
-        finish_copy_locked();
-        return OO_SUCCESS;
+                return OO_SUCCESS;
+            });
     }
 
 private:
-    void begin_locked(
-        CollectivePlanFor collective,
-        const ooverlap::comm::api::CollectiveLaunchState& launch,
-        size_t count,
-        oo_dtype_t dtype,
-        oo_reduce_op_t op,
-        const ooverlap::comm::LaunchConfig& config) {
-        active_ = true;
-        ready_ = false;
-        failed_ = false;
-        copied_ = 0;
-
-        collective_ = collective;
-        epoch_ = launch.collective_epoch;
-        world_size_ = launch.world_size;
-        count_ = count;
-        dtype_size_ = launch.dtype_size;
-        dtype_ = dtype;
-        op_ = op;
-        config_ = config;
-        status_ = OO_SUCCESS;
-    }
-
-    oo_status_t validate_locked(
-        CollectivePlanFor collective,
-        const ooverlap::comm::api::CollectiveLaunchState& launch,
-        size_t count,
-        oo_dtype_t dtype,
-        oo_reduce_op_t op,
-        const ooverlap::comm::LaunchConfig& config) const {
-        if (!active_ ||
-            collective_ != collective ||
-            epoch_ != launch.collective_epoch ||
-            world_size_ != launch.world_size ||
-            count_ != count ||
-            dtype_size_ != launch.dtype_size ||
-            dtype_ != dtype ||
-            !same_launch_config(config_, config)) {
-            return OO_ERROR_INVALID_ARGUMENT;
-        }
-
-        if (collective == CollectivePlanFor::AllReduce && op_ != op) {
-            return OO_ERROR_INVALID_ARGUMENT;
-        }
-
-        return OO_SUCCESS;
-    }
-
-    oo_status_t fill_common_input_locked(
-        oo_group_t* group,
-        const ooverlap::comm::api::CollectiveLaunchState& launch,
-        size_t count,
-        CollectivePlanFor collective,
-        const LaunchConfig& config,
-        TransferPlanBuildInput* out) const {
-        if (group == nullptr ||
-            out == nullptr ||
-            group->num_devices != launch.world_size ||
-            launch.dtype_size == 0) {
-            return OO_ERROR_INVALID_ARGUMENT;
-        }
-
-        TransferPlanBuildInput input{};
-        input.topo.topology =
-            group->topology_valid ? &group->topology : nullptr;
-        input.topo.rank_devices = group->devices;
-        input.topo.world_size = group->num_devices;
-
-        input.collective = collective;
-        input.launch_config = config;
-        input.world_size = launch.world_size;
-        input.count = count;
-        input.dtype_size = launch.dtype_size;
-        input.out_of_place = false;
-
-        *out = input;
-        return OO_SUCCESS;
-    }
-
-    oo_status_t build_allreduce_plan_locked(
-        oo_group_t* group,
-        const ooverlap::comm::api::CollectiveLaunchState& launch,
-        size_t count,
-        const ooverlap::comm::LaunchConfig& config) {
-        TransferPlanBuildInput input{};
-
-        oo_status_t status =
-            fill_common_input_locked(
-                group,
-                launch,
-                count,
-                CollectivePlanFor::AllReduce,
-                config,
-                &input);
-
-        if (status != OO_SUCCESS) {
-            return status;
-        }
-
-        if (!build_allreduce_transfer_plan(&allreduce_plan_, input)) {
-            return OO_ERROR_UNSUPPORTED;
-        }
-
-        return OO_SUCCESS;
-    }
-
-    oo_status_t build_all_gather_plan_locked(
-        oo_group_t* group,
-        const ooverlap::comm::api::CollectiveLaunchState& launch,
-        size_t count,
-        const ooverlap::comm::LaunchConfig& config) {
-        TransferPlanBuildInput input{};
-
-        oo_status_t status =
-            fill_common_input_locked(
-                group,
-                launch,
-                count,
-                CollectivePlanFor::AllGather,
-                config,
-                &input);
-
-        if (status != OO_SUCCESS) {
-            return status;
-        }
-
-        if (!build_all_gather_transfer_plan(&all_gather_plan_, input)) {
-            return OO_ERROR_UNSUPPORTED;
-        }
-
-        return OO_SUCCESS;
-    }
-
-    void finish_copy_locked() {
-        copied_ += 1;
-
-        if (copied_ == world_size_) {
-            reset_locked();
-        }
-    }
-
-    void reset_locked() {
-        active_ = false;
-        ready_ = false;
-        failed_ = false;
-        copied_ = 0;
-
-        collective_ = CollectivePlanFor::AllReduce;
-        epoch_ = 0;
-        world_size_ = 0;
-        count_ = 0;
-        dtype_size_ = 0;
-        dtype_ = OO_DTYPE_FLOAT16;
-        op_ = OO_REDUCE_ADD;
-        config_ = LaunchConfig{};
-        status_ = OO_SUCCESS;
-
-        transfer_plan_clear(&allreduce_plan_);
-        transfer_plan_clear(&all_gather_plan_);
-    }
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-
-    bool active_ = false;
-    bool ready_ = false;
-    bool failed_ = false;
-
-    int copied_ = 0;
-
-    CollectivePlanFor collective_ = CollectivePlanFor::AllReduce;
-    int epoch_ = 0;
-    int world_size_ = 0;
-
-    size_t count_ = 0;
-    size_t dtype_size_ = 0;
-
-    oo_dtype_t dtype_ = OO_DTYPE_FLOAT16;
-    oo_reduce_op_t op_ = OO_REDUCE_ADD;
-    LaunchConfig config_{};
-
-    oo_status_t status_ = OO_SUCCESS;
-
-    AllreduceTransferPlan allreduce_plan_{};
-    AllGatherTransferPlan all_gather_plan_{};
+    SameProcessPlanSlot<kTmaMultiGpuAllReduceMaxTransferTasks> allreduce_{};
+    SameProcessPlanSlot<kTmaMultiGpuReduceScatterMaxTransferTasks> reduce_scatter_{};
+    SameProcessPlanSlot<kTmaMultiGpuAllGatherMaxTransferTasks> all_gather_{};
 };
 
 } // namespace

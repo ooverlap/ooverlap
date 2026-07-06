@@ -1,6 +1,7 @@
 #pragma once
 
 #include "comm/launch_config.h"
+#include "comm/plan/transfer_plan_distribution.h"
 #include "ooverlap/comm.h"
 
 #include <cuda_runtime.h>
@@ -39,16 +40,6 @@ namespace ooverlap {
  *        local_in != local_buf.
  *     3. Reduce every peer's matching partition into local_buf's partition.
  *     4. Stop. Unlike allreduce, there is no copy/broadcast phase.
- *
- * Example for 4 GPUs:
- *
- *   Rank 0 owns quarter 0.
- *
- *     reduce GPU1 quarter0 -> GPU0 quarter0
- *     reduce GPU2 quarter0 -> GPU0 quarter0
- *     reduce GPU3 quarter0 -> GPU0 quarter0
- *
- *   No copy back to GPU1/GPU2/GPU3.
  */
 cudaError_t enqueue_tma_multi_gpu_reduce_scatter_rank_sm90(
     const void* local_in,
@@ -66,5 +57,24 @@ cudaError_t enqueue_tma_multi_gpu_reduce_scatter_rank_sm90(
     const int* const* peer_ready_signals,
     int collective_epoch,
     comm::LaunchConfig launch_config = comm::default_launch_config());
+
+cudaError_t enqueue_tma_multi_gpu_reduce_scatter_rank_sm90_transfer_plan(
+    const void* local_in,
+    void* local_buf,
+    void* const* peer_bufs,
+    const int* peer_ranks,
+    int peer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    int rank,
+    int world_size,
+    int local_device,
+    cudaStream_t stream,
+    int* local_ready_signal,
+    const int* const* peer_ready_signals,
+    int collective_epoch,
+    comm::LaunchConfig launch_config,
+    const comm::plan::ReduceScatterTransferPlan& transfer_plan);
 
 } // namespace ooverlap

@@ -1,5 +1,6 @@
 #include "comm/ooverlap_comm_private.h"
 
+#include "comm/plan/transfer_plan_distribution.h"
 #include "comm/tma_multi_gpu_reduce_scatter_sm90.h"
 
 namespace {
@@ -57,11 +58,34 @@ oo_status_t reduce_scatter_impl(
             launch.bytes,
             tuning_mode);
 
+    ooverlap::comm::plan::ReduceScatterTransferPlan transfer_plan{};
+
+    if (node == nullptr ||
+        node->group == nullptr ||
+        node->group->transfer_plan_distribution == nullptr) {
+        return OO_ERROR_INTERNAL;
+    }
+
+    status =
+        node->group->transfer_plan_distribution->get_reduce_scatter_transfer_plan(
+            node,
+            launch,
+            count,
+            dtype,
+            op,
+            config,
+            &transfer_plan);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
     cudaError_t error =
-        ooverlap::enqueue_tma_multi_gpu_reduce_scatter_rank_sm90(
+        ooverlap::enqueue_tma_multi_gpu_reduce_scatter_rank_sm90_transfer_plan(
             launch.local_ptr,
             launch.local_ptr,
             launch.peer_ptrs,
+            launch.peer_ranks,
             launch.peer_count,
             count,
             dtype,
@@ -73,7 +97,8 @@ oo_status_t reduce_scatter_impl(
             launch.local_ready_signal,
             launch.peer_ready_signals,
             launch.collective_epoch,
-            config);
+            config,
+            transfer_plan);
 
     return ooverlap::comm::api::cuda_to_status(error);
 }

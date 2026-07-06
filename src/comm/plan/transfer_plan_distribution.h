@@ -14,12 +14,19 @@ constexpr int kTmaMultiGpuAllReduceMaxTransferTasks =
     (kTmaMultiGpuAllReduceMaxPeers + 1) *
     (2 * kTmaMultiGpuAllReduceMaxPeers + 1);
 
+constexpr int kTmaMultiGpuReduceScatterMaxTransferTasks =
+    (kTmaMultiGpuReduceScatterMaxPeers + 1) *
+    (kTmaMultiGpuReduceScatterMaxPeers + 1);
+
 constexpr int kTmaMultiGpuAllGatherMaxTransferTasks =
     (kTmaMultiGpuAllGatherMaxPeers + 1) *
     (kTmaMultiGpuAllGatherMaxPeers + 1);
 
 using AllreduceTransferPlan =
     TransferPlan<kTmaMultiGpuAllReduceMaxTransferTasks>;
+
+using ReduceScatterTransferPlan =
+    TransferPlan<kTmaMultiGpuReduceScatterMaxTransferTasks>;
 
 using AllGatherTransferPlan =
     TransferPlan<kTmaMultiGpuAllGatherMaxTransferTasks>;
@@ -36,6 +43,15 @@ public:
         oo_reduce_op_t op,
         const ooverlap::comm::LaunchConfig& config,
         AllreduceTransferPlan* out_plan) = 0;
+
+    virtual oo_status_t get_reduce_scatter_transfer_plan(
+        oo_node_t* node,
+        const ooverlap::comm::api::CollectiveLaunchState& launch,
+        size_t count,
+        oo_dtype_t dtype,
+        oo_reduce_op_t op,
+        const ooverlap::comm::LaunchConfig& config,
+        ReduceScatterTransferPlan* out_plan) = 0;
 
     virtual oo_status_t get_all_gather_transfer_plan(
         oo_node_t* node,
