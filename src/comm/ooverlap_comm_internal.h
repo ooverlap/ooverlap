@@ -20,25 +20,26 @@ enum class oo_group_memory_kind {
     /*
      * Same-process VMM allocations with cuMemSetAccess.
      *
-     * Buffer allocation and cleanup are VMM-backed. Transport choice must still
-     * come from topology/transfer planning, not from this enum.
+     * Buffer allocation/cleanup is VMM-backed. Transport choice still comes
+     * from topology + logical transfer planning.
      */
     same_process_vmm = 0,
 
     /*
      * Same-process normal CUDA allocations or external wrapped pointers.
      *
-     * This is the external-buffer path. Peer access enabling is a setup detail;
-     * whether a collective can use direct NVLink, direct PCIe/SYS, SHM, or a
-     * fallback route is represented by topology.
+     * Peer access enabling is only a setup side-effect for external pointers.
+     * Do not store peer-access state here; topology is the source of truth for
+     * transport planning.
      */
     same_process_cuda_p2p = 1,
 
     /*
      * Multiprocess legacy CUDA IPC.
      *
-     * Peer memory views are imported/opened by the launch-exchange backend, not
-     * passed through public collective APIs.
+     * IPC peer memory views should be registered/imported into group-owned
+     * buffer state. Public collectives should still only take this rank's local
+     * buffer.
      */
     multiprocess_legacy_ipc = 2
 };
@@ -101,15 +102,9 @@ struct oo_ready_signal {
 
 namespace ooverlap {
 namespace comm {
-
-namespace api {
-class CollectiveLaunchExchangeBackend;
-}
-
 namespace plan {
 class TransferPlanDistributionBackend;
 }
-
 } // namespace comm
 } // namespace ooverlap
 
@@ -127,9 +122,9 @@ struct oo_group {
      * Meaningful only for multiprocess_ipc.
      *
      * In IPC mode, each OS process owns exactly one rank/node. That rank owns
-     * its local user buffer and ready signal; the launch-exchange backend is
-     * responsible for exchanging/importing the rank memory views needed by a
-     * collective epoch.
+     * its local user buffer and ready signal. IPC buffer registration/import
+     * will later populate collective_buffers[] with this process's pointer view
+     * for each logical rank.
      */
     int local_rank = -1;
     int local_world_size = 0;
@@ -139,39 +134,40 @@ struct oo_group {
     /*
      * Ready-signal state indexed by logical rank.
      *
-     * ready_signal_slots[r] owns or imports the cleanup state for rank r's
-     * ready signal. Do not keep a second mirror array; all code should use this
-     * field.
+     * ready_signal_slots[r] owns or imports the cleanup state for rank r's ready
+     * signal. All code should use this field directly.
      */
     oo_ready_signal ready_signal_slots[kOoMaxLocalDevices] = {};
 
     /*
+     * Current rank-buffer registry for public collectives.
+     *
+     * Public collective APIs pass only this rank's local buffer. The launch
+     * helper builds peer pointer views from this registry instead of requiring
+     * peers[]/peer_count from the caller.
+     *
+     * Same-process behavior:
+     *   oo_buffer_alloc()/oo_buffer_wrap() register the returned buffer at
+     *   collective_buffers[node->rank]. prepare_collective_launch() reads all
+     *   ranks from this array and returns immediately; GPU ready signals do the
+     *   actual rendezvous.
+     *
+     * Limitation:
+     *   This is intentionally one current collective buffer per rank. If we need
+     *   multiple live tensors per group later, replace this with an explicit
+     *   oo_buffer_set_t.
+     */
+    oo_buffer_t* collective_buffers[kOoMaxLocalDevices] = {};
+
+    /*
      * Topology is the source of truth for transport capability.
      *
-     * Do not store separate peer_access_enabled matrices in oo_group. Peer
-     * access enabling is setup side-effect; transport choice belongs in
-     * topology + logical transfer planning.
+     * Do not store a separate peer_access_enabled matrix in oo_group. Peer
+     * access enabling is setup side-effect; transport choice belongs in topology
+     * + logical transfer planning.
      */
     bool topology_valid = false;
     ooverlap::topology::Topology topology{};
-
-    /*
-     * Group-owned collective launch exchange.
-     *
-     * Public collectives should pass only the local rank buffer. This backend
-     * converts that local contribution into a rank-indexed CollectiveLaunchState
-     * containing the memory views and ready signals needed by lowering.
-     *
-     * Same-process implementation:
-     *   all ranks contribute local oo_buffer_t for the active collective epoch;
-     *   the backend waits until every rank arrived, then returns rank views.
-     *
-     * IPC implementation later:
-     *   ranks exchange/import descriptors through broker/IPC, then return rank
-     *   views. Public collective signatures do not change.
-     */
-    std::unique_ptr<ooverlap::comm::api::CollectiveLaunchExchangeBackend>
-        collective_launch_exchange{};
 
     /*
      * Group-owned logical TransferPlan distribution.
@@ -195,8 +191,8 @@ struct oo_node {
      * Monotonic per-node collective sequence.
      *
      * Rank-local calls must be issued in matching order across ranks, same as
-     * NCCL. The launch-exchange backend should use this to detect ordering
-     * mismatches.
+     * NCCL. prepare_collective_launch() increments this and passes the epoch to
+     * GPU-side ready-signal rendezvous.
      */
     int collective_epoch = 0;
 };

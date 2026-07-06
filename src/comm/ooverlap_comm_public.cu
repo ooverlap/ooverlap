@@ -15,44 +15,23 @@
 #include <utility>
 #include <vector>
 
-/*
- * Temporary complete definition for the forward declaration stored in oo_group.
- *
- * The next patch should move this exact interface to a small header, for
- * example:
- *
- *   src/comm/collective_launch_exchange.h
- *
- * and include that header here instead.  A complete type is needed in this
- * translation unit because oo_group_destroy() deletes oo_group, whose destructor
- * destroys std::unique_ptr<CollectiveLaunchExchangeBackend>.
- */
-namespace ooverlap {
-namespace comm {
-namespace api {
-
-class CollectiveLaunchExchangeBackend {
-public:
-    virtual ~CollectiveLaunchExchangeBackend() = default;
-
-    virtual oo_status_t prepare_collective_launch(
-        oo_node_t* node,
-        oo_buffer_t* local,
-        ooverlap::comm::CollectivePlanFor collective,
-        size_t element_offset,
-        size_t count,
-        oo_dtype_t dtype,
-        CollectiveLaunchState* out) = 0;
-};
-
-} // namespace api
-} // namespace comm
-} // namespace ooverlap
-
 namespace {
 
 bool valid_group_size(int num_devices) {
     return num_devices > 0 && num_devices <= kOoMaxLocalDevices;
+}
+
+std::vector<int> devices_vector(
+    const int* devices,
+    int num_devices) {
+    std::vector<int> out;
+    out.reserve(static_cast<size_t>(num_devices));
+
+    for (int i = 0; i < num_devices; ++i) {
+        out.push_back(devices[i]);
+    }
+
+    return out;
 }
 
 oo_status_t enable_group_peer_access_all_to_all(oo_group_t* group) {
@@ -67,15 +46,17 @@ oo_status_t enable_group_peer_access_all_to_all(oo_group_t* group) {
             return OO_ERROR_INVALID_DEVICE;
         }
 
+        ooverlap::system::runtime::set_device(src_device);
+
         for (int dst_rank = 0; dst_rank < group->num_devices; ++dst_rank) {
+            if (src_rank == dst_rank) {
+                continue;
+            }
+
             const int dst_device = group->devices[dst_rank];
 
             if (dst_device < 0) {
                 return OO_ERROR_INVALID_DEVICE;
-            }
-
-            if (src_rank == dst_rank) {
-                continue;
             }
 
             bool enabled = false;
@@ -97,19 +78,6 @@ oo_status_t enable_group_peer_access_all_to_all(oo_group_t* group) {
     }
 
     return OO_SUCCESS;
-}
-
-std::vector<int> devices_vector(
-    const int* devices,
-    int num_devices) {
-    std::vector<int> out;
-    out.reserve(static_cast<size_t>(num_devices));
-
-    for (int i = 0; i < num_devices; ++i) {
-        out.push_back(devices[i]);
-    }
-
-    return out;
 }
 
 oo_status_t initialize_group_topology(
@@ -145,6 +113,33 @@ oo_status_t initialize_group_topology(
         group->topology_valid = false;
         group->topology = ooverlap::topology::Topology{};
         return ooverlap::comm::api::exception_to_status();
+    }
+}
+
+void register_collective_buffer(oo_buffer_t* buffer) {
+    if (buffer == nullptr ||
+        buffer->group == nullptr ||
+        buffer->owner_rank < 0 ||
+        buffer->owner_rank >= kOoMaxLocalDevices) {
+        return;
+    }
+
+    buffer->group->collective_buffers[buffer->owner_rank] = buffer;
+}
+
+void unregister_collective_buffer(oo_buffer_t* buffer) {
+    if (buffer == nullptr ||
+        buffer->group == nullptr ||
+        buffer->owner_rank < 0 ||
+        buffer->owner_rank >= kOoMaxLocalDevices) {
+        return;
+    }
+
+    oo_group_t* group = buffer->group;
+    const int rank = buffer->owner_rank;
+
+    if (group->collective_buffers[rank] == buffer) {
+        group->collective_buffers[rank] = nullptr;
     }
 }
 
@@ -190,17 +185,11 @@ oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
             return OO_ERROR_INVALID_DEVICE;
         }
 
-        cudaError_t err =
-            cudaSetDevice(device);
-
-        if (err != cudaSuccess) {
-            destroy_group_ready_signals(group);
-            return ooverlap::comm::api::cuda_to_status(err);
-        }
+        ooverlap::system::runtime::set_device(device);
 
         void* signal = nullptr;
 
-        err =
+        cudaError_t err =
             cudaMalloc(
                 &signal,
                 sizeof(int));
@@ -319,6 +308,8 @@ void destroy_buffer_storage(oo_buffer_t* buffer) {
         return;
     }
 
+    unregister_collective_buffer(buffer);
+
     if (buffer->system_kind == ooverlap::system::peer_buffer_kind::owned_vmm) {
         ooverlap::system::free_peer_visible_buffer(buffer->mapped);
     } else if (
@@ -436,18 +427,14 @@ oo_status_t oo_group_create(
             group->devices[i] = devices[i];
         }
 
-        /*
-         * VMM groups do not require cudaDeviceEnablePeerAccess for user buffers.
-         * Record static topology/link information without runtime probes.
-         */
         oo_status_t status =
             initialize_group_topology(
                 group.get(),
-                false,  // do not enable peer access in topology discovery
-                false,  // no SHM fallback transport during runtime group creation yet
-                false,  // no runtime validation probes
-                false,  // no atomic probes
-                false); // no TMA probes
+                false,
+                false,
+                false,
+                false,
+                false);
 
         if (status != OO_SUCCESS) {
             return status;
@@ -499,11 +486,6 @@ oo_status_t oo_group_create_p2p(
             group->devices[i] = devices[i];
         }
 
-        /*
-         * External/wrapped cudaMalloc pointers need peer access enabled as a
-         * runtime setup side-effect.  Do not store a second peer-access matrix in
-         * oo_group; topology is the source of truth for planning.
-         */
         oo_status_t status =
             enable_group_peer_access_all_to_all(group.get());
 
@@ -514,11 +496,11 @@ oo_status_t oo_group_create_p2p(
         status =
             initialize_group_topology(
                 group.get(),
-                false,  // peer access is already enabled above
-                false,  // no SHM fallback transport during runtime group creation yet
-                false,  // no runtime validation probes
-                false,  // no atomic probes
-                false); // no TMA probes
+                false,
+                false,
+                false,
+                false,
+                false);
 
         if (status != OO_SUCCESS) {
             return status;
@@ -584,12 +566,6 @@ oo_status_t oo_group_create_ipc(
             group->devices[i] = devices[i];
         }
 
-        /*
-         * IPC topology/launch exchange is intentionally not implemented here
-         * yet. Some IPC deployments restrict CUDA_VISIBLE_DEVICES per process,
-         * so discovering all devices during every rank's group creation would be
-         * unsafe.
-         */
         group->topology_valid = false;
         group->topology = ooverlap::topology::Topology{};
 
@@ -612,10 +588,14 @@ void oo_group_destroy(oo_group_t* group) {
         return;
     }
 
+    for (int rank = 0; rank < kOoMaxLocalDevices; ++rank) {
+        group->collective_buffers[rank] = nullptr;
+    }
+
     destroy_group_ready_signals(group);
-    group->collective_launch_exchange.reset();
     group->transfer_plan_distribution.reset();
     group->broker.reset();
+
     delete group;
 }
 
@@ -718,6 +698,8 @@ oo_status_t oo_buffer_alloc(
         buffer->system_kind = ooverlap::system::peer_buffer_kind::owned_vmm;
         buffer->mapped = mapped;
 
+        register_collective_buffer(buffer.get());
+
         *out_buffer = buffer.release();
         return OO_SUCCESS;
     } catch (...) {
@@ -744,36 +726,6 @@ oo_status_t oo_buffer_wrap(
     }
 
     try {
-        cudaPointerAttributes attr{};
-
-        cudaError_t attr_err =
-            cudaPointerGetAttributes(
-                &attr,
-                ptr);
-
-        if (attr_err != cudaSuccess) {
-            /*
-             * Clear sticky runtime error state before returning.
-             */
-            (void)cudaGetLastError();
-            return OO_ERROR_INVALID_ARGUMENT;
-        }
-
-#if CUDART_VERSION >= 10000
-        if (attr.type != cudaMemoryTypeDevice &&
-            attr.type != cudaMemoryTypeManaged) {
-            return OO_ERROR_INVALID_ARGUMENT;
-        }
-#else
-        if (attr.memoryType != cudaMemoryTypeDevice) {
-            return OO_ERROR_INVALID_ARGUMENT;
-        }
-#endif
-
-        if (attr.device >= 0 && attr.device != node->device) {
-            return OO_ERROR_INVALID_ARGUMENT;
-        }
-
         std::unique_ptr<oo_buffer_t> buffer(new oo_buffer_t{});
         buffer->ptr = ptr;
         buffer->bytes = bytes;
@@ -783,6 +735,8 @@ oo_status_t oo_buffer_wrap(
         buffer->owner_rank = node->rank;
         buffer->owner_device = node->device;
         buffer->system_kind = ooverlap::system::peer_buffer_kind::wrapped;
+
+        register_collective_buffer(buffer.get());
 
         *out_buffer = buffer.release();
         return OO_SUCCESS;
