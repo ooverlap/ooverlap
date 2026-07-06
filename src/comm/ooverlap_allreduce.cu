@@ -1,6 +1,7 @@
 #include "comm/ooverlap_comm_private.h"
 
 #include "comm/tma_multi_gpu_allreduce_sm90.h"
+#include "comm/plan/transfer_plan_distribution.h"
 
 namespace {
 
@@ -42,6 +43,48 @@ oo_status_t allreduce_impl(
             launch.bytes,
             tuning_mode);
 
+    /*
+     * Logical task-generation/distribution layer.
+     *
+     * For same-process groups, the backend lets the first arriving rank build
+     * the TransferPlan and makes the other ranks wait until it is ready.
+     *
+     * For IPC groups, the backend will later make rank 0 build and broadcast
+     * the TransferPlan.
+     *
+     * The returned transfer_plan is a rank-local copy. It contains no raw
+     * pointers. Raw pointer lowering happens in the SM90 enqueue layer.
+     */
+    ooverlap::comm::plan::AllreduceTransferPlan transfer_plan{};
+
+    if (node == nullptr ||
+        node->group == nullptr ||
+        node->group->transfer_plan_distribution == nullptr) {
+        return OO_ERROR_INTERNAL;
+    }
+
+    status =
+        node->group->transfer_plan_distribution->get_allreduce_transfer_plan(
+            node,
+            launch,
+            count,
+            dtype,
+            op,
+            config,
+            &transfer_plan);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
+    /*
+     * Temporary fallback.
+     *
+     * This still uses the old raw-pointer plan builder inside
+     * tma_multi_gpu_allreduce_sm90.cu. The next patch should replace this call
+     * with a transfer-plan enqueue function that lowers transfer_plan into a
+     * WindowTaskExecutorPlan for this rank.
+     */
     cudaError_t error =
         ooverlap::enqueue_tma_multi_gpu_allreduce_rank_sm90(
             launch.local_ptr,

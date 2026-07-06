@@ -4,6 +4,7 @@
 #include "ooverlap/system/p2p.cuh"
 
 #include "comm/utils/collective_utils.h"
+#include "comm/plan/transfer_plan_distribution.h"
 #include "topology/topology.h"
 
 #include <cuda_runtime.h>
@@ -423,6 +424,9 @@ oo_status_t oo_group_create(
             return status;
         }
 
+        group->transfer_plan_distribution =
+            ooverlap::comm::plan::make_same_process_transfer_plan_distribution_backend();
+
         *out_group = group.release();
         return OO_SUCCESS;
     } catch (...) {
@@ -503,6 +507,9 @@ oo_status_t oo_group_create_p2p(
             destroy_group_ready_signals(group.get());
             return status;
         }
+
+        group->transfer_plan_distribution =
+            ooverlap::comm::plan::make_same_process_transfer_plan_distribution_backend();
 
         *out_group = group.release();
         return OO_SUCCESS;

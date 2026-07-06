@@ -77,6 +77,14 @@ struct oo_ready_signal {
     ooverlap::system::imported_peer_buffer imported{};
 };
 
+namespace ooverlap {
+namespace comm {
+namespace plan {
+class TransferPlanDistributionBackend;
+}
+}
+}
+
 struct oo_group {
     int num_devices = 0;
     int devices[kOoMaxLocalDevices] = {};
@@ -123,6 +131,9 @@ struct oo_group {
 
     bool topology_valid = false;
     ooverlap::topology::Topology topology{};
+
+    std::unique_ptr<ooverlap::comm::plan::TransferPlanDistributionBackend>
+                            transfer_plan_distribution{};
 };
 
 struct oo_node {
