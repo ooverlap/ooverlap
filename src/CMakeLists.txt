@@ -213,6 +213,8 @@ if(OOVERLAP_NEED_CORE)
     ${OOVERLAP_SRC_DIR}/comm/tma_multi_gpu_reduce_scatter_sm90.cu
     ${OOVERLAP_SRC_DIR}/comm/tma_multi_gpu_all_gather_sm90.cu
     ${OOVERLAP_SRC_DIR}/comm/tuning/tuning_policy.cpp
+
+    ${OOVERLAP_SRC_DIR}/comm/plan/transfer_plan_distribution.cu
   )
 
   add_library(ooverlap::comm ALIAS ooverlap_comm)

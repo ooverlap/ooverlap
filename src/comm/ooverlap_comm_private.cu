@@ -385,6 +385,9 @@ oo_status_t prepare_collective_launch(
             reinterpret_cast<void*>(
                 reinterpret_cast<std::uint8_t*>(peer->ptr) + offset_bytes);
 
+        out->peer_ranks[peer_idx] = peer->owner_rank;
+        out->peer_devices[peer_idx] = peer->owner_device;
+
         oo_ready_signal& peer_signal =
             group->ready_signal_slots[peer->owner_rank];
 

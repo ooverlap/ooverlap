@@ -86,22 +86,24 @@ oo_status_t allreduce_impl(
      * WindowTaskExecutorPlan for this rank.
      */
     cudaError_t error =
-        ooverlap::enqueue_tma_multi_gpu_allreduce_rank_sm90(
-            launch.local_ptr,
-            launch.local_ptr,
-            launch.peer_ptrs,
-            launch.peer_count,
-            count,
-            dtype,
-            op,
-            launch.rank,
-            launch.world_size,
-            launch.local_device,
-            stream,
-            launch.local_ready_signal,
-            launch.peer_ready_signals,
-            launch.collective_epoch,
-            config);
+    ooverlap::enqueue_tma_multi_gpu_allreduce_rank_sm90_transfer_plan(
+        launch.local_ptr,
+        launch.local_ptr,
+        launch.peer_ptrs,
+        launch.peer_ranks,
+        launch.peer_count,
+        count,
+        dtype,
+        op,
+        launch.rank,
+        launch.world_size,
+        launch.local_device,
+        stream,
+        launch.local_ready_signal,
+        launch.peer_ready_signals,
+        launch.collective_epoch,
+        config,
+        transfer_plan);
 
     return ooverlap::comm::api::cuda_to_status(error);
 }
