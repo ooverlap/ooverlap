@@ -240,7 +240,8 @@ bool lower_transfer_plan_for_rank(
     const RankPointerBinding<MaxRanks, MaxStagingSlots>& binding,
     const comm::LaunchConfig& launch_config,
     WindowTaskExecutorPlan<MaxWindowTasks>* out_window_plan,
-    int* out_num_blocks) {
+    int* out_num_blocks,
+    int reserved_prefix_tasks_per_cta = 0) {
     if (out_window_plan == nullptr ||
         out_num_blocks == nullptr ||
         binding.current_rank < 0 ||
@@ -284,8 +285,16 @@ bool lower_transfer_plan_for_rank(
         return false;
     }
 
+    const int tasks_per_cta_after_prefix =
+        rank_transfer_count + reserved_prefix_tasks_per_cta;
+    
+    if (tasks_per_cta_after_prefix <= 0 ||
+        tasks_per_cta_after_prefix > MaxWindowTasks) {
+        return false;
+    }
+    
     const int max_ctas_by_plan =
-        MaxWindowTasks / rank_transfer_count;
+        MaxWindowTasks / tasks_per_cta_after_prefix;
 
     if (max_ctas_by_plan <= 0) {
         return false;

@@ -170,18 +170,24 @@ __device__ __forceinline__ void execute_window_task(
                     barriers);
             return;
 
+
         case task::WindowTaskOp::ReadyPublish:
-            publish_ready_signal(
-                task.signal_flags,
-                task.ready_epoch,
-                static_cast<MultiGpuReadySignalProtocol>(task.ready_protocol));
+            if (threadIdx.x == 0) {
+                publish_ready_signal(
+                    task.signal_flags,
+                    task.ready_epoch,
+                    static_cast<MultiGpuReadySignalProtocol>(
+                        task.ready_protocol));
+            }
             return;
         
         case task::WindowTaskOp::ReadyWait:
-            wait_until_ready_signal_at_least(
-                task.signal_flags,
-                task.ready_epoch,
-                task.ready_poll_sleep_cycles);
+            if (threadIdx.x == 0) {
+                wait_until_ready_signal_at_least(
+                    task.signal_flags,
+                    task.ready_epoch,
+                    task.ready_poll_sleep_cycles);
+            }
             return;
 
         case task::WindowTaskOp::None:
