@@ -46,11 +46,6 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
 
-    wait_for_multi_gpu_collective_ready(
-        local_ready_signal,
-        ready_plan,
-        collective_epoch);
-
     extern __shared__ uint4 shared_storage_u4[];
 
     unsigned char* shared_raw =

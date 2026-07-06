@@ -5,6 +5,7 @@
 #include "comm/pipeline/window_pipeline.cuh"
 #include "comm/plan/window_plan.cuh"
 #include "comm/tma_variant_config.h"
+#include "comm/kernels/multi_gpu_ready_signal.cuh"
 
 namespace ooverlap {
 namespace comm {
@@ -167,6 +168,20 @@ __device__ __forceinline__ void execute_window_task(
                     task.signal_base_window,
                     shared_raw,
                     barriers);
+            return;
+
+        case task::WindowTaskOp::ReadyPublish:
+            publish_ready_signal(
+                task.signal_flags,
+                task.ready_epoch,
+                static_cast<MultiGpuReadySignalProtocol>(task.ready_protocol));
+            return;
+        
+        case task::WindowTaskOp::ReadyWait:
+            wait_until_ready_signal_at_least(
+                task.signal_flags,
+                task.ready_epoch,
+                task.ready_poll_sleep_cycles);
             return;
 
         case task::WindowTaskOp::None:

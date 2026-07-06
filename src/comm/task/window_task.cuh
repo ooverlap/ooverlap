@@ -53,6 +53,12 @@ enum class WindowTaskOp : uint8_t {
      * into task.dst.
      */
     ReduceTMAAfterSignal = 7,
+
+    /*
+     * Waiting Tasks
+     */
+    ReadyPublish = 8,
+    ReadyWait = 9,
 };
 
 struct WindowTask {
@@ -85,6 +91,13 @@ struct WindowTask {
      */
     int* signal_flags = nullptr;
     int signal_base_window = 0;
+
+    /*
+     * Ready variables
+     */
+    int ready_epoch = 0;
+    int ready_protocol = 0;
+    int ready_poll_sleep_cycles = 0;
 
     /*
      * terminal means: after this task, the CTA returns and does not execute
@@ -279,8 +292,42 @@ __host__ __device__ __forceinline__ WindowTask make_copy_fast_after_signal_task(
     return task;
 }
 
+__host__ __device__ __forceinline__ WindowTask make_ready_publish_task(
+    int* ready_signal,
+    int epoch,
+    int protocol,
+    bool terminal = false) {
+    WindowTask task{};
+    task.op = WindowTaskOp::ReadyPublish;
+    task.signal_flags = ready_signal;
+    task.ready_epoch = epoch;
+    task.ready_protocol = protocol;
+    task.terminal = terminal;
+    return task;
+}
+
+__host__ __device__ __forceinline__ WindowTask make_ready_wait_task(
+    const int* ready_signal,
+    int epoch,
+    int poll_sleep_cycles,
+    bool terminal = false) {
+    WindowTask task{};
+    task.op = WindowTaskOp::ReadyWait;
+    task.signal_flags = const_cast<int*>(ready_signal);
+    task.ready_epoch = epoch;
+    task.ready_poll_sleep_cycles = poll_sleep_cycles;
+    task.terminal = terminal;
+    return task;
+}
+
 __host__ __device__ __forceinline__ bool window_task_has_work(
     const WindowTask& task) {
+    if (task.op == WindowTaskOp::ReadyPublish ||
+        task.op == WindowTaskOp::ReadyWait) {
+        return task.signal_flags != nullptr &&
+               task.ready_epoch > 0;
+    }
+
     return task.op != WindowTaskOp::None &&
            task.src != nullptr &&
            task.dst != nullptr &&
