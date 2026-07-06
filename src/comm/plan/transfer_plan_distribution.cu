@@ -1,14 +1,17 @@
 #include "comm/plan/transfer_plan_distribution.h"
 
 #include "comm/plan/transfer_planner.h"
+#include "ooverlap/comm.h"
 
-#include <condition_variable>
 #include <mutex>
+#include <utility>
 
 namespace ooverlap {
 namespace comm {
 namespace plan {
 namespace {
+
+constexpr int kPlanCacheEntries = 16;
 
 bool same_launch_config(
     const LaunchConfig& a,
@@ -39,7 +42,6 @@ bool same_launch_config(
 
 struct TransferPlanRequestKey {
     CollectivePlanFor collective = CollectivePlanFor::AllReduce;
-    int epoch = 0;
     int world_size = 0;
 
     size_t count = 0;
@@ -55,7 +57,6 @@ bool same_request_key(
     const TransferPlanRequestKey& a,
     const TransferPlanRequestKey& b) {
     return a.collective == b.collective &&
-           a.epoch == b.epoch &&
            a.world_size == b.world_size &&
            a.count == b.count &&
            a.dtype_size == b.dtype_size &&
@@ -73,7 +74,6 @@ TransferPlanRequestKey make_request_key(
     const LaunchConfig& config) {
     TransferPlanRequestKey key{};
     key.collective = collective;
-    key.epoch = launch.collective_epoch;
     key.world_size = launch.world_size;
     key.count = count;
     key.dtype_size = launch.dtype_size;
@@ -100,114 +100,77 @@ TransferPlanBuildInput make_build_input(
     input.world_size = launch.world_size;
     input.count = count;
     input.dtype_size = launch.dtype_size;
-
-    /*
-     * Current public collectives are in-place over full logical buffers.
-     * If/when compact input/output buffers are added, this is the bit that
-     * should become collective-call metadata instead of a hardcoded false.
-     */
     input.out_of_place = false;
     return input;
 }
 
 template <int MaxTransferTasks>
-struct SameProcessPlanSlot {
-    std::mutex mutex;
-    std::condition_variable cv;
-
-    bool active = false;
-    bool ready = false;
-    bool failed = false;
-
-    int copied = 0;
-    oo_status_t status = OO_SUCCESS;
-
+struct CachedPlanEntry {
+    bool valid = false;
     TransferPlanRequestKey key{};
     TransferPlan<MaxTransferTasks> plan{};
 };
 
 template <int MaxTransferTasks>
-void reset_slot_locked(
-    SameProcessPlanSlot<MaxTransferTasks>* slot) {
-    if (slot == nullptr) {
-        return;
-    }
-
-    slot->active = false;
-    slot->ready = false;
-    slot->failed = false;
-    slot->copied = 0;
-    slot->status = OO_SUCCESS;
-    slot->key = TransferPlanRequestKey{};
-    transfer_plan_clear(&slot->plan);
-}
+struct SameProcessPlanCache {
+    std::mutex mutex;
+    int next_victim = 0;
+    CachedPlanEntry<MaxTransferTasks> entries[kPlanCacheEntries] = {};
+};
 
 template <int MaxTransferTasks, typename Builder>
-oo_status_t get_or_build_same_process_plan(
-    SameProcessPlanSlot<MaxTransferTasks>* slot,
-    oo_node_t* node,
-    const ooverlap::comm::api::CollectiveLaunchState& launch,
+oo_status_t get_or_build_cached_same_process_plan(
+    SameProcessPlanCache<MaxTransferTasks>* cache,
     const TransferPlanRequestKey& key,
     TransferPlan<MaxTransferTasks>* out_plan,
     Builder&& builder) {
-    if (slot == nullptr ||
-        node == nullptr ||
-        node->group == nullptr ||
-        out_plan == nullptr ||
-        launch.world_size <= 0) {
+    if (cache == nullptr || key.world_size <= 0) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    std::unique_lock<std::mutex> lock(slot->mutex);
+    std::lock_guard<std::mutex> lock(cache->mutex);
 
-    if (!slot->active) {
-        slot->active = true;
-        slot->ready = false;
-        slot->failed = false;
-        slot->copied = 0;
-        slot->status = OO_SUCCESS;
-        slot->key = key;
+    for (int i = 0; i < kPlanCacheEntries; ++i) {
+        CachedPlanEntry<MaxTransferTasks>& entry =
+            cache->entries[i];
 
-        const oo_status_t status =
-            builder(&slot->plan);
-
-        if (status != OO_SUCCESS) {
-            slot->failed = true;
-            slot->status = status;
+        if (entry.valid && same_request_key(entry.key, key)) {
+            *out_plan = entry.plan;
+            return OO_SUCCESS;
         }
-
-        slot->ready = true;
-        slot->cv.notify_all();
-    } else {
-        if (!same_request_key(slot->key, key)) {
-            return OO_ERROR_INVALID_ARGUMENT;
-        }
-
-        slot->cv.wait(lock, [slot]() {
-            return slot->ready;
-        });
     }
 
-    if (slot->failed) {
-        const oo_status_t status = slot->status;
+    int slot = -1;
 
-        slot->copied += 1;
-
-        if (slot->copied == slot->key.world_size) {
-            reset_slot_locked(slot);
+    for (int i = 0; i < kPlanCacheEntries; ++i) {
+        if (!cache->entries[i].valid) {
+            slot = i;
+            break;
         }
+    }
 
+    if (slot < 0) {
+        slot = cache->next_victim;
+        cache->next_victim =
+            (cache->next_victim + 1) % kPlanCacheEntries;
+    }
+
+    CachedPlanEntry<MaxTransferTasks>& entry =
+        cache->entries[slot];
+
+    entry.valid = false;
+    entry.key = key;
+    transfer_plan_clear(&entry.plan);
+
+    const oo_status_t status =
+        builder(&entry.plan);
+
+    if (status != OO_SUCCESS) {
         return status;
     }
 
-    *out_plan = slot->plan;
-
-    slot->copied += 1;
-
-    if (slot->copied == slot->key.world_size) {
-        reset_slot_locked(slot);
-    }
-
+    entry.valid = true;
+    *out_plan = entry.plan;
     return OO_SUCCESS;
 }
 
@@ -224,7 +187,6 @@ public:
         AllreduceTransferPlan* out_plan) override {
         if (node == nullptr ||
             node->group == nullptr ||
-            out_plan == nullptr ||
             launch.dtype_size == 0 ||
             config.plan_for != CollectivePlanFor::AllReduce) {
             return OO_ERROR_INVALID_ARGUMENT;
@@ -241,10 +203,8 @@ public:
                 op,
                 config);
 
-        return get_or_build_same_process_plan(
+        return get_or_build_cached_same_process_plan(
             &allreduce_,
-            node,
-            launch,
             key,
             out_plan,
             [group, &launch, count, &config](AllreduceTransferPlan* plan) {
@@ -261,11 +221,9 @@ public:
                         config,
                         CollectivePlanFor::AllReduce);
 
-                if (!build_allreduce_transfer_plan(plan, input)) {
-                    return OO_ERROR_UNSUPPORTED;
-                }
-
-                return OO_SUCCESS;
+                return build_allreduce_transfer_plan(plan, input)
+                    ? OO_SUCCESS
+                    : OO_ERROR_UNSUPPORTED;
             });
     }
 
@@ -296,10 +254,8 @@ public:
                 op,
                 config);
 
-        return get_or_build_same_process_plan(
+        return get_or_build_cached_same_process_plan(
             &reduce_scatter_,
-            node,
-            launch,
             key,
             out_plan,
             [group, &launch, count, &config](ReduceScatterTransferPlan* plan) {
@@ -316,11 +272,9 @@ public:
                         config,
                         CollectivePlanFor::ReduceScatter);
 
-                if (!build_reduce_scatter_transfer_plan(plan, input)) {
-                    return OO_ERROR_UNSUPPORTED;
-                }
-
-                return OO_SUCCESS;
+                return build_reduce_scatter_transfer_plan(plan, input)
+                    ? OO_SUCCESS
+                    : OO_ERROR_UNSUPPORTED;
             });
     }
 
@@ -350,10 +304,8 @@ public:
                 OO_REDUCE_ADD,
                 config);
 
-        return get_or_build_same_process_plan(
+        return get_or_build_cached_same_process_plan(
             &all_gather_,
-            node,
-            launch,
             key,
             out_plan,
             [group, &launch, count, &config](AllGatherTransferPlan* plan) {
@@ -370,18 +322,16 @@ public:
                         config,
                         CollectivePlanFor::AllGather);
 
-                if (!build_all_gather_transfer_plan(plan, input)) {
-                    return OO_ERROR_UNSUPPORTED;
-                }
-
-                return OO_SUCCESS;
+                return build_all_gather_transfer_plan(plan, input)
+                    ? OO_SUCCESS
+                    : OO_ERROR_UNSUPPORTED;
             });
     }
 
 private:
-    SameProcessPlanSlot<kTmaMultiGpuAllReduceMaxTransferTasks> allreduce_{};
-    SameProcessPlanSlot<kTmaMultiGpuReduceScatterMaxTransferTasks> reduce_scatter_{};
-    SameProcessPlanSlot<kTmaMultiGpuAllGatherMaxTransferTasks> all_gather_{};
+    SameProcessPlanCache<kTmaMultiGpuAllReduceMaxTransferTasks> allreduce_{};
+    SameProcessPlanCache<kTmaMultiGpuReduceScatterMaxTransferTasks> reduce_scatter_{};
+    SameProcessPlanCache<kTmaMultiGpuAllGatherMaxTransferTasks> all_gather_{};
 };
 
 } // namespace

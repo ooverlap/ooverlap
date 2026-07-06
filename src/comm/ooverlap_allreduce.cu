@@ -47,7 +47,7 @@ oo_status_t allreduce_impl(
             launch.bytes,
             tuning_mode);
 
-    ooverlap::comm::plan::AllreduceTransferPlan transfer_plan{};
+    ooverlap::comm::plan::AllreduceTransferPlan* transfer_plan = nullptr;
 
     status =
         node->group->transfer_plan_distribution->get_allreduce_transfer_plan(
@@ -57,7 +57,7 @@ oo_status_t allreduce_impl(
             dtype,
             op,
             config,
-            &transfer_plan);
+            transfer_plan);
 
     if (status != OO_SUCCESS) {
         return status;
@@ -70,7 +70,7 @@ oo_status_t allreduce_impl(
             op,
             stream,
             config,
-            transfer_plan);
+            *transfer_plan);
 
     return ooverlap::comm::api::cuda_to_status(error);
 }

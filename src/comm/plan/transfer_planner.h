@@ -1,7 +1,6 @@
 #pragma once
 
 #include "comm/plan/transfer_plan.h"
-#include "comm/utils/collective_utils.h"
 #include "comm/utils/utils.h"
 
 #include <cstddef>
@@ -13,10 +12,16 @@ namespace plan {
 /*
  * Topology/logical planning layer.
  *
- * These helpers build rank-level TransferTask plans. They do not touch raw
- * pointers. They are safe for same-process and multiprocess usage as long as
- * every rank/process passes the same rank->device map and topology view.
+ * This is kept header-only because the concrete TransferPlan size is a template
+ * parameter.  The build path is optimized for the benchmark/research case:
+ *
+ *   - no full TransferTask array clear on build
+ *   - no rank_partition helper call per rank
+ *   - no repeated topology link scan per emitted task
+ *   - no heavy validation inside the inner loops
  */
+
+constexpr int kPlannerMaxRanks = 16;
 
 struct RankTopologyView {
     const topology::Topology* topology = nullptr;
@@ -43,9 +48,7 @@ struct TransferPlanBuildInput {
     std::size_t dtype_size = 0;
 
     /*
-     * For out-of-place collectives, set this true so the logical planner emits
-     * RankInput -> RankBuffer local-copy tasks. Current public allreduce path
-     * is in-place, so this defaults false.
+     * Current public collectives are in-place over full logical buffers.
      */
     bool out_of_place = false;
 };
@@ -54,6 +57,35 @@ __host__ __device__ __forceinline__ bool valid_rank(
     int rank,
     int world_size) {
     return rank >= 0 && rank < world_size;
+}
+
+template <int MaxTransferTasks>
+__host__ __device__ __forceinline__ void transfer_plan_reset_metadata(
+    TransferPlan<MaxTransferTasks>* plan,
+    int world_size) {
+    plan->world_size = world_size;
+    plan->total_tasks = 0;
+}
+
+template <int MaxTransferTasks>
+__host__ __device__ __forceinline__ void transfer_plan_abort_build(
+    TransferPlan<MaxTransferTasks>* plan) {
+    if (plan != nullptr) {
+        plan->world_size = 0;
+        plan->total_tasks = 0;
+    }
+}
+
+template <int MaxTransferTasks>
+__host__ __device__ __forceinline__ bool transfer_plan_push_fast(
+    TransferPlan<MaxTransferTasks>* plan,
+    const TransferTask& task) {
+    if (plan->total_tasks >= MaxTransferTasks) {
+        return false;
+    }
+
+    plan->tasks[plan->total_tasks++] = task;
+    return true;
 }
 
 inline const topology::Link* find_topology_link_by_devices(
@@ -142,38 +174,61 @@ inline topology::TransportKind choose_direct_or_fallback_transport(
 
     /*
      * Preserve old behavior when no topology is supplied: treat peers as direct.
-     * Later routing can tighten this to "unsupported".
      */
     return topology::TransportKind::DirectPcie;
 }
 
-inline bool compute_rank_slice_bytes(
+struct TransportMatrix {
+    topology::TransportKind kind[kPlannerMaxRanks][kPlannerMaxRanks] = {};
+};
+
+inline bool build_transport_matrix(
+    const RankTopologyView& topo,
+    int world_size,
+    TransportMatrix* out) {
+    if (out == nullptr ||
+        world_size <= 0 ||
+        world_size > kPlannerMaxRanks) {
+        return false;
+    }
+
+    RankTopologyView fixed_topo = topo;
+    fixed_topo.world_size = world_size;
+
+    for (int src = 0; src < world_size; ++src) {
+        for (int dst = 0; dst < world_size; ++dst) {
+            out->kind[src][dst] =
+                choose_direct_or_fallback_transport(
+                    fixed_topo,
+                    src,
+                    dst);
+        }
+    }
+
+    return true;
+}
+
+__host__ __device__ __forceinline__ bool compute_rank_slice_bytes_fast(
     std::size_t count,
     std::size_t dtype_size,
     int rank,
     int world_size,
     std::size_t* out_begin_bytes,
     std::size_t* out_slice_bytes) {
-    if (out_begin_bytes == nullptr ||
-        out_slice_bytes == nullptr ||
-        dtype_size == 0) {
-        return false;
-    }
+    const std::size_t world =
+        static_cast<std::size_t>(world_size);
+    const std::size_t r =
+        static_cast<std::size_t>(rank);
 
-    *out_begin_bytes = 0;
-    *out_slice_bytes = 0;
+    const std::size_t base =
+        count / world;
+    const std::size_t rem =
+        count - base * world;
 
-    std::size_t begin_elems = 0;
-    std::size_t slice_elems = 0;
-
-    if (!comm::utils::rank_partition(
-            count,
-            rank,
-            world_size,
-            &begin_elems,
-            &slice_elems)) {
-        return false;
-    }
+    const std::size_t begin_elems =
+        r * base + ((r < rem) ? r : rem);
+    const std::size_t slice_elems =
+        base + ((r < rem) ? 1 : 0);
 
     *out_begin_bytes = begin_elems * dtype_size;
     *out_slice_bytes = slice_elems * dtype_size;
@@ -189,6 +244,12 @@ inline int window_count_for_transfer_bytes(
         launch_config.window_chunks);
 }
 
+__host__ __device__ __forceinline__ bool transport_uses_direct_tma(
+    topology::TransportKind transport) {
+    return transport == topology::TransportKind::DirectNvlink ||
+           transport == topology::TransportKind::DirectPcie;
+}
+
 inline TransferTask make_copy_transfer_task(
     int executor_rank,
     int src_rank,
@@ -201,6 +262,9 @@ inline TransferTask make_copy_transfer_task(
     topology::TransportKind transport,
     bool terminal,
     int phase) {
+    const bool direct_tma =
+        transport_uses_direct_tma(transport);
+
     TransferTask task{};
     task.op = TransferOp::Copy;
     task.executor_rank = executor_rank;
@@ -213,12 +277,8 @@ inline TransferTask make_copy_transfer_task(
     task.end_window = num_windows;
     task.window_chunks = window_chunks;
     task.transport = transport;
-    task.requires_tma_load =
-        transport == topology::TransportKind::DirectNvlink ||
-        transport == topology::TransportKind::DirectPcie;
-    task.requires_tma_store =
-        transport == topology::TransportKind::DirectNvlink ||
-        transport == topology::TransportKind::DirectPcie;
+    task.requires_tma_load = direct_tma;
+    task.requires_tma_store = direct_tma;
     task.requires_tma_reduce = false;
     task.requires_native_atomic = false;
     task.terminal = terminal;
@@ -238,6 +298,9 @@ inline TransferTask make_reduce_transfer_task(
     topology::TransportKind transport,
     bool terminal,
     int phase) {
+    const bool direct_tma =
+        transport_uses_direct_tma(transport);
+
     TransferTask task{};
     task.op = TransferOp::Reduce;
     task.executor_rank = executor_rank;
@@ -250,63 +313,62 @@ inline TransferTask make_reduce_transfer_task(
     task.end_window = num_windows;
     task.window_chunks = window_chunks;
     task.transport = transport;
-    task.requires_tma_load =
-        transport == topology::TransportKind::DirectNvlink ||
-        transport == topology::TransportKind::DirectPcie;
+    task.requires_tma_load = direct_tma;
     task.requires_tma_store = false;
-    task.requires_tma_reduce =
-        transport == topology::TransportKind::DirectNvlink ||
-        transport == topology::TransportKind::DirectPcie;
-    task.requires_native_atomic =
-        transport == topology::TransportKind::DirectNvlink ||
-        transport == topology::TransportKind::DirectPcie;
+    task.requires_tma_reduce = direct_tma;
+    task.requires_native_atomic = direct_tma;
     task.terminal = terminal;
     task.phase = phase;
     return task;
 }
 
+inline bool valid_build_input(
+    const TransferPlanBuildInput& input) {
+    return input.world_size > 0 &&
+           input.world_size <= kPlannerMaxRanks &&
+           input.dtype_size != 0 &&
+           input.launch_config.window_chunks > 0 &&
+           input.launch_config.chunk_bytes > 0;
+}
+
 /*
  * First-pass logical allreduce planner.
  *
- * This emits the same logical shape as the current naive allreduce builder:
+ * Logical shape:
  *   optional local input copy
  *   reduce every peer's rank slice into executor rank's buffer
  *   copy executor rank's result slice back to every peer
- *
- * It is topology-aware only at the level of annotating each transfer with the
- * selected transport. The lowering layer still decides whether it can lower
- * that transport to current WindowTask operations.
  */
 template <int MaxTransferTasks>
 bool build_allreduce_transfer_plan(
     TransferPlan<MaxTransferTasks>* plan,
     const TransferPlanBuildInput& input) {
-    if (plan == nullptr ||
-        input.world_size <= 0 ||
-        input.dtype_size == 0 ||
-        input.launch_config.window_chunks <= 0 ||
-        input.launch_config.chunk_bytes <= 0) {
+    if (plan == nullptr || !valid_build_input(input)) {
         return false;
     }
 
-    // TODO: this is slow as we saw before
-    transfer_plan_clear(plan);
-    plan->world_size = input.world_size;
+    transfer_plan_reset_metadata(plan, input.world_size);
+
+    TransportMatrix transports{};
+    if (!build_transport_matrix(
+            input.topo,
+            input.world_size,
+            &transports)) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
 
     for (int rank = 0; rank < input.world_size; ++rank) {
         std::size_t slice_begin_bytes = 0;
         std::size_t slice_bytes = 0;
 
-        if (!compute_rank_slice_bytes(
-                input.count,
-                input.dtype_size,
-                rank,
-                input.world_size,
-                &slice_begin_bytes,
-                &slice_bytes)) {
-            transfer_plan_clear(plan);
-            return false;
-        }
+        compute_rank_slice_bytes_fast(
+            input.count,
+            input.dtype_size,
+            rank,
+            input.world_size,
+            &slice_begin_bytes,
+            &slice_bytes);
 
         const int num_windows =
             window_count_for_transfer_bytes(
@@ -323,7 +385,7 @@ bool build_allreduce_transfer_plan(
             const bool terminal =
                 input.world_size == 1;
 
-            TransferTask local_copy =
+            const TransferTask local_copy =
                 make_copy_transfer_task(
                     rank,
                     rank,
@@ -337,8 +399,8 @@ bool build_allreduce_transfer_plan(
                     terminal,
                     phase++);
 
-            if (!transfer_plan_push(plan, local_copy)) {
-                transfer_plan_clear(plan);
+            if (!transfer_plan_push_fast(plan, local_copy)) {
+                transfer_plan_abort_build(plan);
                 return false;
             }
         }
@@ -348,13 +410,7 @@ bool build_allreduce_transfer_plan(
                 continue;
             }
 
-            const topology::TransportKind transport =
-                choose_direct_or_fallback_transport(
-                    input.topo,
-                    rank,
-                    peer);
-
-            TransferTask reduce =
+            const TransferTask reduce =
                 make_reduce_transfer_task(
                     rank,
                     peer,
@@ -364,17 +420,18 @@ bool build_allreduce_transfer_plan(
                     slice_bytes,
                     num_windows,
                     input.launch_config.window_chunks,
-                    transport,
+                    transports.kind[rank][peer],
                     false,
                     phase++);
 
-            if (!transfer_plan_push(plan, reduce)) {
-                transfer_plan_clear(plan);
+            if (!transfer_plan_push_fast(plan, reduce)) {
+                transfer_plan_abort_build(plan);
                 return false;
             }
         }
 
-        int remaining_peers = input.world_size - 1;
+        int remaining_peers =
+            input.world_size - 1;
 
         for (int peer = 0; peer < input.world_size; ++peer) {
             if (peer == rank) {
@@ -383,13 +440,7 @@ bool build_allreduce_transfer_plan(
 
             --remaining_peers;
 
-            const topology::TransportKind transport =
-                choose_direct_or_fallback_transport(
-                    input.topo,
-                    rank,
-                    peer);
-
-            TransferTask copy =
+            const TransferTask copy =
                 make_copy_transfer_task(
                     rank,
                     rank,
@@ -399,12 +450,12 @@ bool build_allreduce_transfer_plan(
                     slice_bytes,
                     num_windows,
                     input.launch_config.window_chunks,
-                    transport,
+                    transports.kind[rank][peer],
                     remaining_peers == 0,
                     phase++);
 
-            if (!transfer_plan_push(plan, copy)) {
-                transfer_plan_clear(plan);
+            if (!transfer_plan_push_fast(plan, copy)) {
+                transfer_plan_abort_build(plan);
                 return false;
             }
         }
@@ -420,31 +471,32 @@ template <int MaxTransferTasks>
 bool build_reduce_scatter_transfer_plan(
     TransferPlan<MaxTransferTasks>* plan,
     const TransferPlanBuildInput& input) {
-    if (plan == nullptr ||
-        input.world_size <= 0 ||
-        input.dtype_size == 0 ||
-        input.launch_config.window_chunks <= 0 ||
-        input.launch_config.chunk_bytes <= 0) {
+    if (plan == nullptr || !valid_build_input(input)) {
         return false;
     }
 
-    transfer_plan_clear(plan);
-    plan->world_size = input.world_size;
+    transfer_plan_reset_metadata(plan, input.world_size);
+
+    TransportMatrix transports{};
+    if (!build_transport_matrix(
+            input.topo,
+            input.world_size,
+            &transports)) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
 
     for (int rank = 0; rank < input.world_size; ++rank) {
         std::size_t slice_begin_bytes = 0;
         std::size_t slice_bytes = 0;
 
-        if (!compute_rank_slice_bytes(
-                input.count,
-                input.dtype_size,
-                rank,
-                input.world_size,
-                &slice_begin_bytes,
-                &slice_bytes)) {
-            transfer_plan_clear(plan);
-            return false;
-        }
+        compute_rank_slice_bytes_fast(
+            input.count,
+            input.dtype_size,
+            rank,
+            input.world_size,
+            &slice_begin_bytes,
+            &slice_bytes);
 
         const int num_windows =
             window_count_for_transfer_bytes(
@@ -458,7 +510,7 @@ bool build_reduce_scatter_transfer_plan(
         int phase = 0;
 
         if (input.out_of_place) {
-            TransferTask local_copy =
+            const TransferTask local_copy =
                 make_copy_transfer_task(
                     rank,
                     rank,
@@ -472,13 +524,14 @@ bool build_reduce_scatter_transfer_plan(
                     input.world_size == 1,
                     phase++);
 
-            if (!transfer_plan_push(plan, local_copy)) {
-                transfer_plan_clear(plan);
+            if (!transfer_plan_push_fast(plan, local_copy)) {
+                transfer_plan_abort_build(plan);
                 return false;
             }
         }
 
-        int remaining_peers = input.world_size - 1;
+        int remaining_peers =
+            input.world_size - 1;
 
         for (int peer = 0; peer < input.world_size; ++peer) {
             if (peer == rank) {
@@ -487,13 +540,7 @@ bool build_reduce_scatter_transfer_plan(
 
             --remaining_peers;
 
-            const topology::TransportKind transport =
-                choose_direct_or_fallback_transport(
-                    input.topo,
-                    rank,
-                    peer);
-
-            TransferTask reduce =
+            const TransferTask reduce =
                 make_reduce_transfer_task(
                     rank,
                     peer,
@@ -503,12 +550,12 @@ bool build_reduce_scatter_transfer_plan(
                     slice_bytes,
                     num_windows,
                     input.launch_config.window_chunks,
-                    transport,
+                    transports.kind[rank][peer],
                     remaining_peers == 0,
                     phase++);
 
-            if (!transfer_plan_push(plan, reduce)) {
-                transfer_plan_clear(plan);
+            if (!transfer_plan_push_fast(plan, reduce)) {
+                transfer_plan_abort_build(plan);
                 return false;
             }
         }
@@ -521,38 +568,37 @@ bool build_reduce_scatter_transfer_plan(
  * First-pass all-gather logical planner.
  *
  * Semantics: each executor rank sends/copies its partition to every peer rank.
- * Lowering may later choose push or pull physical direction depending on
- * transport and WindowTask capabilities.
  */
 template <int MaxTransferTasks>
 bool build_all_gather_transfer_plan(
     TransferPlan<MaxTransferTasks>* plan,
     const TransferPlanBuildInput& input) {
-    if (plan == nullptr ||
-        input.world_size <= 0 ||
-        input.dtype_size == 0 ||
-        input.launch_config.window_chunks <= 0 ||
-        input.launch_config.chunk_bytes <= 0) {
+    if (plan == nullptr || !valid_build_input(input)) {
         return false;
     }
 
-    transfer_plan_clear(plan);
-    plan->world_size = input.world_size;
+    transfer_plan_reset_metadata(plan, input.world_size);
+
+    TransportMatrix transports{};
+    if (!build_transport_matrix(
+            input.topo,
+            input.world_size,
+            &transports)) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
 
     for (int rank = 0; rank < input.world_size; ++rank) {
         std::size_t slice_begin_bytes = 0;
         std::size_t slice_bytes = 0;
 
-        if (!compute_rank_slice_bytes(
-                input.count,
-                input.dtype_size,
-                rank,
-                input.world_size,
-                &slice_begin_bytes,
-                &slice_bytes)) {
-            transfer_plan_clear(plan);
-            return false;
-        }
+        compute_rank_slice_bytes_fast(
+            input.count,
+            input.dtype_size,
+            rank,
+            input.world_size,
+            &slice_begin_bytes,
+            &slice_bytes);
 
         const int num_windows =
             window_count_for_transfer_bytes(
@@ -566,7 +612,7 @@ bool build_all_gather_transfer_plan(
         int phase = 0;
 
         if (input.out_of_place) {
-            TransferTask local_copy =
+            const TransferTask local_copy =
                 make_copy_transfer_task(
                     rank,
                     rank,
@@ -580,13 +626,14 @@ bool build_all_gather_transfer_plan(
                     input.world_size == 1,
                     phase++);
 
-            if (!transfer_plan_push(plan, local_copy)) {
-                transfer_plan_clear(plan);
+            if (!transfer_plan_push_fast(plan, local_copy)) {
+                transfer_plan_abort_build(plan);
                 return false;
             }
         }
 
-        int remaining_peers = input.world_size - 1;
+        int remaining_peers =
+            input.world_size - 1;
 
         for (int peer = 0; peer < input.world_size; ++peer) {
             if (peer == rank) {
@@ -595,13 +642,7 @@ bool build_all_gather_transfer_plan(
 
             --remaining_peers;
 
-            const topology::TransportKind transport =
-                choose_direct_or_fallback_transport(
-                    input.topo,
-                    rank,
-                    peer);
-
-            TransferTask copy =
+            const TransferTask copy =
                 make_copy_transfer_task(
                     rank,
                     rank,
@@ -611,12 +652,12 @@ bool build_all_gather_transfer_plan(
                     slice_bytes,
                     num_windows,
                     input.launch_config.window_chunks,
-                    transport,
+                    transports.kind[rank][peer],
                     remaining_peers == 0,
                     phase++);
 
-            if (!transfer_plan_push(plan, copy)) {
-                transfer_plan_clear(plan);
+            if (!transfer_plan_push_fast(plan, copy)) {
+                transfer_plan_abort_build(plan);
                 return false;
             }
         }
