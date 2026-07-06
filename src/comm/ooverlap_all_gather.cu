@@ -1,6 +1,7 @@
 #include "comm/ooverlap_comm_private.h"
 
 #include "comm/tma_multi_gpu_all_gather_sm90.h"
+#include "comm/plan/transfer_plan_distribution.h"
 
 namespace {
 
@@ -41,11 +42,33 @@ oo_status_t all_gather_impl(
             launch.bytes,
             tuning_mode);
 
+    ooverlap::comm::plan::AllGatherTransferPlan transfer_plan{};
+
+    if (node == nullptr ||
+        node->group == nullptr ||
+        node->group->transfer_plan_distribution == nullptr) {
+        return OO_ERROR_INTERNAL;
+    }
+
+    status =
+        node->group->transfer_plan_distribution->get_all_gather_transfer_plan(
+            node,
+            launch,
+            count,
+            dtype,
+            config,
+            &transfer_plan);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
     cudaError_t error =
-        ooverlap::enqueue_tma_multi_gpu_all_gather_rank_sm90(
+        ooverlap::enqueue_tma_multi_gpu_all_gather_rank_sm90_transfer_plan(
             launch.local_ptr,
             launch.local_ptr,
             launch.peer_ptrs,
+            launch.peer_ranks,
             launch.peer_count,
             count,
             dtype,
@@ -56,7 +79,8 @@ oo_status_t all_gather_impl(
             launch.local_ready_signal,
             launch.peer_ready_signals,
             launch.collective_epoch,
-            config);
+            config,
+            transfer_plan);
 
     return ooverlap::comm::api::cuda_to_status(error);
 }

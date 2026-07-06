@@ -14,8 +14,15 @@ constexpr int kTmaMultiGpuAllReduceMaxTransferTasks =
     (kTmaMultiGpuAllReduceMaxPeers + 1) *
     (2 * kTmaMultiGpuAllReduceMaxPeers + 1);
 
+constexpr int kTmaMultiGpuAllGatherMaxTransferTasks =
+    (kTmaMultiGpuAllGatherMaxPeers + 1) *
+    (kTmaMultiGpuAllGatherMaxPeers + 1);
+
 using AllreduceTransferPlan =
     TransferPlan<kTmaMultiGpuAllReduceMaxTransferTasks>;
+
+using AllGatherTransferPlan =
+    TransferPlan<kTmaMultiGpuAllGatherMaxTransferTasks>;
 
 class TransferPlanDistributionBackend {
 public:
@@ -29,6 +36,14 @@ public:
         oo_reduce_op_t op,
         const ooverlap::comm::LaunchConfig& config,
         AllreduceTransferPlan* out_plan) = 0;
+
+    virtual oo_status_t get_all_gather_transfer_plan(
+        oo_node_t* node,
+        const ooverlap::comm::api::CollectiveLaunchState& launch,
+        size_t count,
+        oo_dtype_t dtype,
+        const ooverlap::comm::LaunchConfig& config,
+        AllGatherTransferPlan* out_plan) = 0;
 };
 
 std::unique_ptr<TransferPlanDistributionBackend>
