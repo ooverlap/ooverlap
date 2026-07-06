@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <driver_types.h>
 #include <new>
 #include <stdexcept>
 
@@ -134,6 +135,7 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
         binding.rank_input[peer_rank] = launch.peer_ptrs[peer_idx];
         binding.rank_output[peer_rank] = launch.peer_ptrs[peer_idx];
     }
+
 
     comm::plan::WindowTaskExecutorPlan<MaxTasks> window_plan{};
     int num_blocks = 0;

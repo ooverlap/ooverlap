@@ -45,7 +45,7 @@ oo_status_t all_gather_impl(
             launch.bytes,
             tuning_mode);
 
-    ooverlap::comm::plan::AllGatherTransferPlan transfer_plan{};
+    ooverlap::comm::plan::AllGatherTransferPlan* transfer_plan = nullptr;
 
     status =
         node->group->transfer_plan_distribution->get_all_gather_transfer_plan(
@@ -66,7 +66,7 @@ oo_status_t all_gather_impl(
             dtype,
             stream,
             config,
-            transfer_plan);
+            *transfer_plan);
 
     return ooverlap::comm::api::cuda_to_status(error);
 }

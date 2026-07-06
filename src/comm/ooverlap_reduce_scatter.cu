@@ -61,7 +61,7 @@ oo_status_t reduce_scatter_impl(
             launch.bytes,
             tuning_mode);
 
-    ooverlap::comm::plan::ReduceScatterTransferPlan transfer_plan{};
+    ooverlap::comm::plan::ReduceScatterTransferPlan* transfer_plan = nullptr;
 
     status =
         node->group->transfer_plan_distribution->get_reduce_scatter_transfer_plan(
@@ -84,7 +84,7 @@ oo_status_t reduce_scatter_impl(
             op,
             stream,
             config,
-            transfer_plan);
+            *transfer_plan);
 
     return ooverlap::comm::api::cuda_to_status(error);
 }

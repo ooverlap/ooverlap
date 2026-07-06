@@ -42,7 +42,7 @@ public:
         oo_dtype_t dtype,
         oo_reduce_op_t op,
         const ooverlap::comm::LaunchConfig& config,
-        AllreduceTransferPlan* out_plan) = 0;
+        AllreduceTransferPlan** out_plan) = 0;
 
     virtual oo_status_t get_reduce_scatter_transfer_plan(
         oo_node_t* node,
@@ -51,7 +51,7 @@ public:
         oo_dtype_t dtype,
         oo_reduce_op_t op,
         const ooverlap::comm::LaunchConfig& config,
-        ReduceScatterTransferPlan* out_plan) = 0;
+        ReduceScatterTransferPlan** out_plan) = 0;
 
     virtual oo_status_t get_all_gather_transfer_plan(
         oo_node_t* node,
@@ -59,7 +59,7 @@ public:
         size_t count,
         oo_dtype_t dtype,
         const ooverlap::comm::LaunchConfig& config,
-        AllGatherTransferPlan* out_plan) = 0;
+        AllGatherTransferPlan** out_plan) = 0;
 };
 
 std::unique_ptr<TransferPlanDistributionBackend>

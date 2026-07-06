@@ -46,7 +46,6 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
 
-
     wait_for_multi_gpu_collective_ready(
         local_ready_signal,
         ready_plan,
@@ -105,26 +104,33 @@ void configure_multi_gpu_window_task_executor_once(
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
-    struct CacheEntry {
-        bool configured = false;
-        size_t dynamic_smem_bytes = 0;
-    };
+    if (device < 0 || device >= 32) {
+        throw std::runtime_error("invalid device");
+    }
 
     static std::mutex mutex;
-    static std::unordered_map<int, CacheEntry> cache;
+    static unsigned int configured_mask = 0;
 
-    const size_t dynamic_smem_bytes = Variant::dynamic_shared_bytes;
-    const size_t total_smem_bytes = Variant::total_shared_bytes;
+    const unsigned int bit =
+        1u << static_cast<unsigned int>(device);
+
+    /*
+     * Fast path: no map lookup, no lock, no CUDA calls.
+     */
+    if ((configured_mask & bit) != 0u) {
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(mutex);
 
-    auto it = cache.find(device);
-
-    if (it != cache.end() &&
-        it->second.configured &&
-        it->second.dynamic_smem_bytes == dynamic_smem_bytes) {
+    if ((configured_mask & bit) != 0u) {
         return;
     }
+
+    constexpr size_t dynamic_smem_bytes =
+        Variant::dynamic_shared_bytes;
+    constexpr size_t total_smem_bytes =
+        Variant::total_shared_bytes;
 
     system::runtime::set_device(device);
 
@@ -175,7 +181,7 @@ void configure_multi_gpu_window_task_executor_once(
             100),
         "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
 
-    cache[device] = {true, dynamic_smem_bytes};
+    configured_mask |= bit;
 }
 
 } // namespace kernels

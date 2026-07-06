@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <driver_types.h>
 #include <new>
 #include <stdexcept>
 
@@ -176,8 +177,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
             launch.local_device,
             "tma_multi_gpu_allreduce: requested shared memory exceeds opt-in limit");
 
-    system::runtime::set_device(launch.local_device);
-
     comm::kernels::multi_gpu_window_task_executor_kernel_sm90<
         ReduceApply,
         ChunkBytes,
@@ -195,7 +194,7 @@ cudaError_t launch_allreduce_rank_variant_sm90(
                 ready_plan,
                 launch.collective_epoch);
 
-    return cudaGetLastError();
+    return cudaSuccess;
 }
 
 template <

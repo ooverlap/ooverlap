@@ -57,7 +57,7 @@ oo_status_t allreduce_impl(
             dtype,
             op,
             config,
-            transfer_plan);
+            &transfer_plan);
 
     if (status != OO_SUCCESS) {
         return status;

@@ -122,7 +122,7 @@ template <int MaxTransferTasks, typename Builder>
 oo_status_t get_or_build_cached_same_process_plan(
     SameProcessPlanCache<MaxTransferTasks>* cache,
     const TransferPlanRequestKey& key,
-    TransferPlan<MaxTransferTasks>* out_plan,
+    TransferPlan<MaxTransferTasks>** out_plan,
     Builder&& builder) {
     if (cache == nullptr || key.world_size <= 0) {
         return OO_ERROR_INVALID_ARGUMENT;
@@ -135,7 +135,7 @@ oo_status_t get_or_build_cached_same_process_plan(
             cache->entries[i];
 
         if (entry.valid && same_request_key(entry.key, key)) {
-            *out_plan = entry.plan;
+            *out_plan = &entry.plan;
             return OO_SUCCESS;
         }
     }
@@ -170,7 +170,7 @@ oo_status_t get_or_build_cached_same_process_plan(
     }
 
     entry.valid = true;
-    *out_plan = entry.plan;
+    *out_plan = &entry.plan;
     return OO_SUCCESS;
 }
 
@@ -184,7 +184,7 @@ public:
         oo_dtype_t dtype,
         oo_reduce_op_t op,
         const ooverlap::comm::LaunchConfig& config,
-        AllreduceTransferPlan* out_plan) override {
+        AllreduceTransferPlan** out_plan) override {
         if (node == nullptr ||
             node->group == nullptr ||
             launch.dtype_size == 0 ||
@@ -234,7 +234,7 @@ public:
         oo_dtype_t dtype,
         oo_reduce_op_t op,
         const ooverlap::comm::LaunchConfig& config,
-        ReduceScatterTransferPlan* out_plan) override {
+        ReduceScatterTransferPlan** out_plan) override {
         if (node == nullptr ||
             node->group == nullptr ||
             out_plan == nullptr ||
@@ -284,7 +284,7 @@ public:
         size_t count,
         oo_dtype_t dtype,
         const ooverlap::comm::LaunchConfig& config,
-        AllGatherTransferPlan* out_plan) override {
+        AllGatherTransferPlan** out_plan) override {
         if (node == nullptr ||
             node->group == nullptr ||
             out_plan == nullptr ||
