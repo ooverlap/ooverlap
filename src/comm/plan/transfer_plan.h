@@ -23,6 +23,9 @@ enum class TransferOp : std::uint8_t {
     None = 0,
     Copy = 1,
     Reduce = 2,
+
+    ReadyPublish = 3,
+    ReadyWait = 4,
 };
 
 enum class LogicalBufferRole : std::uint8_t {
@@ -154,6 +157,8 @@ struct TransferTask {
      * order as emitted. This field is for later cross-transport scheduling.
      */
     int phase = 0;
+
+    int ready_rank = -1;
 };
 
 template <int MaxTransferTasks>
@@ -196,6 +201,12 @@ __host__ __device__ __forceinline__ bool transfer_plan_push(
 
 __host__ __device__ __forceinline__ bool transfer_task_has_work(
     const TransferTask& task) {
+    if (task.op == TransferOp::ReadyPublish ||
+        task.op == TransferOp::ReadyWait) {
+        return task.executor_rank >= 0 &&
+               task.ready_rank >= 0;
+    }
+
     return task.op != TransferOp::None &&
            task.executor_rank >= 0 &&
            task.bytes != 0 &&

@@ -14,6 +14,15 @@ namespace ooverlap {
 namespace comm {
 namespace plan {
 
+template <int MaxRanks>
+struct ReadySignalBinding {
+    int* local_ready_signal = nullptr;
+    const int* ready_signal_by_rank[MaxRanks] = {};
+    int epoch = 0;
+    int protocol = 0;
+    int poll_sleep_cycles = 0;
+};
+
 /*
  * Rank-local pointer binding.
  *
