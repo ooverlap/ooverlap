@@ -75,7 +75,7 @@ struct TransportInfo {
     ProbeResult tma_store_f16_probe{};
     ProbeResult tma_reduce_f16_probe{};
 
-    std::string description;
+    char description[256] = {};
 };
 
 struct Node {
@@ -90,8 +90,8 @@ struct Node {
     int compute_major = 0;
     int compute_minor = 0;
 
-    std::string name;
-    std::string pci_bus_id_string;
+    char name[128] = {};
+    char pci_bus_id_string[64] = {};
 };
 
 struct Link {

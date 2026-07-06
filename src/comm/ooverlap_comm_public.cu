@@ -14,6 +14,7 @@
 #include <new>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 namespace {
 
@@ -82,7 +83,9 @@ std::vector<int> devices_vector(const int* devices, int num_devices) {
 oo_status_t initialize_group_topology(
     oo_group_t* group,
     bool enable_peer_access_in_discovery,
+    bool include_shm_fallback,
     bool run_validation_probes,
+    bool run_atomic_probes,
     bool run_tma_probes) {
     if (group == nullptr || !valid_group_size(group->num_devices)) {
         return OO_ERROR_INVALID_ARGUMENT;
@@ -91,11 +94,11 @@ oo_status_t initialize_group_topology(
     try {
         ooverlap::topology::DiscoverOptions options{};
         options.enable_peer_access = enable_peer_access_in_discovery;
-        options.include_shm_fallback = true;
+        options.include_shm_fallback = include_shm_fallback;
         options.require_cuda_peer_access = false;
         options.run_validation_probes = run_validation_probes;
         options.run_tma_probes = run_tma_probes;
-        options.run_atomic_probes = run_validation_probes;
+        options.run_atomic_probes = run_atomic_probes;
 
         group->topology =
             ooverlap::topology::discover_current_process_topology(
@@ -409,9 +412,11 @@ oo_status_t oo_group_create(
         oo_status_t status =
             initialize_group_topology(
                 group.get(),
-                false,
-                false,
-                false);
+                false,  // do not enable peer access in topology discovery
+                false,  // no SHM fallback transport during runtime group creation yet
+                false,  // no runtime validation probes
+                false,  // no atomic probes
+                false); // no TMA probes
 
         if (status != OO_SUCCESS) {
             return status;
@@ -488,9 +493,13 @@ oo_status_t oo_group_create_p2p(
         status =
             initialize_group_topology(
                 group.get(),
-                true,
-                true,
-                false);
+                false,  // do not enable peer access in topology discovery
+                false,  // no SHM fallback transport during runtime group creation yet
+                false,  // no runtime validation probes
+                false,  // no atomic probes
+                false); // no TMA probes
+
+
 
         if (status != OO_SUCCESS) {
             return status;

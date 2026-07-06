@@ -35,6 +35,19 @@ namespace ooverlap {
 namespace topology {
 namespace {
 
+template <size_t N>
+void copy_cstr(char (&dst)[N], const char* src) {
+    if (src == nullptr || N == 0) {
+        return;
+    }
+
+    std::snprintf(
+        dst,
+        N,
+        "%s",
+        src);
+}
+
 void check_cuda(cudaError_t err, const char* what) {
     if (err != cudaSuccess) {
         std::ostringstream oss;
@@ -367,7 +380,7 @@ Node discover_node(
     Node node{};
     node.ordinal = ordinal;
     node.device = device;
-    node.name = prop.name;
+    copy_cstr(node.name, prop.name);
     node.compute_major = prop.major;
     node.compute_minor = prop.minor;
     node.pci_domain_id = prop.pciDomainID;
@@ -385,7 +398,7 @@ Node discover_node(
     TOPO_TRACE("after cudaDeviceGetPCIBusId device=%d err=%d", device, int(bus_err));
 
     if (bus_err == cudaSuccess) {
-        node.pci_bus_id_string = pci_bus_id;
+        copy_cstr(node.pci_bus_id_string, pci_bus_id);
     } else {
         (void)cudaGetLastError();
     }
@@ -846,10 +859,11 @@ Link discover_link(
         TOPO_TRACE("after direct_atomic_capability_from_results %d -> %d", src_device, dst_device);
 
         direct.performance_rank = link.performance_rank;
-        direct.description =
+        copy_cstr(
+            direct.description,
             link.preferred_kind == LinkKind::Nvlink
                 ? "direct CUDA peer access, inferred NVLink-class link"
-                : "direct CUDA peer access over PCIe/SYS-class link";
+                : "direct CUDA peer access over PCIe/SYS-class link");
 
         TOPO_TRACE("before direct transport push %d -> %d", src_device, dst_device);
         link.transports.push_back(direct);
@@ -896,8 +910,9 @@ Link discover_link(
         TOPO_TRACE("after shm_atomic_capability_from_results %d -> %d", src_device, dst_device);
 
         shm.performance_rank = -1;
-        shm.description =
-            "host shared-memory fallback transport using cudaHostAllocMapped probe";
+        copy_cstr(
+            shm.description,
+            "host shared-memory fallback transport using cudaHostAllocMapped probe");
 
         TOPO_TRACE("before shm transport push %d -> %d", src_device, dst_device);
         link.transports.push_back(shm);
@@ -1331,13 +1346,13 @@ std::string topology_to_json(const Topology& topology) {
         out << "{"
             << "\"ordinal\":" << node.ordinal << ","
             << "\"device\":" << node.device << ","
-            << "\"name\":\"" << escape_json(node.name) << "\","
+            << "\"name\":\"" << escape_json(std::string(node.name)) << "\","
             << "\"compute_major\":" << node.compute_major << ","
             << "\"compute_minor\":" << node.compute_minor << ","
             << "\"pci_domain_id\":" << node.pci_domain_id << ","
             << "\"pci_bus_id\":" << node.pci_bus_id << ","
             << "\"pci_device_id\":" << node.pci_device_id << ","
-            << "\"pci_bus_id_string\":\"" << escape_json(node.pci_bus_id_string) << "\","
+            << "\"pci_bus_id_string\":\"" << escape_json(std::string(node.pci_bus_id_string)) << "\","
             << "\"numa_node\":" << node.numa_node
             << "}";
     }
@@ -1394,7 +1409,7 @@ std::string topology_to_json(const Topology& topology) {
                 << "\"available\":" << bool_text(transport.available) << ","
                 << "\"performance_rank\":" << transport.performance_rank << ","
                 << "\"estimated_bandwidth_gbps\":" << transport.estimated_bandwidth_gbps << ","
-                << "\"description\":\"" << escape_json(transport.description) << "\","
+                << "\"description\":\"" << escape_json(std::string(transport.description)) << "\","
                 << "\"atomics\":{"
                 << "\"signal32\":" << bool_text(a.signal32) << ","
                 << "\"global_load_store\":" << bool_text(a.global_load_store) << ","
