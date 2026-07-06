@@ -10,56 +10,12 @@
 #include <new>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace {
 
 bool valid_group_size(int num_devices) {
     return num_devices > 0 && num_devices <= kOoMaxLocalDevices;
-}
-
-bool peer_buffer_allowed_for_group(
-    const oo_group_t* group,
-    const oo_buffer_t* peer) {
-    if (group == nullptr || peer == nullptr) {
-        return false;
-    }
-
-    using ooverlap::system::peer_buffer_kind;
-
-    switch (group->memory_kind) {
-        case oo_group_memory_kind::same_process_vmm:
-            /*
-             * Keep this permissive for backwards compatibility.
-             *
-             * VMM-owned buffers are expected here, but wrapped buffers may work
-             * if the caller manually enabled peer access.
-             */
-            return peer->system_kind == peer_buffer_kind::owned_vmm ||
-                   peer->system_kind == peer_buffer_kind::wrapped ||
-                   peer->system_kind == peer_buffer_kind::imported_legacy ||
-                   peer->system_kind == peer_buffer_kind::imported_vmm;
-
-        case oo_group_memory_kind::same_process_cuda_p2p:
-            /*
-             * Main external-buffer path:
-             *   external allocator -> oo_buffer_wrap()
-             *
-             * VMM-owned is also allowed so mixed tests do not fail.
-             */
-            return peer->system_kind == peer_buffer_kind::wrapped ||
-                   peer->system_kind == peer_buffer_kind::owned_vmm;
-
-        case oo_group_memory_kind::multiprocess_legacy_ipc:
-            /*
-             * In multiprocess mode a peer pointer must be an imported mapping,
-             * not another local wrapped pointer.
-             */
-            return peer->system_kind == peer_buffer_kind::imported_legacy ||
-                   peer->system_kind == peer_buffer_kind::imported_vmm;
-
-        default:
-            return false;
-    }
 }
 
 } // namespace
@@ -151,13 +107,6 @@ oo_status_t fill_rank_partition(
     size_t* out_element_offset,
     size_t* out_count) {
     if (out_element_offset == nullptr || out_count == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    *out_element_offset = 0;
-    *out_count = 0;
-
-    if (world_size <= 0 || rank < 0 || rank >= world_size) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
@@ -264,12 +213,13 @@ LaunchConfig select_public_launch_config(
 oo_status_t prepare_collective_launch(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
+    CollectivePlanFor collective,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
     CollectiveLaunchState* out) {
+    (void)collective;
+
     if (out == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
@@ -285,27 +235,14 @@ oo_status_t prepare_collective_launch(
 
     oo_group_t* group = node->group;
 
-    if (!valid_group_size(group->num_devices)) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (node->rank < 0 ||
+    if (!valid_group_size(group->num_devices) ||
+        group->num_devices > kOoMaxLocalDevices ||
+        node->rank < 0 ||
         node->rank >= group->num_devices ||
-        node->device != group->devices[node->rank]) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (local->group != group ||
+        node->device != group->devices[node->rank] ||
+        local->group != group ||
         local->owner_rank != node->rank ||
         local->owner_device != node->device) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (peer_count != group->num_devices - 1) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (peer_count > 0 && peers == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
@@ -337,44 +274,51 @@ oo_status_t prepare_collective_launch(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
+    /*
+     * Refresh this rank's current collective buffer.  This lets callers wrap or
+     * allocate once and then call collectives sequentially without explicitly
+     * passing peer buffers.
+     */
+    group->collective_buffers[node->rank] = local;
+
+    const int world_size = group->num_devices;
+    const int peer_count = world_size - 1;
+
     if (peer_count > kMaxPublicPeers) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
+    oo_ready_signal& local_signal =
+        group->ready_signal_slots[node->rank];
+
     out->local_ptr =
         reinterpret_cast<void*>(
             reinterpret_cast<std::uint8_t*>(local->ptr) + offset_bytes);
-
     out->peer_count = peer_count;
     out->rank = node->rank;
-    out->world_size = group->num_devices;
+    out->world_size = world_size;
     out->local_device = node->device;
     out->dtype_size = oo_dtype_size(dtype);
     out->bytes = bytes;
     out->collective_epoch = ++node->collective_epoch;
-
-    oo_ready_signal& local_signal =
-        group->ready_signal_slots[node->rank];
-
     out->local_ready_signal =
         reinterpret_cast<int*>(local_signal.ptr);
 
-    for (int peer_idx = 0; peer_idx < peer_count; ++peer_idx) {
-        oo_buffer_t* peer = peers[peer_idx];
+    int peer_idx = 0;
+
+    for (int rank = 0; rank < world_size; ++rank) {
+        if (rank == node->rank) {
+            continue;
+        }
+
+        oo_buffer_t* peer = group->collective_buffers[rank];
 
         if (peer == nullptr ||
             peer->ptr == nullptr ||
             peer->group != group ||
-            peer->owner_rank < 0 ||
-            peer->owner_rank >= group->num_devices ||
-            peer->owner_rank == node->rank) {
+            peer->owner_rank != rank) {
             return OO_ERROR_INVALID_ARGUMENT;
         }
-
-        if (!peer_buffer_allowed_for_group(group, peer)) {
-            return OO_ERROR_INVALID_ARGUMENT;
-        }
-
 
         if (offset_bytes > peer->bytes ||
             bytes > peer->bytes - offset_bytes) {
@@ -384,15 +328,16 @@ oo_status_t prepare_collective_launch(
         out->peer_ptrs[peer_idx] =
             reinterpret_cast<void*>(
                 reinterpret_cast<std::uint8_t*>(peer->ptr) + offset_bytes);
-
-        out->peer_ranks[peer_idx] = peer->owner_rank;
+        out->peer_ranks[peer_idx] = rank;
         out->peer_devices[peer_idx] = peer->owner_device;
 
         oo_ready_signal& peer_signal =
-            group->ready_signal_slots[peer->owner_rank];
+            group->ready_signal_slots[rank];
 
         out->peer_ready_signals[peer_idx] =
             reinterpret_cast<const int*>(peer_signal.ptr);
+
+        peer_idx += 1;
     }
 
     return OO_SUCCESS;
@@ -507,6 +452,12 @@ oo_status_t oo_buffer_import_legacy_descriptor(
                 (*out_buffer)->owner_rank = rank;
                 break;
             }
+        }
+
+        if ((*out_buffer)->owner_rank >= 0 &&
+            (*out_buffer)->owner_rank < kOoMaxLocalDevices) {
+            node->group->collective_buffers[(*out_buffer)->owner_rank] =
+                *out_buffer;
         }
 
         return OO_SUCCESS;

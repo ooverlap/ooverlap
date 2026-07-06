@@ -69,11 +69,21 @@ LaunchConfig select_public_launch_config(
     size_t bytes,
     oo_tuning_mode_t tuning_mode);
 
+/*
+ * Build a rank-local collective launch state from the group-owned current
+ * collective buffer registry.
+ *
+ * Public collective APIs pass only this rank's local buffer.  This helper
+ * refreshes group->collective_buffers[node->rank] with local, reads the other
+ * rank buffers from group->collective_buffers[], and returns immediately.
+ *
+ * No host-side rank barrier happens here.  The GPU ready-signal protocol still
+ * provides the kernel-side rendezvous.
+ */
 oo_status_t prepare_collective_launch(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
+    CollectivePlanFor collective,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
