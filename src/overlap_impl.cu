@@ -218,11 +218,11 @@ void OverlapImpl::OoverlapEnsureBuffer(at::Tensor C) {
     CUDA_CHECK(cudaSetDevice(oo_devices_[oo_rank_]), "cudaSetDevice");
     OO_CHECK(oo_buffer_wrap(oo_node_, c_ptr, bytes, &oo_local_buf_), "oo_buffer_wrap");
 
-    OO_CHECK(
-        oo_buffer_exchange_ipc_peers(oo_node_, oo_local_buf_, oo_peer_bufs_, &oo_peer_count_),
-        "oo_buffer_exchange_ipc_peers");
+    /*OO_CHECK(*/
+        /*oo_buffer_exchange_ipc_peers(oo_node_, oo_local_buf_, oo_peer_bufs_, &oo_peer_count_),*/
+        /*"oo_buffer_exchange_ipc_peers");*/
 
-    TORCH_CHECK(oo_peer_count_ == 1, "expected exactly one ooverlap peer");
+    //TORCH_CHECK(oo_peer_count_ == 1, "expected exactly one ooverlap peer");
 
     oo_registered_ptr_ = c_ptr;
     oo_registered_bytes_ = bytes;

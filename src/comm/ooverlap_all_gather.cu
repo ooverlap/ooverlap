@@ -1,15 +1,13 @@
 #include "comm/ooverlap_comm_private.h"
 
-#include "comm/tma_multi_gpu_all_gather_sm90.h"
 #include "comm/plan/transfer_plan_distribution.h"
+#include "comm/tma_multi_gpu_all_gather_sm90.h"
 
 namespace {
 
 oo_status_t all_gather_impl(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -19,14 +17,19 @@ oo_status_t all_gather_impl(
         return OO_ERROR_UNSUPPORTED;
     }
 
+    if (node == nullptr ||
+        node->group == nullptr ||
+        node->group->transfer_plan_distribution == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
     ooverlap::comm::api::CollectiveLaunchState launch{};
 
     oo_status_t status =
         ooverlap::comm::api::prepare_collective_launch(
             node,
             local,
-            peers,
-            peer_count,
+            ooverlap::comm::CollectivePlanFor::AllGather,
             element_offset,
             count,
             dtype,
@@ -43,12 +46,6 @@ oo_status_t all_gather_impl(
             tuning_mode);
 
     ooverlap::comm::plan::AllGatherTransferPlan transfer_plan{};
-
-    if (node == nullptr ||
-        node->group == nullptr ||
-        node->group->transfer_plan_distribution == nullptr) {
-        return OO_ERROR_INTERNAL;
-    }
 
     status =
         node->group->transfer_plan_distribution->get_all_gather_transfer_plan(
@@ -79,8 +76,6 @@ oo_status_t all_gather_impl(
 extern "C" oo_status_t oo_all_gather_offset(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -88,8 +83,6 @@ extern "C" oo_status_t oo_all_gather_offset(
     return all_gather_impl(
         node,
         local,
-        peers,
-        peer_count,
         element_offset,
         count,
         dtype,
@@ -100,16 +93,12 @@ extern "C" oo_status_t oo_all_gather_offset(
 extern "C" oo_status_t oo_all_gather(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     cudaStream_t stream) {
     return oo_all_gather_offset(
         node,
         local,
-        peers,
-        peer_count,
         0,
         count,
         dtype,
@@ -119,8 +108,6 @@ extern "C" oo_status_t oo_all_gather(
 extern "C" oo_status_t oo_all_gather_offset_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -129,8 +116,6 @@ extern "C" oo_status_t oo_all_gather_offset_tuned(
     return all_gather_impl(
         node,
         local,
-        peers,
-        peer_count,
         element_offset,
         count,
         dtype,
@@ -141,8 +126,6 @@ extern "C" oo_status_t oo_all_gather_offset_tuned(
 extern "C" oo_status_t oo_all_gather_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     oo_tuning_mode_t tuning_mode,
@@ -150,8 +133,6 @@ extern "C" oo_status_t oo_all_gather_tuned(
     return oo_all_gather_offset_tuned(
         node,
         local,
-        peers,
-        peer_count,
         0,
         count,
         dtype,

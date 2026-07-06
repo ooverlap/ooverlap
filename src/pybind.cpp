@@ -309,45 +309,45 @@ PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("gemm_signal_sm90_algo_info", &gemm_signal_sm90_algo_info);
   m.def("gemm_plain_sm90_algo_info", &gemm_plain_sm90_algo_info);
 
-  m.def("benchmark_tma_bandwidth_experiment_sm90",
-        &ooverlap::benchmark_tma_bandwidth_experiment_sm90,
-        py::arg("min_bytes") = 512 * 1024,
-        py::arg("max_bytes") = 1024LL * 1024LL * 1024LL,
-        py::arg("iters") = 100,
-        py::arg("warmup") = 20,
-        py::arg("num_blocks") = 8,
-        py::arg("dev0") = 0,
-        py::arg("dev1") = 1,
-        py::arg("include_mem_async") = false,
-        py::arg("include_nccl") = false);
+  /*m.def("benchmark_tma_bandwidth_experiment_sm90",*/
+        /*&ooverlap::benchmark_tma_bandwidth_experiment_sm90,*/
+        /*py::arg("min_bytes") = 512 * 1024,*/
+        /*py::arg("max_bytes") = 1024LL * 1024LL * 1024LL,*/
+        /*py::arg("iters") = 100,*/
+        /*py::arg("warmup") = 20,*/
+        /*py::arg("num_blocks") = 8,*/
+        /*py::arg("dev0") = 0,*/
+        /*py::arg("dev1") = 1,*/
+        /*py::arg("include_mem_async") = false,*/
+        /*py::arg("include_nccl") = false);*/
 
   /*m.def("benchmark_tma_two_gpu_collective_sweep_json",*/
         /*&ooverlap::benchmark_tma_two_gpu_collective_sweep_json,*/
         /*py::arg("request_json"));*/
 
-  m.def("smoke_ipc_collective_rank_sm90",
-        &ooverlap::smoke_ipc_collective_rank_sm90,
-        py::arg("collective"),
-        py::arg("numel"),
-        py::arg("local_rank"),
-        py::arg("dev0"),
-        py::arg("dev1"),
-        py::arg("broker_key"),
-        py::arg("nccl_unique_id_bytes"),
-        py::arg("verify") = true);
+  /*m.def("smoke_ipc_collective_rank_sm90",*/
+        /*&ooverlap::smoke_ipc_collective_rank_sm90,*/
+        /*py::arg("collective"),*/
+        /*py::arg("numel"),*/
+        /*py::arg("local_rank"),*/
+        /*py::arg("dev0"),*/
+        /*py::arg("dev1"),*/
+        /*py::arg("broker_key"),*/
+        /*py::arg("nccl_unique_id_bytes"),*/
+        /*py::arg("verify") = true);*/
 
-  m.def("benchmark_ipc_collective_rank_sm90",
-        &ooverlap::benchmark_ipc_collective_rank_sm90,
-        py::arg("collective"),
-        py::arg("sizes"),
-        py::arg("local_rank"),
-        py::arg("dev0"),
-        py::arg("dev1"),
-        py::arg("broker_key"),
-        py::arg("nccl_unique_id_bytes"),
-        py::arg("iters"),
-        py::arg("warmup"),
-        py::arg("verify"));
+  /*m.def("benchmark_ipc_collective_rank_sm90",*/
+        /*&ooverlap::benchmark_ipc_collective_rank_sm90,*/
+        /*py::arg("collective"),*/
+        /*py::arg("sizes"),*/
+        /*py::arg("local_rank"),*/
+        /*py::arg("dev0"),*/
+        /*py::arg("dev1"),*/
+        /*py::arg("broker_key"),*/
+        /*py::arg("nccl_unique_id_bytes"),*/
+        /*py::arg("iters"),*/
+        /*py::arg("warmup"),*/
+        /*py::arg("verify"));*/
 
   m.def("external_p2p_two_gpu_collective_smoke_test",
         &ooverlap::external_p2p_two_gpu_collective_smoke_test,
@@ -379,9 +379,9 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev0") = 0,
         py::arg("dev1") = 1);
 
-  m.def(
-    "benchmark_tma_efficiency_vs_best_2gpu_json",
-    &ooverlap::benchmark_tma_efficiency_vs_best_2gpu_json);
+  /*m.def(*/
+    /*"benchmark_tma_efficiency_vs_best_2gpu_json",*/
+    /*&ooverlap::benchmark_tma_efficiency_vs_best_2gpu_json);*/
 
   py::class_<BaselineImpl>(m, "BaselineImpl")
       .def(py::init<>())

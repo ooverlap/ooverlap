@@ -48,14 +48,9 @@ void launch_ooverlap_public_once_for_rank(
     BenchMode mode,
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* peer,
     size_t numel,
     cudaStream_t stream,
     const char* label) {
-    oo_buffer_t* peers[] = {
-        peer,
-    };
-
     const oo_tuning_mode_t tuning_mode =
         tuning_mode_for(mode);
 
@@ -64,8 +59,6 @@ void launch_ooverlap_public_once_for_rank(
             oo_allreduce_tuned(
                 node,
                 local,
-                peers,
-                1,
                 numel,
                 OO_DTYPE_FLOAT16,
                 OO_REDUCE_SUM,
@@ -82,8 +75,6 @@ void launch_ooverlap_public_once_for_rank(
             oo_reduce_scatter_tuned(
                 node,
                 local,
-                peers,
-                1,
                 numel,
                 OO_DTYPE_FLOAT16,
                 OO_REDUCE_SUM,
@@ -99,8 +90,6 @@ void launch_ooverlap_public_once_for_rank(
             oo_all_gather_tuned(
                 node,
                 local,
-                peers,
-                1,
                 numel,
                 OO_DTYPE_FLOAT16,
                 tuning_mode,
@@ -127,7 +116,6 @@ void launch_ooverlap_public_once(
         mode,
         node0,
         rank0_buf,
-        rank1_buf,
         numel,
         stream0,
         "ooverlap rank0");
@@ -137,7 +125,6 @@ void launch_ooverlap_public_once(
         mode,
         node1,
         rank1_buf,
-        rank0_buf,
         numel,
         stream1,
         "ooverlap rank1");
@@ -670,42 +657,6 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             bytes,
             "cudaMalloc(nccl_rank1)");
 
-        /*
-         * Wrap externally allocated CUDA memory.
-         * The wrappers are non-owning.
-         */
-        testing::check_oo(
-            oo_buffer_wrap(
-                node0,
-                normal_rank0,
-                bytes,
-                &normal_rank0_buf),
-            "oo_buffer_wrap(normal rank0)");
-
-        testing::check_oo(
-            oo_buffer_wrap(
-                node1,
-                normal_rank1,
-                bytes,
-                &normal_rank1_buf),
-            "oo_buffer_wrap(normal rank1)");
-
-        testing::check_oo(
-            oo_buffer_wrap(
-                node0,
-                efficiency_rank0,
-                bytes,
-                &efficiency_rank0_buf),
-            "oo_buffer_wrap(efficiency rank0)");
-
-        testing::check_oo(
-            oo_buffer_wrap(
-                node1,
-                efficiency_rank1,
-                bytes,
-                &efficiency_rank1_buf),
-            "oo_buffer_wrap(efficiency rank1)");
-
         testing::fill_two_rank_sources_fp16(
             rank0_src,
             rank1_src,
@@ -722,6 +673,26 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
                 devices));
 
         std::map<std::string, double> results;
+
+        /*
+         * The group keeps one current collective buffer per rank.  Do not keep
+         * normal and efficiency wrappers registered at the same time.
+         */
+        testing::check_oo(
+            oo_buffer_wrap(
+                node0,
+                normal_rank0,
+                bytes,
+                &normal_rank0_buf),
+            "oo_buffer_wrap(normal rank0)");
+
+        testing::check_oo(
+            oo_buffer_wrap(
+                node1,
+                normal_rank1,
+                bytes,
+                &normal_rank1_buf),
+            "oo_buffer_wrap(normal rank1)");
 
         bench_ooverlap_external_variant(
             results,
@@ -746,6 +717,25 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             iters,
             warmup);
 
+        testing::destroy_oo_buffer(normal_rank0_buf);
+        testing::destroy_oo_buffer(normal_rank1_buf);
+
+        testing::check_oo(
+            oo_buffer_wrap(
+                node0,
+                efficiency_rank0,
+                bytes,
+                &efficiency_rank0_buf),
+            "oo_buffer_wrap(efficiency rank0)");
+
+        testing::check_oo(
+            oo_buffer_wrap(
+                node1,
+                efficiency_rank1,
+                bytes,
+                &efficiency_rank1_buf),
+            "oo_buffer_wrap(efficiency rank1)");
+
         bench_ooverlap_external_variant(
             results,
             "efficiency_ms",
@@ -768,6 +758,9 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             stream1,
             iters,
             warmup);
+
+        testing::destroy_oo_buffer(efficiency_rank0_buf);
+        testing::destroy_oo_buffer(efficiency_rank1_buf);
 
         testing::prepare_two_work_buffers(
             rank0_src,

@@ -8,8 +8,6 @@ namespace {
 oo_status_t reduce_scatter_impl(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -21,14 +19,19 @@ oo_status_t reduce_scatter_impl(
         return OO_ERROR_UNSUPPORTED;
     }
 
+    if (node == nullptr ||
+        node->group == nullptr ||
+        node->group->transfer_plan_distribution == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
     ooverlap::comm::api::CollectiveLaunchState launch{};
 
     oo_status_t status =
         ooverlap::comm::api::prepare_collective_launch(
             node,
             local,
-            peers,
-            peer_count,
+            ooverlap::comm::CollectivePlanFor::ReduceScatter,
             element_offset,
             count,
             dtype,
@@ -59,12 +62,6 @@ oo_status_t reduce_scatter_impl(
             tuning_mode);
 
     ooverlap::comm::plan::ReduceScatterTransferPlan transfer_plan{};
-
-    if (node == nullptr ||
-        node->group == nullptr ||
-        node->group->transfer_plan_distribution == nullptr) {
-        return OO_ERROR_INTERNAL;
-    }
 
     status =
         node->group->transfer_plan_distribution->get_reduce_scatter_transfer_plan(
@@ -97,8 +94,6 @@ oo_status_t reduce_scatter_impl(
 extern "C" oo_status_t oo_reduce_scatter_offset(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -108,8 +103,6 @@ extern "C" oo_status_t oo_reduce_scatter_offset(
     return reduce_scatter_impl(
         node,
         local,
-        peers,
-        peer_count,
         element_offset,
         count,
         dtype,
@@ -122,8 +115,6 @@ extern "C" oo_status_t oo_reduce_scatter_offset(
 extern "C" oo_status_t oo_reduce_scatter(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     oo_reduce_op_t op,
@@ -132,8 +123,6 @@ extern "C" oo_status_t oo_reduce_scatter(
     return oo_reduce_scatter_offset(
         node,
         local,
-        peers,
-        peer_count,
         0,
         count,
         dtype,
@@ -145,8 +134,6 @@ extern "C" oo_status_t oo_reduce_scatter(
 extern "C" oo_status_t oo_reduce_scatter_offset_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -157,8 +144,6 @@ extern "C" oo_status_t oo_reduce_scatter_offset_tuned(
     return reduce_scatter_impl(
         node,
         local,
-        peers,
-        peer_count,
         element_offset,
         count,
         dtype,
@@ -171,8 +156,6 @@ extern "C" oo_status_t oo_reduce_scatter_offset_tuned(
 extern "C" oo_status_t oo_reduce_scatter_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     oo_reduce_op_t op,
@@ -182,8 +165,6 @@ extern "C" oo_status_t oo_reduce_scatter_tuned(
     return oo_reduce_scatter_offset_tuned(
         node,
         local,
-        peers,
-        peer_count,
         0,
         count,
         dtype,

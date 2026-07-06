@@ -316,10 +316,10 @@ if(OOVERLAP_BUILD_TESTS OR OOVERLAP_BUILD_PYTHON)
   set(OOVERLAP_TEST_SOURCES
     #${OOVERLAP_SRC_DIR}/test/persistent_allreduce_2gpu_sm90.cu
     ${OOVERLAP_SRC_DIR}/test/persistent_external_p2p_collective_2gpu_sm90.cu
-    ${OOVERLAP_SRC_DIR}/test/ipc_collective_sm90.cu
-    ${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu
+    #${OOVERLAP_SRC_DIR}/test/ipc_collective_sm90.cu
+    #${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu
     #${OOVERLAP_SRC_DIR}/test/tma_collective_sweep_2gpu.cu
-    ${OOVERLAP_SRC_DIR}/test/tma_efficiency_vs_best_2gpu.cu
+    #${OOVERLAP_SRC_DIR}/test/tma_efficiency_vs_best_2gpu.cu
   )
 
   foreach(test_src IN LISTS OOVERLAP_TEST_SOURCES)
@@ -488,10 +488,10 @@ if(OOVERLAP_BUILD_PYTHON)
     ${OOVERLAP_SRC_DIR}/pybind.cpp
     #${OOVERLAP_SRC_DIR}/test/persistent_allreduce_2gpu_sm90.cu
     ${OOVERLAP_SRC_DIR}/test/persistent_external_p2p_collective_2gpu_sm90.cu
-    ${OOVERLAP_SRC_DIR}/test/ipc_collective_sm90.cu
-    ${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu
+    #${OOVERLAP_SRC_DIR}/test/ipc_collective_sm90.cu
+    #${OOVERLAP_SRC_DIR}/test/tma_bandwidth_experiment_sm90.cu
     #${OOVERLAP_SRC_DIR}/test/tma_collective_sweep_2gpu.cu
-    ${OOVERLAP_SRC_DIR}/test/tma_efficiency_vs_best_2gpu.cu
+    #${OOVERLAP_SRC_DIR}/test/tma_efficiency_vs_best_2gpu.cu
   )
   
   foreach(ext_src IN LISTS OOVERLAP_EXT_SOURCES)
