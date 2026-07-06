@@ -14,6 +14,14 @@ namespace ooverlap {
 namespace comm {
 namespace plan {
 
+/*
+ * Launch-time ready-signal binding.
+ *
+ * TransferPlan remains pointer-free/cacheable. ReadyPublish/ReadyWait
+ * TransferTasks only describe logical ready ranks. The actual ready-signal
+ * pointers, epoch, protocol, and polling policy are supplied here at lowering
+ * time by the enqueue path.
+ */
 template <int MaxRanks>
 struct ReadySignalBinding {
     int* local_ready_signal = nullptr;
@@ -169,6 +177,80 @@ inline bool transfer_should_use_fast_copy(
            task.transport == topology::TransportKind::DirectPcie;
 }
 
+__host__ __device__ __forceinline__ bool transfer_task_is_ready(
+    const TransferTask& task) {
+    return task.op == TransferOp::ReadyPublish ||
+           task.op == TransferOp::ReadyWait;
+}
+
+__host__ __device__ __forceinline__ bool transfer_task_is_windowed(
+    const TransferTask& task) {
+    return task.op == TransferOp::Copy ||
+           task.op == TransferOp::Reduce;
+}
+
+inline bool lower_ready_transfer_task_to_window_task(
+    const TransferTask& transfer,
+    const ReadySignalBinding<16>* /* unused */) {
+    /*
+     * Placeholder overload intentionally not used.
+     *
+     * The real implementation is templated below.  This function only prevents
+     * accidental non-templated declarations from being introduced elsewhere.
+     */
+    (void)transfer;
+    return false;
+}
+
+template <int MaxRanks>
+inline bool lower_ready_transfer_task_to_window_task(
+    const TransferTask& transfer,
+    const ReadySignalBinding<MaxRanks>& ready,
+    task::WindowTask* out) {
+    if (out == nullptr ||
+        ready.epoch <= 0 ||
+        transfer.executor_rank < 0 ||
+        transfer.ready_rank < 0 ||
+        transfer.ready_rank >= MaxRanks) {
+        return false;
+    }
+
+    if (transfer.op == TransferOp::ReadyPublish) {
+        if (ready.local_ready_signal == nullptr) {
+            return false;
+        }
+
+        *out =
+            task::make_ready_publish_task(
+                ready.local_ready_signal,
+                ready.epoch,
+                ready.protocol,
+                transfer.terminal);
+
+        return true;
+    }
+
+    if (transfer.op == TransferOp::ReadyWait) {
+        const int* ready_signal =
+            ready.ready_signal_by_rank[transfer.ready_rank];
+
+        if (ready_signal == nullptr) {
+            return false;
+        }
+
+        *out =
+            task::make_ready_wait_task(
+                ready_signal,
+                ready.epoch,
+                ready.poll_sleep_cycles,
+                transfer.terminal);
+
+        return true;
+    }
+
+    return false;
+}
+
 inline bool lower_transfer_task_to_window_task(
     const TransferTask& transfer,
     const void* src,
@@ -250,14 +332,16 @@ bool lower_transfer_plan_for_rank(
     const comm::LaunchConfig& launch_config,
     WindowTaskExecutorPlan<MaxWindowTasks>* out_window_plan,
     int* out_num_blocks,
-    int reserved_prefix_tasks_per_cta = 0) {
+    int reserved_prefix_tasks_per_cta = 0,
+    const ReadySignalBinding<MaxRanks>* ready_binding = nullptr) {
     if (out_window_plan == nullptr ||
         out_num_blocks == nullptr ||
         binding.current_rank < 0 ||
         binding.current_rank >= binding.world_size ||
         binding.world_size <= 0 ||
         binding.world_size > MaxRanks ||
-        launch_config.max_ctas < 0) {
+        launch_config.max_ctas < 0 ||
+        reserved_prefix_tasks_per_cta < 0) {
         return false;
     }
 
@@ -265,7 +349,22 @@ bool lower_transfer_plan_for_rank(
     out_window_plan->tasks_per_cta = 0;
     *out_num_blocks = 0;
 
-    int rank_transfer_count = 0;
+    /*
+     * Transition behavior:
+     *
+     * - If ready_binding is supplied, ReadyPublish/ReadyWait TransferTasks are
+     *   lowered into WindowTasks and replicated into every CTA stripe.
+     *
+     * - If ready_binding is nullptr, logical ready tasks are ignored.  This keeps
+     *   old launcher-side prepend_ready_tasks_to_each_cta() code compiling while
+     *   the launchers are migrated.
+     */
+    const bool lower_ready_tasks =
+        ready_binding != nullptr &&
+        ready_binding->epoch > 0;
+
+    int rank_ready_task_count = 0;
+    int rank_window_task_count = 0;
     int max_end_window = 0;
 
     for (int i = 0; i < transfer_plan.total_tasks; ++i) {
@@ -279,40 +378,71 @@ bool lower_transfer_plan_for_rank(
             return false;
         }
 
-        ++rank_transfer_count;
+        if (transfer_task_is_ready(transfer)) {
+            if (lower_ready_tasks) {
+                ++rank_ready_task_count;
+            }
+
+            continue;
+        }
+
+        if (!transfer_task_is_windowed(transfer)) {
+            return false;
+        }
+
+        ++rank_window_task_count;
+
         max_end_window =
             comm::utils::max_int(
                 max_end_window,
                 transfer.end_window);
     }
 
-    if (rank_transfer_count == 0) {
+    if (rank_ready_task_count == 0 && rank_window_task_count == 0) {
         return true;
     }
 
-    if (rank_transfer_count > MaxWindowTasks) {
+    const int tasks_per_cta =
+        rank_ready_task_count + rank_window_task_count;
+
+    if (tasks_per_cta <= 0 || tasks_per_cta > MaxWindowTasks) {
         return false;
     }
 
-    const int tasks_per_cta_after_prefix =
-        rank_transfer_count + reserved_prefix_tasks_per_cta;
-    
-    if (tasks_per_cta_after_prefix <= 0 ||
-        tasks_per_cta_after_prefix > MaxWindowTasks) {
+    /*
+     * reserved_prefix_tasks_per_cta is kept only for compatibility with the
+     * temporary launcher-side ready prepend path.  New code should pass zero
+     * here and use ready_binding.
+     */
+    const int capacity_tasks_per_cta =
+        tasks_per_cta + reserved_prefix_tasks_per_cta;
+
+    if (capacity_tasks_per_cta <= 0 ||
+        capacity_tasks_per_cta > MaxWindowTasks) {
         return false;
     }
-    
+
     const int max_ctas_by_plan =
-        MaxWindowTasks / tasks_per_cta_after_prefix;
+        MaxWindowTasks / capacity_tasks_per_cta;
 
     if (max_ctas_by_plan <= 0) {
         return false;
     }
 
-    int cta_count =
-        comm::utils::cta_count_for_windows(
-            max_end_window,
-            launch_config.max_ctas);
+    int cta_count = 0;
+
+    if (rank_window_task_count > 0) {
+        cta_count =
+            comm::utils::cta_count_for_windows(
+                max_end_window,
+                launch_config.max_ctas);
+    } else {
+        /*
+         * Sync-only plan.  This is mostly useful for testing.  Real collectives
+         * normally have at least one windowed transfer task.
+         */
+        cta_count = 1;
+    }
 
     cta_count =
         comm::utils::min_int(
@@ -324,7 +454,7 @@ bool lower_transfer_plan_for_rank(
     }
 
     const int total_window_tasks =
-        cta_count * rank_transfer_count;
+        cta_count * tasks_per_cta;
 
     if (total_window_tasks > MaxWindowTasks) {
         return false;
@@ -334,18 +464,41 @@ bool lower_transfer_plan_for_rank(
 
     for (int cta_idx = 0; cta_idx < cta_count; ++cta_idx) {
         const comm::utils::WindowRange cta_range =
-            comm::utils::cta_window_range(
-                cta_idx,
-                cta_count,
-                full_range);
+            rank_window_task_count > 0
+                ? comm::utils::cta_window_range(
+                      cta_idx,
+                      cta_count,
+                      full_range)
+                : comm::utils::WindowRange{0, 0};
 
         int task_idx =
-            cta_idx * rank_transfer_count;
+            cta_idx * tasks_per_cta;
 
         for (int i = 0; i < transfer_plan.total_tasks; ++i) {
             const TransferTask& transfer = transfer_plan.tasks[i];
 
             if (transfer.executor_rank != binding.current_rank) {
+                continue;
+            }
+
+            if (transfer_task_is_ready(transfer)) {
+                if (!lower_ready_tasks) {
+                    continue;
+                }
+
+                task::WindowTask ready_task{};
+
+                if (!lower_ready_transfer_task_to_window_task(
+                        transfer,
+                        *ready_binding,
+                        &ready_task)) {
+                    out_window_plan->total_tasks = 0;
+                    out_window_plan->tasks_per_cta = 0;
+                    *out_num_blocks = 0;
+                    return false;
+                }
+
+                out_window_plan->tasks[task_idx++] = ready_task;
                 continue;
             }
 
@@ -397,7 +550,7 @@ bool lower_transfer_plan_for_rank(
         }
     }
 
-    out_window_plan->tasks_per_cta = rank_transfer_count;
+    out_window_plan->tasks_per_cta = tasks_per_cta;
     out_window_plan->total_tasks = total_window_tasks;
     *out_num_blocks = cta_count;
 
