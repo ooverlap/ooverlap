@@ -1,10 +1,10 @@
 #include "comm/ooverlap_comm_private.h"
 
-#include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/system/p2p.cuh"
+#include "ooverlap/system/runtime_utils.cuh"
 
-#include "comm/utils/collective_utils.h"
 #include "comm/plan/transfer_plan_distribution.h"
+#include "comm/utils/collective_utils.h"
 #include "topology/topology.h"
 
 #include <cuda_runtime.h>
@@ -14,7 +14,40 @@
 #include <new>
 #include <utility>
 #include <vector>
-#include <iostream>
+
+/*
+ * Temporary complete definition for the forward declaration stored in oo_group.
+ *
+ * The next patch should move this exact interface to a small header, for
+ * example:
+ *
+ *   src/comm/collective_launch_exchange.h
+ *
+ * and include that header here instead.  A complete type is needed in this
+ * translation unit because oo_group_destroy() deletes oo_group, whose destructor
+ * destroys std::unique_ptr<CollectiveLaunchExchangeBackend>.
+ */
+namespace ooverlap {
+namespace comm {
+namespace api {
+
+class CollectiveLaunchExchangeBackend {
+public:
+    virtual ~CollectiveLaunchExchangeBackend() = default;
+
+    virtual oo_status_t prepare_collective_launch(
+        oo_node_t* node,
+        oo_buffer_t* local,
+        ooverlap::comm::CollectivePlanFor collective,
+        size_t element_offset,
+        size_t count,
+        oo_dtype_t dtype,
+        CollectiveLaunchState* out) = 0;
+};
+
+} // namespace api
+} // namespace comm
+} // namespace ooverlap
 
 namespace {
 
@@ -27,22 +60,21 @@ oo_status_t enable_group_peer_access_all_to_all(oo_group_t* group) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    for (int i = 0; i < group->num_devices; ++i) {
-        const int src_device = group->devices[i];
+    for (int src_rank = 0; src_rank < group->num_devices; ++src_rank) {
+        const int src_device = group->devices[src_rank];
 
         if (src_device < 0) {
             return OO_ERROR_INVALID_DEVICE;
         }
 
-        for (int j = 0; j < group->num_devices; ++j) {
-            const int dst_device = group->devices[j];
+        for (int dst_rank = 0; dst_rank < group->num_devices; ++dst_rank) {
+            const int dst_device = group->devices[dst_rank];
 
             if (dst_device < 0) {
                 return OO_ERROR_INVALID_DEVICE;
             }
 
-            if (i == j) {
-                group->peer_access_enabled[i][j] = true;
+            if (src_rank == dst_rank) {
                 continue;
             }
 
@@ -61,15 +93,15 @@ oo_status_t enable_group_peer_access_all_to_all(oo_group_t* group) {
             if (!enabled) {
                 return OO_ERROR_UNSUPPORTED;
             }
-
-            group->peer_access_enabled[i][j] = true;
         }
     }
 
     return OO_SUCCESS;
 }
 
-std::vector<int> devices_vector(const int* devices, int num_devices) {
+std::vector<int> devices_vector(
+    const int* devices,
+    int num_devices) {
     std::vector<int> out;
     out.reserve(static_cast<size_t>(num_devices));
 
@@ -140,9 +172,8 @@ void destroy_group_ready_signals(oo_group_t* group) {
         return;
     }
 
-    for (int i = 0; i < kOoMaxLocalDevices; ++i) {
-        clear_ready_signal(group->ready_signal_slots[i]);
-        group->ready_signals[i] = {};
+    for (int rank = 0; rank < kOoMaxLocalDevices; ++rank) {
+        clear_ready_signal(group->ready_signal_slots[rank]);
     }
 }
 
@@ -201,15 +232,6 @@ oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
         slot.owner_device = device;
         slot.kind = oo_ready_signal_kind::owned_legacy;
         slot.owned_legacy_ptr = signal;
-
-        /*
-         * Compatibility mirror. Do not free through this mirror.
-         * destroy_group_ready_signals() frees via ready_signal_slots.
-         */
-        group->ready_signals[rank].ptr = signal;
-        group->ready_signals[rank].mapped_size = sizeof(int);
-        group->ready_signals[rank].requested_size = sizeof(int);
-        group->ready_signals[rank].owner_device = device;
     }
 
     return OO_SUCCESS;
@@ -228,6 +250,10 @@ oo_status_t allocate_ipc_ready_signals(oo_group_t* group) {
     }
 
     const int local_device = group->devices[rank];
+
+    if (local_device < 0) {
+        return OO_ERROR_INVALID_DEVICE;
+    }
 
     void* local_signal = nullptr;
 
@@ -330,16 +356,22 @@ const char* oo_status_string(oo_status_t status) {
     switch (status) {
         case OO_SUCCESS:
             return "OO_SUCCESS";
+
         case OO_ERROR_INVALID_ARGUMENT:
             return "OO_ERROR_INVALID_ARGUMENT";
+
         case OO_ERROR_INVALID_DEVICE:
             return "OO_ERROR_INVALID_DEVICE";
+
         case OO_ERROR_UNSUPPORTED:
             return "OO_ERROR_UNSUPPORTED";
+
         case OO_ERROR_CUDA:
             return "OO_ERROR_CUDA";
+
         case OO_ERROR_INTERNAL:
             return "OO_ERROR_INTERNAL";
+
         default:
             return "OO_ERROR_UNKNOWN";
     }
@@ -405,9 +437,8 @@ oo_status_t oo_group_create(
         }
 
         /*
-         * VMM groups do not require cudaDeviceEnablePeerAccess for user buffers,
-         * so do not run runtime validation probes here. This records static
-         * topology/link information without changing peer-access state.
+         * VMM groups do not require cudaDeviceEnablePeerAccess for user buffers.
+         * Record static topology/link information without runtime probes.
          */
         oo_status_t status =
             initialize_group_topology(
@@ -469,10 +500,9 @@ oo_status_t oo_group_create_p2p(
         }
 
         /*
-         * Must happen before ready-signal allocation/use.
-         *
-         * This also makes external cudaMalloc / PyTorch allocations on peer
-         * devices directly addressable by kernels in this process.
+         * External/wrapped cudaMalloc pointers need peer access enabled as a
+         * runtime setup side-effect.  Do not store a second peer-access matrix in
+         * oo_group; topology is the source of truth for planning.
          */
         oo_status_t status =
             enable_group_peer_access_all_to_all(group.get());
@@ -481,34 +511,19 @@ oo_status_t oo_group_create_p2p(
             return status;
         }
 
-        /*
-         * Same-process P2P groups are the first topology-aware execution target.
-         * Peer access is already enabled above; discovery may call enable again
-         * and will treat cudaErrorPeerAccessAlreadyEnabled as success.
-         *
-         * Keep TMA probes off during group creation for now. We use direct copy
-         * and atomic probes here, then make TMA transport decisions stricter in
-         * the transfer planner/lowerer before wiring real collectives.
-         */
         status =
             initialize_group_topology(
                 group.get(),
-                false,  // do not enable peer access in topology discovery
+                false,  // peer access is already enabled above
                 false,  // no SHM fallback transport during runtime group creation yet
                 false,  // no runtime validation probes
                 false,  // no atomic probes
                 false); // no TMA probes
 
-
-
         if (status != OO_SUCCESS) {
             return status;
         }
 
-        /*
-         * Internal synchronization flags. These are not user buffers.
-         * They deliberately use cudaMalloc, not VMM.
-         */
         status =
             allocate_same_process_cuda_ready_signals(group.get());
 
@@ -570,12 +585,10 @@ oo_status_t oo_group_create_ipc(
         }
 
         /*
-         * Do not build IPC topology here yet.
-         *
-         * Rank 0 will build the logical transfer plan and distribute it in the
-         * next patch. Some IPC deployments restrict CUDA_VISIBLE_DEVICES per
-         * process, so discovering all devices during every rank's group creation
-         * would be unsafe.
+         * IPC topology/launch exchange is intentionally not implemented here
+         * yet. Some IPC deployments restrict CUDA_VISIBLE_DEVICES per process,
+         * so discovering all devices during every rank's group creation would be
+         * unsafe.
          */
         group->topology_valid = false;
         group->topology = ooverlap::topology::Topology{};
@@ -600,6 +613,8 @@ void oo_group_destroy(oo_group_t* group) {
     }
 
     destroy_group_ready_signals(group);
+    group->collective_launch_exchange.reset();
+    group->transfer_plan_distribution.reset();
     group->broker.reset();
     delete group;
 }
@@ -735,7 +750,7 @@ oo_status_t oo_buffer_wrap(
             cudaPointerGetAttributes(
                 &attr,
                 ptr);
-        
+
         if (attr_err != cudaSuccess) {
             /*
              * Clear sticky runtime error state before returning.
@@ -743,18 +758,18 @@ oo_status_t oo_buffer_wrap(
             (void)cudaGetLastError();
             return OO_ERROR_INVALID_ARGUMENT;
         }
-        
-        #if CUDART_VERSION >= 10000
+
+#if CUDART_VERSION >= 10000
         if (attr.type != cudaMemoryTypeDevice &&
             attr.type != cudaMemoryTypeManaged) {
             return OO_ERROR_INVALID_ARGUMENT;
         }
-        #else
+#else
         if (attr.memoryType != cudaMemoryTypeDevice) {
             return OO_ERROR_INVALID_ARGUMENT;
         }
-        #endif
-        
+#endif
+
         if (attr.device >= 0 && attr.device != node->device) {
             return OO_ERROR_INVALID_ARGUMENT;
         }
@@ -812,98 +827,13 @@ oo_status_t oo_group_sync(oo_group_t* group) {
             return OO_SUCCESS;
         }
 
-        for (int i = 0; i < group->num_devices; ++i) {
-            ooverlap::system::runtime::set_device(group->devices[i]);
+        for (int rank = 0; rank < group->num_devices; ++rank) {
+            ooverlap::system::runtime::set_device(group->devices[rank]);
             ooverlap::system::runtime::check_cuda(
                 cudaDeviceSynchronize(),
                 "cudaDeviceSynchronize");
         }
 
-        return OO_SUCCESS;
-    } catch (...) {
-        return ooverlap::comm::api::exception_to_status();
-    }
-}
-
-oo_status_t oo_buffer_exchange_ipc_peers(
-    oo_node_t* node,
-    oo_buffer_t* local,
-    oo_buffer_t** out_peers,
-    int* out_peer_count) {
-    if (out_peer_count != nullptr) {
-        *out_peer_count = 0;
-    }
-
-    if (node == nullptr ||
-        node->group == nullptr ||
-        node->group->broker == nullptr ||
-        local == nullptr ||
-        out_peers == nullptr ||
-        out_peer_count == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    oo_group_t* group = node->group;
-
-    if (node->rank < 0 ||
-        node->rank >= group->num_devices ||
-        group->local_rank != node->rank ||
-        group->local_world_size != group->num_devices) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    try {
-        ooverlap::system::legacy_peer_buffer_descriptor local_desc{};
-
-        oo_status_t status =
-            oo_buffer_export_legacy_descriptor(
-                local,
-                &local_desc);
-
-        if (status != OO_SUCCESS) {
-            return status;
-        }
-
-        std::vector<ooverlap::system::legacy_peer_buffer_descriptor> descs(
-            static_cast<size_t>(group->num_devices));
-
-        group->broker->exchange_data(
-            descs.data(),
-            &local_desc,
-            sizeof(local_desc));
-
-        group->broker->sync();
-
-        int peer_count = 0;
-
-        for (int rank = 0; rank < group->num_devices; ++rank) {
-            if (rank == node->rank) {
-                continue;
-            }
-
-            oo_buffer_t* peer = nullptr;
-
-            status =
-                oo_buffer_import_legacy_descriptor(
-                    node,
-                    descs[static_cast<size_t>(rank)],
-                    &peer);
-
-            if (status != OO_SUCCESS) {
-                for (int i = 0; i < peer_count; ++i) {
-                    oo_buffer_destroy(out_peers[i]);
-                    out_peers[i] = nullptr;
-                }
-
-                return status;
-            }
-
-            out_peers[peer_count++] = peer;
-        }
-
-        group->broker->sync();
-
-        *out_peer_count = peer_count;
         return OO_SUCCESS;
     } catch (...) {
         return ooverlap::comm::api::exception_to_status();

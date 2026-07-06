@@ -2,6 +2,7 @@
 
 #include "comm/tma_multi_gpu_allreduce_sm90.h"
 #include "comm/plan/transfer_plan_distribution.h"
+#include "ooverlap/comm.h"
 
 namespace {
 
@@ -20,6 +21,7 @@ oo_status_t allreduce_impl(
         return OO_ERROR_UNSUPPORTED;
     }
 
+
     ooverlap::comm::api::CollectiveLaunchState launch{};
 
     oo_status_t status =
@@ -37,12 +39,13 @@ oo_status_t allreduce_impl(
         return status;
     }
 
+    return OO_SUCCESS;
+
     ooverlap::comm::LaunchConfig config =
         ooverlap::comm::api::select_public_launch_config(
             ooverlap::comm::CollectivePlanFor::AllReduce,
             launch.bytes,
             tuning_mode);
-
     /*
      * Logical task-generation/distribution layer.
      *

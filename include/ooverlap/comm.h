@@ -53,7 +53,8 @@ typedef struct {
 size_t oo_dtype_size(
     oo_dtype_t dtype);
 
-const char* oo_status_string(oo_status_t status);
+const char* oo_status_string(
+    oo_status_t status);
 
 oo_status_t oo_rank_partition(
     int rank,
@@ -146,33 +147,21 @@ size_t oo_buffer_mapped_bytes(
 oo_buffer_kind_t oo_buffer_kind(
     const oo_buffer_t* buffer);
 
-/* IPC / synchronization */
+/* Synchronization */
 oo_status_t oo_group_sync(
     oo_group_t* group);
 
 /*
- * Exchange this rank's local buffer with all remote ranks.
+ * Clean public collectives.
  *
- * out_peers must have space for:
- *
- *   oo_group_size(oo_node_group(node)) - 1
- *
- * entries.
- *
- * out_peer_count receives the number of peer buffers written.
+ * The caller passes only this rank's local logical buffer.
+ * Peer memory views are resolved by the group/launch-exchange backend.
  */
-oo_status_t oo_buffer_exchange_ipc_peers(
-    oo_node_t* node,
-    oo_buffer_t* local,
-    oo_buffer_t** out_peers,
-    int* out_peer_count);
 
 /* Allreduce */
 oo_status_t oo_allreduce_offset(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -182,8 +171,6 @@ oo_status_t oo_allreduce_offset(
 oo_status_t oo_allreduce(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     oo_reduce_op_t op,
@@ -192,8 +179,6 @@ oo_status_t oo_allreduce(
 oo_status_t oo_allreduce_offset_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -204,8 +189,6 @@ oo_status_t oo_allreduce_offset_tuned(
 oo_status_t oo_allreduce_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     oo_reduce_op_t op,
@@ -216,8 +199,6 @@ oo_status_t oo_allreduce_tuned(
 oo_status_t oo_reduce_scatter_offset(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -228,8 +209,6 @@ oo_status_t oo_reduce_scatter_offset(
 oo_status_t oo_reduce_scatter(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     oo_reduce_op_t op,
@@ -239,8 +218,6 @@ oo_status_t oo_reduce_scatter(
 oo_status_t oo_reduce_scatter_offset_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -252,8 +229,6 @@ oo_status_t oo_reduce_scatter_offset_tuned(
 oo_status_t oo_reduce_scatter_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     oo_reduce_op_t op,
@@ -265,8 +240,6 @@ oo_status_t oo_reduce_scatter_tuned(
 oo_status_t oo_all_gather_offset(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -275,8 +248,6 @@ oo_status_t oo_all_gather_offset(
 oo_status_t oo_all_gather(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     cudaStream_t stream);
@@ -284,8 +255,6 @@ oo_status_t oo_all_gather(
 oo_status_t oo_all_gather_offset_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t element_offset,
     size_t count,
     oo_dtype_t dtype,
@@ -295,13 +264,306 @@ oo_status_t oo_all_gather_offset_tuned(
 oo_status_t oo_all_gather_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
-    oo_buffer_t* const* peers,
-    int peer_count,
     size_t count,
     oo_dtype_t dtype,
     oo_tuning_mode_t tuning_mode,
     cudaStream_t stream);
 
 #ifdef __cplusplus
-}
+} /* extern "C" */
 #endif
+
+/*
+ * Legacy C++ source-compatibility wrappers.
+ *
+ * These intentionally ignore peers/peer_count.  Peer buffer discovery must be
+ * handled by the group/launch-exchange backend, not by public collective APIs.
+ *
+ * C cannot overload functions, so old C call sites must be updated manually.
+ */
+#ifdef __cplusplus
+
+#ifndef OO_DISABLE_LEGACY_PEER_COLLECTIVE_API
+
+/* Allreduce legacy wrappers */
+inline oo_status_t oo_allreduce_offset(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_allreduce_offset(
+        node,
+        local,
+        element_offset,
+        count,
+        dtype,
+        op,
+        stream);
+}
+
+inline oo_status_t oo_allreduce(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_allreduce(
+        node,
+        local,
+        count,
+        dtype,
+        op,
+        stream);
+}
+
+inline oo_status_t oo_allreduce_offset_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_allreduce_offset_tuned(
+        node,
+        local,
+        element_offset,
+        count,
+        dtype,
+        op,
+        tuning_mode,
+        stream);
+}
+
+inline oo_status_t oo_allreduce_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_allreduce_tuned(
+        node,
+        local,
+        count,
+        dtype,
+        op,
+        tuning_mode,
+        stream);
+}
+
+/* Reduce-scatter legacy wrappers */
+inline oo_status_t oo_reduce_scatter_offset(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tensor_slice_t* out_slice,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_reduce_scatter_offset(
+        node,
+        local,
+        element_offset,
+        count,
+        dtype,
+        op,
+        out_slice,
+        stream);
+}
+
+inline oo_status_t oo_reduce_scatter(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tensor_slice_t* out_slice,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_reduce_scatter(
+        node,
+        local,
+        count,
+        dtype,
+        op,
+        out_slice,
+        stream);
+}
+
+inline oo_status_t oo_reduce_scatter_offset_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    oo_tensor_slice_t* out_slice,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_reduce_scatter_offset_tuned(
+        node,
+        local,
+        element_offset,
+        count,
+        dtype,
+        op,
+        tuning_mode,
+        out_slice,
+        stream);
+}
+
+inline oo_status_t oo_reduce_scatter_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    oo_tensor_slice_t* out_slice,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_reduce_scatter_tuned(
+        node,
+        local,
+        count,
+        dtype,
+        op,
+        tuning_mode,
+        out_slice,
+        stream);
+}
+
+/* All-gather legacy wrappers */
+inline oo_status_t oo_all_gather_offset(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_all_gather_offset(
+        node,
+        local,
+        element_offset,
+        count,
+        dtype,
+        stream);
+}
+
+inline oo_status_t oo_all_gather(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_all_gather(
+        node,
+        local,
+        count,
+        dtype,
+        stream);
+}
+
+inline oo_status_t oo_all_gather_offset_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_all_gather_offset_tuned(
+        node,
+        local,
+        element_offset,
+        count,
+        dtype,
+        tuning_mode,
+        stream);
+}
+
+inline oo_status_t oo_all_gather_tuned(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* peers,
+    int peer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    (void)peers;
+    (void)peer_count;
+
+    return oo_all_gather_tuned(
+        node,
+        local,
+        count,
+        dtype,
+        tuning_mode,
+        stream);
+}
+
+#endif /* OO_DISABLE_LEGACY_PEER_COLLECTIVE_API */
+
+#endif /* __cplusplus */

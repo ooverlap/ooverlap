@@ -19,19 +19,26 @@ constexpr int kOoMaxLocalDevices = 16;
 enum class oo_group_memory_kind {
     /*
      * Same-process VMM allocations with cuMemSetAccess.
-     * This is the current oo_group_create() behavior.
+     *
+     * Buffer allocation and cleanup are VMM-backed. Transport choice must still
+     * come from topology/transfer planning, not from this enum.
      */
     same_process_vmm = 0,
 
     /*
-     * Same-process normal CUDA allocations / external wrapped pointers.
-     * Peer visibility comes from cudaDeviceEnablePeerAccess.
+     * Same-process normal CUDA allocations or external wrapped pointers.
+     *
+     * This is the external-buffer path. Peer access enabling is a setup detail;
+     * whether a collective can use direct NVLink, direct PCIe/SYS, SHM, or a
+     * fallback route is represented by topology.
      */
     same_process_cuda_p2p = 1,
 
     /*
      * Multiprocess legacy CUDA IPC.
-     * Peer buffers are imported with cudaIpcOpenMemHandle.
+     *
+     * Peer memory views are imported/opened by the launch-exchange backend, not
+     * passed through public collective APIs.
      */
     multiprocess_legacy_ipc = 2
 };
@@ -44,16 +51,25 @@ enum class oo_group_bootstrap_kind {
 enum class oo_ready_signal_kind {
     empty = 0,
 
-    // Same-process VMM allocation visible to all local devices.
+    /*
+     * Same-process VMM allocation visible to all local devices.
+     */
     owned_vmm = 1,
 
-    // cudaMalloc allocation owned by this process/rank, exported by legacy IPC.
+    /*
+     * cudaMalloc allocation owned by this process/rank. Same-process groups may
+     * use this directly; IPC groups export it through legacy CUDA IPC.
+     */
     owned_legacy = 2,
 
-    // cudaIpcOpenMemHandle mapping imported from another process/rank.
+    /*
+     * cudaIpcOpenMemHandle mapping imported from another process/rank.
+     */
     imported_legacy = 3,
 
-    // VMM FD imported mapping. Kept for future extension.
+    /*
+     * VMM FD imported mapping. Kept for future extension.
+     */
     imported_vmm = 4
 };
 
@@ -67,36 +83,53 @@ struct oo_ready_signal {
 
     oo_ready_signal_kind kind = oo_ready_signal_kind::empty;
 
-    // Valid for kind == owned_vmm.
+    /*
+     * Valid for kind == owned_vmm.
+     */
     ooverlap::system::mapped_peer_buffer owned_vmm{};
 
-    // Valid for kind == owned_legacy.
+    /*
+     * Valid for kind == owned_legacy.
+     */
     void* owned_legacy_ptr = nullptr;
 
-    // Valid for kind == imported_legacy/imported_vmm.
+    /*
+     * Valid for kind == imported_legacy/imported_vmm.
+     */
     ooverlap::system::imported_peer_buffer imported{};
 };
 
 namespace ooverlap {
 namespace comm {
+
+namespace api {
+class CollectiveLaunchExchangeBackend;
+}
+
 namespace plan {
 class TransferPlanDistributionBackend;
 }
-}
-}
+
+} // namespace comm
+} // namespace ooverlap
 
 struct oo_group {
     int num_devices = 0;
     int devices[kOoMaxLocalDevices] = {};
 
-    oo_group_bootstrap_kind bootstrap_kind = oo_group_bootstrap_kind::same_process;
+    oo_group_bootstrap_kind bootstrap_kind =
+        oo_group_bootstrap_kind::same_process;
+
+    oo_group_memory_kind memory_kind =
+        oo_group_memory_kind::same_process_vmm;
 
     /*
      * Meaningful only for multiprocess_ipc.
      *
-     * In that mode, each OS process owns exactly one rank/node. That rank
-     * allocates its local ready signal, exports it, then imports peers' ready
-     * signals through Broker + CUDA IPC.
+     * In IPC mode, each OS process owns exactly one rank/node. That rank owns
+     * its local user buffer and ready signal; the launch-exchange backend is
+     * responsible for exchanging/importing the rank memory views needed by a
+     * collective epoch.
      */
     int local_rank = -1;
     int local_world_size = 0;
@@ -104,36 +137,53 @@ struct oo_group {
     std::unique_ptr<ooverlap::system::Broker> broker{};
 
     /*
-     * New first-class ready-signal state.
+     * Ready-signal state indexed by logical rank.
      *
-     * ready_signal_slots[r] knows whether the pointer is owned in this process
-     * or imported from another process, and therefore how to clean it up.
+     * ready_signal_slots[r] owns or imports the cleanup state for rank r's
+     * ready signal. Do not keep a second mirror array; all code should use this
+     * field.
      */
     oo_ready_signal ready_signal_slots[kOoMaxLocalDevices] = {};
 
     /*
-     * Compatibility mirror for older same-process code/tests that may inspect
-     * group->ready_signals directly. Do not free through this array anymore;
-     * free through ready_signal_slots.
-     */
-    ooverlap::system::mapped_peer_buffer ready_signals[kOoMaxLocalDevices] = {};
-
-    oo_group_memory_kind memory_kind =
-                oo_group_memory_kind::same_process_vmm;
-    
-    /*
-     * Meaningful for same_process_cuda_p2p.
+     * Topology is the source of truth for transport capability.
      *
-     * peer_access_enabled[src_rank][dst_rank] means the CUDA context for
-     * devices[src_rank] enabled access to allocations owned by devices[dst_rank].
+     * Do not store separate peer_access_enabled matrices in oo_group. Peer
+     * access enabling is setup side-effect; transport choice belongs in
+     * topology + logical transfer planning.
      */
-    bool peer_access_enabled[kOoMaxLocalDevices][kOoMaxLocalDevices] = {};
-
     bool topology_valid = false;
     ooverlap::topology::Topology topology{};
 
+    /*
+     * Group-owned collective launch exchange.
+     *
+     * Public collectives should pass only the local rank buffer. This backend
+     * converts that local contribution into a rank-indexed CollectiveLaunchState
+     * containing the memory views and ready signals needed by lowering.
+     *
+     * Same-process implementation:
+     *   all ranks contribute local oo_buffer_t for the active collective epoch;
+     *   the backend waits until every rank arrived, then returns rank views.
+     *
+     * IPC implementation later:
+     *   ranks exchange/import descriptors through broker/IPC, then return rank
+     *   views. Public collective signatures do not change.
+     */
+    std::unique_ptr<ooverlap::comm::api::CollectiveLaunchExchangeBackend>
+        collective_launch_exchange{};
+
+    /*
+     * Group-owned logical TransferPlan distribution.
+     *
+     * Same-process implementation:
+     *   first arriving rank builds the logical plan; others wait and copy it.
+     *
+     * IPC implementation later:
+     *   rank 0 builds/broadcasts the logical plan.
+     */
     std::unique_ptr<ooverlap::comm::plan::TransferPlanDistributionBackend>
-                            transfer_plan_distribution{};
+        transfer_plan_distribution{};
 };
 
 struct oo_node {
@@ -141,8 +191,13 @@ struct oo_node {
     int rank = -1;
     int device = -1;
 
-    // Monotonic per-node collective sequence.
-    // Rank-local calls must be issued in matching order, same as NCCL.
+    /*
+     * Monotonic per-node collective sequence.
+     *
+     * Rank-local calls must be issued in matching order across ranks, same as
+     * NCCL. The launch-exchange backend should use this to detect ordering
+     * mismatches.
+     */
     int collective_epoch = 0;
 };
 
@@ -152,51 +207,45 @@ struct oo_buffer {
     size_t mapped_bytes = 0;
 
     /*
-     * Public coarse kind. Until include/ooverlap/comm.h grows more enum values,
-     * imported buffers report as WRAPPED publicly but are distinguished by
-     * system_kind/imported internally.
+     * Public coarse kind.
+     *
+     * Imported buffers may still report as WRAPPED publicly until the public ABI
+     * grows more detailed buffer kinds. Internally, system_kind is the precise
+     * provenance.
      */
     oo_buffer_kind_t kind = OO_BUFFER_KIND_WRAPPED;
 
-    // Internal validation/debug metadata.
+    /*
+     * Internal validation/debug metadata.
+     */
     oo_group_t* group = nullptr;
     int owner_rank = -1;
     int owner_device = -1;
 
     /*
-     * Internal, precise provenance.
-     *
-     * This is the important change: imported CUDA IPC mappings are no longer
-     * indistinguishable from plain wrapped pointers.
+     * Internal precise provenance.
      */
     ooverlap::system::peer_buffer_kind system_kind =
         ooverlap::system::peer_buffer_kind::empty;
 
-    // Valid only for public kind == OO_BUFFER_KIND_VMM and system_kind == owned_vmm.
+    /*
+     * Valid only for public kind == OO_BUFFER_KIND_VMM and
+     * system_kind == owned_vmm.
+     */
     ooverlap::system::mapped_peer_buffer mapped{};
 
-    // Valid for system_kind == imported_legacy/imported_vmm.
+    /*
+     * Valid for system_kind == imported_legacy/imported_vmm.
+     */
     ooverlap::system::imported_peer_buffer imported{};
 };
 
 /*
- * Optional C ABI extension for node-local multiprocess bootstrap.
- *
- * You should add this declaration to include/ooverlap/comm.h too if you want
- * external users/Python bindings to call it directly.
- */
-extern "C" oo_status_t oo_group_create_ipc(
-    const int* devices,
-    int num_devices,
-    int local_rank,
-    const char* broker_key,
-    oo_group_t** out_group);
-
-/*
  * C++ helper APIs for the IPC path.
  *
- * These are intentionally in the internal header because they use C++ descriptor
- * types from peer_buffer.cuh. Add C ABI wrappers later if needed.
+ * These are intentionally in the internal header because they use C++
+ * descriptor types from peer_buffer.cuh. Add C ABI wrappers later only if
+ * external users/Python bindings need to call these directly.
  */
 oo_status_t oo_buffer_export_legacy_descriptor(
     oo_buffer_t* buffer,
