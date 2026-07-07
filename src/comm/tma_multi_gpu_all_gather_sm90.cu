@@ -145,14 +145,34 @@ cudaError_t launch_all_gather_rank_variant_sm90(
             launch.peer_count,
             launch.peer_ready_signals);
 
-    const bool use_ready_tasks =
+    comm::plan::ReadySignalBinding<MaxRanks> ready_binding{};
+    ready_binding.local_ready_signal = launch.local_ready_signal;
+    ready_binding.epoch = launch.collective_epoch;
+    ready_binding.protocol = static_cast<int>(ready_plan.protocol);
+    ready_binding.poll_sleep_cycles = ready_plan.poll_sleep_cycles;
+
+    if (launch.rank >= 0 && launch.rank < MaxRanks) {
+        ready_binding.ready_signal_by_rank[launch.rank] =
+            launch.local_ready_signal;
+    }
+
+    for (int peer_idx = 0; peer_idx < ready_plan.peer_count; ++peer_idx) {
+        const int peer_rank = launch.peer_ranks[peer_idx];
+
+        if (peer_rank >= 0 && peer_rank < MaxRanks) {
+            ready_binding.ready_signal_by_rank[peer_rank] =
+                ready_plan.peer_ready_signals[peer_idx];
+        }
+    }
+
+    const bool use_ready_binding =
         launch.local_ready_signal != nullptr &&
         launch.collective_epoch > 0 &&
         ready_plan.protocol !=
             comm::kernels::MultiGpuReadySignalProtocol::Disabled;
 
-    const int ready_prefix_tasks_per_cta =
-        use_ready_tasks ? (1 + ready_plan.peer_count) : 0;
+    const comm::plan::ReadySignalBinding<MaxRanks>* ready_binding_ptr =
+        use_ready_binding ? &ready_binding : nullptr;
 
     comm::plan::WindowTaskExecutorPlan<MaxTasks> window_plan{};
     int num_blocks = 0;
@@ -168,7 +188,8 @@ cudaError_t launch_all_gather_rank_variant_sm90(
                 launch_config,
                 &window_plan,
                 &num_blocks,
-                ready_prefix_tasks_per_cta);
+                0,
+                ready_binding_ptr);
 
     if (!plan_ok) {
         return cudaErrorInvalidValue;
@@ -176,20 +197,6 @@ cudaError_t launch_all_gather_rank_variant_sm90(
 
     if (num_blocks <= 0 || window_plan.total_tasks <= 0) {
         return cudaSuccess;
-    }
-
-    if (use_ready_tasks) {
-        if (!comm::plan::prepend_ready_tasks_to_each_cta(
-                &window_plan,
-                num_blocks,
-                launch.local_ready_signal,
-                launch.peer_ready_signals,
-                ready_plan.peer_count,
-                launch.collective_epoch,
-                static_cast<int>(ready_plan.protocol),
-                ready_plan.poll_sleep_cycles)) {
-            return cudaErrorInvalidValue;
-        }
     }
 
     system::runtime::set_device(launch.local_device);
