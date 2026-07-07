@@ -25,7 +25,7 @@ namespace plan {
 template <int MaxRanks>
 struct ReadySignalBinding {
     /*
-     * Channel-aware fields.  New code should fill these.
+     * Channel-aware fields. New code should fill these.
      */
     int* local_ready_signal_by_channel[kReadySignalChannelCount] = {};
     const int* ready_signal_by_rank_channel
@@ -34,7 +34,7 @@ struct ReadySignalBinding {
     int poll_sleep_cycles_by_channel[kReadySignalChannelCount] = {};
 
     /*
-     * Compatibility fields for old launchers.  These are interpreted as the
+     * Compatibility fields for old launchers. These are interpreted as the
      * DeviceMemory channel when the channel-aware entries are null.
      */
     int* local_ready_signal = nullptr;
@@ -202,9 +202,11 @@ inline bool transfer_should_use_fast_copy(
      *
      * Later this should consult topology probe capabilities directly.
      */
-    return task.op == TransferOp::Copy &&
-           (task.transport == topology::TransportKind::DirectPcie ||
-            transfer_task_uses_shm_staging(task));
+    /*return task.op == TransferOp::Copy &&*/
+           /*(task.transport == topology::TransportKind::DirectPcie ||*/
+            /*transfer_task_uses_shm_staging(task));*/
+
+    return false;
 }
 
 __host__ __device__ __forceinline__ bool transfer_task_is_ready(
@@ -225,7 +227,7 @@ inline bool lower_ready_transfer_task_to_window_task(
     /*
      * Placeholder overload intentionally not used.
      *
-     * The real implementation is templated below.  This function only prevents
+     * The real implementation is templated below. This function only prevents
      * accidental non-templated declarations from being introduced elsewhere.
      */
     (void)transfer;
@@ -317,6 +319,15 @@ inline bool lower_ready_transfer_task_to_window_task(
     return false;
 }
 
+inline task::WindowTaskOp select_copy_window_op(
+    const TransferTask& transfer) {
+    if (transfer_should_use_fast_copy(transfer)) {
+        return task::WindowTaskOp::CopyFast;
+    }
+
+    return task::WindowTaskOp::CopyTMA;
+}
+
 inline bool lower_transfer_task_to_window_task(
     const TransferTask& transfer,
     const void* src,
@@ -342,7 +353,7 @@ inline bool lower_transfer_task_to_window_task(
          * Non-direct non-staging transports still need their own executor rules.
          *
          * A Copy task that explicitly references ShmStaging is lowered to
-         * CopyFast below.  This lets planners opt into staging by using
+         * CopyFast below. This lets planners opt into staging by using
          * shm_staging_ref(slot, offset) without requiring a dedicated staging
          * WindowTaskOp yet.
          */
@@ -368,49 +379,83 @@ inline bool lower_transfer_task_to_window_task(
     }
 
     if (transfer.op == TransferOp::Copy) {
-        if (transfer_should_use_fast_copy(transfer)) {
-            *out =
-                task::make_copy_fast_task(
-                    src,
-                    dst,
-                    transfer.bytes,
-                    begin_window,
-                    end_window,
-                    transfer.window_chunks,
-                    transfer.terminal);
-        } else {
-            *out =
-                task::make_copy_tma_task(
-                    src,
-                    dst,
-                    transfer.bytes,
-                    begin_window,
-                    end_window,
-                    transfer.window_chunks,
-                    transfer.terminal);
-        }
+        switch (select_copy_window_op(transfer)) {
+            case task::WindowTaskOp::CopyFast:
+                *out =
+                    task::make_copy_fast_task(
+                        src,
+                        dst,
+                        transfer.bytes,
+                        begin_window,
+                        end_window,
+                        transfer.window_chunks,
+                        transfer.terminal);
+                return true;
 
-        return true;
+            case task::WindowTaskOp::CopyTMA:
+                *out =
+                    task::make_copy_tma_task(
+                        src,
+                        dst,
+                        transfer.bytes,
+                        begin_window,
+                        end_window,
+                        transfer.window_chunks,
+                        transfer.terminal);
+                return true;
+
+            default:
+                return false;
+        }
     }
 
     return false;
 }
 
-template <
-    int MaxTransferTasks,
-    int MaxWindowTasks,
-    int MaxRanks,
-    int MaxStagingSlots>
-bool lower_transfer_plan_for_rank(
-    const TransferPlan<MaxTransferTasks>& transfer_plan,
+namespace lowering_detail {
+
+/*
+ * Pass options are intentionally conservative. The default behavior should remain
+ * equivalent to the old monolithic lower_transfer_plan_for_rank().
+ *
+ * Add real optimization toggles here as you implement them.
+ */
+struct LoweringPassOptions {
+    bool enable_transfer_passes = true;
+    bool enable_window_passes = true;
+
+    /*
+     * The current executor has historically had a temporary local-task limit in
+     * execute_window_task_stripe(). Keep this disabled by default so the skeleton
+     * preserves old lowering behavior. Enable while debugging if needed.
+     */
+    bool enforce_executor_task_limit = false;
+    int max_executable_tasks_per_cta = 2;
+};
+
+template <int MaxRanks>
+struct LoweringContext {
+    int current_rank = -1;
+    int world_size = 0;
+
+    const comm::LaunchConfig* launch_config = nullptr;
+    const ReadySignalBinding<MaxRanks>* ready_binding = nullptr;
+
+    bool lower_ready_tasks = false;
+    int reserved_prefix_tasks_per_cta = 0;
+
+    LoweringPassOptions options{};
+};
+
+template <int MaxRanks, int MaxStagingSlots>
+inline bool make_lowering_context(
     const RankPointerBinding<MaxRanks, MaxStagingSlots>& binding,
     const comm::LaunchConfig& launch_config,
-    WindowTaskExecutorPlan<MaxWindowTasks>* out_window_plan,
-    int* out_num_blocks,
-    int reserved_prefix_tasks_per_cta = 0,
-    const ReadySignalBinding<MaxRanks>* ready_binding = nullptr) {
-    if (out_window_plan == nullptr ||
-        out_num_blocks == nullptr ||
+    int reserved_prefix_tasks_per_cta,
+    const ReadySignalBinding<MaxRanks>* ready_binding,
+    const LoweringPassOptions& options,
+    LoweringContext<MaxRanks>* out) {
+    if (out == nullptr ||
         binding.current_rank < 0 ||
         binding.current_rank >= binding.world_size ||
         binding.world_size <= 0 ||
@@ -420,32 +465,99 @@ bool lower_transfer_plan_for_rank(
         return false;
     }
 
-    out_window_plan->total_tasks = 0;
-    out_window_plan->tasks_per_cta = 0;
-    *out_num_blocks = 0;
-
-    /*
-     * Transition behavior:
-     *
-     * - If ready_binding is supplied, ReadyPublish/ReadyWait TransferTasks are
-     *   lowered into WindowTasks and replicated into every CTA stripe.
-     *
-     * - If ready_binding is nullptr, logical ready tasks are ignored.  This keeps
-     *   old launcher-side prepend_ready_tasks_to_each_cta() code compiling while
-     *   the launchers are migrated.
-     */
-    const bool lower_ready_tasks =
+    LoweringContext<MaxRanks> ctx{};
+    ctx.current_rank = binding.current_rank;
+    ctx.world_size = binding.world_size;
+    ctx.launch_config = &launch_config;
+    ctx.ready_binding = ready_binding;
+    ctx.lower_ready_tasks =
         ready_binding != nullptr &&
         ready_binding->epoch > 0;
+    ctx.reserved_prefix_tasks_per_cta = reserved_prefix_tasks_per_cta;
+    ctx.options = options;
 
-    int rank_ready_task_count = 0;
-    int rank_window_task_count = 0;
+    *out = ctx;
+    return true;
+}
+
+template <int MaxTransferTasks>
+struct RankTransferTaskBuffer {
+    static_assert(MaxTransferTasks > 0, "MaxTransferTasks must be > 0");
+
+    int count = 0;
+    int ready_count = 0;
+    int window_count = 0;
     int max_end_window = 0;
+
+    TransferTask tasks[MaxTransferTasks] = {};
+};
+
+template <int MaxTransferTasks>
+inline bool rank_transfer_task_buffer_push(
+    RankTransferTaskBuffer<MaxTransferTasks>* buffer,
+    const TransferTask& task) {
+    if (buffer == nullptr ||
+        buffer->count < 0 ||
+        buffer->count >= MaxTransferTasks) {
+        return false;
+    }
+
+    buffer->tasks[buffer->count++] = task;
+    return true;
+}
+
+template <int MaxTransferTasks>
+inline bool recompute_rank_transfer_task_stats(
+    RankTransferTaskBuffer<MaxTransferTasks>* buffer) {
+    if (buffer == nullptr ||
+        buffer->count < 0 ||
+        buffer->count > MaxTransferTasks) {
+        return false;
+    }
+
+    buffer->ready_count = 0;
+    buffer->window_count = 0;
+    buffer->max_end_window = 0;
+
+    for (int i = 0; i < buffer->count; ++i) {
+        const TransferTask& transfer = buffer->tasks[i];
+
+        if (transfer_task_is_ready(transfer)) {
+            ++buffer->ready_count;
+            continue;
+        }
+
+        if (!transfer_task_is_windowed(transfer)) {
+            return false;
+        }
+
+        ++buffer->window_count;
+        buffer->max_end_window =
+            comm::utils::max_int(
+                buffer->max_end_window,
+                transfer.end_window);
+    }
+
+    return true;
+}
+
+template <int MaxTransferTasks, int MaxRanks>
+inline bool collect_rank_transfer_tasks(
+    const TransferPlan<MaxTransferTasks>& transfer_plan,
+    const LoweringContext<MaxRanks>& ctx,
+    RankTransferTaskBuffer<MaxTransferTasks>* out) {
+    if (out == nullptr ||
+        transfer_plan.total_tasks < 0 ||
+        transfer_plan.total_tasks > MaxTransferTasks) {
+        return false;
+    }
+
+    *out = RankTransferTaskBuffer<MaxTransferTasks>{};
 
     for (int i = 0; i < transfer_plan.total_tasks; ++i) {
         const TransferTask& transfer = transfer_plan.tasks[i];
 
-        if (transfer.executor_rank != binding.current_rank) {
+        if (transfer.executor_rank != ctx.current_rank) {
             continue;
         }
 
@@ -454,8 +566,12 @@ bool lower_transfer_plan_for_rank(
         }
 
         if (transfer_task_is_ready(transfer)) {
-            if (lower_ready_tasks) {
-                ++rank_ready_task_count;
+            if (!ctx.lower_ready_tasks) {
+                continue;
+            }
+
+            if (!rank_transfer_task_buffer_push(out, transfer)) {
+                return false;
             }
 
             continue;
@@ -465,99 +581,251 @@ bool lower_transfer_plan_for_rank(
             return false;
         }
 
-        ++rank_window_task_count;
-
-        max_end_window =
-            comm::utils::max_int(
-                max_end_window,
-                transfer.end_window);
+        if (!rank_transfer_task_buffer_push(out, transfer)) {
+            return false;
+        }
     }
 
-    if (rank_ready_task_count == 0 && rank_window_task_count == 0) {
+    return recompute_rank_transfer_task_stats(out);
+}
+
+/*
+ * Transfer-task pass skeletons.
+ *
+ * These run before pointer binding. They are the right place for logical IR
+ * rewrites: ready cleanup, adjacent task merging, safe reordering by phase,
+ * topology/staging rewrites, etc.
+ */
+template <int MaxTransferTasks, int MaxRanks>
+inline bool pass_validate_transfer_tasks(
+    const LoweringContext<MaxRanks>& ctx,
+    const RankTransferTaskBuffer<MaxTransferTasks>& tasks) {
+    if (tasks.count < 0 || tasks.count > MaxTransferTasks) {
+        return false;
+    }
+
+    for (int i = 0; i < tasks.count; ++i) {
+        const TransferTask& transfer = tasks.tasks[i];
+
+        if (transfer.executor_rank != ctx.current_rank ||
+            !transfer_task_has_work(transfer)) {
+            return false;
+        }
+
+        if (transfer_task_is_ready(transfer)) {
+            if (!ctx.lower_ready_tasks) {
+                return false;
+            }
+            continue;
+        }
+
+        if (!transfer_task_is_windowed(transfer)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+template <int MaxTransferTasks, int MaxRanks>
+inline bool pass_drop_disabled_ready_tasks(
+    const LoweringContext<MaxRanks>& ctx,
+    RankTransferTaskBuffer<MaxTransferTasks>* tasks) {
+    if (tasks == nullptr) {
+        return false;
+    }
+
+    if (ctx.lower_ready_tasks) {
         return true;
     }
 
-    const int tasks_per_cta =
-        rank_ready_task_count + rank_window_task_count;
+    int write = 0;
+    for (int read = 0; read < tasks->count; ++read) {
+        const TransferTask& transfer = tasks->tasks[read];
+        if (transfer_task_is_ready(transfer)) {
+            continue;
+        }
+        tasks->tasks[write++] = transfer;
+    }
 
-    if (tasks_per_cta <= 0 || tasks_per_cta > MaxWindowTasks) {
+    for (int i = write; i < tasks->count; ++i) {
+        tasks->tasks[i] = TransferTask{};
+    }
+
+    tasks->count = write;
+    return recompute_rank_transfer_task_stats(tasks);
+}
+
+template <int MaxTransferTasks, int MaxRanks>
+inline bool pass_placeholder_optimize_transfer_tasks(
+    const LoweringContext<MaxRanks>& /* ctx */,
+    RankTransferTaskBuffer<MaxTransferTasks>* tasks) {
+    /*
+     * TODO examples:
+     * - remove redundant ReadyWait/ReadyPublish pairs
+     * - coalesce adjacent Copy tasks with same src/dst/transport/caps
+     * - coalesce adjacent Reduce tasks with same src/dst/transport/caps
+     * - split or reshape staging tasks
+     * - reorder independent tasks by phase after dependency proof
+     */
+    return tasks != nullptr;
+}
+
+template <int MaxTransferTasks, int MaxRanks>
+inline bool run_transfer_task_lowering_passes(
+    const LoweringContext<MaxRanks>& ctx,
+    RankTransferTaskBuffer<MaxTransferTasks>* tasks) {
+    if (tasks == nullptr) {
+        return false;
+    }
+
+    if (!ctx.options.enable_transfer_passes) {
+        return recompute_rank_transfer_task_stats(tasks);
+    }
+
+    if (!pass_validate_transfer_tasks(ctx, *tasks)) {
+        return false;
+    }
+
+    if (!pass_drop_disabled_ready_tasks(ctx, tasks)) {
+        return false;
+    }
+
+    if (!pass_placeholder_optimize_transfer_tasks(ctx, tasks)) {
+        return false;
+    }
+
+    if (!recompute_rank_transfer_task_stats(tasks)) {
+        return false;
+    }
+
+    return pass_validate_transfer_tasks(ctx, *tasks);
+}
+
+struct LoweringShape {
+    int tasks_per_cta = 0;
+    int capacity_tasks_per_cta = 0;
+    int max_ctas_by_plan = 0;
+    int cta_count = 0;
+    int total_window_tasks = 0;
+    int max_end_window = 0;
+};
+
+template <int MaxTransferTasks, int MaxWindowTasks, int MaxRanks>
+inline bool compute_lowering_shape(
+    const LoweringContext<MaxRanks>& ctx,
+    const RankTransferTaskBuffer<MaxTransferTasks>& tasks,
+    LoweringShape* out) {
+    if (out == nullptr || ctx.launch_config == nullptr) {
+        return false;
+    }
+
+    LoweringShape shape{};
+    shape.max_end_window = tasks.max_end_window;
+
+    if (tasks.ready_count == 0 && tasks.window_count == 0) {
+        *out = shape;
+        return true;
+    }
+
+    shape.tasks_per_cta = tasks.ready_count + tasks.window_count;
+
+    if (shape.tasks_per_cta <= 0 || shape.tasks_per_cta > MaxWindowTasks) {
         return false;
     }
 
     /*
      * reserved_prefix_tasks_per_cta is kept only for compatibility with the
-     * temporary launcher-side ready prepend path.  New code should pass zero
+     * temporary launcher-side ready prepend path. New code should pass zero
      * here and use ready_binding.
      */
-    const int capacity_tasks_per_cta =
-        tasks_per_cta + reserved_prefix_tasks_per_cta;
+    shape.capacity_tasks_per_cta =
+        shape.tasks_per_cta + ctx.reserved_prefix_tasks_per_cta;
 
-    if (capacity_tasks_per_cta <= 0 ||
-        capacity_tasks_per_cta > MaxWindowTasks) {
+    if (shape.capacity_tasks_per_cta <= 0 ||
+        shape.capacity_tasks_per_cta > MaxWindowTasks) {
         return false;
     }
 
-    const int max_ctas_by_plan =
-        MaxWindowTasks / capacity_tasks_per_cta;
+    shape.max_ctas_by_plan =
+        MaxWindowTasks / shape.capacity_tasks_per_cta;
 
-    if (max_ctas_by_plan <= 0) {
+    if (shape.max_ctas_by_plan <= 0) {
         return false;
     }
 
-    int cta_count = 0;
-
-    if (rank_window_task_count > 0) {
-        cta_count =
+    if (tasks.window_count > 0) {
+        shape.cta_count =
             comm::utils::cta_count_for_windows(
-                max_end_window,
-                launch_config.max_ctas);
+                tasks.max_end_window,
+                ctx.launch_config->max_ctas);
     } else {
-        /*
-         * Sync-only plan.  This is mostly useful for testing.  Real collectives
-         * normally have at least one windowed transfer task.
-         */
-        cta_count = 1;
+        /* Sync-only plan. Mostly useful for tests. */
+        shape.cta_count = 1;
     }
 
-    cta_count =
+    shape.cta_count =
         comm::utils::min_int(
-            cta_count,
-            max_ctas_by_plan);
+            shape.cta_count,
+            shape.max_ctas_by_plan);
 
-    if (cta_count <= 0) {
+    if (shape.cta_count <= 0) {
+        *out = shape;
         return true;
     }
 
-    const int total_window_tasks =
-        cta_count * tasks_per_cta;
+    shape.total_window_tasks = shape.cta_count * shape.tasks_per_cta;
 
-    if (total_window_tasks > MaxWindowTasks) {
+    if (shape.total_window_tasks > MaxWindowTasks) {
         return false;
     }
 
-    const comm::utils::WindowRange full_range{0, max_end_window};
+    *out = shape;
+    return true;
+}
 
-    for (int cta_idx = 0; cta_idx < cta_count; ++cta_idx) {
+template <int MaxTransferTasks, int MaxWindowTasks, int MaxRanks, int MaxStagingSlots>
+inline bool emit_window_plan_from_rank_tasks(
+    const RankTransferTaskBuffer<MaxTransferTasks>& rank_tasks,
+    const RankPointerBinding<MaxRanks, MaxStagingSlots>& binding,
+    const LoweringContext<MaxRanks>& ctx,
+    const LoweringShape& shape,
+    WindowTaskExecutorPlan<MaxWindowTasks>* out_window_plan,
+    int* out_num_blocks) {
+    if (out_window_plan == nullptr || out_num_blocks == nullptr) {
+        return false;
+    }
+
+    out_window_plan->total_tasks = 0;
+    out_window_plan->tasks_per_cta = 0;
+    *out_num_blocks = 0;
+
+    if (shape.cta_count <= 0 || shape.tasks_per_cta <= 0) {
+        return true;
+    }
+
+    if (shape.total_window_tasks > MaxWindowTasks) {
+        return false;
+    }
+
+    const comm::utils::WindowRange full_range{0, shape.max_end_window};
+
+    for (int cta_idx = 0; cta_idx < shape.cta_count; ++cta_idx) {
         const comm::utils::WindowRange cta_range =
-            rank_window_task_count > 0
+            rank_tasks.window_count > 0
                 ? comm::utils::cta_window_range(
                       cta_idx,
-                      cta_count,
+                      shape.cta_count,
                       full_range)
                 : comm::utils::WindowRange{0, 0};
 
-        int task_idx =
-            cta_idx * tasks_per_cta;
+        int task_idx = cta_idx * shape.tasks_per_cta;
 
-        for (int i = 0; i < transfer_plan.total_tasks; ++i) {
-            const TransferTask& transfer = transfer_plan.tasks[i];
-
-            if (transfer.executor_rank != binding.current_rank) {
-                continue;
-            }
+        for (int i = 0; i < rank_tasks.count; ++i) {
+            const TransferTask& transfer = rank_tasks.tasks[i];
 
             if (transfer_task_is_ready(transfer)) {
-                if (!lower_ready_tasks) {
+                if (!ctx.lower_ready_tasks || ctx.ready_binding == nullptr) {
                     continue;
                 }
 
@@ -565,7 +833,7 @@ bool lower_transfer_plan_for_rank(
 
                 if (!lower_ready_transfer_task_to_window_task(
                         transfer,
-                        *ready_binding,
+                        *ctx.ready_binding,
                         &ready_task)) {
                     out_window_plan->total_tasks = 0;
                     out_window_plan->tasks_per_cta = 0;
@@ -625,9 +893,189 @@ bool lower_transfer_plan_for_rank(
         }
     }
 
-    out_window_plan->tasks_per_cta = tasks_per_cta;
-    out_window_plan->total_tasks = total_window_tasks;
-    *out_num_blocks = cta_count;
+    out_window_plan->tasks_per_cta = shape.tasks_per_cta;
+    out_window_plan->total_tasks = shape.total_window_tasks;
+    *out_num_blocks = shape.cta_count;
+
+    return true;
+}
+
+/*
+ * Window-plan pass skeletons.
+ *
+ * These run after pointer binding and final WindowTask selection. They are the
+ * right place for low-level peephole passes, stripe-shape checks, and future
+ * signal-variant selection.
+ */
+template <int MaxWindowTasks, int MaxRanks>
+inline bool pass_validate_window_plan_shape(
+    const LoweringContext<MaxRanks>& /* ctx */,
+    const WindowTaskExecutorPlan<MaxWindowTasks>& plan,
+    int num_blocks) {
+    if (num_blocks < 0 ||
+        plan.total_tasks < 0 ||
+        plan.total_tasks > MaxWindowTasks ||
+        plan.tasks_per_cta < 0) {
+        return false;
+    }
+
+    if (num_blocks == 0) {
+        return plan.total_tasks == 0 && plan.tasks_per_cta == 0;
+    }
+
+    if (plan.tasks_per_cta <= 0) {
+        return false;
+    }
+
+    return plan.total_tasks == num_blocks * plan.tasks_per_cta;
+}
+
+template <int MaxWindowTasks, int MaxRanks>
+inline bool pass_validate_executor_task_limit(
+    const LoweringContext<MaxRanks>& ctx,
+    const WindowTaskExecutorPlan<MaxWindowTasks>& plan) {
+    if (!ctx.options.enforce_executor_task_limit) {
+        return true;
+    }
+
+    return plan.tasks_per_cta <= ctx.options.max_executable_tasks_per_cta;
+}
+
+template <int MaxWindowTasks, int MaxRanks>
+inline bool pass_placeholder_optimize_window_plan(
+    const LoweringContext<MaxRanks>& /* ctx */,
+    WindowTaskExecutorPlan<MaxWindowTasks>* plan,
+    int* num_blocks) {
+    /*
+     * TODO examples:
+     * - select CopyTMASignal / CopyFastAfterSignal / ReduceTMAAfterSignal
+     * - merge adjacent WindowTasks inside each CTA stripe
+     * - remove redundant ReadyWait/ReadyPublish after lowering
+     * - validate terminal task position
+     * - compact stripes only if executor contract changes accordingly
+     */
+    return plan != nullptr && num_blocks != nullptr;
+}
+
+template <int MaxWindowTasks, int MaxRanks>
+inline bool run_window_plan_lowering_passes(
+    const LoweringContext<MaxRanks>& ctx,
+    WindowTaskExecutorPlan<MaxWindowTasks>* plan,
+    int* num_blocks) {
+    if (plan == nullptr || num_blocks == nullptr) {
+        return false;
+    }
+
+    if (!ctx.options.enable_window_passes) {
+        return pass_validate_window_plan_shape(ctx, *plan, *num_blocks);
+    }
+
+    if (!pass_validate_window_plan_shape(ctx, *plan, *num_blocks)) {
+        return false;
+    }
+
+    if (!pass_validate_executor_task_limit(ctx, *plan)) {
+        return false;
+    }
+
+    if (!pass_placeholder_optimize_window_plan(ctx, plan, num_blocks)) {
+        return false;
+    }
+
+    return pass_validate_window_plan_shape(ctx, *plan, *num_blocks);
+}
+
+} // namespace lowering_detail
+
+template <
+    int MaxTransferTasks,
+    int MaxWindowTasks,
+    int MaxRanks,
+    int MaxStagingSlots>
+bool lower_transfer_plan_for_rank(
+    const TransferPlan<MaxTransferTasks>& transfer_plan,
+    const RankPointerBinding<MaxRanks, MaxStagingSlots>& binding,
+    const comm::LaunchConfig& launch_config,
+    WindowTaskExecutorPlan<MaxWindowTasks>* out_window_plan,
+    int* out_num_blocks,
+    int reserved_prefix_tasks_per_cta = 0,
+    const ReadySignalBinding<MaxRanks>* ready_binding = nullptr,
+    const lowering_detail::LoweringPassOptions& pass_options =
+        lowering_detail::LoweringPassOptions{}) {
+    if (out_window_plan == nullptr || out_num_blocks == nullptr) {
+        return false;
+    }
+
+    out_window_plan->total_tasks = 0;
+    out_window_plan->tasks_per_cta = 0;
+    *out_num_blocks = 0;
+
+    lowering_detail::LoweringContext<MaxRanks> ctx{};
+
+    if (!lowering_detail::make_lowering_context(
+            binding,
+            launch_config,
+            reserved_prefix_tasks_per_cta,
+            ready_binding,
+            pass_options,
+            &ctx)) {
+        return false;
+    }
+
+    lowering_detail::RankTransferTaskBuffer<MaxTransferTasks> rank_tasks{};
+
+    if (!lowering_detail::collect_rank_transfer_tasks(
+            transfer_plan,
+            ctx,
+            &rank_tasks)) {
+        return false;
+    }
+
+    if (!lowering_detail::run_transfer_task_lowering_passes(
+            ctx,
+            &rank_tasks)) {
+        return false;
+    }
+
+    lowering_detail::LoweringShape shape{};
+
+    if (!lowering_detail::compute_lowering_shape<
+            MaxTransferTasks,
+            MaxWindowTasks,
+            MaxRanks>(
+                ctx,
+                rank_tasks,
+                &shape)) {
+        return false;
+    }
+
+    if (shape.cta_count <= 0 || shape.tasks_per_cta <= 0) {
+        return true;
+    }
+
+    if (!lowering_detail::emit_window_plan_from_rank_tasks<
+            MaxTransferTasks,
+            MaxWindowTasks,
+            MaxRanks,
+            MaxStagingSlots>(
+                rank_tasks,
+                binding,
+                ctx,
+                shape,
+                out_window_plan,
+                out_num_blocks)) {
+        return false;
+    }
+
+    if (!lowering_detail::run_window_plan_lowering_passes(
+            ctx,
+            out_window_plan,
+            out_num_blocks)) {
+        out_window_plan->total_tasks = 0;
+        out_window_plan->tasks_per_cta = 0;
+        *out_num_blocks = 0;
+        return false;
+    }
 
     return true;
 }
