@@ -56,6 +56,40 @@ oo_status_t cuda_to_status(cudaError_t error) {
     return OO_ERROR_CUDA;
 }
 
+oo_status_t resolve_host_mapped_ready_ptr_for_current_device(
+    oo_ready_signal& signal,
+    int** out) {
+    if (out == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out = nullptr;
+
+    if (signal.kind != oo_ready_signal_kind::owned_host_mapped) {
+        *out = reinterpret_cast<int*>(signal.ptr);
+        return OO_SUCCESS;
+    }
+
+    if (signal.owned_host_ptr == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    void* device_ptr = nullptr;
+
+    const cudaError_t err =
+        cudaHostGetDevicePointer(
+            &device_ptr,
+            signal.owned_host_ptr,
+            0);
+
+    if (err != cudaSuccess) {
+        return cuda_to_status(err);
+    }
+
+    *out = reinterpret_cast<int*>(device_ptr);
+    return OO_SUCCESS;
+}
+
 oo_status_t checked_element_bytes(
     size_t count,
     oo_dtype_t dtype,
@@ -293,6 +327,26 @@ oo_status_t prepare_collective_launch(
     oo_ready_signal& local_host_signal =
         group->host_ready_signal_slots[node->rank];
 
+    {
+        const cudaError_t err =
+            cudaSetDevice(node->device);
+
+        if (err != cudaSuccess) {
+            return cuda_to_status(err);
+        }
+    }
+
+    int* local_host_ready_signal = nullptr;
+
+    status =
+        resolve_host_mapped_ready_ptr_for_current_device(
+            local_host_signal,
+            &local_host_ready_signal);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
     out->local_ptr =
         reinterpret_cast<void*>(
             reinterpret_cast<std::uint8_t*>(local->ptr) + offset_bytes);
@@ -308,7 +362,7 @@ oo_status_t prepare_collective_launch(
     out->local_ready_signal_by_channel[kOoReadySignalChannelDeviceMemory] =
         reinterpret_cast<int*>(local_signal.ptr);
     out->local_ready_signal_by_channel[kOoReadySignalChannelHostMapped] =
-        reinterpret_cast<int*>(local_host_signal.ptr);
+        local_host_ready_signal;
     out->ready_signal_protocol_by_channel[kOoReadySignalChannelDeviceMemory] = 0;
     out->ready_signal_protocol_by_channel[kOoReadySignalChannelHostMapped] = 2;
     out->ready_signal_poll_sleep_cycles_by_channel
@@ -368,9 +422,20 @@ oo_status_t prepare_collective_launch(
         out->peer_ready_signals_by_channel
             [peer_idx][kOoReadySignalChannelDeviceMemory] =
                 reinterpret_cast<const int*>(peer_signal.ptr);
+        int* peer_host_ready_signal = nullptr;
+
+        status =
+            resolve_host_mapped_ready_ptr_for_current_device(
+                peer_host_signal,
+                &peer_host_ready_signal);
+
+        if (status != OO_SUCCESS) {
+            return status;
+        }
+
         out->peer_ready_signals_by_channel
             [peer_idx][kOoReadySignalChannelHostMapped] =
-                reinterpret_cast<const int*>(peer_host_signal.ptr);
+                reinterpret_cast<const int*>(peer_host_ready_signal);
 
         peer_idx += 1;
     }

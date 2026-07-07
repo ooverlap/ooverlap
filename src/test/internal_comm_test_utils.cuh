@@ -31,14 +31,20 @@ inline void reset_ready_signals(oo_group_t* group) {
     for (int r = 0; r < group->num_devices; ++r) {
         oo_ready_signal& slot = group->ready_signal_slots[r];
 
-        if (slot.ptr == nullptr || slot.owner_device < 0) {
-            continue;
+        if (slot.ptr != nullptr && slot.owner_device >= 0) {
+            system::runtime::set_device(slot.owner_device);
+            system::runtime::check_cuda(
+                cudaMemset(slot.ptr, 0, sizeof(int)),
+                "cudaMemset(ready signal)");
         }
 
-        system::runtime::set_device(slot.owner_device);
-        system::runtime::check_cuda(
-            cudaMemset(slot.ptr, 0, sizeof(int)),
-            "cudaMemset(ready signal)");
+        oo_ready_signal& host_slot =
+            group->host_ready_signal_slots[r];
+
+        if (host_slot.kind == oo_ready_signal_kind::owned_host_mapped &&
+            host_slot.owned_host_ptr != nullptr) {
+            *reinterpret_cast<int*>(host_slot.owned_host_ptr) = 0;
+        }
     }
 }
 

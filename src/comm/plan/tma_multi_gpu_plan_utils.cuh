@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <set>
 
 #define OOVERLAP_DEBUG_TRANSFER_PLAN 1
 
@@ -722,34 +723,6 @@ inline void debug_print_transfer_task(
 }
 
 template <int MaxTransferTasks>
-inline void debug_print_transfer_plan(
-    const char* tag,
-    const TransferPlan<MaxTransferTasks>& plan) {
-    std::fprintf(
-        stderr,
-        "\n[%s] TransferPlan: world_size=%d total_tasks=%d max_tasks=%d\n",
-        tag != nullptr ? tag : "transfer_plan",
-        plan.world_size,
-        plan.total_tasks,
-        MaxTransferTasks);
-
-    if (plan.total_tasks < 0 || plan.total_tasks > MaxTransferTasks) {
-        std::fprintf(
-            stderr,
-            "  invalid total_tasks=%d for max_tasks=%d\n\n",
-            plan.total_tasks,
-            MaxTransferTasks);
-        return;
-    }
-
-    for (int i = 0; i < plan.total_tasks; ++i) {
-        debug_print_transfer_task(i, plan.tasks[i]);
-    }
-
-    std::fprintf(stderr, "\n");
-}
-
-template <int MaxTransferTasks>
 inline void debug_print_transfer_plan_for_rank(
     const char* tag,
     const TransferPlan<MaxTransferTasks>& plan,
@@ -776,6 +749,40 @@ inline void debug_print_transfer_plan_for_rank(
         if (plan.tasks[i].executor_rank == rank) {
             debug_print_transfer_task(i, plan.tasks[i]);
         }
+    }
+
+    std::fprintf(stderr, "\n");
+}
+
+template <int MaxTransferTasks>
+inline void debug_print_transfer_plan(
+    const char* tag,
+    const TransferPlan<MaxTransferTasks>& plan) {
+    std::fprintf(
+        stderr,
+        "\n[%s] TransferPlan: world_size=%d total_tasks=%d max_tasks=%d\n",
+        tag != nullptr ? tag : "transfer_plan",
+        plan.world_size,
+        plan.total_tasks,
+        MaxTransferTasks);
+
+    if (plan.total_tasks < 0 || plan.total_tasks > MaxTransferTasks) {
+        std::fprintf(
+            stderr,
+            "  invalid total_tasks=%d for max_tasks=%d\n\n",
+            plan.total_tasks,
+            MaxTransferTasks);
+        return;
+    }
+
+    std::set<int> unique_ranks;
+
+    for (int i = 0; i < plan.total_tasks; ++i) {
+        unique_ranks.insert(plan.tasks[i].executor_rank);
+    }
+
+    for (auto& it : unique_ranks) {
+        debug_print_transfer_plan_for_rank(tag, plan, it);
     }
 
     std::fprintf(stderr, "\n");
