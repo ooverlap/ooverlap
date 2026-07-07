@@ -111,6 +111,8 @@ struct oo_ready_signal {
      */
     void* owned_legacy_ptr = nullptr;
 
+    void* owned_host_ptr = nullptr;
+
     /*
      * Valid for kind == imported_legacy/imported_vmm.
      */
