@@ -316,6 +316,20 @@ oo_status_t prepare_collective_launch(
     out->ready_signal_poll_sleep_cycles_by_channel
         [kOoReadySignalChannelHostMapped] = 256;
 
+    out->staging_slot_count = 0;
+
+    for (int slot = 0; slot < kOoMaxStagingSlots; ++slot) {
+        const oo_staging_buffer& staging =
+            group->staging_slots[slot];
+
+        out->staging_ptrs[slot] = staging.device_ptr;
+        out->staging_bytes[slot] = staging.bytes;
+
+        if (staging.device_ptr != nullptr && staging.bytes != 0) {
+            out->staging_slot_count = slot + 1;
+        }
+    }
+
     int peer_idx = 0;
 
     for (int rank = 0; rank < world_size; ++rank) {

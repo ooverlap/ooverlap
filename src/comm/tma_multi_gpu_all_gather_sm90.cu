@@ -193,7 +193,7 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         comm::plan::kTmaMultiGpuAllGatherMaxPeers;
     constexpr int MaxRanks =
         kOoMaxLocalDevices;
-    constexpr int MaxStagingSlots = 0;
+    constexpr int MaxStagingSlots = kOoMaxStagingSlots;
 
     if (launch_config.plan_for != comm::CollectivePlanFor::AllGather ||
         !comm::launch_config_valid(launch_config)) {
@@ -236,6 +236,12 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         binding.rank_buffer[peer_rank] = launch.peer_ptrs[peer_idx];
         binding.rank_input[peer_rank] = launch.peer_ptrs[peer_idx];
         binding.rank_output[peer_rank] = launch.peer_ptrs[peer_idx];
+    }
+
+    for (int slot = 0;
+         slot < MaxStagingSlots && slot < launch.staging_slot_count;
+         ++slot) {
+        binding.shm_staging[slot] = launch.staging_ptrs[slot];
     }
 
     const auto ready_plan =

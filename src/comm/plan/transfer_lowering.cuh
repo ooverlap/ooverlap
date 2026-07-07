@@ -181,6 +181,12 @@ inline bool transfer_transport_direct(
            transport == topology::TransportKind::DirectPcie;
 }
 
+inline bool transfer_task_uses_shm_staging(
+    const TransferTask& task) {
+    return task.src.role == LogicalBufferRole::ShmStaging ||
+           task.dst.role == LogicalBufferRole::ShmStaging;
+}
+
 inline bool transfer_should_use_fast_copy(
     const TransferTask& task) {
     /*
@@ -192,7 +198,8 @@ inline bool transfer_should_use_fast_copy(
      * Later this should consult topology probe capabilities directly.
      */
     return task.op == TransferOp::Copy &&
-           task.transport == topology::TransportKind::DirectPcie;
+           (task.transport == topology::TransportKind::DirectPcie ||
+            transfer_task_uses_shm_staging(task));
 }
 
 __host__ __device__ __forceinline__ bool transfer_task_is_ready(
@@ -318,9 +325,18 @@ inline bool lower_transfer_task_to_window_task(
         return false;
     }
 
-    if (!transfer_transport_direct(transfer.transport)) {
+    const bool uses_shm_staging =
+        transfer_task_uses_shm_staging(transfer);
+
+    if (!transfer_transport_direct(transfer.transport) &&
+        !(transfer.op == TransferOp::Copy && uses_shm_staging)) {
         /*
-         * SHM/staging transports need their own executor/lowering rules.
+         * Non-direct non-staging transports still need their own executor rules.
+         *
+         * A Copy task that explicitly references ShmStaging is lowered to
+         * CopyFast below.  This lets planners opt into staging by using
+         * shm_staging_ref(slot, offset) without requiring a dedicated staging
+         * WindowTaskOp yet.
          */
         return false;
     }

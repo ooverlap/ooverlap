@@ -39,6 +39,14 @@ struct CollectiveLaunchState {
     int ready_signal_protocol_by_channel[kOoReadySignalChannelCount] = {};
     int ready_signal_poll_sleep_cycles_by_channel[kOoReadySignalChannelCount] = {};
 
+    /*
+     * Group-owned staging slots, already converted to device-visible pointers.
+     * These are optional until planners start emitting ShmStaging references.
+     */
+    void* staging_ptrs[kOoMaxStagingSlots] = {};
+    size_t staging_bytes[kOoMaxStagingSlots] = {};
+    int staging_slot_count = 0;
+
     int rank = -1;
     int world_size = 0;
     int local_device = -1;
