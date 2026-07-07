@@ -870,6 +870,7 @@ void oo_group_destroy(oo_group_t* group) {
         group->collective_buffers[rank] = nullptr;
     }
 
+    destroy_group_staging_buffers(group);
     destroy_group_ready_signals(group);
     group->transfer_plan_distribution.reset();
     group->broker.reset();

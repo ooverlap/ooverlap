@@ -101,6 +101,21 @@ TransferPlanBuildInput make_build_input(
     input.count = count;
     input.dtype_size = launch.dtype_size;
     input.out_of_place = false;
+
+    input.staging_slot_count =
+        launch.staging_slot_count < kPlannerMaxStagingSlots
+            ? launch.staging_slot_count
+            : kPlannerMaxStagingSlots;
+    
+    if (input.staging_slot_count < 0) {
+        input.staging_slot_count = 0;
+    }
+    
+    for (int slot = 0; slot < input.staging_slot_count; ++slot) {
+        input.staging_bytes[slot] =
+            launch.staging_bytes[slot];
+    }
+
     return input;
 }
 

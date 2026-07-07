@@ -22,6 +22,7 @@ namespace plan {
  */
 
 constexpr int kPlannerMaxRanks = 16;
+constexpr int kPlannerMaxStagingSlots = 4;
 
 struct RankTopologyView {
     const topology::Topology* topology = nullptr;
@@ -51,6 +52,9 @@ struct TransferPlanBuildInput {
      * Current public collectives are in-place over full logical buffers.
      */
     bool out_of_place = false;
+
+    int staging_slot_count = 0;
+    std::size_t staging_bytes[kPlannerMaxStagingSlots] = {};
 };
 
 __host__ __device__ __forceinline__ bool valid_rank(
@@ -494,7 +498,32 @@ inline bool valid_build_input(
            input.world_size <= kPlannerMaxRanks &&
            input.dtype_size != 0 &&
            input.launch_config.window_chunks > 0 &&
-           input.launch_config.chunk_bytes > 0;
+           input.launch_config.chunk_bytes > 0 &&
+           input.staging_slot_count >= 0 &&
+           input.staging_slot_count <= kPlannerMaxStagingSlots;
+}
+
+__host__ __device__ __forceinline__ bool staging_slice_valid(
+    const TransferPlanBuildInput& input,
+    int staging_slot,
+    std::size_t byte_offset,
+    std::size_t bytes) {
+    if (staging_slot < 0 ||
+        staging_slot >= input.staging_slot_count ||
+        staging_slot >= kPlannerMaxStagingSlots ||
+        bytes == 0) {
+        return false;
+    }
+
+    const std::size_t slot_bytes =
+        input.staging_bytes[staging_slot];
+
+    if (slot_bytes == 0 ||
+        byte_offset > slot_bytes) {
+        return false;
+    }
+
+    return bytes <= slot_bytes - byte_offset;
 }
 
 } // namespace plan
