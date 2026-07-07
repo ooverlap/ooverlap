@@ -690,11 +690,11 @@ oo_status_t oo_group_create(
         oo_status_t status =
             initialize_group_topology(
                 group.get(),
-                false,
-                false,
-                false,
-                false,
-                false);
+                true,
+                true,
+                true,
+                true,
+                true);
 
         if (status != OO_SUCCESS) {
             return status;
@@ -765,11 +765,11 @@ oo_status_t oo_group_create_p2p(
         status =
             initialize_group_topology(
                 group.get(),
-                false,
-                false,
-                false,
-                false,
-                false);
+                true,
+                true,
+                true,
+                true,
+                true);
 
         if (status != OO_SUCCESS) {
             return status;
