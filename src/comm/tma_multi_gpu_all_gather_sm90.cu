@@ -63,6 +63,103 @@ bool validate_all_gather_launch(
     return true;
 }
 
+#ifndef OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
+#define OOVERLAP_DEBUG_PRINT_WINDOW_TASKS 1
+#endif
+
+#if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
+const char* debug_window_task_op_name(
+    comm::task::WindowTaskOp op) {
+    switch (op) {
+        case comm::task::WindowTaskOp::None:
+            return "None";
+        case comm::task::WindowTaskOp::ReduceTMA:
+            return "ReduceTMA";
+        case comm::task::WindowTaskOp::ReduceTMASignal:
+            return "ReduceTMASignal";
+        case comm::task::WindowTaskOp::CopyTMA:
+            return "CopyTMA";
+        case comm::task::WindowTaskOp::CopyFast:
+            return "CopyFast";
+        case comm::task::WindowTaskOp::CopyFastAfterSignal:
+            return "CopyFastAfterSignal";
+        case comm::task::WindowTaskOp::CopyTMASignal:
+            return "CopyTMASignal";
+        case comm::task::WindowTaskOp::ReduceTMAAfterSignal:
+            return "ReduceTMAAfterSignal";
+        case comm::task::WindowTaskOp::ReadyPublish:
+            return "ReadyPublish";
+        case comm::task::WindowTaskOp::ReadyWait:
+            return "ReadyWait";
+        default:
+            return "Unknown";
+    }
+}
+
+template <int MaxTasks>
+void debug_print_window_task_plan(
+    const char* tag,
+    int rank,
+    int num_blocks,
+    const comm::plan::WindowTaskExecutorPlan<MaxTasks>& plan) {
+    std::fprintf(
+        stderr,
+        "\n[%s rank=%d] WindowTaskExecutorPlan: total_tasks=%d tasks_per_cta=%d num_blocks=%d sizeof(WindowTask)=%zu sizeof(plan)=%zu\n",
+        tag,
+        rank,
+        plan.total_tasks,
+        plan.tasks_per_cta,
+        num_blocks,
+        sizeof(comm::task::WindowTask),
+        sizeof(plan));
+
+    for (int cta = 0; cta < num_blocks; ++cta) {
+        std::fprintf(stderr, "  CTA %d:\n", cta);
+
+        for (int local_task = 0;
+             local_task < plan.tasks_per_cta;
+             ++local_task) {
+            const int task_idx =
+                cta * plan.tasks_per_cta + local_task;
+
+            if (task_idx >= plan.total_tasks) {
+                break;
+            }
+
+            const comm::task::WindowTask& task =
+                plan.tasks[task_idx];
+
+            std::fprintf(
+                stderr,
+                "    task[%d] local=%d op=%s(%d) "
+                "src=%p dst=%p total_bytes=%zu "
+                "begin_window=%d end_window=%d window_chunks=%d "
+                "signal_flags=%p signal_base_window=%d "
+                "ready_epoch=%d ready_protocol=%d ready_poll_sleep_cycles=%d "
+                "terminal=%d\n",
+                task_idx,
+                local_task,
+                debug_window_task_op_name(task.op),
+                static_cast<int>(task.op),
+                task.src,
+                task.dst,
+                task.total_bytes,
+                task.begin_window,
+                task.end_window,
+                task.window_chunks,
+                static_cast<void*>(task.signal_flags),
+                task.signal_base_window,
+                task.ready_epoch,
+                task.ready_protocol,
+                task.ready_poll_sleep_cycles,
+                static_cast<int>(task.terminal));
+        }
+    }
+
+    std::fprintf(stderr, "\n");
+}
+#endif
+
 template <
     typename DummyReduceOp,
     int ChunkBytes,
@@ -118,6 +215,7 @@ cudaError_t launch_all_gather_rank_variant_sm90(
             comm::plan::kTmaMultiGpuAllGatherMaxTransferTasks) {
         return cudaErrorInvalidValue;
     }
+
 
     /*
      * The public all-gather API is currently in-place over one full logical
@@ -198,6 +296,14 @@ cudaError_t launch_all_gather_rank_variant_sm90(
     if (num_blocks <= 0 || window_plan.total_tasks <= 0) {
         return cudaSuccess;
     }
+
+    #if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
+        debug_print_window_task_plan<MaxTasks>(
+            "all_gather",
+            launch.rank,
+            num_blocks,
+            window_plan);
+    #endif
 
     system::runtime::set_device(launch.local_device);
 

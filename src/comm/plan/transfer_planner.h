@@ -345,6 +345,50 @@ inline TransferTask make_ready_wait_transfer_task(
     return task;
 }
 
+template <int MaxTransferTasks>
+inline bool append_ready_rendezvous_tasks(
+    TransferPlan<MaxTransferTasks>* plan,
+    int rank,
+    int world_size,
+    int* phase) {
+    if (plan == nullptr ||
+        phase == nullptr ||
+        rank < 0 ||
+        rank >= world_size ||
+        world_size <= 1) {
+        return true;
+    }
+
+    const TransferTask publish =
+        make_ready_publish_transfer_task(
+            rank,
+            (*phase)++);
+
+    if (!transfer_plan_push_fast(plan, publish)) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
+
+    for (int peer = 0; peer < world_size; ++peer) {
+        if (peer == rank) {
+            continue;
+        }
+
+        const TransferTask wait =
+            make_ready_wait_transfer_task(
+                rank,
+                peer,
+                (*phase)++);
+
+        if (!transfer_plan_push_fast(plan, wait)) {
+            transfer_plan_abort_build(plan);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 inline bool valid_build_input(
     const TransferPlanBuildInput& input) {
     return input.world_size > 0 &&
@@ -428,9 +472,13 @@ bool build_allreduce_transfer_plan(
             }
         }
 
-        transfer_plan_push_fast(
-            plan,
-            make_ready_publish_transfer_task(rank, phase++));
+        if (!append_ready_rendezvous_tasks(
+                plan,
+                rank,
+                input.world_size,
+                &phase)) {
+            return false;
+        }
 
         for (int peer = 0; peer < input.world_size; ++peer) {
             if (peer == rank) {
@@ -556,6 +604,14 @@ bool build_reduce_scatter_transfer_plan(
                 return false;
             }
         }
+        
+        if (!append_ready_rendezvous_tasks(
+                plan,
+                rank,
+                input.world_size,
+                &phase)) {
+            return false;
+        }
 
         int remaining_peers =
             input.world_size - 1;
@@ -657,6 +713,14 @@ bool build_all_gather_transfer_plan(
                 transfer_plan_abort_build(plan);
                 return false;
             }
+        }
+
+        if (!append_ready_rendezvous_tasks(
+                plan,
+                rank,
+                input.world_size,
+                &phase)) {
+            return false;
         }
 
         int remaining_peers =
