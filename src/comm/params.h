@@ -12,7 +12,7 @@
 // -----------------------------------------------------------------------------
 
 #define TMA_TWO_GPU_PEER_DEFAULT_THREADS 32
-#define TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS 1
+#define TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS 2
 #define TMA_TWO_GPU_PEER_DEFAULT_WINDOW_CHUNKS 128
 
 #define TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES (8 * 1024)
