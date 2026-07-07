@@ -45,6 +45,7 @@ struct CollectiveLaunchState {
      */
     void* staging_ptrs[kOoMaxStagingSlots] = {};
     size_t staging_bytes[kOoMaxStagingSlots] = {};
+    int staging_numa_nodes[kOoMaxStagingSlots] = {};
     int staging_slot_count = 0;
 
     int rank = -1;

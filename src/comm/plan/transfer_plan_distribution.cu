@@ -114,6 +114,8 @@ TransferPlanBuildInput make_build_input(
     for (int slot = 0; slot < input.staging_slot_count; ++slot) {
         input.staging_bytes[slot] =
             launch.staging_bytes[slot];
+        input.staging_numa_nodes[slot] =
+            launch.staging_numa_nodes[slot];
     }
 
     return input;

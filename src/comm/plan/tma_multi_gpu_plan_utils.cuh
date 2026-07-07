@@ -58,6 +58,7 @@ struct TransferPlanBuildInput {
 
     int staging_slot_count = 0;
     std::size_t staging_bytes[kPlannerMaxStagingSlots] = {};
+    int staging_numa_nodes[kPlannerMaxStagingSlots] = {};
 };
 
 __host__ __device__ __forceinline__ bool valid_rank(
@@ -357,14 +358,27 @@ inline TransferTask make_reduce_transfer_task(
 inline TransferTask make_ready_publish_transfer_task(
     int executor_rank,
     ReadySignalChannel channel,
-    int phase) {
+    int phase,
+    int ready_phase) {
     TransferTask task{};
     task.op = TransferOp::ReadyPublish;
     task.executor_rank = executor_rank;
     task.ready_rank = executor_rank;
     task.ready_channel = static_cast<int>(channel);
+    task.ready_phase = ready_phase;
     task.phase = phase;
     return task;
+}
+
+inline TransferTask make_ready_publish_transfer_task(
+    int executor_rank,
+    ReadySignalChannel channel,
+    int phase) {
+    return make_ready_publish_transfer_task(
+        executor_rank,
+        channel,
+        phase,
+        0);
 }
 
 inline TransferTask make_ready_publish_transfer_task(
@@ -373,7 +387,24 @@ inline TransferTask make_ready_publish_transfer_task(
     return make_ready_publish_transfer_task(
         executor_rank,
         ReadySignalChannel::DeviceMemory,
-        phase);
+        phase,
+        0);
+}
+
+inline TransferTask make_ready_wait_transfer_task(
+    int executor_rank,
+    int ready_rank,
+    ReadySignalChannel channel,
+    int phase,
+    int ready_phase) {
+    TransferTask task{};
+    task.op = TransferOp::ReadyWait;
+    task.executor_rank = executor_rank;
+    task.ready_rank = ready_rank;
+    task.ready_channel = static_cast<int>(channel);
+    task.ready_phase = ready_phase;
+    task.phase = phase;
+    return task;
 }
 
 inline TransferTask make_ready_wait_transfer_task(
@@ -381,13 +412,12 @@ inline TransferTask make_ready_wait_transfer_task(
     int ready_rank,
     ReadySignalChannel channel,
     int phase) {
-    TransferTask task{};
-    task.op = TransferOp::ReadyWait;
-    task.executor_rank = executor_rank;
-    task.ready_rank = ready_rank;
-    task.ready_channel = static_cast<int>(channel);
-    task.phase = phase;
-    return task;
+    return make_ready_wait_transfer_task(
+        executor_rank,
+        ready_rank,
+        channel,
+        phase,
+        0);
 }
 
 inline TransferTask make_ready_wait_transfer_task(
@@ -398,7 +428,8 @@ inline TransferTask make_ready_wait_transfer_task(
         executor_rank,
         ready_rank,
         ReadySignalChannel::DeviceMemory,
-        phase);
+        phase,
+        0);
 }
 
 template <int MaxTransferTasks>
@@ -529,6 +560,45 @@ __host__ __device__ __forceinline__ bool staging_slice_valid(
     return bytes <= slot_bytes - byte_offset;
 }
 
+__host__ __device__ __forceinline__ int staging_slot_numa_node(
+    const TransferPlanBuildInput& input,
+    int staging_slot) {
+    if (staging_slot < 0 ||
+        staging_slot >= input.staging_slot_count ||
+        staging_slot >= kPlannerMaxStagingSlots) {
+        return -1;
+    }
+
+    return input.staging_numa_nodes[staging_slot];
+}
+
+__host__ __device__ __forceinline__ int choose_staging_slot_for_numa(
+    const TransferPlanBuildInput& input,
+    int preferred_numa_node,
+    std::size_t required_bytes) {
+    if (input.staging_slot_count <= 0 ||
+        required_bytes == 0) {
+        return -1;
+    }
+
+    if (preferred_numa_node >= 0) {
+        for (int slot = 0; slot < input.staging_slot_count; ++slot) {
+            if (staging_slot_numa_node(input, slot) == preferred_numa_node &&
+                staging_slice_valid(input, slot, 0, required_bytes)) {
+                return slot;
+            }
+        }
+    }
+
+    for (int slot = 0; slot < input.staging_slot_count; ++slot) {
+        if (staging_slice_valid(input, slot, 0, required_bytes)) {
+            return slot;
+        }
+    }
+
+    return -1;
+}
+
 inline const char* debug_transfer_op_name(
     TransferOp op) {
     switch (op) {
@@ -621,7 +691,7 @@ inline void debug_print_transfer_task(
         "  task[%d]: op=%s(%d) executor=%d src_rank=%d dst_rank=%d "
         "bytes=%zu windows=[%d,%d) window_chunks=%d "
         "transport=%s(%d) caps={load=%d store=%d reduce=%d atomic=%d} "
-        "terminal=%d phase=%d ready={rank=%d channel=%s(%d)} ",
+        "terminal=%d phase=%d ready={rank=%d channel=%s(%d) phase=%d} ",
         task_idx,
         debug_transfer_op_name(task.op),
         static_cast<int>(task.op),
@@ -642,7 +712,8 @@ inline void debug_print_transfer_task(
         task.phase,
         task.ready_rank,
         debug_ready_signal_channel_name(task.ready_channel),
-        task.ready_channel);
+        task.ready_channel,
+        task.ready_phase);
 
     debug_print_logical_buffer_ref("src", task.src);
     std::fprintf(stderr, " ");

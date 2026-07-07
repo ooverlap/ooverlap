@@ -49,6 +49,11 @@ __host__ __device__ __forceinline__ bool valid_ready_signal_channel(
     return channel >= 0 && channel < kReadySignalChannelCount;
 }
 
+__host__ __device__ __forceinline__ bool valid_ready_signal_phase(
+    int ready_phase) {
+    return ready_phase >= 0 && ready_phase < kReadySignalPhaseStride;
+}
+
 /*
  * Rank-local pointer binding.
  *
@@ -237,11 +242,14 @@ inline bool lower_ready_transfer_task_to_window_task(
         transfer.executor_rank < 0 ||
         transfer.ready_rank < 0 ||
         transfer.ready_rank >= MaxRanks ||
-        !valid_ready_signal_channel(transfer.ready_channel)) {
+        !valid_ready_signal_channel(transfer.ready_channel) ||
+        !valid_ready_signal_phase(transfer.ready_phase)) {
         return false;
     }
 
     const int channel = transfer.ready_channel;
+    const int ready_value =
+        ready.epoch * kReadySignalPhaseStride + transfer.ready_phase;
 
     int* local_signal =
         ready.local_ready_signal_by_channel[channel];
@@ -284,7 +292,7 @@ inline bool lower_ready_transfer_task_to_window_task(
         *out =
             task::make_ready_publish_task(
                 local_signal,
-                ready.epoch,
+                ready_value,
                 protocol,
                 transfer.terminal);
 
@@ -299,7 +307,7 @@ inline bool lower_ready_transfer_task_to_window_task(
         *out =
             task::make_ready_wait_task(
                 peer_signal,
-                ready.epoch,
+                ready_value,
                 poll_sleep_cycles,
                 transfer.terminal);
 

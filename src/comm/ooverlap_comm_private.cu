@@ -324,6 +324,7 @@ oo_status_t prepare_collective_launch(
 
         out->staging_ptrs[slot] = staging.device_ptr;
         out->staging_bytes[slot] = staging.bytes;
+        out->staging_numa_nodes[slot] = staging.numa_node;
 
         if (staging.device_ptr != nullptr && staging.bytes != 0) {
             out->staging_slot_count = slot + 1;

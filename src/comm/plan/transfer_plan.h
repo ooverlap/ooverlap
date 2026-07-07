@@ -42,6 +42,18 @@ enum class ReadySignalChannel : std::uint8_t {
 
 constexpr int kReadySignalChannelCount = 2;
 
+/*
+ * ReadyPublish/ReadyWait tasks can be used multiple times inside one collective
+ * epoch.  Lowering converts (collective_epoch, ready_phase) into a monotonically
+ * increasing signal value:
+ *
+ *   ready_value = collective_epoch * kReadySignalPhaseStride + ready_phase
+ *
+ * Keep this larger than the number of synchronization phases a planner can emit
+ * inside one collective.
+ */
+constexpr int kReadySignalPhaseStride = 1024;
+
 enum class LogicalBufferRole : std::uint8_t {
     RankBuffer = 0,
     RankInput = 1,
@@ -179,6 +191,15 @@ struct TransferTask {
      */
     int ready_rank = -1;
     int ready_channel = static_cast<int>(ReadySignalChannel::DeviceMemory);
+
+    /*
+     * Synchronization phase within the collective epoch.
+     *
+     * ready_phase=0 is the entry rendezvous. Later planner phases can use
+     * ready_phase=1,2,... for island-complete, staging-complete, etc. This is
+     * separate from task.phase, which is only local task ordering.
+     */
+    int ready_phase = 0;
 };
 
 template <int MaxTransferTasks>
@@ -226,7 +247,9 @@ __host__ __device__ __forceinline__ bool transfer_task_has_work(
         return task.executor_rank >= 0 &&
                task.ready_rank >= 0 &&
                task.ready_channel >= 0 &&
-               task.ready_channel < kReadySignalChannelCount;
+               task.ready_channel < kReadySignalChannelCount &&
+               task.ready_phase >= 0 &&
+               task.ready_phase < kReadySignalPhaseStride;
     }
 
     return task.op != TransferOp::None &&
