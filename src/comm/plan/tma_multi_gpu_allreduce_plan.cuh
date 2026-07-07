@@ -146,6 +146,7 @@ bool build_allreduce_transfer_plan(
         }
     }
 
+    debug_print_transfer_plan_if_enabled("allreduce", *plan);
     return true;
 }
 

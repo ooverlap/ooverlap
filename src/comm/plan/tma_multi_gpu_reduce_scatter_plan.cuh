@@ -117,6 +117,7 @@ bool build_reduce_scatter_transfer_plan(
         }
     }
 
+    debug_print_transfer_plan_if_enabled("reduce_scatter", *plan);
     return true;
 }
 

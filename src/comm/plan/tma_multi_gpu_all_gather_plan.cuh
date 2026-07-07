@@ -114,6 +114,7 @@ bool build_all_gather_transfer_plan(
         }
     }
 
+    debug_print_transfer_plan_if_enabled("all_gather", *plan);
     return true;
 }
 

@@ -4,6 +4,9 @@
 #include "comm/utils/utils.h"
 
 #include <cstddef>
+#include <cstdio>
+
+#define OOVERLAP_DEBUG_TRANSFER_PLAN 1
 
 namespace ooverlap {
 namespace comm {
@@ -525,6 +528,200 @@ __host__ __device__ __forceinline__ bool staging_slice_valid(
 
     return bytes <= slot_bytes - byte_offset;
 }
+
+inline const char* debug_transfer_op_name(
+    TransferOp op) {
+    switch (op) {
+        case TransferOp::None:
+            return "None";
+        case TransferOp::Copy:
+            return "Copy";
+        case TransferOp::Reduce:
+            return "Reduce";
+        case TransferOp::ReadyPublish:
+            return "ReadyPublish";
+        case TransferOp::ReadyWait:
+            return "ReadyWait";
+        default:
+            return "UnknownTransferOp";
+    }
+}
+
+inline const char* debug_logical_buffer_role_name(
+    LogicalBufferRole role) {
+    switch (role) {
+        case LogicalBufferRole::RankBuffer:
+            return "RankBuffer";
+        case LogicalBufferRole::RankInput:
+            return "RankInput";
+        case LogicalBufferRole::RankOutput:
+            return "RankOutput";
+        case LogicalBufferRole::ShmStaging:
+            return "ShmStaging";
+        default:
+            return "UnknownLogicalBufferRole";
+    }
+}
+
+inline const char* debug_transport_kind_name(
+    topology::TransportKind transport) {
+    switch (transport) {
+        case topology::TransportKind::DirectNvlink:
+            return "DirectNvlink";
+        case topology::TransportKind::DirectPcie:
+            return "DirectPcie";
+        case topology::TransportKind::Shm:
+            return "Shm";
+        default:
+            return "UnknownTransport";
+    }
+}
+
+inline const char* debug_ready_signal_channel_name(
+    ReadySignalChannel channel) {
+    switch (channel) {
+        case ReadySignalChannel::DeviceMemory:
+            return "DeviceMemory";
+        case ReadySignalChannel::HostMapped:
+            return "HostMapped";
+        default:
+            return "UnknownReadyChannel";
+    }
+}
+
+inline const char* debug_ready_signal_channel_name(
+    int channel) {
+    if (channel < 0 || channel >= kReadySignalChannelCount) {
+        return "InvalidReadyChannel";
+    }
+
+    return debug_ready_signal_channel_name(
+        static_cast<ReadySignalChannel>(channel));
+}
+
+inline void debug_print_logical_buffer_ref(
+    const char* label,
+    const LogicalBufferRef& ref) {
+    std::fprintf(
+        stderr,
+        "%s={role=%s(%d) owner_rank=%d staging_slot=%d byte_offset=%zu}",
+        label != nullptr ? label : "ref",
+        debug_logical_buffer_role_name(ref.role),
+        static_cast<int>(ref.role),
+        ref.owner_rank,
+        ref.staging_slot,
+        ref.byte_offset);
+}
+
+inline void debug_print_transfer_task(
+    int task_idx,
+    const TransferTask& task) {
+    std::fprintf(
+        stderr,
+        "  task[%d]: op=%s(%d) executor=%d src_rank=%d dst_rank=%d "
+        "bytes=%zu windows=[%d,%d) window_chunks=%d "
+        "transport=%s(%d) caps={load=%d store=%d reduce=%d atomic=%d} "
+        "terminal=%d phase=%d ready={rank=%d channel=%s(%d)} ",
+        task_idx,
+        debug_transfer_op_name(task.op),
+        static_cast<int>(task.op),
+        task.executor_rank,
+        task.src_rank,
+        task.dst_rank,
+        task.bytes,
+        task.begin_window,
+        task.end_window,
+        task.window_chunks,
+        debug_transport_kind_name(task.transport),
+        static_cast<int>(task.transport),
+        static_cast<int>(task.requires_tma_load),
+        static_cast<int>(task.requires_tma_store),
+        static_cast<int>(task.requires_tma_reduce),
+        static_cast<int>(task.requires_native_atomic),
+        static_cast<int>(task.terminal),
+        task.phase,
+        task.ready_rank,
+        debug_ready_signal_channel_name(task.ready_channel),
+        task.ready_channel);
+
+    debug_print_logical_buffer_ref("src", task.src);
+    std::fprintf(stderr, " ");
+    debug_print_logical_buffer_ref("dst", task.dst);
+    std::fprintf(stderr, "\n");
+}
+
+template <int MaxTransferTasks>
+inline void debug_print_transfer_plan(
+    const char* tag,
+    const TransferPlan<MaxTransferTasks>& plan) {
+    std::fprintf(
+        stderr,
+        "\n[%s] TransferPlan: world_size=%d total_tasks=%d max_tasks=%d\n",
+        tag != nullptr ? tag : "transfer_plan",
+        plan.world_size,
+        plan.total_tasks,
+        MaxTransferTasks);
+
+    if (plan.total_tasks < 0 || plan.total_tasks > MaxTransferTasks) {
+        std::fprintf(
+            stderr,
+            "  invalid total_tasks=%d for max_tasks=%d\n\n",
+            plan.total_tasks,
+            MaxTransferTasks);
+        return;
+    }
+
+    for (int i = 0; i < plan.total_tasks; ++i) {
+        debug_print_transfer_task(i, plan.tasks[i]);
+    }
+
+    std::fprintf(stderr, "\n");
+}
+
+template <int MaxTransferTasks>
+inline void debug_print_transfer_plan_for_rank(
+    const char* tag,
+    const TransferPlan<MaxTransferTasks>& plan,
+    int rank) {
+    std::fprintf(
+        stderr,
+        "\n[%s rank=%d] TransferPlan: world_size=%d total_tasks=%d max_tasks=%d\n",
+        tag != nullptr ? tag : "transfer_plan",
+        rank,
+        plan.world_size,
+        plan.total_tasks,
+        MaxTransferTasks);
+
+    if (plan.total_tasks < 0 || plan.total_tasks > MaxTransferTasks) {
+        std::fprintf(
+            stderr,
+            "  invalid total_tasks=%d for max_tasks=%d\n\n",
+            plan.total_tasks,
+            MaxTransferTasks);
+        return;
+    }
+
+    for (int i = 0; i < plan.total_tasks; ++i) {
+        if (plan.tasks[i].executor_rank == rank) {
+            debug_print_transfer_task(i, plan.tasks[i]);
+        }
+    }
+
+    std::fprintf(stderr, "\n");
+}
+
+template <int MaxTransferTasks>
+inline void debug_print_transfer_plan_if_enabled(
+    const char* tag,
+    const TransferPlan<MaxTransferTasks>& plan) {
+#if defined(OOVERLAP_DEBUG_TRANSFER_PLAN)
+    debug_print_transfer_plan(tag, plan);
+#else
+    (void)tag;
+    (void)plan;
+#endif
+}
+
 
 } // namespace plan
 } // namespace comm
