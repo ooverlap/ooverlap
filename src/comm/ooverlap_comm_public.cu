@@ -157,6 +157,10 @@ void clear_ready_signal(oo_ready_signal& slot) {
     } else if (slot.kind == oo_ready_signal_kind::imported_legacy ||
                slot.kind == oo_ready_signal_kind::imported_vmm) {
         slot.imported.reset();
+    } else if (slot.kind == oo_ready_signal_kind::owned_host_mapped) {
+        if (slot.owned_host_ptr != nullptr) {
+            cudaFreeHost(slot.owned_host_ptr);
+        }
     }
 
     slot = oo_ready_signal{};
@@ -169,6 +173,7 @@ void destroy_group_ready_signals(oo_group_t* group) {
 
     for (int rank = 0; rank < kOoMaxLocalDevices; ++rank) {
         clear_ready_signal(group->ready_signal_slots[rank]);
+        clear_ready_signal(group->host_ready_signal_slots[rank]);
     }
 }
 
@@ -221,6 +226,49 @@ oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
         slot.owner_device = device;
         slot.kind = oo_ready_signal_kind::owned_legacy;
         slot.owned_legacy_ptr = signal;
+
+        /*
+         * Also allocate the host-mapped channel up front.  This lets the planner
+         * choose HostMapped per edge without changing launch setup.
+         */
+        void* host_signal = nullptr;
+        void* host_device_signal = nullptr;
+
+        err =
+            cudaHostAlloc(
+                &host_signal,
+                sizeof(int),
+                cudaHostAllocMapped | cudaHostAllocPortable);
+
+        if (err != cudaSuccess) {
+            destroy_group_ready_signals(group);
+            return ooverlap::comm::api::cuda_to_status(err);
+        }
+
+        *reinterpret_cast<int*>(host_signal) = 0;
+
+        err =
+            cudaHostGetDevicePointer(
+                &host_device_signal,
+                host_signal,
+                0);
+
+        if (err != cudaSuccess) {
+            cudaFreeHost(host_signal);
+            destroy_group_ready_signals(group);
+            return ooverlap::comm::api::cuda_to_status(err);
+        }
+
+        oo_ready_signal& host_slot =
+            group->host_ready_signal_slots[rank];
+
+        host_slot.ptr = host_device_signal;
+        host_slot.bytes = sizeof(int);
+        host_slot.mapped_bytes = sizeof(int);
+        host_slot.owner_rank = rank;
+        host_slot.owner_device = device;
+        host_slot.kind = oo_ready_signal_kind::owned_host_mapped;
+        host_slot.owned_host_ptr = host_signal;
     }
 
     return OO_SUCCESS;

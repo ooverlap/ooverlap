@@ -178,6 +178,31 @@ inline topology::TransportKind choose_direct_or_fallback_transport(
     return topology::TransportKind::DirectPcie;
 }
 
+inline ReadySignalChannel choose_ready_signal_channel(
+    const RankTopologyView& topo,
+    int waiter_rank,
+    int owner_rank) {
+    if (!valid_rank(waiter_rank, topo.world_size) ||
+        !valid_rank(owner_rank, topo.world_size)) {
+        return ReadySignalChannel::DeviceMemory;
+    }
+
+    if (waiter_rank == owner_rank) {
+        return ReadySignalChannel::DeviceMemory;
+    }
+
+    const topology::TransportKind direct_or_fallback =
+        choose_direct_or_fallback_transport(
+            topo,
+            waiter_rank,
+            owner_rank);
+
+    return direct_or_fallback == topology::TransportKind::DirectNvlink ||
+           direct_or_fallback == topology::TransportKind::DirectPcie
+               ? ReadySignalChannel::DeviceMemory
+               : ReadySignalChannel::HostMapped;
+}
+
 struct TransportMatrix {
     topology::TransportKind kind[kPlannerMaxRanks][kPlannerMaxRanks] = {};
 };
@@ -324,11 +349,36 @@ inline TransferTask make_reduce_transfer_task(
 
 inline TransferTask make_ready_publish_transfer_task(
     int executor_rank,
+    ReadySignalChannel channel,
     int phase) {
     TransferTask task{};
     task.op = TransferOp::ReadyPublish;
     task.executor_rank = executor_rank;
     task.ready_rank = executor_rank;
+    task.ready_channel = static_cast<int>(channel);
+    task.phase = phase;
+    return task;
+}
+
+inline TransferTask make_ready_publish_transfer_task(
+    int executor_rank,
+    int phase) {
+    return make_ready_publish_transfer_task(
+        executor_rank,
+        ReadySignalChannel::DeviceMemory,
+        phase);
+}
+
+inline TransferTask make_ready_wait_transfer_task(
+    int executor_rank,
+    int ready_rank,
+    ReadySignalChannel channel,
+    int phase) {
+    TransferTask task{};
+    task.op = TransferOp::ReadyWait;
+    task.executor_rank = executor_rank;
+    task.ready_rank = ready_rank;
+    task.ready_channel = static_cast<int>(channel);
     task.phase = phase;
     return task;
 }
@@ -337,17 +387,17 @@ inline TransferTask make_ready_wait_transfer_task(
     int executor_rank,
     int ready_rank,
     int phase) {
-    TransferTask task{};
-    task.op = TransferOp::ReadyWait;
-    task.executor_rank = executor_rank;
-    task.ready_rank = ready_rank;
-    task.phase = phase;
-    return task;
+    return make_ready_wait_transfer_task(
+        executor_rank,
+        ready_rank,
+        ReadySignalChannel::DeviceMemory,
+        phase);
 }
 
 template <int MaxTransferTasks>
 inline bool append_ready_rendezvous_tasks(
     TransferPlan<MaxTransferTasks>* plan,
+    const RankTopologyView& topo,
     int rank,
     int world_size,
     int* phase) {
@@ -359,14 +409,42 @@ inline bool append_ready_rendezvous_tasks(
         return true;
     }
 
-    const TransferTask publish =
-        make_ready_publish_transfer_task(
-            rank,
-            (*phase)++);
+    bool publish_channel_used[kReadySignalChannelCount] = {};
 
-    if (!transfer_plan_push_fast(plan, publish)) {
-        transfer_plan_abort_build(plan);
-        return false;
+    for (int peer = 0; peer < world_size; ++peer) {
+        if (peer == rank) {
+            continue;
+        }
+
+        /*
+         * Which channel will peer use when waiting on this rank?
+         * This is directional and may differ from the channel this rank uses
+         * when waiting on peer in asymmetric topologies.
+         */
+        const ReadySignalChannel publish_channel =
+            choose_ready_signal_channel(
+                topo,
+                peer,
+                rank);
+
+        publish_channel_used[static_cast<int>(publish_channel)] = true;
+    }
+
+    for (int channel = 0; channel < kReadySignalChannelCount; ++channel) {
+        if (!publish_channel_used[channel]) {
+            continue;
+        }
+
+        const TransferTask publish =
+            make_ready_publish_transfer_task(
+                rank,
+                static_cast<ReadySignalChannel>(channel),
+                (*phase)++);
+
+        if (!transfer_plan_push_fast(plan, publish)) {
+            transfer_plan_abort_build(plan);
+            return false;
+        }
     }
 
     for (int peer = 0; peer < world_size; ++peer) {
@@ -374,10 +452,17 @@ inline bool append_ready_rendezvous_tasks(
             continue;
         }
 
+        const ReadySignalChannel wait_channel =
+            choose_ready_signal_channel(
+                topo,
+                rank,
+                peer);
+
         const TransferTask wait =
             make_ready_wait_transfer_task(
                 rank,
                 peer,
+                wait_channel,
                 (*phase)++);
 
         if (!transfer_plan_push_fast(plan, wait)) {
@@ -387,6 +472,20 @@ inline bool append_ready_rendezvous_tasks(
     }
 
     return true;
+}
+
+template <int MaxTransferTasks>
+inline bool append_ready_rendezvous_tasks(
+    TransferPlan<MaxTransferTasks>* plan,
+    int rank,
+    int world_size,
+    int* phase) {
+    return append_ready_rendezvous_tasks(
+        plan,
+        RankTopologyView{},
+        rank,
+        world_size,
+        phase);
 }
 
 inline bool valid_build_input(
@@ -474,6 +573,7 @@ bool build_allreduce_transfer_plan(
 
         if (!append_ready_rendezvous_tasks(
                 plan,
+                input.topo,
                 rank,
                 input.world_size,
                 &phase)) {
@@ -607,6 +707,7 @@ bool build_reduce_scatter_transfer_plan(
         
         if (!append_ready_rendezvous_tasks(
                 plan,
+                input.topo,
                 rank,
                 input.world_size,
                 &phase)) {
@@ -717,6 +818,7 @@ bool build_all_gather_transfer_plan(
 
         if (!append_ready_rendezvous_tasks(
                 plan,
+                input.topo,
                 rank,
                 input.world_size,
                 &phase)) {

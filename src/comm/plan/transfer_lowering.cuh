@@ -24,12 +24,30 @@ namespace plan {
  */
 template <int MaxRanks>
 struct ReadySignalBinding {
+    /*
+     * Channel-aware fields.  New code should fill these.
+     */
+    int* local_ready_signal_by_channel[kReadySignalChannelCount] = {};
+    const int* ready_signal_by_rank_channel
+        [MaxRanks][kReadySignalChannelCount] = {};
+    int protocol_by_channel[kReadySignalChannelCount] = {};
+    int poll_sleep_cycles_by_channel[kReadySignalChannelCount] = {};
+
+    /*
+     * Compatibility fields for old launchers.  These are interpreted as the
+     * DeviceMemory channel when the channel-aware entries are null.
+     */
     int* local_ready_signal = nullptr;
     const int* ready_signal_by_rank[MaxRanks] = {};
     int epoch = 0;
     int protocol = 0;
     int poll_sleep_cycles = 0;
 };
+
+__host__ __device__ __forceinline__ bool valid_ready_signal_channel(
+    int channel) {
+    return channel >= 0 && channel < kReadySignalChannelCount;
+}
 
 /*
  * Rank-local pointer binding.
@@ -211,38 +229,71 @@ inline bool lower_ready_transfer_task_to_window_task(
         ready.epoch <= 0 ||
         transfer.executor_rank < 0 ||
         transfer.ready_rank < 0 ||
-        transfer.ready_rank >= MaxRanks) {
+        transfer.ready_rank >= MaxRanks ||
+        !valid_ready_signal_channel(transfer.ready_channel)) {
         return false;
     }
 
+    const int channel = transfer.ready_channel;
+
+    int* local_signal =
+        ready.local_ready_signal_by_channel[channel];
+
+    const int* peer_signal =
+        ready.ready_signal_by_rank_channel[transfer.ready_rank][channel];
+
+    int protocol =
+        ready.protocol_by_channel[channel];
+
+    int poll_sleep_cycles =
+        ready.poll_sleep_cycles_by_channel[channel];
+
+    /*
+     * Backward compatibility for old single-channel launchers.
+     */
+    if (channel == static_cast<int>(ReadySignalChannel::DeviceMemory)) {
+        if (local_signal == nullptr) {
+            local_signal = ready.local_ready_signal;
+        }
+
+        if (peer_signal == nullptr) {
+            peer_signal = ready.ready_signal_by_rank[transfer.ready_rank];
+        }
+
+        if (protocol == 0) {
+            protocol = ready.protocol;
+        }
+
+        if (poll_sleep_cycles == 0) {
+            poll_sleep_cycles = ready.poll_sleep_cycles;
+        }
+    }
+
     if (transfer.op == TransferOp::ReadyPublish) {
-        if (ready.local_ready_signal == nullptr) {
+        if (local_signal == nullptr) {
             return false;
         }
 
         *out =
             task::make_ready_publish_task(
-                ready.local_ready_signal,
+                local_signal,
                 ready.epoch,
-                ready.protocol,
+                protocol,
                 transfer.terminal);
 
         return true;
     }
 
     if (transfer.op == TransferOp::ReadyWait) {
-        const int* ready_signal =
-            ready.ready_signal_by_rank[transfer.ready_rank];
-
-        if (ready_signal == nullptr) {
+        if (peer_signal == nullptr) {
             return false;
         }
 
         *out =
             task::make_ready_wait_task(
-                ready_signal,
+                peer_signal,
                 ready.epoch,
-                ready.poll_sleep_cycles,
+                poll_sleep_cycles,
                 transfer.terminal);
 
         return true;

@@ -290,6 +290,8 @@ oo_status_t prepare_collective_launch(
 
     oo_ready_signal& local_signal =
         group->ready_signal_slots[node->rank];
+    oo_ready_signal& local_host_signal =
+        group->host_ready_signal_slots[node->rank];
 
     out->local_ptr =
         reinterpret_cast<void*>(
@@ -303,6 +305,16 @@ oo_status_t prepare_collective_launch(
     out->collective_epoch = ++node->collective_epoch;
     out->local_ready_signal =
         reinterpret_cast<int*>(local_signal.ptr);
+    out->local_ready_signal_by_channel[kOoReadySignalChannelDeviceMemory] =
+        reinterpret_cast<int*>(local_signal.ptr);
+    out->local_ready_signal_by_channel[kOoReadySignalChannelHostMapped] =
+        reinterpret_cast<int*>(local_host_signal.ptr);
+    out->ready_signal_protocol_by_channel[kOoReadySignalChannelDeviceMemory] = 0;
+    out->ready_signal_protocol_by_channel[kOoReadySignalChannelHostMapped] = 2;
+    out->ready_signal_poll_sleep_cycles_by_channel
+        [kOoReadySignalChannelDeviceMemory] = 64;
+    out->ready_signal_poll_sleep_cycles_by_channel
+        [kOoReadySignalChannelHostMapped] = 256;
 
     int peer_idx = 0;
 
@@ -333,9 +345,17 @@ oo_status_t prepare_collective_launch(
 
         oo_ready_signal& peer_signal =
             group->ready_signal_slots[rank];
+        oo_ready_signal& peer_host_signal =
+            group->host_ready_signal_slots[rank];
 
         out->peer_ready_signals[peer_idx] =
             reinterpret_cast<const int*>(peer_signal.ptr);
+        out->peer_ready_signals_by_channel
+            [peer_idx][kOoReadySignalChannelDeviceMemory] =
+                reinterpret_cast<const int*>(peer_signal.ptr);
+        out->peer_ready_signals_by_channel
+            [peer_idx][kOoReadySignalChannelHostMapped] =
+                reinterpret_cast<const int*>(peer_host_signal.ptr);
 
         peer_idx += 1;
     }

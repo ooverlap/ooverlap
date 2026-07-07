@@ -28,6 +28,20 @@ enum class TransferOp : std::uint8_t {
     ReadyWait = 4,
 };
 
+/*
+ * Logical ready-signal channel.
+ *
+ * TransferPlan stays pointer-free.  A channel only says which class of signal
+ * must be used for a ReadyPublish/ReadyWait edge.  Lowering resolves the
+ * channel to this rank's concrete pointer/protocol.
+ */
+enum class ReadySignalChannel : std::uint8_t {
+    DeviceMemory = 0,
+    HostMapped = 1,
+};
+
+constexpr int kReadySignalChannelCount = 2;
+
 enum class LogicalBufferRole : std::uint8_t {
     RankBuffer = 0,
     RankInput = 1,
@@ -158,7 +172,13 @@ struct TransferTask {
      */
     int phase = 0;
 
+    /*
+     * Ready task fields.  ready_rank is the owner rank of the signal.  For
+     * ReadyPublish it is normally executor_rank. ready_channel is a
+     * ReadySignalChannel integer.
+     */
     int ready_rank = -1;
+    int ready_channel = static_cast<int>(ReadySignalChannel::DeviceMemory);
 };
 
 template <int MaxTransferTasks>
@@ -204,7 +224,9 @@ __host__ __device__ __forceinline__ bool transfer_task_has_work(
     if (task.op == TransferOp::ReadyPublish ||
         task.op == TransferOp::ReadyWait) {
         return task.executor_rank >= 0 &&
-               task.ready_rank >= 0;
+               task.ready_rank >= 0 &&
+               task.ready_channel >= 0 &&
+               task.ready_channel < kReadySignalChannelCount;
     }
 
     return task.op != TransferOp::None &&

@@ -244,14 +244,43 @@ cudaError_t launch_all_gather_rank_variant_sm90(
             launch.peer_ready_signals);
 
     comm::plan::ReadySignalBinding<MaxRanks> ready_binding{};
-    ready_binding.local_ready_signal = launch.local_ready_signal;
     ready_binding.epoch = launch.collective_epoch;
-    ready_binding.protocol = static_cast<int>(ready_plan.protocol);
-    ready_binding.poll_sleep_cycles = ready_plan.poll_sleep_cycles;
+
+    bool has_ready_binding = false;
+
+    for (int channel = 0;
+         channel < comm::plan::kReadySignalChannelCount;
+         ++channel) {
+        ready_binding.local_ready_signal_by_channel[channel] =
+            launch.local_ready_signal_by_channel[channel];
+        ready_binding.protocol_by_channel[channel] =
+            launch.ready_signal_protocol_by_channel[channel];
+        ready_binding.poll_sleep_cycles_by_channel[channel] =
+            launch.ready_signal_poll_sleep_cycles_by_channel[channel];
+
+        if (launch.local_ready_signal_by_channel[channel] != nullptr) {
+            has_ready_binding = true;
+        }
+    }
+
+    ready_binding.local_ready_signal =
+        launch.local_ready_signal;
+    ready_binding.protocol =
+        launch.ready_signal_protocol_by_channel
+            [::kOoReadySignalChannelDeviceMemory];
+    ready_binding.poll_sleep_cycles =
+        launch.ready_signal_poll_sleep_cycles_by_channel
+            [::kOoReadySignalChannelDeviceMemory];
 
     if (launch.rank >= 0 && launch.rank < MaxRanks) {
         ready_binding.ready_signal_by_rank[launch.rank] =
             launch.local_ready_signal;
+        for (int channel = 0;
+             channel < comm::plan::kReadySignalChannelCount;
+             ++channel) {
+            ready_binding.ready_signal_by_rank_channel[launch.rank][channel] =
+                launch.local_ready_signal_by_channel[channel];
+        }
     }
 
     for (int peer_idx = 0; peer_idx < ready_plan.peer_count; ++peer_idx) {
@@ -260,14 +289,19 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         if (peer_rank >= 0 && peer_rank < MaxRanks) {
             ready_binding.ready_signal_by_rank[peer_rank] =
                 ready_plan.peer_ready_signals[peer_idx];
+            for (int channel = 0;
+                 channel < comm::plan::kReadySignalChannelCount;
+                 ++channel) {
+                ready_binding.ready_signal_by_rank_channel
+                    [peer_rank][channel] =
+                        launch.peer_ready_signals_by_channel[peer_idx][channel];
+            }
         }
     }
 
     const bool use_ready_binding =
-        launch.local_ready_signal != nullptr &&
-        launch.collective_epoch > 0 &&
-        ready_plan.protocol !=
-            comm::kernels::MultiGpuReadySignalProtocol::Disabled;
+        has_ready_binding &&
+        launch.collective_epoch > 0;
 
     const comm::plan::ReadySignalBinding<MaxRanks>* ready_binding_ptr =
         use_ready_binding ? &ready_binding : nullptr;

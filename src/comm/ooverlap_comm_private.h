@@ -22,8 +22,22 @@ struct CollectiveLaunchState {
     int peer_devices[kMaxPublicPeers] = {};
     int peer_count = 0;
 
+    /*
+     * Legacy single-channel fields.  These mirror the DeviceMemory channel.
+     */
     int* local_ready_signal = nullptr;
     const int* peer_ready_signals[kMaxPublicPeers] = {};
+
+    /*
+     * Channel-aware ready pointers/protocols.  The planner chooses a logical
+     * ReadySignalChannel per edge; lowering resolves that channel through these
+     * arrays.
+     */
+    int* local_ready_signal_by_channel[kOoReadySignalChannelCount] = {};
+    const int* peer_ready_signals_by_channel
+        [kMaxPublicPeers][kOoReadySignalChannelCount] = {};
+    int ready_signal_protocol_by_channel[kOoReadySignalChannelCount] = {};
+    int ready_signal_poll_sleep_cycles_by_channel[kOoReadySignalChannelCount] = {};
 
     int rank = -1;
     int world_size = 0;

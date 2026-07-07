@@ -16,6 +16,17 @@
 
 constexpr int kOoMaxLocalDevices = 16;
 
+enum class oo_ready_signal_channel : int {
+    device_memory = 0,
+    host_mapped = 1,
+};
+
+constexpr int kOoReadySignalChannelCount = 2;
+constexpr int kOoReadySignalChannelDeviceMemory =
+    static_cast<int>(oo_ready_signal_channel::device_memory);
+constexpr int kOoReadySignalChannelHostMapped =
+    static_cast<int>(oo_ready_signal_channel::host_mapped);
+
 enum class oo_group_memory_kind {
     /*
      * Same-process VMM allocations with cuMemSetAccess.
@@ -71,7 +82,13 @@ enum class oo_ready_signal_kind {
     /*
      * VMM FD imported mapping. Kept for future extension.
      */
-    imported_vmm = 4
+    imported_vmm = 4,
+
+    /*
+     * Mapped pinned host allocation. ptr is the device pointer returned by
+     * cudaHostGetDevicePointer(); owned_host_ptr is the host pointer.
+     */
+    owned_host_mapped = 5
 };
 
 struct oo_ready_signal {
@@ -138,6 +155,9 @@ struct oo_group {
      * signal. All code should use this field directly.
      */
     oo_ready_signal ready_signal_slots[kOoMaxLocalDevices] = {};
+
+    /* Additional channel: mapped pinned host ready signals. */
+    oo_ready_signal host_ready_signal_slots[kOoMaxLocalDevices] = {};
 
     /*
      * Current rank-buffer registry for public collectives.
