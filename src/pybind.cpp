@@ -22,6 +22,7 @@
 //#include "test/tma_collective_sweep_2gpu.h"
 #include "test/tma_efficiency_vs_best_2gpu.h"
 #include "test/persistent_external_p2p_collective_2gpu_sm90.h"
+#include "test/host_mapped_ready_microtest.h"
 
 namespace py = pybind11;
 
@@ -297,10 +298,18 @@ void baseline_gemm_col(
               cublas_status_to_string(st));
 }
 
+
 } // namespace
 
 PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("generate_nccl_id", &generate_nccl_id);
+
+  m.def("host_mapped_ready_signal_roundtrip",
+        &ooverlap::host_mapped_ready_signal_roundtrip,
+        py::arg("dev_publish"),
+        py::arg("dev_wait"),
+        py::arg("value") = 7,
+        py::arg("max_iters") = 100000000ull);
 
   m.def("gemm_signal_sm90", &gemm_signal_sm90);
   m.def("gemm_scatter_sm90", &gemm_scatter_sm90);
