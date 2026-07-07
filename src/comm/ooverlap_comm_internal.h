@@ -27,6 +27,18 @@ constexpr int kOoReadySignalChannelDeviceMemory =
 constexpr int kOoReadySignalChannelHostMapped =
     static_cast<int>(oo_ready_signal_channel::host_mapped);
 
+/*
+ * Fixed staging-buffer configuration.
+ *
+ * First implementation: preallocate a small fixed number of large host-mapped
+ * staging slots at group creation time.  Planners can later reference these by
+ * LogicalBufferRole::ShmStaging + staging_slot.
+ *
+ * Tune by changing these constants and recompiling.
+ */
+constexpr int kOoMaxStagingSlots = 4;
+constexpr size_t kOoStagingSlotBytes = 256ull * 1024ull * 1024ull;
+
 enum class oo_group_memory_kind {
     /*
      * Same-process VMM allocations with cuMemSetAccess.
@@ -119,6 +131,46 @@ struct oo_ready_signal {
     ooverlap::system::imported_peer_buffer imported{};
 };
 
+enum class oo_staging_buffer_kind {
+    empty = 0,
+
+    /*
+     * Host virtual allocation, best-effort NUMA placement, then
+     * cudaHostRegister(...Mapped...) so every local GPU gets a device-visible
+     * pointer for the same backing pages.
+     */
+    owned_host_registered = 1,
+
+    /*
+     * Fallback path from cudaHostAllocMapped when mmap/cudaHostRegister is not
+     * used or not available.
+     */
+    owned_host_mapped = 2,
+};
+
+struct oo_staging_buffer {
+    /*
+     * CPU pointer used for lifetime management and optional host initialization.
+     */
+    void* host_ptr = nullptr;
+
+    /*
+     * Device-visible pointer returned by cudaHostGetDevicePointer().  This is
+     * what RankPointerBinding::shm_staging[slot] should receive later.
+     */
+    void* device_ptr = nullptr;
+
+    size_t bytes = 0;
+
+    /*
+     * Requested NUMA node.  -1 means no NUMA binding was requested/available.
+     * Placement is best-effort and allocation is still valid if binding fails.
+     */
+    int numa_node = -1;
+
+    oo_staging_buffer_kind kind = oo_staging_buffer_kind::empty;
+};
+
 namespace ooverlap {
 namespace comm {
 namespace plan {
@@ -160,6 +212,15 @@ struct oo_group {
 
     /* Additional channel: mapped pinned host ready signals. */
     oo_ready_signal host_ready_signal_slots[kOoMaxLocalDevices] = {};
+
+    /*
+     * Fixed group-owned staging slots.
+     *
+     * These are intentionally independent from user tensor buffers.  The planner
+     * will later reference them by staging_slot index; lowering will bind that
+     * index to the device_ptr stored here.
+     */
+    oo_staging_buffer staging_slots[kOoMaxStagingSlots] = {};
 
     /*
      * Current rank-buffer registry for public collectives.

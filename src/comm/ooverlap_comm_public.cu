@@ -9,11 +9,20 @@
 
 #include <cuda_runtime.h>
 
+#include <cerrno>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <linux/mempolicy.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -32,6 +41,209 @@ std::vector<int> devices_vector(
     }
 
     return out;
+}
+
+/*
+ * Best-effort static NUMA placement for staging slots.
+ *
+ * Tune and recompile.  If the machine has fewer NUMA nodes, mbind may fail; that
+ * is intentionally non-fatal because the staging allocation is still usable.
+ */
+constexpr int kOoStagingPreferredNumaNodeCount = 2;
+constexpr int kOoStagingPreferredNumaNodes[kOoStagingPreferredNumaNodeCount] = {
+    0,
+    1,
+};
+
+int preferred_staging_numa_node(int slot) {
+    if (slot < 0 || kOoStagingPreferredNumaNodeCount <= 0) {
+        return -1;
+    }
+
+    return kOoStagingPreferredNumaNodes[
+        slot % kOoStagingPreferredNumaNodeCount];
+}
+
+bool bind_memory_to_numa_node_best_effort(
+    void* ptr,
+    size_t bytes,
+    int numa_node) {
+    if (ptr == nullptr || bytes == 0 || numa_node < 0) {
+        return false;
+    }
+
+#if defined(__linux__) && defined(SYS_mbind)
+    if (numa_node >= static_cast<int>(8 * sizeof(unsigned long))) {
+        return false;
+    }
+
+    unsigned long nodemask =
+        1ul << static_cast<unsigned int>(numa_node);
+
+    /*
+     * MPOL_BIND before pages are touched.  This is best-effort only.
+     *
+     * Do not make group creation fail when mbind is unavailable or denied; the
+     * staging buffer is a correctness resource, NUMA placement is optimization.
+     */
+    const long rc =
+        syscall(
+            SYS_mbind,
+            ptr,
+            bytes,
+            MPOL_BIND,
+            &nodemask,
+            static_cast<unsigned long>(numa_node + 1),
+            0);
+
+    return rc == 0;
+#else
+    (void)ptr;
+    (void)bytes;
+    (void)numa_node;
+    return false;
+#endif
+}
+
+void clear_staging_buffer(oo_staging_buffer& slot) {
+    if (slot.host_ptr != nullptr) {
+        if (slot.kind == oo_staging_buffer_kind::owned_host_registered) {
+            cudaHostUnregister(slot.host_ptr);
+
+#if defined(__linux__)
+            munmap(slot.host_ptr, slot.bytes);
+#endif
+        } else if (slot.kind == oo_staging_buffer_kind::owned_host_mapped) {
+            cudaFreeHost(slot.host_ptr);
+        }
+    }
+
+    slot = oo_staging_buffer{};
+}
+
+void destroy_group_staging_buffers(oo_group_t* group) {
+    if (group == nullptr) {
+        return;
+    }
+
+    for (int slot = 0; slot < kOoMaxStagingSlots; ++slot) {
+        clear_staging_buffer(group->staging_slots[slot]);
+    }
+}
+
+oo_status_t allocate_group_staging_buffers(oo_group_t* group) {
+    if (group == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    static_assert(
+        kOoMaxStagingSlots >= 0,
+        "kOoMaxStagingSlots must be non-negative");
+    static_assert(
+        kOoStagingSlotBytes > 0,
+        "kOoStagingSlotBytes must be positive");
+
+    for (int slot_idx = 0; slot_idx < kOoMaxStagingSlots; ++slot_idx) {
+        oo_staging_buffer& slot =
+            group->staging_slots[slot_idx];
+
+        if (slot.host_ptr != nullptr || slot.device_ptr != nullptr) {
+            destroy_group_staging_buffers(group);
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        const int numa_node =
+            preferred_staging_numa_node(slot_idx);
+
+        void* host_ptr = nullptr;
+        void* device_ptr = nullptr;
+        cudaError_t err = cudaSuccess;
+
+#if defined(__linux__)
+        host_ptr =
+            mmap(
+                nullptr,
+                kOoStagingSlotBytes,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0);
+
+        if (host_ptr == MAP_FAILED) {
+            host_ptr = nullptr;
+            destroy_group_staging_buffers(group);
+            return OO_ERROR_INTERNAL;
+        }
+
+        bind_memory_to_numa_node_best_effort(
+            host_ptr,
+            kOoStagingSlotBytes,
+            numa_node);
+
+        std::memset(host_ptr, 0, kOoStagingSlotBytes);
+
+        err =
+            cudaHostRegister(
+                host_ptr,
+                kOoStagingSlotBytes,
+                cudaHostRegisterMapped | cudaHostRegisterPortable);
+
+        if (err != cudaSuccess) {
+            munmap(host_ptr, kOoStagingSlotBytes);
+            destroy_group_staging_buffers(group);
+            return ooverlap::comm::api::cuda_to_status(err);
+        }
+
+        err =
+            cudaHostGetDevicePointer(
+                &device_ptr,
+                host_ptr,
+                0);
+
+        if (err != cudaSuccess) {
+            cudaHostUnregister(host_ptr);
+            munmap(host_ptr, kOoStagingSlotBytes);
+            destroy_group_staging_buffers(group);
+            return ooverlap::comm::api::cuda_to_status(err);
+        }
+
+        slot.kind = oo_staging_buffer_kind::owned_host_registered;
+#else
+        err =
+            cudaHostAlloc(
+                &host_ptr,
+                kOoStagingSlotBytes,
+                cudaHostAllocMapped | cudaHostAllocPortable);
+
+        if (err != cudaSuccess) {
+            destroy_group_staging_buffers(group);
+            return ooverlap::comm::api::cuda_to_status(err);
+        }
+
+        std::memset(host_ptr, 0, kOoStagingSlotBytes);
+
+        err =
+            cudaHostGetDevicePointer(
+                &device_ptr,
+                host_ptr,
+                0);
+
+        if (err != cudaSuccess) {
+            cudaFreeHost(host_ptr);
+            destroy_group_staging_buffers(group);
+            return ooverlap::comm::api::cuda_to_status(err);
+        }
+
+        slot.kind = oo_staging_buffer_kind::owned_host_mapped;
+#endif
+
+        slot.host_ptr = host_ptr;
+        slot.device_ptr = device_ptr;
+        slot.bytes = kOoStagingSlotBytes;
+        slot.numa_node = numa_node;
+    }
+
+    return OO_SUCCESS;
 }
 
 oo_status_t enable_group_peer_access_all_to_all(oo_group_t* group) {
@@ -495,6 +707,15 @@ oo_status_t oo_group_create(
             return status;
         }
 
+
+        status =
+            allocate_group_staging_buffers(group.get());
+
+        if (status != OO_SUCCESS) {
+            destroy_group_ready_signals(group.get());
+            return status;
+        }
+
         group->transfer_plan_distribution =
             ooverlap::comm::plan::make_same_process_transfer_plan_distribution_backend();
 
@@ -556,6 +777,15 @@ oo_status_t oo_group_create_p2p(
 
         status =
             allocate_same_process_cuda_ready_signals(group.get());
+
+        if (status != OO_SUCCESS) {
+            destroy_group_ready_signals(group.get());
+            return status;
+        }
+
+
+        status =
+            allocate_group_staging_buffers(group.get());
 
         if (status != OO_SUCCESS) {
             destroy_group_ready_signals(group.get());
