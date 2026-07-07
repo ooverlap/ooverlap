@@ -88,30 +88,50 @@ inline MultiGpuReadySignalPlan<MaxPeers> make_multi_gpu_ready_signal_plan(
     return plan;
 }
 
+
+#define OOVERLAP_DEBUG_READY_PRINTF 1
+
 __device__ __forceinline__ void publish_ready_signal_store_release(
     int* ready_signal,
     int collective_epoch) {
     if (ready_signal == nullptr) {
+#if defined(OOVERLAP_DEBUG_READY_PRINTF)
+        printf("[ready publish] null ready_signal expected=%d block=%d thread=%d\n",
+               collective_epoch,
+               static_cast<int>(blockIdx.x),
+               static_cast<int>(threadIdx.x));
+#endif
         return;
     }
 
-    /*
-     * Single-writer slot protocol:
-     *   owner rank writes ready[owner_rank]
-     *   all peers only read that slot
-     *
-     * This avoids atomic RMW on the fast path.  The system fence after the
-     * volatile store keeps the published epoch visible outside the writer GPU.
-     */
     volatile int* ready =
         reinterpret_cast<volatile int*>(ready_signal);
+
+#if defined(OOVERLAP_DEBUG_READY_PRINTF)
+    const int before = ready[0];
+#endif
 
     ready[0] = collective_epoch;
 
 #if defined(__CUDA_ARCH__)
     __threadfence_system();
 #endif
+
+#if defined(OOVERLAP_DEBUG_READY_PRINTF)
+    const int after = ready[0];
+
+    printf("[ready publish] ptr=%p before=%d write=%d after=%d block=%d thread=%d\n",
+           static_cast<void*>(ready_signal),
+           before,
+           collective_epoch,
+           after,
+           static_cast<int>(blockIdx.x),
+           static_cast<int>(threadIdx.x));
+#endif
 }
+
+
+
 
 __device__ __forceinline__ void publish_ready_signal_atomic_max(
     int* ready_signal,
@@ -167,15 +187,83 @@ __device__ __forceinline__ int load_ready_signal(
     return ready[0];
 }
 
+/*__device__ __forceinline__ void wait_until_ready_signal_at_least(*/
+    /*const int* ready_signal,*/
+    /*int collective_epoch,*/
+    /*int poll_sleep_cycles) {*/
+    /*if (ready_signal == nullptr || collective_epoch <= 0) {*/
+        /*return;*/
+    /*}*/
+
+    /*while (load_ready_signal(ready_signal) < collective_epoch) {*/
+/*#if defined(__CUDA_ARCH__)*/
+        /*if (poll_sleep_cycles > 0) {*/
+            /*__nanosleep(static_cast<unsigned int>(poll_sleep_cycles));*/
+        /*}*/
+/*#endif*/
+    /*}*/
+/*}*/
+
+
+
+
 __device__ __forceinline__ void wait_until_ready_signal_at_least(
     const int* ready_signal,
     int collective_epoch,
     int poll_sleep_cycles) {
     if (ready_signal == nullptr || collective_epoch <= 0) {
+#if defined(OOVERLAP_DEBUG_READY_PRINTF)
+        printf("[ready wait] skip ptr=%p expected=%d block=%d thread=%d\n",
+               static_cast<const void*>(ready_signal),
+               collective_epoch,
+               static_cast<int>(blockIdx.x),
+               static_cast<int>(threadIdx.x));
+#endif
         return;
     }
 
-    while (load_ready_signal(ready_signal) < collective_epoch) {
+#if defined(OOVERLAP_DEBUG_READY_PRINTF)
+    int first = load_ready_signal(ready_signal);
+    printf("[ready wait begin] ptr=%p expected=%d observed=%d block=%d thread=%d\n",
+           static_cast<const void*>(ready_signal),
+           collective_epoch,
+           first,
+           static_cast<int>(blockIdx.x),
+           static_cast<int>(threadIdx.x));
+#endif
+
+    unsigned long long iters = 0;
+
+    while (true) {
+        const int observed = load_ready_signal(ready_signal);
+
+        if (observed >= collective_epoch) {
+#if defined(OOVERLAP_DEBUG_READY_PRINTF)
+            printf("[ready wait done] ptr=%p expected=%d observed=%d iters=%llu block=%d thread=%d\n",
+                   static_cast<const void*>(ready_signal),
+                   collective_epoch,
+                   observed,
+                   iters,
+                   static_cast<int>(blockIdx.x),
+                   static_cast<int>(threadIdx.x));
+#endif
+            return;
+        }
+
+#if defined(OOVERLAP_DEBUG_READY_PRINTF)
+        if ((iters & ((1ull << 20) - 1ull)) == 0ull) {
+            printf("[ready wait spin] ptr=%p expected=%d observed=%d iters=%llu block=%d thread=%d\n",
+                   static_cast<const void*>(ready_signal),
+                   collective_epoch,
+                   observed,
+                   iters,
+                   static_cast<int>(blockIdx.x),
+                   static_cast<int>(threadIdx.x));
+        }
+#endif
+
+        ++iters;
+
 #if defined(__CUDA_ARCH__)
         if (poll_sleep_cycles > 0) {
             __nanosleep(static_cast<unsigned int>(poll_sleep_cycles));
@@ -183,6 +271,17 @@ __device__ __forceinline__ void wait_until_ready_signal_at_least(
 #endif
     }
 }
+
+
+
+
+
+
+
+
+
+
+
 
 template <int MaxPeers>
 __device__ __forceinline__ void wait_for_multi_gpu_collective_ready(
