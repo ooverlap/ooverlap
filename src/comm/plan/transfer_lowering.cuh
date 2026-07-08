@@ -1234,9 +1234,7 @@ bool lower_transfer_plan_for_rank(
         return false;
     }
 
-    return true;
-
-    lowering_detail::RankTransferTaskBuffer<MaxTransferTasks> rank_tasks;
+    thread_local static lowering_detail::RankTransferTaskBuffer<MaxTransferTasks> rank_tasks;
     lowering_detail::rank_transfer_task_buffer_reset(&rank_tasks);
 
     if (!lowering_detail::collect_rank_transfer_tasks(

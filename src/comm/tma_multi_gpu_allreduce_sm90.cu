@@ -236,8 +236,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         return cudaSuccess;
     }
 
-    return cudaSuccess;
-
     system::runtime::set_device(launch.local_device);
 
     comm::kernels::configure_multi_gpu_window_task_executor_once<

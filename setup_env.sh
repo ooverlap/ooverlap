@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 # -------- user-tunable defaults --------
-MODULE_SETUP="${MODULE_SETUP:-$HOME/modules-conf/setup_env_gcore13-2.sh}"
-INSTALL_TORCH="${INSTALL_TORCH:-$HOME/scripts/install_torch.sh}"
+MODULE_SETUP="${MODULE_SETUP:-$HOME/modules-conf/setup_env_gcore14-2.sh}"
+INSTALL_TORCH="${INSTALL_TORCH:-$HOME/scripts/install_torch_14.sh}"
 BUILD_DIR="${BUILD_DIR:-$HOME/ooverlap/build}"
 JOBS="${JOBS:-12}"
 CUDA_ARCH="${CUDA_ARCH:-90a}"
@@ -81,7 +81,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-PYTHON_BIN="$VENV_DIR/bin/python3.11"
+PYTHON_BIN="$VENV_DIR/bin/python3.13"
 [[ -x "$PYTHON_BIN" ]] || PYTHON_BIN="$VENV_DIR/bin/python"
 [[ -x "$PYTHON_BIN" ]] || die "No Python found in venv"
 
