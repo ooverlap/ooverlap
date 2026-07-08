@@ -37,6 +37,10 @@ function(ooverlap_enable_release_opts target)
     target_compile_options(${target} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-O3>
       $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+      # OOVERLAP_CUDA_MAX_PERF_FLAGS_V3
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>
+      $<$<COMPILE_LANGUAGE:CUDA>:--extra-device-vectorization>
+      $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
     )
   endif()
 endfunction()

@@ -112,6 +112,7 @@ fi
 # -------- configure --------
 log "Running cmake configure"
 cmake -S .. -B . \
+  -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$TORCH_PREFIX_PATH" \
   -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
   -DPython3_EXECUTABLE="$PYTHON_BIN" \
