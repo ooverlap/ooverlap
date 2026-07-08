@@ -59,6 +59,18 @@ enum class WindowTaskOp : uint8_t {
      */
     ReadyPublish = 8,
     ReadyWait = 9,
+
+    /*
+     * OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: merged consecutive ReadyPublish + ReadyWait.
+     *
+     * signal_flags      = local publish signal
+     * ready_epoch       = publish epoch/value
+     * ready_protocol    = publish protocol
+     * ready_wait_signal = peer signal to wait on
+     * ready_wait_epoch  = wait epoch/value
+     * ready_owner_cta   = CTA that performs the publish; all CTAs wait
+     */
+    ReadyPublishWait = 10,
 };
 
 struct WindowTask {
@@ -98,6 +110,10 @@ struct WindowTask {
     int ready_epoch = 0;
     int ready_protocol = 0;
     int ready_poll_sleep_cycles = 0;
+
+    const int* ready_wait_signal = nullptr;
+    int ready_wait_epoch = 0;
+    int ready_owner_cta = 0;
 
     /*
      * terminal means: after this task, the CTA returns and does not execute
@@ -320,8 +336,39 @@ __host__ __device__ __forceinline__ WindowTask make_ready_wait_task(
     return task;
 }
 
+
+/* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: maker for merged consecutive ReadyPublish + ReadyWait. */
+__host__ __device__ __forceinline__ WindowTask make_ready_publish_wait_task(
+    int* publish_signal,
+    int publish_epoch,
+    int publish_protocol,
+    const int* wait_signal,
+    int wait_epoch,
+    int wait_poll_sleep_cycles,
+    int owner_cta,
+    bool terminal = false) {
+    WindowTask task{};
+    task.op = WindowTaskOp::ReadyPublishWait;
+    task.signal_flags = publish_signal;
+    task.ready_epoch = publish_epoch;
+    task.ready_protocol = publish_protocol;
+    task.ready_wait_signal = wait_signal;
+    task.ready_wait_epoch = wait_epoch;
+    task.ready_poll_sleep_cycles = wait_poll_sleep_cycles;
+    task.ready_owner_cta = owner_cta;
+    task.terminal = terminal;
+    return task;
+}
+
 __host__ __device__ __forceinline__ bool window_task_has_work(
     const WindowTask& task) {
+    if (task.op == WindowTaskOp::ReadyPublishWait) {
+        return task.signal_flags != nullptr &&
+               task.ready_epoch > 0 &&
+               task.ready_wait_signal != nullptr &&
+               task.ready_wait_epoch > 0;
+    }
+
     if (task.op == WindowTaskOp::ReadyPublish ||
         task.op == WindowTaskOp::ReadyWait) {
         return task.signal_flags != nullptr &&

@@ -319,6 +319,93 @@ inline bool lower_ready_transfer_task_to_window_task(
     return false;
 }
 
+
+/* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: lower consecutive ReadyPublish + ReadyWait into one task. */
+template <int MaxRanks>
+inline bool lower_ready_publish_wait_transfer_tasks_to_window_task(
+    const TransferTask& publish,
+    const TransferTask& wait,
+    const ReadySignalBinding<MaxRanks>& ready,
+    int owner_cta,
+    task::WindowTask* out) {
+    if (out == nullptr ||
+        ready.epoch <= 0 ||
+        publish.op != TransferOp::ReadyPublish ||
+        wait.op != TransferOp::ReadyWait ||
+        publish.executor_rank != wait.executor_rank ||
+        publish.executor_rank < 0 ||
+        publish.ready_rank < 0 ||
+        publish.ready_rank >= MaxRanks ||
+        wait.ready_rank < 0 ||
+        wait.ready_rank >= MaxRanks ||
+        !valid_ready_signal_channel(publish.ready_channel) ||
+        !valid_ready_signal_channel(wait.ready_channel) ||
+        !valid_ready_signal_phase(publish.ready_phase) ||
+        !valid_ready_signal_phase(wait.ready_phase)) {
+        return false;
+    }
+
+    const int publish_channel = publish.ready_channel;
+    const int wait_channel = wait.ready_channel;
+
+    int* publish_signal =
+        ready.local_ready_signal_by_channel[publish_channel];
+
+    int publish_protocol =
+        ready.protocol_by_channel[publish_channel];
+
+    const int* wait_signal =
+        ready.ready_signal_by_rank_channel[wait.ready_rank][wait_channel];
+
+    int wait_poll_sleep_cycles =
+        ready.poll_sleep_cycles_by_channel[wait_channel];
+
+    /*
+     * Backward compatibility for old single-channel launchers.
+     */
+    if (publish_channel == static_cast<int>(ReadySignalChannel::DeviceMemory)) {
+        if (publish_signal == nullptr) {
+            publish_signal = ready.local_ready_signal;
+        }
+
+        if (publish_protocol == 0) {
+            publish_protocol = ready.protocol;
+        }
+    }
+
+    if (wait_channel == static_cast<int>(ReadySignalChannel::DeviceMemory)) {
+        if (wait_signal == nullptr) {
+            wait_signal = ready.ready_signal_by_rank[wait.ready_rank];
+        }
+
+        if (wait_poll_sleep_cycles == 0) {
+            wait_poll_sleep_cycles = ready.poll_sleep_cycles;
+        }
+    }
+
+    if (publish_signal == nullptr || wait_signal == nullptr) {
+        return false;
+    }
+
+    const int publish_value =
+        ready.epoch * kReadySignalPhaseStride + publish.ready_phase;
+    const int wait_value =
+        ready.epoch * kReadySignalPhaseStride + wait.ready_phase;
+
+    *out =
+        task::make_ready_publish_wait_task(
+            publish_signal,
+            publish_value,
+            publish_protocol,
+            wait_signal,
+            wait_value,
+            wait_poll_sleep_cycles,
+            owner_cta,
+            wait.terminal);
+
+    return true;
+}
+
 inline task::WindowTaskOp select_copy_window_op(
     const TransferTask& transfer) {
     if (transfer_should_use_fast_copy(transfer)) {
@@ -425,6 +512,15 @@ struct LoweringPassOptions {
     bool enable_window_passes = true;
 
     /*
+     * Merge consecutive ReadyPublish + ReadyWait into one WindowTask.
+     *
+     * Only one CTA performs the publish. All CTAs wait on the peer ready signal.
+     * Multiple merged pairs are assigned owner CTAs round-robin to avoid putting
+     * every publish on CTA 0.
+     */
+    bool enable_ready_publish_wait_merge = true;
+
+    /*
      * The current executor has historically had a temporary local-task limit in
      * execute_window_task_stripe(). Keep this disabled by default so the skeleton
      * preserves old lowering behavior. Enable while debugging if needed.
@@ -486,6 +582,7 @@ struct RankTransferTaskBuffer {
 
     int count = 0;
     int ready_count = 0;
+    int ready_pair_count = 0;
     int window_count = 0;
     int max_end_window = 0;
 
@@ -506,6 +603,16 @@ inline bool rank_transfer_task_buffer_push(
     return true;
 }
 
+
+inline bool transfer_tasks_are_mergeable_ready_publish_wait_pair(
+    const TransferTask& publish,
+    const TransferTask& wait) {
+    return publish.op == TransferOp::ReadyPublish &&
+           wait.op == TransferOp::ReadyWait &&
+           publish.executor_rank == wait.executor_rank &&
+           !publish.terminal;
+}
+
 template <int MaxTransferTasks>
 inline bool recompute_rank_transfer_task_stats(
     RankTransferTaskBuffer<MaxTransferTasks>* buffer) {
@@ -516,6 +623,7 @@ inline bool recompute_rank_transfer_task_stats(
     }
 
     buffer->ready_count = 0;
+    buffer->ready_pair_count = 0;
     buffer->window_count = 0;
     buffer->max_end_window = 0;
 
@@ -524,6 +632,16 @@ inline bool recompute_rank_transfer_task_stats(
 
         if (transfer_task_is_ready(transfer)) {
             ++buffer->ready_count;
+
+            if (i + 1 < buffer->count &&
+                transfer_tasks_are_mergeable_ready_publish_wait_pair(
+                    buffer->tasks[i],
+                    buffer->tasks[i + 1])) {
+                ++buffer->ready_count;
+                ++buffer->ready_pair_count;
+                ++i;
+            }
+
             continue;
         }
 
@@ -728,7 +846,15 @@ inline bool compute_lowering_shape(
         return true;
     }
 
-    shape.tasks_per_cta = tasks.ready_count + tasks.window_count;
+    const int merged_ready_task_savings =
+        ctx.options.enable_ready_publish_wait_merge
+            ? tasks.ready_pair_count
+            : 0;
+
+    shape.tasks_per_cta =
+        tasks.ready_count +
+        tasks.window_count -
+        merged_ready_task_savings;
 
     if (shape.tasks_per_cta <= 0 || shape.tasks_per_cta > MaxWindowTasks) {
         return false;
@@ -820,12 +946,43 @@ inline bool emit_window_plan_from_rank_tasks(
                 : comm::utils::WindowRange{0, 0};
 
         int task_idx = cta_idx * shape.tasks_per_cta;
+        int ready_pair_index = 0;
 
         for (int i = 0; i < rank_tasks.count; ++i) {
             const TransferTask& transfer = rank_tasks.tasks[i];
 
             if (transfer_task_is_ready(transfer)) {
                 if (!ctx.lower_ready_tasks || ctx.ready_binding == nullptr) {
+                    continue;
+                }
+
+                if (ctx.options.enable_ready_publish_wait_merge &&
+                    i + 1 < rank_tasks.count &&
+                    transfer_tasks_are_mergeable_ready_publish_wait_pair(
+                        rank_tasks.tasks[i],
+                        rank_tasks.tasks[i + 1])) {
+                    const int owner_cta =
+                        shape.cta_count > 0
+                            ? (ready_pair_index % shape.cta_count)
+                            : 0;
+
+                    task::WindowTask merged_ready_task{};
+
+                    if (!lower_ready_publish_wait_transfer_tasks_to_window_task(
+                            rank_tasks.tasks[i],
+                            rank_tasks.tasks[i + 1],
+                            *ctx.ready_binding,
+                            owner_cta,
+                            &merged_ready_task)) {
+                        out_window_plan->total_tasks = 0;
+                        out_window_plan->tasks_per_cta = 0;
+                        *out_num_blocks = 0;
+                        return false;
+                    }
+
+                    out_window_plan->tasks[task_idx++] = merged_ready_task;
+                    ++ready_pair_index;
+                    ++i;
                     continue;
                 }
 
@@ -985,6 +1142,7 @@ inline bool run_window_plan_lowering_passes(
     return pass_validate_window_plan_shape(ctx, *plan, *num_blocks);
 }
 
+/* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: lowering changes active. */
 } // namespace lowering_detail
 
 template <

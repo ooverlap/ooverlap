@@ -177,11 +177,44 @@ __device__ __forceinline__ void wait_until_ready_signal_at_least(
 
     while (load_ready_signal(ready_signal) < collective_epoch) {
 #if defined(__CUDA_ARCH__)
-        if (poll_sleep_cycles > 0) {
-            __nanosleep(static_cast<unsigned int>(poll_sleep_cycles));
-        }
+        __nanosleep(64);
 #endif
     }
+}
+
+
+/* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: combined publish+wait helper.
+ *
+ * Exactly one CTA, selected by owner_cta, performs the publish. Every CTA
+ * waits on the peer signal. This preserves the "all CTAs wait before later
+ * work" property while avoiding duplicate publishes.
+ */
+__device__ __forceinline__ void publish_then_wait_ready_signal_for_cta(
+    int cta_idx,
+    int owner_cta,
+    int* publish_signal,
+    int publish_epoch,
+    MultiGpuReadySignalProtocol publish_protocol,
+    const int* wait_signal,
+    int wait_epoch,
+    int wait_poll_sleep_cycles) {
+    if (wait_signal == nullptr || wait_epoch <= 0) {
+        return;
+    }
+
+    if (cta_idx == owner_cta &&
+        publish_signal != nullptr &&
+        publish_epoch > 0) {
+        publish_ready_signal(
+            publish_signal,
+            publish_epoch,
+            publish_protocol);
+    }
+
+    wait_until_ready_signal_at_least(
+        wait_signal,
+        wait_epoch,
+        wait_poll_sleep_cycles);
 }
 
 template <int MaxPeers>

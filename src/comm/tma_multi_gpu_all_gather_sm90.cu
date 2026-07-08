@@ -64,7 +64,7 @@ bool validate_all_gather_launch(
 }
 
 #ifndef OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
-#define OOVERLAP_DEBUG_PRINT_WINDOW_TASKS 0
+#define OOVERLAP_DEBUG_PRINT_WINDOW_TASKS 1
 #endif
 
 #if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
@@ -91,6 +91,8 @@ const char* debug_window_task_op_name(
             return "ReadyPublish";
         case comm::task::WindowTaskOp::ReadyWait:
             return "ReadyWait";
+        case comm::task::WindowTaskOp::ReadyPublishWait:
+            return "ReadyPublishWait";
         default:
             return "Unknown";
     }
