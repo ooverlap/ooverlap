@@ -44,35 +44,22 @@ def print_metrics(title, metrics):
             print(f"  {k}: {v}")
 
     nccl_ms = metrics.get("nccl_ms", None)
+    nccl_symmetric_ms = metrics.get("nccl_symmetric_ms", None)
+    ooverlap_ms = metrics.get("ooverlap_ms", None)
 
     if isinstance(nccl_ms, float) and nccl_ms > 0.0:
-        print("\n[Speedup over NCCL]")
+        print("\n[Speedup over normal NCCL]")
 
-        ooverlap_ms = metrics.get("ooverlap_ms", None)
         if isinstance(ooverlap_ms, float) and ooverlap_ms > 0.0:
             print_speedup_line("ooverlap", "nccl", nccl_ms, ooverlap_ms)
 
-        nccl_registered_ms = metrics.get("nccl_registered_ms", None)
-        if isinstance(nccl_registered_ms, float) and nccl_registered_ms > 0.0:
-            print_speedup_line(
-                "nccl_registered",
-                "nccl",
-                nccl_ms,
-                nccl_registered_ms,
-            )
+        if isinstance(nccl_symmetric_ms, float) and nccl_symmetric_ms > 0.0:
+            print_speedup_line("nccl_symmetric", "nccl", nccl_ms, nccl_symmetric_ms)
 
-    nccl_registered_ms = metrics.get("nccl_registered_ms", None)
-    ooverlap_ms = metrics.get("ooverlap_ms", None)
-
-    if (isinstance(nccl_registered_ms, float) and nccl_registered_ms > 0.0 and
+    if (isinstance(nccl_symmetric_ms, float) and nccl_symmetric_ms > 0.0 and
             isinstance(ooverlap_ms, float) and ooverlap_ms > 0.0):
-        print("\n[Speedup over registered NCCL]")
-        print_speedup_line(
-            "ooverlap",
-            "nccl_registered",
-            nccl_registered_ms,
-            ooverlap_ms,
-        )
+        print("\n[Speedup over symmetric NCCL]")
+        print_speedup_line("ooverlap", "nccl_symmetric", nccl_symmetric_ms, ooverlap_ms)
 
 
 def collective_display_name(collective: str) -> str:
@@ -207,7 +194,7 @@ def main():
     print(f"[info] cuda device count: {torch.cuda.device_count()}")
     print(f"[info] collective={args.collective} ({display_collective})")
     print("[info] memory mode=external cudaMalloc buffers + oo_buffer_wrap + oo_group_create_p2p")
-    print("[info] NCCL modes=normal cudaMalloc, plus optional ncclMemAlloc + ncclCommRegister")
+    print("[info] NCCL modes=normal cudaMalloc, symmetric ncclMemAlloc + ncclCommWindowRegister")
     print(f"[info] dev0={args.dev0} dev1={args.dev1}")
     print(f"[info] numel={args.numel} iters={args.iters} warmup={args.warmup}")
 

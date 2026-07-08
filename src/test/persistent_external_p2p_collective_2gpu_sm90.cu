@@ -14,8 +14,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <dlfcn.h>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -24,195 +22,95 @@
 #define OOVERLAP_BENCH_VERIFY_RESULTS 0
 #endif
 
-#ifndef OOVERLAP_BENCH_TRY_NCCL_REGISTERED
-#define OOVERLAP_BENCH_TRY_NCCL_REGISTERED 1
-#endif
-
 namespace ooverlap {
 namespace {
 
 using testing::TestCollective;
 
-struct NcclRegistrationApi {
-    using MemAllocFn = ncclResult_t (*)(void**, size_t);
-    using MemFreeFn = ncclResult_t (*)(void*);
-    using CommRegisterFn = ncclResult_t (*)(const ncclComm_t, void*, size_t, void**);
-    using CommDeregisterFn = ncclResult_t (*)(const ncclComm_t, void*);
-
-    MemAllocFn mem_alloc = nullptr;
-    MemFreeFn mem_free = nullptr;
-    CommRegisterFn comm_register = nullptr;
-    CommDeregisterFn comm_deregister = nullptr;
-};
-
-struct NcclRegisteredBuffers {
-    half* rank0 = nullptr;
-    half* rank1 = nullptr;
-    void* rank0_handle = nullptr;
-    void* rank1_handle = nullptr;
-    bool enabled = false;
-};
-
-NcclRegistrationApi load_nccl_registration_api() {
-    NcclRegistrationApi api{};
-
-#if OOVERLAP_BENCH_TRY_NCCL_REGISTERED
-    api.mem_alloc =
-        reinterpret_cast<NcclRegistrationApi::MemAllocFn>(
-            dlsym(RTLD_DEFAULT, "ncclMemAlloc"));
-    api.mem_free =
-        reinterpret_cast<NcclRegistrationApi::MemFreeFn>(
-            dlsym(RTLD_DEFAULT, "ncclMemFree"));
-    api.comm_register =
-        reinterpret_cast<NcclRegistrationApi::CommRegisterFn>(
-            dlsym(RTLD_DEFAULT, "ncclCommRegister"));
-    api.comm_deregister =
-        reinterpret_cast<NcclRegistrationApi::CommDeregisterFn>(
-            dlsym(RTLD_DEFAULT, "ncclCommDeregister"));
-#endif
-
-    return api;
-}
-
-bool nccl_registration_api_available(
-    const NcclRegistrationApi& api) {
-    return api.mem_alloc != nullptr &&
-           api.mem_free != nullptr &&
-           api.comm_register != nullptr &&
-           api.comm_deregister != nullptr;
-}
-
-bool optional_nccl_ok(
-    ncclResult_t result,
-    const char* what) {
-    if (result == ncclSuccess) {
-        return true;
-    }
-
-    std::fprintf(
-        stderr,
-        "[warn] %s failed: %s\n",
-        what,
-        ncclGetErrorString(result));
-    std::fflush(stderr);
-    return false;
-}
-
-void free_nccl_registered_buffers(
-    const NcclRegistrationApi& api,
-    int dev0,
-    int dev1,
-    ncclComm_t* comms,
-    NcclRegisteredBuffers& buffers) {
-    if (api.comm_deregister != nullptr && comms != nullptr) {
-        if (buffers.rank0_handle != nullptr && comms[0] != nullptr) {
-            optional_nccl_ok(
-                api.comm_deregister(comms[0], buffers.rank0_handle),
-                "ncclCommDeregister(rank0 registered)");
-            buffers.rank0_handle = nullptr;
-        }
-
-        if (buffers.rank1_handle != nullptr && comms[1] != nullptr) {
-            optional_nccl_ok(
-                api.comm_deregister(comms[1], buffers.rank1_handle),
-                "ncclCommDeregister(rank1 registered)");
-            buffers.rank1_handle = nullptr;
-        }
-    }
-
-    if (api.mem_free != nullptr) {
-        if (buffers.rank0 != nullptr) {
-            system::runtime::set_device(dev0);
-            optional_nccl_ok(
-                api.mem_free(buffers.rank0),
-                "ncclMemFree(rank0 registered)");
-            buffers.rank0 = nullptr;
-        }
-
-        if (buffers.rank1 != nullptr) {
-            system::runtime::set_device(dev1);
-            optional_nccl_ok(
-                api.mem_free(buffers.rank1),
-                "ncclMemFree(rank1 registered)");
-            buffers.rank1 = nullptr;
-        }
-    }
-
-    buffers.enabled = false;
-}
-
-bool try_create_nccl_registered_buffers(
-    const NcclRegistrationApi& api,
-    int dev0,
-    int dev1,
+void nccl_mem_alloc_half_on_device(
+    int device,
+    half** ptr,
     size_t bytes,
+    const char* label) {
+    if (ptr == nullptr) {
+        throw std::invalid_argument(
+            "nccl_mem_alloc_half_on_device: ptr must not be null");
+    }
+
+    *ptr = nullptr;
+
+    system::runtime::set_device(device);
+
+    void* raw = nullptr;
+
+    OOVERLAP_TEST_NCCL_CHECK(
+        ncclMemAlloc(&raw, bytes));
+
+    if (raw == nullptr) {
+        throw std::runtime_error(
+            std::string(label) + ": ncclMemAlloc returned nullptr");
+    }
+
+    *ptr =
+        reinterpret_cast<half*>(raw);
+}
+
+void nccl_mem_free_on_device(
+    int device,
+    half*& ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+
+    /*
+     * Cleanup path should not throw.
+     */
+    (void)cudaSetDevice(device);
+    (void)ncclMemFree(static_cast<void*>(ptr));
+
+    ptr = nullptr;
+}
+
+void register_nccl_symmetric_windows(
     ncclComm_t* comms,
-    NcclRegisteredBuffers* out) {
-    if (out == nullptr) {
-        return false;
+    half* rank0_buf,
+    half* rank1_buf,
+    size_t bytes,
+    ncclWindow_t& rank0_win,
+    ncclWindow_t& rank1_win) {
+    rank0_win = nullptr;
+    rank1_win = nullptr;
+
+    OOVERLAP_TEST_NCCL_CHECK(ncclGroupStart());
+
+    OOVERLAP_TEST_NCCL_CHECK(
+        ncclCommWindowRegister(
+            comms[0],
+            rank0_buf,
+            bytes,
+            &rank0_win,
+            NCCL_WIN_COLL_SYMMETRIC));
+
+    OOVERLAP_TEST_NCCL_CHECK(
+        ncclCommWindowRegister(
+            comms[1],
+            rank1_buf,
+            bytes,
+            &rank1_win,
+            NCCL_WIN_COLL_SYMMETRIC));
+
+    OOVERLAP_TEST_NCCL_CHECK(ncclGroupEnd());
+}
+
+void deregister_nccl_window_best_effort(
+    ncclComm_t comm,
+    ncclWindow_t& win) {
+    if (comm == nullptr || win == nullptr) {
+        return;
     }
 
-    *out = NcclRegisteredBuffers{};
-
-    if (!nccl_registration_api_available(api)) {
-        std::fprintf(
-            stderr,
-            "[warn] NCCL registered-buffer path unavailable: missing "
-            "ncclMemAlloc/ncclMemFree/ncclCommRegister/ncclCommDeregister. "
-            "Skipping nccl_registered_ms.\n");
-        std::fflush(stderr);
-        return false;
-    }
-
-    if (comms == nullptr || comms[0] == nullptr || comms[1] == nullptr) {
-        std::fprintf(
-            stderr,
-            "[warn] NCCL registered-buffer path unavailable: communicators are null. "
-            "Skipping nccl_registered_ms.\n");
-        std::fflush(stderr);
-        return false;
-    }
-
-    system::runtime::set_device(dev0);
-    if (!optional_nccl_ok(
-            api.mem_alloc(reinterpret_cast<void**>(&out->rank0), bytes),
-            "ncclMemAlloc(rank0 registered)")) {
-        free_nccl_registered_buffers(api, dev0, dev1, comms, *out);
-        return false;
-    }
-
-    system::runtime::set_device(dev1);
-    if (!optional_nccl_ok(
-            api.mem_alloc(reinterpret_cast<void**>(&out->rank1), bytes),
-            "ncclMemAlloc(rank1 registered)")) {
-        free_nccl_registered_buffers(api, dev0, dev1, comms, *out);
-        return false;
-    }
-
-    if (!optional_nccl_ok(
-            api.comm_register(
-                comms[0],
-                out->rank0,
-                bytes,
-                &out->rank0_handle),
-            "ncclCommRegister(rank0 registered)")) {
-        free_nccl_registered_buffers(api, dev0, dev1, comms, *out);
-        return false;
-    }
-
-    if (!optional_nccl_ok(
-            api.comm_register(
-                comms[1],
-                out->rank1,
-                bytes,
-                &out->rank1_handle),
-            "ncclCommRegister(rank1 registered)")) {
-        free_nccl_registered_buffers(api, dev0, dev1, comms, *out);
-        return false;
-    }
-
-    out->enabled = true;
-    return true;
+    (void)ncclCommWindowDeregister(comm, win);
+    win = nullptr;
 }
 
 void launch_ooverlap_public_once_for_rank(
@@ -671,7 +569,6 @@ void bench_nccl_external(
 }
 
 void cleanup(
-    const NcclRegistrationApi& nccl_registration_api,
     int dev0,
     int dev1,
     half*& rank0_src,
@@ -680,7 +577,10 @@ void cleanup(
     half*& ooverlap_rank1,
     half*& nccl_rank0,
     half*& nccl_rank1,
-    NcclRegisteredBuffers& nccl_registered,
+    half*& nccl_symmetric_rank0,
+    half*& nccl_symmetric_rank1,
+    ncclWindow_t& nccl_symmetric_rank0_win,
+    ncclWindow_t& nccl_symmetric_rank1_win,
     oo_buffer_t*& ooverlap_rank0_buf,
     oo_buffer_t*& ooverlap_rank1_buf,
     oo_node_t*& node0,
@@ -690,14 +590,15 @@ void cleanup(
     cudaStream_t& stream1,
     ncclComm_t* comms) {
     /*
-     * Registered buffers must be deregistered before communicators are destroyed.
+     * Symmetric windows must be deregistered before communicators are destroyed.
      */
-    free_nccl_registered_buffers(
-        nccl_registration_api,
-        dev0,
-        dev1,
-        comms,
-        nccl_registered);
+    deregister_nccl_window_best_effort(
+        comms != nullptr ? comms[0] : nullptr,
+        nccl_symmetric_rank0_win);
+
+    deregister_nccl_window_best_effort(
+        comms != nullptr ? comms[1] : nullptr,
+        nccl_symmetric_rank1_win);
 
     testing::destroy_nccl_comms(comms, 2);
 
@@ -716,6 +617,9 @@ void cleanup(
 
     testing::cuda_free_on_device(dev0, nccl_rank0);
     testing::cuda_free_on_device(dev1, nccl_rank1);
+
+    nccl_mem_free_on_device(dev0, nccl_symmetric_rank0);
+    nccl_mem_free_on_device(dev1, nccl_symmetric_rank1);
 
     testing::destroy_oo_node(node0);
     testing::destroy_oo_node(node1);
@@ -786,9 +690,6 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
     const size_t bytes =
         numel * sizeof(half);
 
-    const NcclRegistrationApi nccl_registration_api =
-        load_nccl_registration_api();
-
     oo_group_t* group = nullptr;
     oo_node_t* node0 = nullptr;
     oo_node_t* node1 = nullptr;
@@ -807,18 +708,19 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
     half* ooverlap_rank1 = nullptr;
 
     /*
-     * Standard NCCL comparison buffers.
-     * These use plain cudaMalloc.
+     * Standard NCCL comparison buffers: plain cudaMalloc.
      */
     half* nccl_rank0 = nullptr;
     half* nccl_rank1 = nullptr;
 
     /*
-     * Optional NCCL symmetric/registered comparison buffers.
-     * These use ncclMemAlloc + ncclCommRegister when the runtime exposes those
-     * symbols and registration succeeds for the current communicator/topology.
+     * NCCL symmetric/window comparison buffers:
+     * ncclMemAlloc + ncclCommWindowRegister(..., NCCL_WIN_COLL_SYMMETRIC).
      */
-    NcclRegisteredBuffers nccl_registered{};
+    half* nccl_symmetric_rank0 = nullptr;
+    half* nccl_symmetric_rank1 = nullptr;
+    ncclWindow_t nccl_symmetric_rank0_win = nullptr;
+    ncclWindow_t nccl_symmetric_rank1_win = nullptr;
 
     cudaStream_t stream0 = nullptr;
     cudaStream_t stream1 = nullptr;
@@ -900,6 +802,18 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             bytes,
             "cudaMalloc(nccl_rank1)");
 
+        nccl_mem_alloc_half_on_device(
+            node0_dev,
+            &nccl_symmetric_rank0,
+            bytes,
+            "ncclMemAlloc(nccl_symmetric_rank0)");
+
+        nccl_mem_alloc_half_on_device(
+            node1_dev,
+            &nccl_symmetric_rank1,
+            bytes,
+            "ncclMemAlloc(nccl_symmetric_rank1)");
+
         testing::fill_two_rank_sources_fp16(
             rank0_src,
             rank1_src,
@@ -915,14 +829,13 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
                 2,
                 devices));
 
-        const bool have_nccl_registered =
-            try_create_nccl_registered_buffers(
-                nccl_registration_api,
-                node0_dev,
-                node1_dev,
-                bytes,
-                comms,
-                &nccl_registered);
+        register_nccl_symmetric_windows(
+            comms,
+            nccl_symmetric_rank0,
+            nccl_symmetric_rank1,
+            bytes,
+            nccl_symmetric_rank0_win,
+            nccl_symmetric_rank1_win);
 
         std::map<std::string, double> results;
 
@@ -984,25 +897,23 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             iters,
             warmup);
 
-        if (have_nccl_registered) {
-            bench_nccl_external(
-                results,
-                "nccl_registered_ms",
-                collective,
-                rank0_src,
-                rank1_src,
-                nccl_registered.rank0,
-                nccl_registered.rank1,
-                numel,
-                bytes,
-                node0_dev,
-                node1_dev,
-                stream0,
-                stream1,
-                comms,
-                iters,
-                warmup);
-        }
+        bench_nccl_external(
+            results,
+            "nccl_symmetric_ms",
+            collective,
+            rank0_src,
+            rank1_src,
+            nccl_symmetric_rank0,
+            nccl_symmetric_rank1,
+            numel,
+            bytes,
+            node0_dev,
+            node1_dev,
+            stream0,
+            stream1,
+            comms,
+            iters,
+            warmup);
 
         results["collective"] =
             testing::collective_code(collective);
@@ -1020,7 +931,6 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             static_cast<double>(warmup);
 
         cleanup(
-            nccl_registration_api,
             node0_dev,
             node1_dev,
             rank0_src,
@@ -1029,7 +939,10 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             ooverlap_rank1,
             nccl_rank0,
             nccl_rank1,
-            nccl_registered,
+            nccl_symmetric_rank0,
+            nccl_symmetric_rank1,
+            nccl_symmetric_rank0_win,
+            nccl_symmetric_rank1_win,
             ooverlap_rank0_buf,
             ooverlap_rank1_buf,
             node0,
@@ -1048,7 +961,6 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             node1 != nullptr ? oo_node_device(node1) : dev1;
 
         cleanup(
-            nccl_registration_api,
             node0_dev,
             node1_dev,
             rank0_src,
@@ -1057,7 +969,10 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             ooverlap_rank1,
             nccl_rank0,
             nccl_rank1,
-            nccl_registered,
+            nccl_symmetric_rank0,
+            nccl_symmetric_rank1,
+            nccl_symmetric_rank0_win,
+            nccl_symmetric_rank1_win,
             ooverlap_rank0_buf,
             ooverlap_rank1_buf,
             node0,
