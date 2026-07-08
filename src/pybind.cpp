@@ -318,6 +318,27 @@ PYBIND11_MODULE(ooverlap_ext, m) {
   m.def("gemm_signal_sm90_algo_info", &gemm_signal_sm90_algo_info);
   m.def("gemm_plain_sm90_algo_info", &gemm_plain_sm90_algo_info);
 
+
+  // OOVERLAP_TMA_BATCH_EXPERIMENT_API_PATCH:
+  m.def("benchmark_tma_batch_experiment_sweep_sm90",
+        &ooverlap::benchmark_tma_batch_experiment_sweep_sm90,
+        py::arg("sizes_bytes"),
+        py::arg("num_blocks_list"),
+        py::arg("iters") = 100,
+        py::arg("warmup") = 20,
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1);
+
+  m.def("benchmark_tma_batch_experiment_sm90",
+        &ooverlap::benchmark_tma_batch_experiment_sm90,
+        py::arg("min_bytes") = 512 * 1024,
+        py::arg("max_bytes") = 256LL * 1024LL * 1024LL,
+        py::arg("iters") = 100,
+        py::arg("warmup") = 20,
+        py::arg("num_blocks") = 8,
+        py::arg("dev0") = 0,
+        py::arg("dev1") = 1);
+
   /*m.def("benchmark_tma_bandwidth_experiment_sm90",*/
         /*&ooverlap::benchmark_tma_bandwidth_experiment_sm90,*/
         /*py::arg("min_bytes") = 512 * 1024,*/
