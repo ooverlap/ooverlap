@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(ooverlap LANGUAGES CXX CUDA)
 
+
+# OOVERLAP_DEFAULT_RELEASE_PATCH:
+# Default to Release for single-config generators unless the user explicitly
+# selected another build type.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(OOVERLAP_LOG_LEVEL "2" CACHE STRING
     "ooverlap compile-time log level: 0 none, 1 fatal, 2 error, 3 warn, 4 info, 5 debug, 6 trace")
 

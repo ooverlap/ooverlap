@@ -26,6 +26,20 @@ function(ooverlap_enable_pic target)
   set_property(TARGET ${target} PROPERTY POSITION_INDEPENDENT_CODE ON)
 endfunction()
 
+
+
+# OOVERLAP_TARGET_RELEASE_OPTS_PATCH:
+# Force optimized compilation for hot ooverlap targets even when the caller
+# forgets -DCMAKE_BUILD_TYPE=Release.
+function(ooverlap_enable_release_opts target)
+  if(TARGET ${target})
+    target_compile_definitions(${target} PRIVATE NDEBUG)
+    target_compile_options(${target} PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:-O3>
+      $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    )
+  endif()
+endfunction()
 function(ooverlap_public_include_dirs target)
   target_include_directories(${target} PUBLIC
     ${PROJECT_SOURCE_DIR}/include
@@ -157,6 +171,7 @@ add_library(ooverlap::topology ALIAS ooverlap_topology)
 ooverlap_force_sm90a(ooverlap_topology)
 ooverlap_enable_pic(ooverlap_topology)
 
+ooverlap_enable_release_opts(ooverlap_topology)
 set_property(TARGET ooverlap_topology PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 set_property(TARGET ooverlap_topology PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -183,6 +198,7 @@ add_library(ooverlap::system ALIAS ooverlap_system)
 
 ooverlap_enable_pic(ooverlap_system)
 
+ooverlap_enable_release_opts(ooverlap_system)
 target_include_directories(ooverlap_system
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
@@ -222,6 +238,7 @@ if(OOVERLAP_NEED_CORE)
   ooverlap_force_sm90a(ooverlap_comm)
   ooverlap_enable_pic(ooverlap_comm)
 
+  ooverlap_enable_release_opts(ooverlap_comm)
   set_property(TARGET ooverlap_comm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
   set_property(TARGET ooverlap_comm PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -281,6 +298,7 @@ if(OOVERLAP_NEED_CUTLASS)
   ooverlap_force_sm90a(ooverlap_gemm)
   ooverlap_enable_pic(ooverlap_gemm)
 
+  ooverlap_enable_release_opts(ooverlap_gemm)
   # CUTLASS SM90 WGMMA kernels should not be compiled with RDC.
   set_property(TARGET ooverlap_gemm PROPERTY CUDA_SEPARABLE_COMPILATION OFF)
   set_property(TARGET ooverlap_gemm PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
@@ -335,6 +353,7 @@ if(OOVERLAP_BUILD_TESTS OR OOVERLAP_BUILD_PYTHON)
   ooverlap_force_sm90a(ooverlap_tests)
   ooverlap_enable_pic(ooverlap_tests)
 
+  ooverlap_enable_release_opts(ooverlap_tests)
   set_property(TARGET ooverlap_tests PROPERTY CUDA_SEPARABLE_COMPILATION ON)
   set_property(TARGET ooverlap_tests PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -373,6 +392,7 @@ if(OOVERLAP_BUILD_RMSNORM)
     ooverlap_force_sm90a(ooverlap_norm)
     ooverlap_enable_pic(ooverlap_norm)
 
+    ooverlap_enable_release_opts(ooverlap_norm)
     set_property(TARGET ooverlap_norm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
     ooverlap_public_include_dirs(ooverlap_norm)
@@ -400,6 +420,7 @@ if(OOVERLAP_BUILD_PYTHON)
   set_source_files_properties(${OOVERLAP_SRC_DIR}/baseline_impl.cu PROPERTIES LANGUAGE CXX)
 
   ooverlap_enable_pic(ooverlap_baseline_impl)
+  ooverlap_enable_release_opts(ooverlap_baseline_impl)
   ooverlap_public_include_dirs(ooverlap_baseline_impl)
 
   target_include_directories(ooverlap_baseline_impl PUBLIC ${NCCL_INCLUDE_DIR})
@@ -422,6 +443,7 @@ if(OOVERLAP_BUILD_PYTHON)
   ooverlap_force_sm90a(ooverlap_overlap_impl)
   ooverlap_enable_pic(ooverlap_overlap_impl)
 
+  ooverlap_enable_release_opts(ooverlap_overlap_impl)
   set_property(TARGET ooverlap_overlap_impl PROPERTY CUDA_SEPARABLE_COMPILATION ON)
   set_property(TARGET ooverlap_overlap_impl PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -447,6 +469,7 @@ if(OOVERLAP_BUILD_PYTHON)
   set_source_files_properties(${OOVERLAP_SRC_DIR}/nccl_utils.cu PROPERTIES LANGUAGE CXX)
 
   ooverlap_enable_pic(ooverlap_nccl_tool)
+  ooverlap_enable_release_opts(ooverlap_nccl_tool)
   ooverlap_public_include_dirs(ooverlap_nccl_tool)
 
   target_include_directories(ooverlap_nccl_tool PUBLIC ${NCCL_INCLUDE_DIR})
@@ -466,6 +489,8 @@ add_executable(ooverlap_topology_cli
   ${OOVERLAP_SRC_DIR}/topology/topology_cli.cpp
 )
 
+
+ooverlap_enable_release_opts(ooverlap_topology_cli)
 target_include_directories(ooverlap_topology_cli PRIVATE
   ${OOVERLAP_SRC_DIR}
   ${PROJECT_SOURCE_DIR}/include
@@ -507,6 +532,7 @@ if(OOVERLAP_BUILD_PYTHON)
   ooverlap_force_sm90a(ooverlap_ext)
   ooverlap_enable_pic(ooverlap_ext)
 
+  ooverlap_enable_release_opts(ooverlap_ext)
   set_target_properties(ooverlap_ext PROPERTIES
     PREFIX ""
     LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib
