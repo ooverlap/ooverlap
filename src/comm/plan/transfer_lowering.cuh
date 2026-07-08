@@ -433,19 +433,30 @@ inline bool lower_transfer_task_to_window_task(
 
     const bool uses_shm_staging =
         transfer_task_uses_shm_staging(transfer);
-
+    
+    const bool copy_uses_shm_staging =
+        transfer.op == TransferOp::Copy &&
+        uses_shm_staging;
+    
+    const bool reduce_from_shm_staging =
+        transfer.op == TransferOp::Reduce &&
+        transfer.src.role == LogicalBufferRole::ShmStaging &&
+        transfer.dst.role != LogicalBufferRole::ShmStaging;
+    
     if (!transfer_transport_direct(transfer.transport) &&
-        !(transfer.op == TransferOp::Copy && uses_shm_staging)) {
+        !copy_uses_shm_staging &&
+        !reduce_from_shm_staging) {
         /*
          * Non-direct non-staging transports still need their own executor rules.
          *
-         * A Copy task that explicitly references ShmStaging is lowered to
-         * CopyFast below. This lets planners opt into staging by using
-         * shm_staging_ref(slot, offset) without requiring a dedicated staging
-         * WindowTaskOp yet.
+         * Staged collectives are allowed to use ShmStaging explicitly:
+         *   - Copy RankBuffer -> ShmStaging
+         *   - Copy ShmStaging -> RankBuffer
+         *   - Reduce ShmStaging -> RankBuffer
          */
         return false;
     }
+    
 
     if (transfer.op == TransferOp::Reduce) {
         if (!transfer.requires_tma_reduce) {
