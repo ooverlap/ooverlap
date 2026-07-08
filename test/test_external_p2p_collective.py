@@ -24,6 +24,16 @@ def load_ooverlap_ext():
     return mod
 
 
+def print_speedup_line(label: str, baseline_label: str, baseline: float, value: float):
+    speedup = baseline / value
+    pct = (speedup - 1.0) * 100.0
+
+    if pct >= 0.0:
+        print(f"  {label}_speedup_over_{baseline_label}: {speedup:.6f}x (+{pct:.2f}%)")
+    else:
+        print(f"  {label}_speedup_over_{baseline_label}: {speedup:.6f}x ({pct:.2f}%)")
+
+
 def print_metrics(title, metrics):
     print(f"\n[{title}]")
 
@@ -35,29 +45,34 @@ def print_metrics(title, metrics):
 
     nccl_ms = metrics.get("nccl_ms", None)
 
-    if not isinstance(nccl_ms, float) or nccl_ms <= 0.0:
-        return
+    if isinstance(nccl_ms, float) and nccl_ms > 0.0:
+        print("\n[Speedup over NCCL]")
 
-    print("\n[Speedup over NCCL]")
+        ooverlap_ms = metrics.get("ooverlap_ms", None)
+        if isinstance(ooverlap_ms, float) and ooverlap_ms > 0.0:
+            print_speedup_line("ooverlap", "nccl", nccl_ms, ooverlap_ms)
 
-    speedup_keys = [
-        ("normal_ms", "normal"),
-        ("efficiency_ms", "efficiency"),
-    ]
+        nccl_registered_ms = metrics.get("nccl_registered_ms", None)
+        if isinstance(nccl_registered_ms, float) and nccl_registered_ms > 0.0:
+            print_speedup_line(
+                "nccl_registered",
+                "nccl",
+                nccl_ms,
+                nccl_registered_ms,
+            )
 
-    for metric_key, label in speedup_keys:
-        value = metrics.get(metric_key, None)
+    nccl_registered_ms = metrics.get("nccl_registered_ms", None)
+    ooverlap_ms = metrics.get("ooverlap_ms", None)
 
-        if not isinstance(value, float) or value <= 0.0:
-            continue
-
-        speedup = nccl_ms / value
-        pct = (speedup - 1.0) * 100.0
-
-        if pct >= 0.0:
-            print(f"  {label}_speedup_over_nccl: {speedup:.6f}x (+{pct:.2f}%)")
-        else:
-            print(f"  {label}_speedup_over_nccl: {speedup:.6f}x ({pct:.2f}%)")
+    if (isinstance(nccl_registered_ms, float) and nccl_registered_ms > 0.0 and
+            isinstance(ooverlap_ms, float) and ooverlap_ms > 0.0):
+        print("\n[Speedup over registered NCCL]")
+        print_speedup_line(
+            "ooverlap",
+            "nccl_registered",
+            nccl_registered_ms,
+            ooverlap_ms,
+        )
 
 
 def collective_display_name(collective: str) -> str:
@@ -126,43 +141,52 @@ def run_benchmark(
     )
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(
-        "External-buffer P2P 2-GPU collective smoke + benchmark"
-    )
-
-    parser.add_argument(
-        "--collective",
-        choices=VALID_COLLECTIVES,
-        default="allreduce",
-        help="Collective to benchmark: allreduce, reduce_scatter, or all_gather.",
+        description="External-buffer two-GPU collective test/benchmark"
     )
 
     parser.add_argument(
         "--mode",
-        choices=["smoke", "bench", "both"],
+        choices=("smoke", "bench", "both"),
         default="both",
     )
+    parser.add_argument(
+        "--collective",
+        choices=VALID_COLLECTIVES,
+        default="allreduce",
+    )
+    parser.add_argument(
+        "--numel",
+        type=int,
+        default=1 << 20,
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=100,
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=20,
+    )
+    parser.add_argument(
+        "--dev0",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--dev1",
+        type=int,
+        default=1,
+    )
 
-    parser.add_argument("--numel", type=int, default=1 << 20)
-    parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--dev0", type=int, default=0)
-    parser.add_argument("--dev1", type=int, default=1)
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    assert torch.cuda.is_available(), "torch.cuda.is_available() is False"
-    assert torch.cuda.device_count() >= 2, "Need at least 2 GPUs"
-
-    if args.dev0 == args.dev1:
-        raise ValueError("--dev0 and --dev1 must be different")
-
-    if args.dev0 < 0 or args.dev0 >= torch.cuda.device_count():
-        raise ValueError(f"--dev0={args.dev0} is outside available CUDA devices")
-
-    if args.dev1 < 0 or args.dev1 >= torch.cuda.device_count():
-        raise ValueError(f"--dev1={args.dev1} is outside available CUDA devices")
+def main():
+    args = parse_args()
 
     if args.numel <= 0:
         raise ValueError("--numel must be > 0")
@@ -173,11 +197,8 @@ def main():
     if args.warmup < 0:
         raise ValueError("--warmup must be >= 0")
 
-    if args.collective in ("reduce_scatter", "all_gather") and (args.numel % 2) != 0:
-        raise ValueError(
-            f"--numel must be divisible by 2 for {args.collective} "
-            "because the NCCL comparison uses equal 2-GPU shards"
-        )
+    if args.dev0 == args.dev1:
+        raise ValueError("--dev0 and --dev1 must differ")
 
     display_collective = collective_display_name(args.collective)
 
@@ -186,7 +207,7 @@ def main():
     print(f"[info] cuda device count: {torch.cuda.device_count()}")
     print(f"[info] collective={args.collective} ({display_collective})")
     print("[info] memory mode=external cudaMalloc buffers + oo_buffer_wrap + oo_group_create_p2p")
-    print("[info] NCCL mode=normal ncclCommInitAll + cudaMalloc buffers; no ncclMemAlloc/window register")
+    print("[info] NCCL modes=normal cudaMalloc, plus optional ncclMemAlloc + ncclCommRegister")
     print(f"[info] dev0={args.dev0} dev1={args.dev1}")
     print(f"[info] numel={args.numel} iters={args.iters} warmup={args.warmup}")
 
@@ -217,7 +238,7 @@ def main():
         )
 
         print_metrics(
-            f"External-buffer P2P 2-GPU {display_collective} vs NCCL",
+            f"External-buffer P2P 2-GPU {display_collective}: ooverlap vs NCCL",
             metrics,
         )
 
