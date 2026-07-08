@@ -177,7 +177,7 @@ __device__ __forceinline__ void wait_until_ready_signal_at_least(
 
     while (load_ready_signal(ready_signal) < collective_epoch) {
 #if defined(__CUDA_ARCH__)
-        __nanosleep(64);
+        __nanosleep(32);
 #endif
     }
 }

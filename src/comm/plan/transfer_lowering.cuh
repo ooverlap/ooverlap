@@ -965,26 +965,42 @@ inline bool emit_window_plan_from_rank_tasks(
                         shape.cta_count > 0
                             ? (ready_pair_index % shape.cta_count)
                             : 0;
-
-                    task::WindowTask merged_ready_task{};
-
-                    if (!lower_ready_publish_wait_transfer_tasks_to_window_task(
-                            rank_tasks.tasks[i],
-                            rank_tasks.tasks[i + 1],
-                            *ctx.ready_binding,
-                            owner_cta,
-                            &merged_ready_task)) {
-                        out_window_plan->total_tasks = 0;
-                        out_window_plan->tasks_per_cta = 0;
-                        *out_num_blocks = 0;
-                        return false;
+                
+                    task::WindowTask ready_task{};
+                
+                    if (cta_idx == owner_cta) {
+                        if (!lower_ready_publish_wait_transfer_tasks_to_window_task(
+                                rank_tasks.tasks[i],
+                                rank_tasks.tasks[i + 1],
+                                *ctx.ready_binding,
+                                owner_cta,
+                                &ready_task)) {
+                            out_window_plan->total_tasks = 0;
+                            out_window_plan->tasks_per_cta = 0;
+                            *out_num_blocks = 0;
+                            return false;
+                        }
+                    } else {
+                        /*
+                         * Non-owner CTAs only wait on the peer signal. They must not publish
+                         * to the same local ready slot.
+                         */
+                        if (!lower_ready_transfer_task_to_window_task(
+                                rank_tasks.tasks[i + 1],
+                                *ctx.ready_binding,
+                                &ready_task)) {
+                            out_window_plan->total_tasks = 0;
+                            out_window_plan->tasks_per_cta = 0;
+                            *out_num_blocks = 0;
+                            return false;
+                        }
                     }
-
-                    out_window_plan->tasks[task_idx++] = merged_ready_task;
+                
+                    out_window_plan->tasks[task_idx++] = ready_task;
                     ++ready_pair_index;
                     ++i;
                     continue;
-                }
+                } 
 
                 task::WindowTask ready_task{};
 
