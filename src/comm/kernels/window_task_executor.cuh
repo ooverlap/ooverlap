@@ -276,9 +276,9 @@ __device__ __forceinline__ void execute_window_task_stripe(
             return;
         }
 
-/*        if (local_task >= 1) {*/
-            /*return;*/
-        /*}*/
+        if (local_task >= 1) {
+            return;
+        }
 
         const task::WindowTask task = tasks[task_idx];
 

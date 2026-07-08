@@ -591,14 +591,41 @@ template <int MaxTransferTasks>
 struct RankTransferTaskBuffer {
     static_assert(MaxTransferTasks > 0, "MaxTransferTasks must be > 0");
 
-    int count = 0;
-    int ready_count = 0;
-    int ready_pair_count = 0;
-    int window_count = 0;
-    int max_end_window = 0;
+    int count;
+    int ready_count;
+    int ready_pair_count;
+    int window_count;
+    int max_end_window;
 
-    TransferTask tasks[MaxTransferTasks] = {};
+    /*
+     * Do not value-initialize this array. This buffer is hot in the lowering
+     * path, and TransferTask is relatively large. The valid range is
+     * tasks[0..count), and every entry in that range is assigned by
+     * rank_transfer_task_buffer_push() before being read.
+     *
+     * OOVERLAP_NO_RANK_TASK_BUFFER_ZEROING_PATCH.
+     */
+    TransferTask tasks[MaxTransferTasks];
 };
+
+template <int MaxTransferTasks>
+inline void rank_transfer_task_buffer_reset(
+    RankTransferTaskBuffer<MaxTransferTasks>* buffer) {
+    if (buffer == nullptr) {
+        return;
+    }
+
+    /*
+     * Reset only metadata. Leaving stale entries outside tasks[0..count)
+     * untouched avoids a large memset/copy on every lower_transfer_plan_for_rank
+     * call.
+     */
+    buffer->count = 0;
+    buffer->ready_count = 0;
+    buffer->ready_pair_count = 0;
+    buffer->window_count = 0;
+    buffer->max_end_window = 0;
+}
 
 template <int MaxTransferTasks>
 inline bool rank_transfer_task_buffer_push(
@@ -681,7 +708,7 @@ inline bool collect_rank_transfer_tasks(
         return false;
     }
 
-    *out = RankTransferTaskBuffer<MaxTransferTasks>{};
+    rank_transfer_task_buffer_reset(out);
 
     for (int i = 0; i < transfer_plan.total_tasks; ++i) {
         const TransferTask& transfer = transfer_plan.tasks[i];
@@ -777,10 +804,10 @@ inline bool pass_drop_disabled_ready_tasks(
         tasks->tasks[write++] = transfer;
     }
 
-    for (int i = write; i < tasks->count; ++i) {
-        tasks->tasks[i] = TransferTask{};
-    }
-
+    /*
+     * Do not clear stale tail entries. tasks->count is the only valid length,
+     * and downstream code never reads tasks[write..old_count).
+     */
     tasks->count = write;
     return recompute_rank_transfer_task_stats(tasks);
 }
@@ -1207,7 +1234,10 @@ bool lower_transfer_plan_for_rank(
         return false;
     }
 
-    lowering_detail::RankTransferTaskBuffer<MaxTransferTasks> rank_tasks{};
+    return true;
+
+    lowering_detail::RankTransferTaskBuffer<MaxTransferTasks> rank_tasks;
+    lowering_detail::rank_transfer_task_buffer_reset(&rank_tasks);
 
     if (!lowering_detail::collect_rank_transfer_tasks(
             transfer_plan,

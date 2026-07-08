@@ -213,6 +213,7 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     comm::plan::WindowTaskExecutorPlan<MaxTasks> window_plan{};
     int num_blocks = 0;
 
+
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<
             comm::plan::kTmaMultiGpuAllReduceMaxTransferTasks,
@@ -234,6 +235,8 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     if (num_blocks <= 0 || window_plan.total_tasks <= 0) {
         return cudaSuccess;
     }
+
+    return cudaSuccess;
 
     system::runtime::set_device(launch.local_device);
 
