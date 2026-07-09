@@ -580,37 +580,56 @@ __device__ __forceinline__ void BASE_NAME##_fanout_runtime_one_op_nofence(    \
                 size_bytes);                                                 \
             break;                                                           \
         case TmaReduceScope::Cta:                                            \
-        case TmaReduceScope::Cluster:                                        \
-        case TmaReduceScope::Gpu:                                            \
-        case TmaReduceScope::Sys:                                            \
-#if OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE                                      \
-            if (target.scope == TmaReduceScope::Cta) {                       \
+            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {             \
                 BASE_NAME##_op_nofence<TmaReduceScope::Cta>(                 \
                     target.dst_gmem,                                         \
                     src_smem,                                                \
                     size_bytes);                                             \
-            } else if (target.scope == TmaReduceScope::Cluster) {            \
+            } else {                                                         \
+                BASE_NAME##_op_nofence<TmaReduceScope::Default>(             \
+                    target.dst_gmem,                                         \
+                    src_smem,                                                \
+                    size_bytes);                                             \
+            }                                                                \
+            break;                                                           \
+        case TmaReduceScope::Cluster:                                        \
+            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {             \
                 BASE_NAME##_op_nofence<TmaReduceScope::Cluster>(             \
                     target.dst_gmem,                                         \
                     src_smem,                                                \
                     size_bytes);                                             \
-            } else if (target.scope == TmaReduceScope::Gpu) {                \
+            } else {                                                         \
+                BASE_NAME##_op_nofence<TmaReduceScope::Default>(             \
+                    target.dst_gmem,                                         \
+                    src_smem,                                                \
+                    size_bytes);                                             \
+            }                                                                \
+            break;                                                           \
+        case TmaReduceScope::Gpu:                                            \
+            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {             \
                 BASE_NAME##_op_nofence<TmaReduceScope::Gpu>(                 \
                     target.dst_gmem,                                         \
                     src_smem,                                                \
                     size_bytes);                                             \
             } else {                                                         \
-                BASE_NAME##_op_nofence<TmaReduceScope::Sys>(                 \
+                BASE_NAME##_op_nofence<TmaReduceScope::Default>(             \
                     target.dst_gmem,                                         \
                     src_smem,                                                \
                     size_bytes);                                             \
             }                                                                \
-#else                                                                        \
-            BASE_NAME##_op_nofence<TmaReduceScope::Default>(                 \
-                target.dst_gmem,                                             \
-                src_smem,                                                    \
-                size_bytes);                                                 \
-#endif                                                                       \
+            break;                                                           \
+        case TmaReduceScope::Sys:                                            \
+            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {             \
+                BASE_NAME##_op_nofence<TmaReduceScope::Sys>(                 \
+                    target.dst_gmem,                                         \
+                    src_smem,                                                \
+                    size_bytes);                                             \
+            } else {                                                         \
+                BASE_NAME##_op_nofence<TmaReduceScope::Default>(             \
+                    target.dst_gmem,                                         \
+                    src_smem,                                                \
+                    size_bytes);                                             \
+            }                                                                \
             break;                                                           \
         default:                                                             \
             break;                                                           \
@@ -668,15 +687,6 @@ __device__ __forceinline__ void BASE_NAME##_fanout_runtime_commit(            \
     }                                                                        \
 }
 
-OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_f16_async)
-OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_noftz_f16_async)
-OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_noftz_bf16_async)
-OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_bf16_async)
-OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_f32_async)
-OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_min_f16_async)
-OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_min_bf16_async)
-OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_max_f16_async)
-OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_max_bf16_async)
 
 #undef OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME
 
