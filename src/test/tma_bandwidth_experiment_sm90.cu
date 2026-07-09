@@ -41,6 +41,7 @@ static_assert((kChunkBytes % sizeof(uint4)) == 0, "chunk bytes must be 16B align
 enum BatchExperimentId {
     kBatchExperimentReduceTwoToOne = 0,
     kBatchExperimentCopyOneToTwo = 1,
+    kBatchExperimentReduceOneToTwo = 2,
 };
 
 enum BatchMethodId {
@@ -48,6 +49,9 @@ enum BatchMethodId {
     kBatchMethodReduceSplitCtasGpuScope = 1,
     kBatchMethodCopySequentialAllCtas = 2,
     kBatchMethodCopyFanoutOneLoadTwoStores = 3,
+    kBatchMethodReduceSplitCtasOppositeDirectionsGpuScope = 4,
+    kBatchMethodReduceFanoutSequentialAllCtas = 5,
+    kBatchMethodReduceFanoutOneLoadTwoReducesGpuScope = 6,
 };
 
 struct ChunkRange {
@@ -63,6 +67,10 @@ struct BatchExperimentBuffers {
     system::mapped_peer_buffer copy_src_local{};
     system::mapped_peer_buffer copy_dst0_peer{};
     system::mapped_peer_buffer copy_dst1_peer{};
+
+    system::mapped_peer_buffer reduce_fanout_src_local{};
+    system::mapped_peer_buffer reduce_fanout_dst0_peer{};
+    system::mapped_peer_buffer reduce_fanout_dst1_peer{};
 };
 
 __host__ __device__ __forceinline__ int ceil_div_size_to_int(
@@ -94,6 +102,28 @@ __host__ __device__ __forceinline__ ChunkRange make_block_chunk_range(
     }
 
     return range;
+}
+
+__host__ __device__ __forceinline__ ChunkRange make_block_chunk_range_backward(
+    int block_idx,
+    int num_blocks,
+    int num_chunks) {
+    const int reverse_block_idx =
+        num_blocks - 1 - block_idx;
+
+    return make_block_chunk_range(
+        reverse_block_idx,
+        num_blocks,
+        num_chunks);
+}
+
+__host__ __device__ __forceinline__ int chunk_for_iter(
+    ChunkRange range,
+    int iter,
+    bool reverse_chunks) {
+    return reverse_chunks
+        ? range.start_chunk + (range.chunk_count - 1 - iter)
+        : range.start_chunk + iter;
 }
 
 __host__ __forceinline__ bool is_aligned_16_host(
@@ -206,7 +236,7 @@ __device__ __forceinline__ unsigned char* pointer_for_abs_chunk(
  *   - split-CTA experiment: one kernel maps half of the CTAs to src0 and half
  *     to src1 while reducing to the same destination address range.
  */
-template <tma::TmaReduceScope Scope>
+template <tma::TmaReduceScope Scope, bool ReverseChunks>
 __device__ __forceinline__ void run_tma_reduce_one_range_thread0_only(
     const void* src_base,
     void* dst_base,
@@ -245,7 +275,7 @@ __device__ __forceinline__ void run_tma_reduce_one_range_thread0_only(
         }
 
         const int abs_chunk =
-            range.start_chunk + warm;
+            chunk_for_iter(range, warm, ReverseChunks);
 
         comm::pipeline::PipelineStage stage =
             make_stage_for_abs_chunk<kChunkBytes>(
@@ -262,7 +292,7 @@ __device__ __forceinline__ void run_tma_reduce_one_range_thread0_only(
 
     for (int iter = 0; iter < range.chunk_count; ++iter) {
         const int abs_chunk =
-            range.start_chunk + iter;
+            chunk_for_iter(range, iter, ReverseChunks);
 
         const int cur_slot =
             iter % kStageDepth;
@@ -284,7 +314,7 @@ __device__ __forceinline__ void run_tma_reduce_one_range_thread0_only(
 
         if (future_iter < range.chunk_count) {
             const int future_abs_chunk =
-                range.start_chunk + future_iter;
+                chunk_for_iter(range, future_iter, ReverseChunks);
 
             const int future_slot =
                 future_iter % kStageDepth;
@@ -430,6 +460,130 @@ __device__ __forceinline__ void run_tma_copy_fanout2_range_thread0_only(
     __threadfence_system();
 }
 
+
+/*
+ * One source buffer to two destination buffers using TMA reductions:
+ *   load once into shared memory
+ *   issue two cp.reduce.async.bulk operations
+ *   commit once
+ */
+template <tma::TmaReduceScope Scope>
+__device__ __forceinline__ void run_tma_reduce_fanout2_range_thread0_only(
+    const void* src_base,
+    void* dst0_base,
+    void* dst1_base,
+    size_t total_bytes,
+    ChunkRange range,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    if (range.chunk_count <= 0 || total_bytes == 0) {
+        return;
+    }
+
+    const unsigned char* src_bytes =
+        reinterpret_cast<const unsigned char*>(src_base);
+
+    unsigned char* dst0_bytes =
+        reinterpret_cast<unsigned char*>(dst0_base);
+
+    comm::pipeline::PipelineTMALoad load{};
+
+    using ReduceBatch =
+        comm::pipeline::PipelineTMAReduceBatch<
+            kStageDepth,
+            kFillDepth,
+            comm::pipeline::PipelineReduceBatchAddNoFtzF16,
+            Scope>;
+
+    ReduceBatch reduce{};
+
+    for (int warm = 0; warm < kFillDepth; ++warm) {
+        if (warm >= range.chunk_count) {
+            break;
+        }
+
+        const int abs_chunk =
+            range.start_chunk + warm;
+
+        comm::pipeline::PipelineStage stage =
+            make_stage_for_abs_chunk<kChunkBytes>(
+                src_bytes,
+                dst0_bytes,
+                total_bytes,
+                abs_chunk,
+                warm,
+                shared_raw,
+                barriers);
+
+        load.issue(&stage);
+    }
+
+    for (int iter = 0; iter < range.chunk_count; ++iter) {
+        const int abs_chunk =
+            range.start_chunk + iter;
+
+        const int cur_slot =
+            iter % kStageDepth;
+
+        comm::pipeline::PipelineStage cur_stage =
+            make_stage_for_abs_chunk<kChunkBytes>(
+                src_bytes,
+                dst0_bytes,
+                total_bytes,
+                abs_chunk,
+                cur_slot,
+                shared_raw,
+                barriers);
+
+        load.wait_ready(&cur_stage);
+
+        const int future_iter =
+            iter + kFillDepth;
+
+        if (future_iter < range.chunk_count) {
+            const int future_abs_chunk =
+                range.start_chunk + future_iter;
+
+            const int future_slot =
+                future_iter % kStageDepth;
+
+            comm::pipeline::PipelineStage future_stage =
+                make_stage_for_abs_chunk<kChunkBytes>(
+                    src_bytes,
+                    dst0_bytes,
+                    total_bytes,
+                    future_abs_chunk,
+                    future_slot,
+                    shared_raw,
+                    barriers);
+
+            if (iter >= kFillDepth) {
+                reduce.wait_before_stage_reuse();
+            }
+
+            load.issue(&future_stage);
+        }
+
+        void* dst0 =
+            pointer_for_abs_chunk<kChunkBytes>(dst0_base, abs_chunk);
+
+        void* dst1 =
+            pointer_for_abs_chunk<kChunkBytes>(dst1_base, abs_chunk);
+
+        reduce.issue_fence();
+        reduce.issue_bulk_op_nofence(&cur_stage, dst0);
+        reduce.issue_bulk_op_nofence(&cur_stage, dst1);
+        reduce.commit();
+    }
+
+    reduce.wait_complete();
+    __threadfence_system();
+}
+
 __global__ void tma_reduce_add_f16_gpu_scope_kernel(
     const void* src,
     void* dst,
@@ -452,7 +606,7 @@ __global__ void tma_reduce_add_f16_gpu_scope_kernel(
 
     __shared__ sync::semaphore barriers[kBarrierCount];
 
-    run_tma_reduce_one_range_thread0_only<tma::TmaReduceScope::Gpu>(
+    run_tma_reduce_one_range_thread0_only<tma::TmaReduceScope::Gpu, false>(
         src,
         dst,
         total_bytes,
@@ -461,6 +615,7 @@ __global__ void tma_reduce_add_f16_gpu_scope_kernel(
         barriers);
 }
 
+template <bool OppositeDirections>
 __global__ void tma_reduce_add_f16_split2_gpu_scope_kernel(
     const void* src0,
     const void* src1,
@@ -496,10 +651,15 @@ __global__ void tma_reduce_add_f16_split2_gpu_scope_kernel(
         use_src0 ? src0 : src1;
 
     const ChunkRange range =
-        make_block_chunk_range(
-            local_block,
-            local_blocks,
-            num_chunks);
+        (!use_src0 && OppositeDirections)
+            ? make_block_chunk_range_backward(
+                  local_block,
+                  local_blocks,
+                  num_chunks)
+            : make_block_chunk_range(
+                  local_block,
+                  local_blocks,
+                  num_chunks);
 
     if (range.chunk_count <= 0) {
         return;
@@ -512,13 +672,23 @@ __global__ void tma_reduce_add_f16_split2_gpu_scope_kernel(
 
     __shared__ sync::semaphore barriers[kBarrierCount];
 
-    run_tma_reduce_one_range_thread0_only<tma::TmaReduceScope::Gpu>(
-        src,
-        dst,
-        total_bytes,
-        range,
-        shared_raw,
-        barriers);
+    if (!use_src0 && OppositeDirections) {
+        run_tma_reduce_one_range_thread0_only<tma::TmaReduceScope::Gpu, true>(
+            src,
+            dst,
+            total_bytes,
+            range,
+            shared_raw,
+            barriers);
+    } else {
+        run_tma_reduce_one_range_thread0_only<tma::TmaReduceScope::Gpu, false>(
+            src,
+            dst,
+            total_bytes,
+            range,
+            shared_raw,
+            barriers);
+    }
 }
 
 __global__ void tma_copy_one_kernel(
@@ -674,6 +844,40 @@ __global__ void tma_copy_fanout2_kernel(
         barriers);
 }
 
+
+__global__ void tma_reduce_fanout2_gpu_scope_kernel(
+    const void* src,
+    void* dst0,
+    void* dst1,
+    size_t total_bytes,
+    int num_chunks) {
+    const ChunkRange range =
+        make_block_chunk_range(
+            static_cast<int>(blockIdx.x),
+            static_cast<int>(gridDim.x),
+            num_chunks);
+
+    if (range.chunk_count <= 0) {
+        return;
+    }
+
+    extern __shared__ uint4 shared_storage_u4[];
+
+    unsigned char* shared_raw =
+        reinterpret_cast<unsigned char*>(shared_storage_u4);
+
+    __shared__ sync::semaphore barriers[kBarrierCount];
+
+    run_tma_reduce_fanout2_range_thread0_only<tma::TmaReduceScope::Gpu>(
+        src,
+        dst0,
+        dst1,
+        total_bytes,
+        range,
+        shared_raw,
+        barriers);
+}
+
 void configure_one_kernel(
     const void* kernel,
     size_t dynamic_smem_bytes,
@@ -732,10 +936,18 @@ void configure_batch_kernels_once(int device) {
         "tma_reduce_add_f16_gpu_scope_kernel");
 
     configure_one_kernel(
-        reinterpret_cast<const void*>(tma_reduce_add_f16_split2_gpu_scope_kernel),
+        reinterpret_cast<const void*>(
+            tma_reduce_add_f16_split2_gpu_scope_kernel<false>),
         kTmaSmemBytes,
         device,
-        "tma_reduce_add_f16_split2_gpu_scope_kernel");
+        "tma_reduce_add_f16_split2_gpu_scope_kernel<false>");
+
+    configure_one_kernel(
+        reinterpret_cast<const void*>(
+            tma_reduce_add_f16_split2_gpu_scope_kernel<true>),
+        kTmaSmemBytes,
+        device,
+        "tma_reduce_add_f16_split2_gpu_scope_kernel<true>");
 
     configure_one_kernel(
         reinterpret_cast<const void*>(tma_copy_one_kernel),
@@ -748,6 +960,12 @@ void configure_batch_kernels_once(int device) {
         kTmaSmemBytes,
         device,
         "tma_copy_fanout2_kernel");
+
+    configure_one_kernel(
+        reinterpret_cast<const void*>(tma_reduce_fanout2_gpu_scope_kernel),
+        kTmaSmemBytes,
+        device,
+        "tma_reduce_fanout2_gpu_scope_kernel");
 
     if (device >= 0 && device < 32) {
         configured[device] = true;
@@ -821,6 +1039,7 @@ cudaError_t launch_reduce_seq2_gpu_scope(
         stream);
 }
 
+template <bool OppositeDirections>
 cudaError_t launch_reduce_split2_gpu_scope(
     const void* src0,
     const void* src1,
@@ -845,7 +1064,7 @@ cudaError_t launch_reduce_split2_gpu_scope(
     const int ctas_for_src0 =
         num_blocks / 2;
 
-    tma_reduce_add_f16_split2_gpu_scope_kernel<<<
+    tma_reduce_add_f16_split2_gpu_scope_kernel<OppositeDirections><<<
         num_blocks,
         kTmaThreads,
         kTmaSmemBytes,
@@ -941,6 +1160,76 @@ cudaError_t launch_copy_fanout2(
         ceil_div_size_to_int(bytes, static_cast<size_t>(kChunkBytes));
 
     tma_copy_fanout2_kernel<<<
+        num_blocks,
+        kTmaThreads,
+        kTmaSmemBytes,
+        stream>>>(
+            src,
+            dst0,
+            dst1,
+            bytes,
+            num_chunks);
+
+    return cudaGetLastError();
+}
+
+
+cudaError_t launch_reduce_fanout_seq2_gpu_scope(
+    const void* src,
+    void* dst0,
+    void* dst1,
+    size_t bytes,
+    int num_blocks,
+    cudaStream_t stream) {
+    cudaError_t valid =
+        validate_tma_three_ptrs(src, dst0, dst1, bytes);
+
+    if (valid != cudaSuccess) {
+        return valid;
+    }
+
+    valid =
+        launch_reduce_one_gpu_scope(
+            src,
+            dst0,
+            bytes,
+            num_blocks,
+            stream);
+
+    if (valid != cudaSuccess) {
+        return valid;
+    }
+
+    return launch_reduce_one_gpu_scope(
+        src,
+        dst1,
+        bytes,
+        num_blocks,
+        stream);
+}
+
+cudaError_t launch_reduce_fanout2_gpu_scope(
+    const void* src,
+    void* dst0,
+    void* dst1,
+    size_t bytes,
+    int num_blocks,
+    cudaStream_t stream) {
+    cudaError_t valid =
+        validate_tma_three_ptrs(src, dst0, dst1, bytes);
+
+    if (valid != cudaSuccess) {
+        return valid;
+    }
+
+    if ((bytes % sizeof(half)) != 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    const int num_chunks =
+        ceil_div_size_to_int(bytes, static_cast<size_t>(kChunkBytes));
+
+    tma_reduce_fanout2_gpu_scope_kernel<<<
         num_blocks,
         kTmaThreads,
         kTmaSmemBytes,
@@ -1122,6 +1411,27 @@ BatchExperimentBuffers alloc_batch_buffers(
             local_device,
             peer_device);
 
+    bufs.reduce_fanout_src_local =
+        alloc_visible_buffer(
+            bytes,
+            local_device,
+            local_device,
+            peer_device);
+
+    bufs.reduce_fanout_dst0_peer =
+        alloc_visible_buffer(
+            bytes,
+            peer_device,
+            local_device,
+            peer_device);
+
+    bufs.reduce_fanout_dst1_peer =
+        alloc_visible_buffer(
+            bytes,
+            peer_device,
+            local_device,
+            peer_device);
+
     return bufs;
 }
 
@@ -1133,6 +1443,10 @@ void free_batch_buffers(BatchExperimentBuffers& bufs) {
     system::free_peer_visible_buffer(bufs.copy_src_local);
     system::free_peer_visible_buffer(bufs.copy_dst0_peer);
     system::free_peer_visible_buffer(bufs.copy_dst1_peer);
+
+    system::free_peer_visible_buffer(bufs.reduce_fanout_src_local);
+    system::free_peer_visible_buffer(bufs.reduce_fanout_dst0_peer);
+    system::free_peer_visible_buffer(bufs.reduce_fanout_dst1_peer);
 }
 
 void initialize_batch_buffers(
@@ -1147,6 +1461,10 @@ void initialize_batch_buffers(
     fill_buffer(local_device, bufs.copy_src_local.ptr, 7, bytes);
     fill_buffer(peer_device, bufs.copy_dst0_peer.ptr, 0, bytes);
     fill_buffer(peer_device, bufs.copy_dst1_peer.ptr, 0, bytes);
+
+    fill_buffer(local_device, bufs.reduce_fanout_src_local.ptr, 3, bytes);
+    fill_buffer(peer_device, bufs.reduce_fanout_dst0_peer.ptr, 0, bytes);
+    fill_buffer(peer_device, bufs.reduce_fanout_dst1_peer.ptr, 0, bytes);
 }
 
 void add_batch_result(
@@ -1270,7 +1588,7 @@ void run_one_batch_size_and_block_count(
                 iters,
                 warmup,
                 [&](cudaStream_t stream) {
-                    return launch_reduce_split2_gpu_scope(
+                    return launch_reduce_split2_gpu_scope<false>(
                         bufs.reduce_src0_peer.ptr,
                         bufs.reduce_src1_peer.ptr,
                         bufs.reduce_dst_local.ptr,
@@ -1283,6 +1601,35 @@ void run_one_batch_size_and_block_count(
             results,
             kBatchExperimentReduceTwoToOne,
             kBatchMethodReduceSplitCtasGpuScope,
+            peer_device,
+            local_device,
+            local_device,
+            bytes,
+            payload_bytes,
+            num_blocks,
+            split0_ctas,
+            split1_ctas,
+            ms);
+
+        ms =
+            benchmark_launch_ms(
+                local_device,
+                iters,
+                warmup,
+                [&](cudaStream_t stream) {
+                    return launch_reduce_split2_gpu_scope<true>(
+                        bufs.reduce_src0_peer.ptr,
+                        bufs.reduce_src1_peer.ptr,
+                        bufs.reduce_dst_local.ptr,
+                        bytes,
+                        num_blocks,
+                        stream);
+                });
+
+        add_batch_result(
+            results,
+            kBatchExperimentReduceTwoToOne,
+            kBatchMethodReduceSplitCtasOppositeDirectionsGpuScope,
             peer_device,
             local_device,
             local_device,
@@ -1352,6 +1699,68 @@ void run_one_batch_size_and_block_count(
             results,
             kBatchExperimentCopyOneToTwo,
             kBatchMethodCopyFanoutOneLoadTwoStores,
+            local_device,
+            peer_device,
+            local_device,
+            bytes,
+            payload_bytes,
+            num_blocks,
+            num_blocks,
+            num_blocks,
+            ms);
+
+        /*
+         * Experiment C:
+         *   local source buffer -> two peer-owned destination buffers by TMA reduce.
+         */
+        ms =
+            benchmark_launch_ms(
+                local_device,
+                iters,
+                warmup,
+                [&](cudaStream_t stream) {
+                    return launch_reduce_fanout_seq2_gpu_scope(
+                        bufs.reduce_fanout_src_local.ptr,
+                        bufs.reduce_fanout_dst0_peer.ptr,
+                        bufs.reduce_fanout_dst1_peer.ptr,
+                        bytes,
+                        num_blocks,
+                        stream);
+                });
+
+        add_batch_result(
+            results,
+            kBatchExperimentReduceOneToTwo,
+            kBatchMethodReduceFanoutSequentialAllCtas,
+            local_device,
+            peer_device,
+            local_device,
+            bytes,
+            payload_bytes,
+            num_blocks,
+            num_blocks,
+            num_blocks,
+            ms);
+
+        ms =
+            benchmark_launch_ms(
+                local_device,
+                iters,
+                warmup,
+                [&](cudaStream_t stream) {
+                    return launch_reduce_fanout2_gpu_scope(
+                        bufs.reduce_fanout_src_local.ptr,
+                        bufs.reduce_fanout_dst0_peer.ptr,
+                        bufs.reduce_fanout_dst1_peer.ptr,
+                        bytes,
+                        num_blocks,
+                        stream);
+                });
+
+        add_batch_result(
+            results,
+            kBatchExperimentReduceOneToTwo,
+            kBatchMethodReduceFanoutOneLoadTwoReducesGpuScope,
             local_device,
             peer_device,
             local_device,
