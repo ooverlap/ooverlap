@@ -24,7 +24,7 @@ def load_ooverlap_ext():
 EXPERIMENT_NAMES = {
     0: "reduce_two_to_one",
     1: "copy_one_to_two",
-    2: "reduce_one_to_two",
+    2: "reduce_one_to_two_local_remote",
 }
 
 METHOD_NAMES = {
@@ -154,7 +154,7 @@ def print_summary(rows, sizes, num_blocks_list):
             rows,
             nb,
             sizes,
-            "reduce_one_to_two: local src -> peer dst0 + peer dst1",
+            "reduce_one_to_two: local src -> local dst0 + peer dst1",
             2,
             5,
             [

@@ -1418,10 +1418,15 @@ BatchExperimentBuffers alloc_batch_buffers(
             local_device,
             peer_device);
 
+    /*
+     * OOVERLAP_REDUCE_FANOUT_LOCAL_REMOTE_PATCH:
+     * For reduce fanout, keep src local, make dst0 local, and keep dst1 peer.
+     * This tests one local TMA reduction destination plus one remote destination.
+     */
     bufs.reduce_fanout_dst0_peer =
         alloc_visible_buffer(
             bytes,
-            peer_device,
+            local_device,
             local_device,
             peer_device);
 
@@ -1463,7 +1468,7 @@ void initialize_batch_buffers(
     fill_buffer(peer_device, bufs.copy_dst1_peer.ptr, 0, bytes);
 
     fill_buffer(local_device, bufs.reduce_fanout_src_local.ptr, 3, bytes);
-    fill_buffer(peer_device, bufs.reduce_fanout_dst0_peer.ptr, 0, bytes);
+    fill_buffer(local_device, bufs.reduce_fanout_dst0_peer.ptr, 0, bytes);
     fill_buffer(peer_device, bufs.reduce_fanout_dst1_peer.ptr, 0, bytes);
 }
 
@@ -1711,7 +1716,8 @@ void run_one_batch_size_and_block_count(
 
         /*
          * Experiment C:
-         *   local source buffer -> two peer-owned destination buffers by TMA reduce.
+         *   local source buffer -> one local destination and one peer-owned
+         *   destination buffer by TMA reduce.
          */
         ms =
             benchmark_launch_ms(
