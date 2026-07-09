@@ -452,6 +452,234 @@ OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_max_bf16_async)
 
 #undef OOVERLAP_TMA_DEFINE_REDUCE_FANOUT
 
+
+// -----------------------------------------------------------------------------
+// RUNTIME-COUNT FANOUT REDUCE UTILITIES
+// -----------------------------------------------------------------------------
+//
+// OOVERLAP_TMA_REDUCE_FANOUT_RUNTIME_UTIL_PATCH:
+//
+// Use the same-scope array helpers when all fanout destinations use the same
+// scope but lowering decides dst_count dynamically:
+//
+//   void* dsts[MaxFanout];
+//   int dst_count = task.dst_count;
+//
+//   reduce_add_noftz_f16_async_fanout_array_same_scope_commit<
+//       TmaReduceScope::Gpu>(
+//           smem,
+//           bytes,
+//           dsts,
+//           dst_count);
+//
+// Use runtime targets when lowering also decides per-destination scope:
+//
+//   TmaReduceFanoutRuntimeTarget targets[MaxFanout];
+//   targets[0] = reduce_fanout_runtime_target(dst0, TmaReduceScope::Gpu);
+//   targets[1] = reduce_fanout_runtime_target(dst1, TmaReduceScope::Sys);
+//
+//   reduce_add_noftz_f16_async_fanout_runtime_commit(
+//       smem,
+//       bytes,
+//       targets,
+//       dst_count);
+//
+// Scope is still selected by a switch in the executor because the PTX
+// instruction encoding requires a compile-time scope token.
+// -----------------------------------------------------------------------------
+
+struct TmaReduceFanoutRuntimeTarget {
+    void* dst_gmem = nullptr;
+    TmaReduceScope scope = TmaReduceScope::Default;
+};
+
+__device__ __forceinline__ TmaReduceFanoutRuntimeTarget
+reduce_fanout_runtime_target(
+    void* dst_gmem,
+    TmaReduceScope scope) {
+    TmaReduceFanoutRuntimeTarget target{};
+    target.dst_gmem = dst_gmem;
+    target.scope = scope;
+    return target;
+}
+
+#define OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(BASE_NAME)                 \
+template <TmaReduceScope Scope>                                              \
+__device__ __forceinline__ void BASE_NAME##_fanout_array_same_scope_op_nofence( \
+    void* src_smem,                                                          \
+    uint32_t size_bytes,                                                      \
+    void* const* dst_gmems,                                                   \
+    int dst_count) {                                                          \
+    if (size_bytes == 0 || dst_gmems == nullptr || dst_count <= 0) {          \
+        return;                                                              \
+    }                                                                        \
+                                                                             \
+    for (int i = 0; i < dst_count; ++i) {                                     \
+        void* dst_gmem = dst_gmems[i];                                       \
+                                                                             \
+        if (dst_gmem == nullptr) {                                           \
+            continue;                                                        \
+        }                                                                    \
+                                                                             \
+        BASE_NAME##_op_nofence<Scope>(                                       \
+            dst_gmem,                                                        \
+            src_smem,                                                        \
+            size_bytes);                                                     \
+    }                                                                        \
+}                                                                            \
+                                                                             \
+template <TmaReduceScope Scope>                                              \
+__device__ __forceinline__ void BASE_NAME##_fanout_array_same_scope_op(       \
+    void* src_smem,                                                          \
+    uint32_t size_bytes,                                                      \
+    void* const* dst_gmems,                                                   \
+    int dst_count) {                                                          \
+    if (size_bytes == 0 || dst_gmems == nullptr || dst_count <= 0) {          \
+        return;                                                              \
+    }                                                                        \
+                                                                             \
+    reduce_fence_proxy_async_shared_cta();                                   \
+                                                                             \
+    BASE_NAME##_fanout_array_same_scope_op_nofence<Scope>(                   \
+        src_smem,                                                            \
+        size_bytes,                                                          \
+        dst_gmems,                                                           \
+        dst_count);                                                          \
+}                                                                            \
+                                                                             \
+template <TmaReduceScope Scope>                                              \
+__device__ __forceinline__ void BASE_NAME##_fanout_array_same_scope_commit(   \
+    void* src_smem,                                                          \
+    uint32_t size_bytes,                                                      \
+    void* const* dst_gmems,                                                   \
+    int dst_count) {                                                          \
+    BASE_NAME##_fanout_array_same_scope_op<Scope>(                           \
+        src_smem,                                                            \
+        size_bytes,                                                          \
+        dst_gmems,                                                           \
+        dst_count);                                                          \
+                                                                             \
+    if (size_bytes != 0 && dst_gmems != nullptr && dst_count > 0) {           \
+        reduce_commit_group();                                               \
+    }                                                                        \
+}                                                                            \
+                                                                             \
+__device__ __forceinline__ void BASE_NAME##_fanout_runtime_one_op_nofence(    \
+    void* src_smem,                                                          \
+    uint32_t size_bytes,                                                      \
+    TmaReduceFanoutRuntimeTarget target) {                                    \
+    if (size_bytes == 0 || target.dst_gmem == nullptr) {                      \
+        return;                                                              \
+    }                                                                        \
+                                                                             \
+    switch (target.scope) {                                                   \
+        case TmaReduceScope::Default:                                        \
+            BASE_NAME##_op_nofence<TmaReduceScope::Default>(                 \
+                target.dst_gmem,                                             \
+                src_smem,                                                    \
+                size_bytes);                                                 \
+            break;                                                           \
+        case TmaReduceScope::Cta:                                            \
+        case TmaReduceScope::Cluster:                                        \
+        case TmaReduceScope::Gpu:                                            \
+        case TmaReduceScope::Sys:                                            \
+#if OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE                                      \
+            if (target.scope == TmaReduceScope::Cta) {                       \
+                BASE_NAME##_op_nofence<TmaReduceScope::Cta>(                 \
+                    target.dst_gmem,                                         \
+                    src_smem,                                                \
+                    size_bytes);                                             \
+            } else if (target.scope == TmaReduceScope::Cluster) {            \
+                BASE_NAME##_op_nofence<TmaReduceScope::Cluster>(             \
+                    target.dst_gmem,                                         \
+                    src_smem,                                                \
+                    size_bytes);                                             \
+            } else if (target.scope == TmaReduceScope::Gpu) {                \
+                BASE_NAME##_op_nofence<TmaReduceScope::Gpu>(                 \
+                    target.dst_gmem,                                         \
+                    src_smem,                                                \
+                    size_bytes);                                             \
+            } else {                                                         \
+                BASE_NAME##_op_nofence<TmaReduceScope::Sys>(                 \
+                    target.dst_gmem,                                         \
+                    src_smem,                                                \
+                    size_bytes);                                             \
+            }                                                                \
+#else                                                                        \
+            BASE_NAME##_op_nofence<TmaReduceScope::Default>(                 \
+                target.dst_gmem,                                             \
+                src_smem,                                                    \
+                size_bytes);                                                 \
+#endif                                                                       \
+            break;                                                           \
+        default:                                                             \
+            break;                                                           \
+    }                                                                        \
+}                                                                            \
+                                                                             \
+__device__ __forceinline__ void BASE_NAME##_fanout_runtime_op_nofence(        \
+    void* src_smem,                                                          \
+    uint32_t size_bytes,                                                      \
+    const TmaReduceFanoutRuntimeTarget* targets,                              \
+    int dst_count) {                                                          \
+    if (size_bytes == 0 || targets == nullptr || dst_count <= 0) {            \
+        return;                                                              \
+    }                                                                        \
+                                                                             \
+    for (int i = 0; i < dst_count; ++i) {                                     \
+        BASE_NAME##_fanout_runtime_one_op_nofence(                           \
+            src_smem,                                                        \
+            size_bytes,                                                      \
+            targets[i]);                                                     \
+    }                                                                        \
+}                                                                            \
+                                                                             \
+__device__ __forceinline__ void BASE_NAME##_fanout_runtime_op(                \
+    void* src_smem,                                                          \
+    uint32_t size_bytes,                                                      \
+    const TmaReduceFanoutRuntimeTarget* targets,                              \
+    int dst_count) {                                                          \
+    if (size_bytes == 0 || targets == nullptr || dst_count <= 0) {            \
+        return;                                                              \
+    }                                                                        \
+                                                                             \
+    reduce_fence_proxy_async_shared_cta();                                   \
+                                                                             \
+    BASE_NAME##_fanout_runtime_op_nofence(                                   \
+        src_smem,                                                            \
+        size_bytes,                                                          \
+        targets,                                                             \
+        dst_count);                                                          \
+}                                                                            \
+                                                                             \
+__device__ __forceinline__ void BASE_NAME##_fanout_runtime_commit(            \
+    void* src_smem,                                                          \
+    uint32_t size_bytes,                                                      \
+    const TmaReduceFanoutRuntimeTarget* targets,                              \
+    int dst_count) {                                                          \
+    BASE_NAME##_fanout_runtime_op(                                           \
+        src_smem,                                                            \
+        size_bytes,                                                          \
+        targets,                                                             \
+        dst_count);                                                          \
+                                                                             \
+    if (size_bytes != 0 && targets != nullptr && dst_count > 0) {             \
+        reduce_commit_group();                                               \
+    }                                                                        \
+}
+
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_f16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_noftz_f16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_noftz_bf16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_bf16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_add_f32_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_min_f16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_min_bf16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_max_f16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME(reduce_max_bf16_async)
+
+#undef OOVERLAP_TMA_DEFINE_REDUCE_FANOUT_RUNTIME
+
 #undef OOVERLAP_TMA_DEFINE_REDUCE_OP
 #undef OOVERLAP_TMA_REDUCE_EMIT_EXPLICIT_SCOPE
 #undef OOVERLAP_TMA_REDUCE_EMIT_SCOPED

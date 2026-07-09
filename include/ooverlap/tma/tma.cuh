@@ -306,5 +306,90 @@ __device__ __forceinline__ void store_async_fanout_commit(
     }
 }
 
+
+// -----------------------------------------------------------------------------
+// RUNTIME-COUNT FANOUT STORE UTILITIES
+// -----------------------------------------------------------------------------
+//
+// OOVERLAP_TMA_STORE_FANOUT_RUNTIME_UTIL_PATCH:
+//
+// Use these when lowering decides the fanout count at runtime but the executor
+// still has a small fixed-capacity destination array in the task.
+//
+// Example:
+//
+//   void* dsts[MaxFanout];
+//   int dst_count = task.dst_count;
+//
+//   store_async_fanout_array_commit(
+//       smem,
+//       bytes,
+//       dsts,
+//       dst_count);
+//
+// Split form:
+//
+//   store_fence_proxy_async_shared_cta();
+//   store_async_fanout_array_op_nofence(smem, bytes, dsts, dst_count);
+//   store_commit_group();
+// -----------------------------------------------------------------------------
+
+__device__ __forceinline__ void store_async_fanout_array_op_nofence(
+    void* src_smem,
+    uint32_t size_bytes,
+    void* const* dst_gmems,
+    int dst_count) {
+    if (size_bytes == 0 || dst_gmems == nullptr || dst_count <= 0) {
+        return;
+    }
+
+    for (int i = 0; i < dst_count; ++i) {
+        void* dst_gmem = dst_gmems[i];
+
+        if (dst_gmem == nullptr) {
+            continue;
+        }
+
+        store_async_op_nofence(
+            dst_gmem,
+            src_smem,
+            size_bytes);
+    }
+}
+
+__device__ __forceinline__ void store_async_fanout_array_op(
+    void* src_smem,
+    uint32_t size_bytes,
+    void* const* dst_gmems,
+    int dst_count) {
+    if (size_bytes == 0 || dst_gmems == nullptr || dst_count <= 0) {
+        return;
+    }
+
+    store_fence_proxy_async_shared_cta();
+
+    store_async_fanout_array_op_nofence(
+        src_smem,
+        size_bytes,
+        dst_gmems,
+        dst_count);
+}
+
+__device__ __forceinline__ void store_async_fanout_array_commit(
+    void* src_smem,
+    uint32_t size_bytes,
+    void* const* dst_gmems,
+    int dst_count) {
+    store_async_fanout_array_op(
+        src_smem,
+        size_bytes,
+        dst_gmems,
+        dst_count);
+
+    if (size_bytes != 0 && dst_gmems != nullptr && dst_count > 0) {
+        store_commit_group();
+    }
+}
+
 } // namespace tma
 } // namespace ooverlap
