@@ -65,6 +65,22 @@ public:
 std::unique_ptr<TransferPlanDistributionBackend>
 make_same_process_transfer_plan_distribution_backend();
 
+/*
+ * OOVERLAP_IPC_SHARED_PLAN_BACKEND_DECL_PATCH:
+ *
+ * Multiprocess IPC backend.
+ *
+ * It maps a fixed-size POSIX shared-memory plan arena in every process.  On a
+ * cache miss, rank 0 builds the pointer-free TransferPlan directly into the
+ * shared arena and the other ranks read it from the same mapped memory after a
+ * Broker barrier.  No chunk-by-chunk plan exchange is used.
+ */
+std::unique_ptr<TransferPlanDistributionBackend>
+make_ipc_shared_plan_transfer_plan_distribution_backend(
+    const char* broker_key,
+    int local_rank,
+    int world_size);
+
 } // namespace plan
 } // namespace comm
 } // namespace ooverlap

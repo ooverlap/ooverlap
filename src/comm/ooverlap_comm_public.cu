@@ -844,15 +844,42 @@ oo_status_t oo_group_create_ipc(
             group->devices[i] = devices[i];
         }
 
-        group->topology_valid = false;
-        group->topology = ooverlap::topology::Topology{};
+        /*
+         * OOVERLAP_IPC_SHARED_PLAN_GROUP_SETUP_PATCH:
+         *
+         * Setup-only IPC initialization:
+         *   - initialize topology once, with probes/staging disabled for now
+         *   - allocate/exchange device ready signals once
+         *   - map a shared-memory TransferPlan arena and install IPC plan backend
+         *
+         * User buffer IPC registration/import is intentionally not handled here.
+         */
+        oo_status_t status =
+            initialize_group_topology(
+                group.get(),
+                false,  // do not enable all-to-all peer access here
+                false,  // no IPC SHM/staging fallback yet
+                false,  // skip validation probes for setup-only IPC
+                false,  // skip atomic probes
+                false); // skip TMA probes
 
-        const oo_status_t status =
+        if (status != OO_SUCCESS) {
+            return status;
+        }
+
+        status =
             allocate_ipc_ready_signals(group.get());
 
         if (status != OO_SUCCESS) {
             return status;
         }
+
+        group->transfer_plan_distribution =
+            ooverlap::comm::plan::
+                make_ipc_shared_plan_transfer_plan_distribution_backend(
+                    broker_key,
+                    local_rank,
+                    num_devices);
 
         *out_group = group.release();
         return OO_SUCCESS;
