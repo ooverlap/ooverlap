@@ -186,8 +186,11 @@ def spawn_two_ranks(args, mode):
     env_base["OOVERLAP_DEV0"] = str(args.dev0)
     env_base["OOVERLAP_DEV1"] = str(args.dev1)
     env_base["OOVERLAP_VERIFY"] = "1" if args.verify else "0"
+    # Keep this short. Broker constructs UNIX socket paths as:
+    #   /tmp/ooverlap_broker_<key>.sock.<rank>
+    # and currently rejects socket prefixes >= 90 chars.
     env_base["OOVERLAP_BROKER_KEY"] = (
-        args.broker_key or f"ooverlap_ipc_external_p2p_{os.getpid()}_{uuid.uuid4().hex}"
+        args.broker_key or f"ooipc_{os.getpid():x}_{uuid.uuid4().hex[:8]}"
     )
     env_base["OOVERLAP_NCCL_ID_BYTES"] = json.dumps(make_nccl_id_bytes())
 
