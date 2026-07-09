@@ -2,8 +2,24 @@
 import argparse
 import json
 from pathlib import Path
+import importlib.util
 
-import ooverlap_ext
+def load_ooverlap_ext():
+    root = Path(__file__).resolve().parents[1]
+    so = root / "build" / "lib" / "ooverlap_ext.so"
+    if not so.exists():
+        raise FileNotFoundError(f"Could not find {so}. Build first.")
+
+    spec = importlib.util.spec_from_file_location("ooverlap_ext", str(so))
+    mod = importlib.util.module_from_spec(spec)
+
+    if spec.loader is None:
+        raise RuntimeError(f"Could not load extension spec for {so}")
+
+    spec.loader.exec_module(mod)
+    return mod
+
+
 
 EXPERIMENT_NAMES = {
     0: "reduce_two_to_one",
@@ -37,6 +53,8 @@ def main():
     parser.add_argument("--dev1", type=int, default=1)
     parser.add_argument("--json-out", type=Path, default=None)
     args = parser.parse_args()
+
+    ooverlap_ext = load_ooverlap_ext()
 
     rows = ooverlap_ext.benchmark_tma_batch_experiment_sm90(
         args.min_bytes,
