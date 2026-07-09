@@ -355,29 +355,29 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         /*&ooverlap::benchmark_tma_two_gpu_collective_sweep_json,*/
         /*py::arg("request_json"));*/
 
-  /*m.def("smoke_ipc_collective_rank_sm90",*/
-        /*&ooverlap::smoke_ipc_collective_rank_sm90,*/
-        /*py::arg("collective"),*/
-        /*py::arg("numel"),*/
-        /*py::arg("local_rank"),*/
-        /*py::arg("dev0"),*/
-        /*py::arg("dev1"),*/
-        /*py::arg("broker_key"),*/
-        /*py::arg("nccl_unique_id_bytes"),*/
-        /*py::arg("verify") = true);*/
+  m.def("smoke_ipc_collective_rank_sm90",
+        &ooverlap::smoke_ipc_collective_rank_sm90,
+        py::arg("collective"),
+        py::arg("numel"),
+        py::arg("local_rank"),
+        py::arg("dev0"),
+        py::arg("dev1"),
+        py::arg("broker_key"),
+        py::arg("nccl_unique_id_bytes"),
+        py::arg("verify") = true);
 
-  /*m.def("benchmark_ipc_collective_rank_sm90",*/
-        /*&ooverlap::benchmark_ipc_collective_rank_sm90,*/
-        /*py::arg("collective"),*/
-        /*py::arg("sizes"),*/
-        /*py::arg("local_rank"),*/
-        /*py::arg("dev0"),*/
-        /*py::arg("dev1"),*/
-        /*py::arg("broker_key"),*/
-        /*py::arg("nccl_unique_id_bytes"),*/
-        /*py::arg("iters"),*/
-        /*py::arg("warmup"),*/
-        /*py::arg("verify"));*/
+  m.def("benchmark_ipc_collective_rank_sm90",
+        &ooverlap::benchmark_ipc_collective_rank_sm90,
+        py::arg("collective"),
+        py::arg("sizes"),
+        py::arg("local_rank"),
+        py::arg("dev0"),
+        py::arg("dev1"),
+        py::arg("broker_key"),
+        py::arg("nccl_unique_id_bytes"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("verify"));
 
   m.def("external_p2p_two_gpu_collective_smoke_test",
         &ooverlap::external_p2p_two_gpu_collective_smoke_test,

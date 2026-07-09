@@ -28,9 +28,19 @@ struct IpcOoContext {
     oo_group_t* group = nullptr;
     oo_node_t* node = nullptr;
     oo_buffer_t* local_buf = nullptr;
-    oo_buffer_t* peer_buf = nullptr;
+
+    /*
+     * OOVERLAP_IPC_COLLECTIVE_LEGACY_TEST_CONTEXT_PATCH:
+     *
+     * For the new IPC path, the test owns a normal cudaMalloc/framework-style
+     * pointer and registers it with oo_buffer_wrap(...).  The library then
+     * exports/imports peer pointers internally via legacy CUDA IPC during
+     * prepare_collective_launch().
+     */
     half* local_work = nullptr;
+    int local_device = -1;
 };
+
 
 void broker_sync(IpcOoContext& ctx) {
     if (ctx.group != nullptr && ctx.group->broker) {
@@ -46,21 +56,21 @@ void destroy_ipc_oo_context(IpcOoContext& ctx) {
         }
     }
 
-    if (ctx.peer_buf != nullptr) {
-        oo_buffer_destroy(ctx.peer_buf);
-        ctx.peer_buf = nullptr;
-    }
-
-    if (ctx.group != nullptr && ctx.group->broker) {
-        try {
-            ctx.group->broker->sync();
-        } catch (...) {
-        }
-    }
-
     if (ctx.local_buf != nullptr) {
         oo_buffer_destroy(ctx.local_buf);
         ctx.local_buf = nullptr;
+    }
+
+    if (ctx.local_work != nullptr) {
+        try {
+            if (ctx.local_device >= 0) {
+                system::runtime::set_device(ctx.local_device);
+            }
+
+            cudaFree(ctx.local_work);
+        } catch (...) {
+        }
+
         ctx.local_work = nullptr;
     }
 
@@ -73,7 +83,10 @@ void destroy_ipc_oo_context(IpcOoContext& ctx) {
         oo_group_destroy(ctx.group);
         ctx.group = nullptr;
     }
+
+    ctx.local_device = -1;
 }
+
 
 IpcOoContext create_ipc_oo_context(
     int64_t numel,
@@ -81,6 +94,18 @@ IpcOoContext create_ipc_oo_context(
     int dev0,
     int dev1,
     const std::string& broker_key) {
+    /*
+     * OOVERLAP_IPC_COLLECTIVE_LEGACY_TEST_CREATE_PATCH:
+     *
+     * Do not manually exchange/import peer buffers here.  This test now exercises
+     * the real public IPC path:
+     *
+     *   cudaMalloc local pointer
+     *   oo_buffer_wrap(local pointer)
+     *   oo_allreduce / oo_reduce_scatter / oo_all_gather
+     *
+     * The comm layer exports/imports peer pointers internally every collective.
+     */
     if (local_rank != 0 && local_rank != 1) {
         throw std::invalid_argument("local_rank must be 0 or 1");
     }
@@ -90,10 +115,10 @@ IpcOoContext create_ipc_oo_context(
     }
 
     int devices[2] = {dev0, dev1};
-    const int peer_rank = local_rank ^ 1;
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
 
     IpcOoContext ctx;
+    ctx.local_device = local_rank == 0 ? dev0 : dev1;
 
     testing::check_oo(
         oo_group_create_ipc(
@@ -111,85 +136,47 @@ IpcOoContext create_ipc_oo_context(
             &ctx.node),
         "oo_node_create(local)");
 
+    system::runtime::set_device(ctx.local_device);
+
+    testing::check_cuda(
+        cudaMalloc(
+            reinterpret_cast<void**>(&ctx.local_work),
+            bytes),
+        "cudaMalloc(ipc local_work)");
+
     testing::check_oo(
-        oo_buffer_alloc(
+        oo_buffer_wrap(
             ctx.node,
+            ctx.local_work,
             bytes,
             &ctx.local_buf),
-        "oo_buffer_alloc(local VMM)");
-
-    ctx.local_work =
-        reinterpret_cast<half*>(oo_buffer_ptr(ctx.local_buf));
+        "oo_buffer_wrap(ipc local cudaMalloc)");
 
     if (ctx.local_work == nullptr) {
-        throw std::runtime_error("oo_buffer_ptr(local_buf) returned null");
+        throw std::runtime_error("cudaMalloc(ipc local_work) returned null");
     }
 
-    std::vector<int> access_devices = {dev0, dev1};
-
-    ooverlap::system::vmm_peer_buffer_descriptor local_desc =
-        ooverlap::system::make_vmm_peer_buffer_descriptor(
-            ctx.local_buf->mapped,
-            bytes);
-
-    ooverlap::system::ipc::vmm_handle local_fd =
-        ooverlap::system::export_vmm_peer_buffer_fd(
-            ctx.local_buf->mapped);
-
-    std::vector<ooverlap::system::vmm_peer_buffer_descriptor> all_desc(2);
-
-    ctx.group->broker->exchange_data(
-        all_desc.data(),
-        &local_desc,
-        sizeof(local_desc));
-
-    std::vector<int> all_fds(2, -1);
-
-    ctx.group->broker->exchange_fds(
-        all_fds.data(),
-        local_fd.value);
-
-    local_fd.value = -1;
-
-    if (all_fds[peer_rank] < 0) {
-        throw std::runtime_error("exchange_fds did not return peer fd");
-    }
-
-    ooverlap::system::imported_peer_buffer imported_peer =
-        ooverlap::system::import_vmm_peer_buffer(
-            all_fds[peer_rank],
-            all_desc[peer_rank],
-            access_devices);
-
-    testing::check_oo(
-        oo_buffer_adopt_imported_peer_buffer(
-            ctx.node,
-            std::move(imported_peer),
-            &ctx.peer_buf),
-        "oo_buffer_adopt_imported_peer_buffer(peer VMM)");
-
-    ctx.peer_buf->owner_rank = peer_rank;
     broker_sync(ctx);
-
     return ctx;
 }
+
 
 void launch_ooverlap_collective(
     TestCollective collective,
     IpcOoContext& ctx,
     size_t numel,
     cudaStream_t stream) {
-    oo_buffer_t* peer_bufs[] = {
-        ctx.peer_buf,
-    };
-
+    /*
+     * OOVERLAP_IPC_COLLECTIVE_PUBLIC_API_LAUNCH_PATCH:
+     *
+     * Use the current clean public collective API.  Peer buffers are resolved by
+     * prepare_collective_launch() through the IPC export/import backend.
+     */
     if (collective == TestCollective::AllReduce) {
         testing::check_oo(
             oo_allreduce(
                 ctx.node,
                 ctx.local_buf,
-                peer_bufs,
-                1,
                 numel,
                 OO_DTYPE_FLOAT16,
                 OO_REDUCE_SUM,
@@ -205,8 +192,6 @@ void launch_ooverlap_collective(
             oo_reduce_scatter(
                 ctx.node,
                 ctx.local_buf,
-                peer_bufs,
-                1,
                 numel,
                 OO_DTYPE_FLOAT16,
                 OO_REDUCE_SUM,
@@ -221,8 +206,6 @@ void launch_ooverlap_collective(
             oo_all_gather(
                 ctx.node,
                 ctx.local_buf,
-                peer_bufs,
-                1,
                 numel,
                 OO_DTYPE_FLOAT16,
                 stream),
@@ -232,6 +215,7 @@ void launch_ooverlap_collective(
 
     throw std::invalid_argument("launch_ooverlap_collective: unknown collective");
 }
+
 
 void sync_device_stream(
     int device,
