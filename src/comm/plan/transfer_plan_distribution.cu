@@ -368,18 +368,24 @@ private:
  *
  * IPC shared-plan distribution backend.
  *
- * This is intentionally different from Broker::exchange_data-based plan
- * movement.  A shared POSIX shm object is mapped into every process.  Rank 0
- * builds a TransferPlan into that mapping; every rank reads the same bytes after
- * a Broker barrier.  Broker is used only for synchronization, not for moving the
- * plan payload.
+ * A shared POSIX shm object is mapped into every process.  Rank 0 builds the
+ * pointer-free TransferPlan directly into the shared arena payload.  Every rank
+ * returns a typed pointer into that same mapped payload; no memcpy from the arena
+ * into a per-process local plan cache is performed.
  *
  * Scope:
  *   - setup / plan distribution only
  *   - no user-buffer IPC registration here
  *   - no IPC staging here
- *   - assumes one matched collective sequence per IPC group, same as the rest of
- *     the public API
+ *   - one matched collective sequence per IPC group
+ *
+ * Important lifetime rule:
+ *   The returned TransferPlan pointer is valid until the next IPC plan cache
+ *   miss overwrites the single shared arena.  This is fine for the current public
+ *   path because the transfer plan is consumed immediately to lower/enqueue the
+ *   window plan before the next collective starts.  If we later allow multiple
+ *   outstanding host-side collective preparations, use multiple shared slots or
+ *   ref-counted epochs.
  */
 constexpr std::uint32_t kIpcSharedPlanMagic = 0x4f4f5053u; // "OOPS"
 constexpr std::uint32_t kIpcSharedPlanVersion = 1u;
@@ -641,20 +647,42 @@ private:
     IpcSharedPlanArena* arena_ = nullptr;
 };
 
+template <int MaxTransferTasks>
+bool ipc_shared_plan_arena_matches(
+    const IpcSharedPlanArena* arena,
+    CollectivePlanFor collective) {
+    return arena != nullptr &&
+           arena->magic == kIpcSharedPlanMagic &&
+           arena->version == kIpcSharedPlanVersion &&
+           arena->collective == static_cast<int>(collective) &&
+           arena->max_transfer_tasks == MaxTransferTasks &&
+           arena->payload_bytes == sizeof(TransferPlan<MaxTransferTasks>) &&
+           arena->status == static_cast<int>(OO_SUCCESS);
+}
+
 template <int MaxTransferTasks, typename Builder>
-oo_status_t build_or_read_shared_ipc_plan(
+oo_status_t get_or_build_shared_ipc_plan_direct(
+    std::mutex* cache_mutex,
+    bool* cache_valid,
+    TransferPlanRequestKey* cached_key,
     oo_node_t* node,
     IpcSharedPlanArena* arena,
     CollectivePlanFor collective,
-    TransferPlan<MaxTransferTasks>* out_plan,
+    const TransferPlanRequestKey& key,
+    TransferPlan<MaxTransferTasks>** out_plan,
     Builder&& builder) {
-    if (node == nullptr ||
+    if (cache_mutex == nullptr ||
+        cache_valid == nullptr ||
+        cached_key == nullptr ||
+        node == nullptr ||
         node->group == nullptr ||
         node->group->broker == nullptr ||
         arena == nullptr ||
         out_plan == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
+
+    *out_plan = nullptr;
 
     static_assert(
         sizeof(TransferPlan<MaxTransferTasks>) <= kIpcSharedPlanPayloadBytes,
@@ -675,35 +703,43 @@ oo_status_t build_or_read_shared_ipc_plan(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
+    std::lock_guard<std::mutex> lock(*cache_mutex);
+
+    auto* shared_plan =
+        reinterpret_cast<TransferPlan<MaxTransferTasks>*>(arena->payload);
+
     /*
-     * Make sure all ranks have reached the same cache miss before rank 0 writes
-     * the shared arena.
+     * This is a single-slot shared cache.  A cache hit is valid only when this
+     * backend's current key matches and the arena metadata still describes the
+     * requested plan type.
+     */
+    if (*cache_valid &&
+        same_request_key(*cached_key, key) &&
+        ipc_shared_plan_arena_matches<MaxTransferTasks>(arena, collective)) {
+        *out_plan = shared_plan;
+        return OO_SUCCESS;
+    }
+
+    /*
+     * Pre-write barrier: every rank must reach the same miss before rank 0
+     * overwrites the single shared arena.
      */
     group->broker->sync();
 
     if (rank == 0) {
-        TransferPlan<MaxTransferTasks> root_plan{};
-        transfer_plan_clear(&root_plan);
+        transfer_plan_clear(shared_plan);
 
         const oo_status_t status =
-            builder(&root_plan);
+            builder(shared_plan);
 
         arena->status = static_cast<int>(status);
         arena->collective = static_cast<int>(collective);
         arena->max_transfer_tasks = MaxTransferTasks;
         arena->payload_bytes =
-            static_cast<std::uint64_t>(sizeof(root_plan));
+            static_cast<std::uint64_t>(sizeof(*shared_plan));
 
-        if (status == OO_SUCCESS) {
-            std::memcpy(
-                arena->payload,
-                &root_plan,
-                sizeof(root_plan));
-        } else {
-            std::memset(
-                arena->payload,
-                0,
-                sizeof(root_plan));
+        if (status != OO_SUCCESS) {
+            transfer_plan_clear(shared_plan);
         }
 
         __sync_synchronize();
@@ -712,33 +748,27 @@ oo_status_t build_or_read_shared_ipc_plan(
     }
 
     /*
-     * Publish barrier: after this, all ranks may read rank 0's plan bytes.
+     * Publish barrier: after this, all ranks may use the shared plan pointer.
      */
     group->broker->sync();
 
-    oo_status_t result =
+    const oo_status_t result =
         static_cast<oo_status_t>(arena->status);
 
-    if (result == OO_SUCCESS) {
-        if (arena->collective != static_cast<int>(collective) ||
-            arena->max_transfer_tasks != MaxTransferTasks ||
-            arena->payload_bytes != sizeof(*out_plan)) {
-            result = OO_ERROR_INTERNAL;
-        } else {
-            std::memcpy(
-                out_plan,
-                arena->payload,
-                sizeof(*out_plan));
-        }
+    if (result != OO_SUCCESS) {
+        *cache_valid = false;
+        return result;
     }
 
-    /*
-     * Read-complete barrier: prevents a fast rank 0 from overwriting the single
-     * shared arena for a later cache miss while another rank is still reading.
-     */
-    group->broker->sync();
+    if (!ipc_shared_plan_arena_matches<MaxTransferTasks>(arena, collective)) {
+        *cache_valid = false;
+        return OO_ERROR_INTERNAL;
+    }
 
-    return result;
+    *cached_key = key;
+    *cache_valid = true;
+    *out_plan = shared_plan;
+    return OO_SUCCESS;
 }
 
 class IpcSharedPlanTransferPlanDistributionBackend final
@@ -778,34 +808,32 @@ public:
                 op,
                 config);
 
-        return get_or_build_cached_same_process_plan(
-            &allreduce_,
+        return get_or_build_shared_ipc_plan_direct(
+            &cache_mutex_,
+            &cache_valid_,
+            &cached_key_,
+            node,
+            mapping_.arena(),
+            CollectivePlanFor::AllReduce,
             key,
             out_plan,
-            [this, node, group, &launch, count, &config](AllreduceTransferPlan* plan) {
-                return build_or_read_shared_ipc_plan(
-                    node,
-                    mapping_.arena(),
-                    CollectivePlanFor::AllReduce,
-                    plan,
-                    [group, &launch, count, &config](AllreduceTransferPlan* root_plan) {
-                        if (group == nullptr ||
-                            group->num_devices != launch.world_size) {
-                            return OO_ERROR_INVALID_ARGUMENT;
-                        }
+            [group, &launch, count, &config](AllreduceTransferPlan* shared_plan) {
+                if (group == nullptr ||
+                    group->num_devices != launch.world_size) {
+                    return OO_ERROR_INVALID_ARGUMENT;
+                }
 
-                        const TransferPlanBuildInput input =
-                            make_build_input(
-                                group,
-                                launch,
-                                count,
-                                config,
-                                CollectivePlanFor::AllReduce);
+                const TransferPlanBuildInput input =
+                    make_build_input(
+                        group,
+                        launch,
+                        count,
+                        config,
+                        CollectivePlanFor::AllReduce);
 
-                        return build_allreduce_transfer_plan(root_plan, input)
-                            ? OO_SUCCESS
-                            : OO_ERROR_UNSUPPORTED;
-                    });
+                return build_allreduce_transfer_plan(shared_plan, input)
+                    ? OO_SUCCESS
+                    : OO_ERROR_UNSUPPORTED;
             });
     }
 
@@ -837,34 +865,32 @@ public:
                 op,
                 config);
 
-        return get_or_build_cached_same_process_plan(
-            &reduce_scatter_,
+        return get_or_build_shared_ipc_plan_direct(
+            &cache_mutex_,
+            &cache_valid_,
+            &cached_key_,
+            node,
+            mapping_.arena(),
+            CollectivePlanFor::ReduceScatter,
             key,
             out_plan,
-            [this, node, group, &launch, count, &config](ReduceScatterTransferPlan* plan) {
-                return build_or_read_shared_ipc_plan(
-                    node,
-                    mapping_.arena(),
-                    CollectivePlanFor::ReduceScatter,
-                    plan,
-                    [group, &launch, count, &config](ReduceScatterTransferPlan* root_plan) {
-                        if (group == nullptr ||
-                            group->num_devices != launch.world_size) {
-                            return OO_ERROR_INVALID_ARGUMENT;
-                        }
+            [group, &launch, count, &config](ReduceScatterTransferPlan* shared_plan) {
+                if (group == nullptr ||
+                    group->num_devices != launch.world_size) {
+                    return OO_ERROR_INVALID_ARGUMENT;
+                }
 
-                        const TransferPlanBuildInput input =
-                            make_build_input(
-                                group,
-                                launch,
-                                count,
-                                config,
-                                CollectivePlanFor::ReduceScatter);
+                const TransferPlanBuildInput input =
+                    make_build_input(
+                        group,
+                        launch,
+                        count,
+                        config,
+                        CollectivePlanFor::ReduceScatter);
 
-                        return build_reduce_scatter_transfer_plan(root_plan, input)
-                            ? OO_SUCCESS
-                            : OO_ERROR_UNSUPPORTED;
-                    });
+                return build_reduce_scatter_transfer_plan(shared_plan, input)
+                    ? OO_SUCCESS
+                    : OO_ERROR_UNSUPPORTED;
             });
     }
 
@@ -895,42 +921,48 @@ public:
                 OO_REDUCE_ADD,
                 config);
 
-        return get_or_build_cached_same_process_plan(
-            &all_gather_,
+        return get_or_build_shared_ipc_plan_direct(
+            &cache_mutex_,
+            &cache_valid_,
+            &cached_key_,
+            node,
+            mapping_.arena(),
+            CollectivePlanFor::AllGather,
             key,
             out_plan,
-            [this, node, group, &launch, count, &config](AllGatherTransferPlan* plan) {
-                return build_or_read_shared_ipc_plan(
-                    node,
-                    mapping_.arena(),
-                    CollectivePlanFor::AllGather,
-                    plan,
-                    [group, &launch, count, &config](AllGatherTransferPlan* root_plan) {
-                        if (group == nullptr ||
-                            group->num_devices != launch.world_size) {
-                            return OO_ERROR_INVALID_ARGUMENT;
-                        }
+            [group, &launch, count, &config](AllGatherTransferPlan* shared_plan) {
+                if (group == nullptr ||
+                    group->num_devices != launch.world_size) {
+                    return OO_ERROR_INVALID_ARGUMENT;
+                }
 
-                        const TransferPlanBuildInput input =
-                            make_build_input(
-                                group,
-                                launch,
-                                count,
-                                config,
-                                CollectivePlanFor::AllGather);
+                const TransferPlanBuildInput input =
+                    make_build_input(
+                        group,
+                        launch,
+                        count,
+                        config,
+                        CollectivePlanFor::AllGather);
 
-                        return build_all_gather_transfer_plan(root_plan, input)
-                            ? OO_SUCCESS
-                            : OO_ERROR_UNSUPPORTED;
-                    });
+                return build_all_gather_transfer_plan(shared_plan, input)
+                    ? OO_SUCCESS
+                    : OO_ERROR_UNSUPPORTED;
             });
     }
 
 private:
     IpcSharedPlanMapping mapping_;
-    SameProcessPlanCache<kTmaMultiGpuAllReduceMaxTransferTasks> allreduce_{};
-    SameProcessPlanCache<kTmaMultiGpuReduceScatterMaxTransferTasks> reduce_scatter_{};
-    SameProcessPlanCache<kTmaMultiGpuAllGatherMaxTransferTasks> all_gather_{};
+
+    /*
+     * Single-slot cache metadata for the single shared arena payload.
+     *
+     * Do not keep separate per-collective cached entries here unless the shared
+     * arena grows separate payload slots.  With one payload, only the most recent
+     * plan can be valid.
+     */
+    std::mutex cache_mutex_;
+    bool cache_valid_ = false;
+    TransferPlanRequestKey cached_key_{};
 };
 
 

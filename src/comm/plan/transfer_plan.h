@@ -228,10 +228,6 @@ __host__ __device__ __forceinline__ void transfer_plan_clear(
 
     plan->world_size = 0;
     plan->total_tasks = 0;
-
-    for (int i = 0; i < MaxTransferTasks; ++i) {
-        plan->tasks[i] = TransferTask{};
-    }
 }
 
 template <int MaxTransferTasks>
