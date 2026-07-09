@@ -260,6 +260,22 @@ __host__ __device__ __forceinline__ bool transfer_task_has_work(
                task.ready_phase < kReadySignalPhaseStride;
     }
 
+    /*
+     * OOVERLAP_FANOUT_TRANSFER_HAS_WORK_PATCH:
+     * Fanout transfers have one src and many destinations, so validate the
+     * destination count here. Pointer validity is checked during rank-local
+     * lowering after logical refs are resolved.
+     */
+    if (task.op == TransferOp::CopyFanout ||
+        task.op == TransferOp::ReduceFanout) {
+        return task.executor_rank >= 0 &&
+               task.bytes != 0 &&
+               task.window_chunks > 0 &&
+               task.begin_window < task.end_window &&
+               task.fanout_dst_count > 0 &&
+               task.fanout_dst_count <= TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS;
+    }
+
     return task.op != TransferOp::None &&
            task.executor_rank >= 0 &&
            task.bytes != 0 &&

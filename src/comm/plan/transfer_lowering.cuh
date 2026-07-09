@@ -218,7 +218,9 @@ __host__ __device__ __forceinline__ bool transfer_task_is_ready(
 __host__ __device__ __forceinline__ bool transfer_task_is_windowed(
     const TransferTask& task) {
     return task.op == TransferOp::Copy ||
-           task.op == TransferOp::Reduce;
+           task.op == TransferOp::Reduce ||
+           task.op == TransferOp::CopyFanout ||
+           task.op == TransferOp::ReduceFanout;
 }
 
 inline bool lower_ready_transfer_task_to_window_task(
@@ -509,6 +511,89 @@ inline bool lower_transfer_task_to_window_task(
 
     return false;
 }
+
+
+/*
+ * OOVERLAP_FANOUT_TRANSFER_LOWERING_HELPER_PATCH:
+ *
+ * Lower a pointer-resolved TransferOp::{CopyFanout, ReduceFanout} into a
+ * WindowTask. Pointer resolution still happens in emit_window_plan_from_rank_tasks
+ * because it has access to RankPointerBinding.
+ */
+inline bool lower_fanout_transfer_task_to_window_task(
+    const TransferTask& transfer,
+    const void* src,
+    void* const* fanout_dsts,
+    int begin_window,
+    int end_window,
+    task::WindowTask* out) {
+    if (out == nullptr ||
+        src == nullptr ||
+        fanout_dsts == nullptr ||
+        begin_window >= end_window ||
+        transfer.window_chunks <= 0 ||
+        transfer.bytes == 0 ||
+        transfer.fanout_dst_count <= 0 ||
+        transfer.fanout_dst_count > TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS) {
+        return false;
+    }
+
+    for (int i = 0; i < transfer.fanout_dst_count; ++i) {
+        if (fanout_dsts[i] == nullptr) {
+            return false;
+        }
+    }
+
+    if (!transfer_transport_direct(transfer.transport)) {
+        /*
+         * First implementation only supports direct fanout. Shm/staged fanout
+         * can be added later with explicit executor rules.
+         */
+        return false;
+    }
+
+    if (transfer.op == TransferOp::CopyFanout) {
+        if (!transfer.requires_tma_load || !transfer.requires_tma_store) {
+            return false;
+        }
+
+        *out =
+            task::make_copy_tma_fanout_task(
+                src,
+                fanout_dsts,
+                transfer.fanout_dst_count,
+                transfer.bytes,
+                begin_window,
+                end_window,
+                transfer.window_chunks,
+                transfer.terminal);
+
+        return true;
+    }
+
+    if (transfer.op == TransferOp::ReduceFanout) {
+        if (!transfer.requires_tma_load || !transfer.requires_tma_reduce) {
+            return false;
+        }
+
+        *out =
+            task::make_reduce_tma_fanout_task(
+                src,
+                fanout_dsts,
+                transfer.fanout_reduce_scope,
+                transfer.fanout_dst_count,
+                transfer.bytes,
+                begin_window,
+                end_window,
+                transfer.window_chunks,
+                transfer.terminal);
+
+        return true;
+    }
+
+    return false;
+}
+
 
 namespace lowering_detail {
 
@@ -1079,6 +1164,60 @@ inline bool emit_window_plan_from_rank_tasks(
                 resolve_logical_const_ptr(
                     transfer.src,
                     binding);
+
+            /*
+             * OOVERLAP_FANOUT_EMIT_WINDOW_PLAN_PATCH:
+             *
+             * Fanout tasks resolve one source and then resolve every logical
+             * fanout destination into this rank's pointer view.
+             */
+            if (transfer.op == TransferOp::CopyFanout ||
+                transfer.op == TransferOp::ReduceFanout) {
+                if (src == nullptr ||
+                    transfer.fanout_dst_count <= 0 ||
+                    transfer.fanout_dst_count > TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS) {
+                    out_window_plan->total_tasks = 0;
+                    out_window_plan->tasks_per_cta = 0;
+                    *out_num_blocks = 0;
+                    return false;
+                }
+
+                void* fanout_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+
+                for (int fanout_idx = 0;
+                     fanout_idx < transfer.fanout_dst_count;
+                     ++fanout_idx) {
+                    fanout_dsts[fanout_idx] =
+                        resolve_logical_mut_ptr(
+                            transfer.fanout_dsts[fanout_idx],
+                            binding);
+
+                    if (fanout_dsts[fanout_idx] == nullptr) {
+                        out_window_plan->total_tasks = 0;
+                        out_window_plan->tasks_per_cta = 0;
+                        *out_num_blocks = 0;
+                        return false;
+                    }
+                }
+
+                task::WindowTask window_task{};
+
+                if (!lower_fanout_transfer_task_to_window_task(
+                        transfer,
+                        src,
+                        fanout_dsts,
+                        begin_window,
+                        end_window,
+                        &window_task)) {
+                    out_window_plan->total_tasks = 0;
+                    out_window_plan->tasks_per_cta = 0;
+                    *out_num_blocks = 0;
+                    return false;
+                }
+
+                out_window_plan->tasks[task_idx++] = window_task;
+                continue;
+            }
 
             void* dst =
                 resolve_logical_mut_ptr(

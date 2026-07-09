@@ -214,6 +214,104 @@ __host__ __device__ __forceinline__ WindowTask make_copy_tma_task(
         terminal);
 }
 
+
+/*
+ * OOVERLAP_FANOUT_WINDOW_TASK_MAKERS_PATCH:
+ *
+ * Fanout task constructors only build WindowTask metadata. They do not execute
+ * anything; executor/pipeline support is added separately.
+ */
+__host__ __device__ __forceinline__ WindowTask make_copy_tma_fanout_task(
+    const void* src,
+    void* const* fanout_dsts,
+    int fanout_dst_count,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    bool terminal = false) {
+    WindowTask task =
+        make_window_task(
+            WindowTaskOp::CopyTMAFanout,
+            src,
+            nullptr,
+            total_bytes,
+            begin_window,
+            end_window,
+            window_chunks,
+            terminal);
+
+    if (fanout_dst_count < 0) {
+        fanout_dst_count = 0;
+    }
+
+    if (fanout_dst_count > TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS) {
+        fanout_dst_count = TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS;
+    }
+
+    task.fanout_dst_count =
+        static_cast<uint8_t>(fanout_dst_count);
+
+    for (int i = 0; i < fanout_dst_count; ++i) {
+        task.fanout_dsts[i] =
+            fanout_dsts != nullptr ? fanout_dsts[i] : nullptr;
+    }
+
+    return task;
+}
+
+__host__ __device__ __forceinline__ WindowTask make_reduce_tma_fanout_task(
+    const void* src,
+    void* const* fanout_dsts,
+    const int* fanout_reduce_scope,
+    int fanout_dst_count,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    bool terminal = false) {
+    WindowTask task =
+        make_window_task(
+            WindowTaskOp::ReduceTMAFanout,
+            src,
+            nullptr,
+            total_bytes,
+            begin_window,
+            end_window,
+            window_chunks,
+            terminal);
+
+    if (fanout_dst_count < 0) {
+        fanout_dst_count = 0;
+    }
+
+    if (fanout_dst_count > TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS) {
+        fanout_dst_count = TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS;
+    }
+
+    task.fanout_dst_count =
+        static_cast<uint8_t>(fanout_dst_count);
+
+    for (int i = 0; i < fanout_dst_count; ++i) {
+        task.fanout_dsts[i] =
+            fanout_dsts != nullptr ? fanout_dsts[i] : nullptr;
+
+        /*
+         * Keep the scope value as an integer here so window_task.cuh does not
+         * need to include tma_reduce.cuh. The fanout pipeline will cast it back
+         * to tma::TmaReduceScope when it builds runtime reduce targets.
+         */
+        task.fanout_reduce_scope[i] =
+            static_cast<uint8_t>(
+                fanout_reduce_scope != nullptr
+                    ? fanout_reduce_scope[i]
+                    : 0);
+    }
+
+    return task;
+}
+
+
 __host__ __device__ __forceinline__ WindowTask make_copy_tma_signal_task(
     const void* src,
     void* dst,
