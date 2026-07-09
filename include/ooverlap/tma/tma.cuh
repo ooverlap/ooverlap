@@ -218,5 +218,93 @@ __device__ __forceinline__ void store_async(
     store_async_commit(dst_gmem, src_smem, size_bytes);
 }
 
+
+// -----------------------------------------------------------------------------
+// FANOUT STORE UTILITIES
+// -----------------------------------------------------------------------------
+//
+// OOVERLAP_TMA_STORE_FANOUT_UTIL_PATCH:
+//
+// These helpers keep the low-level TMA behavior explicit while making fanout
+// call sites cleaner.  They do not add memory-scope qualifiers because plain
+// cp.async.bulk.global.shared::cta.bulk_group does not have the PTX 9.3
+// reduction `.relaxed.<scope>` qualifier.
+//
+// Argument order is source-smem first, then many global destinations:
+//
+//   store_async_fanout_commit(
+//       smem,
+//       bytes,
+//       dst0,
+//       dst1,
+//       dst2);
+//
+// Split form:
+//
+//   store_fence_proxy_async_shared_cta();
+//   store_async_fanout_op_nofence(smem, bytes, dst0, dst1, dst2);
+//   store_commit_group();
+// -----------------------------------------------------------------------------
+
+template <typename... DstPtrs>
+__device__ __forceinline__ void store_async_fanout_op_nofence(
+    void* src_smem,
+    uint32_t size_bytes,
+    DstPtrs... dst_gmems) {
+    static_assert(
+        sizeof...(DstPtrs) > 0,
+        "store_async_fanout_op_nofence requires at least one destination");
+
+    if (size_bytes == 0) {
+        return;
+    }
+
+    (store_async_op_nofence(
+         dst_gmems,
+         src_smem,
+         size_bytes),
+     ...);
+}
+
+template <typename... DstPtrs>
+__device__ __forceinline__ void store_async_fanout_op(
+    void* src_smem,
+    uint32_t size_bytes,
+    DstPtrs... dst_gmems) {
+    static_assert(
+        sizeof...(DstPtrs) > 0,
+        "store_async_fanout_op requires at least one destination");
+
+    if (size_bytes == 0) {
+        return;
+    }
+
+    store_fence_proxy_async_shared_cta();
+
+    store_async_fanout_op_nofence(
+        src_smem,
+        size_bytes,
+        dst_gmems...);
+}
+
+template <typename... DstPtrs>
+__device__ __forceinline__ void store_async_fanout_commit(
+    void* src_smem,
+    uint32_t size_bytes,
+    DstPtrs... dst_gmems) {
+    static_assert(
+        sizeof...(DstPtrs) > 0,
+        "store_async_fanout_commit requires at least one destination");
+
+    store_async_fanout_op(
+        src_smem,
+        size_bytes,
+        dst_gmems...);
+
+    if (size_bytes != 0) {
+        store_commit_group();
+    }
+}
+
 } // namespace tma
 } // namespace ooverlap

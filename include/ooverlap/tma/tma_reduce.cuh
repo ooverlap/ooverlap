@@ -270,6 +270,188 @@ OOVERLAP_TMA_DEFINE_REDUCE_OP(reduce_min_bf16_async, "min.bf16")
 OOVERLAP_TMA_DEFINE_REDUCE_OP(reduce_max_f16_async, "max.f16")
 OOVERLAP_TMA_DEFINE_REDUCE_OP(reduce_max_bf16_async, "max.bf16")
 
+
+// -----------------------------------------------------------------------------
+// FANOUT REDUCE UTILITIES
+// -----------------------------------------------------------------------------
+//
+// OOVERLAP_TMA_REDUCE_FANOUT_UTIL_PATCH:
+//
+// These helpers let one shared-memory source issue many cp.reduce.async.bulk
+// operations before one commit_group.  For per-destination scopes, pass typed
+// targets:
+//
+//   reduce_add_noftz_f16_async_fanout_commit(
+//       smem,
+//       bytes,
+//       reduce_fanout_target<TmaReduceScope::Gpu>(dst0),
+//       reduce_fanout_target<TmaReduceScope::Sys>(dst1));
+//
+// Same-scope convenience form:
+//
+//   reduce_add_noftz_f16_async_fanout_same_scope_commit<TmaReduceScope::Gpu>(
+//       smem,
+//       bytes,
+//       dst0,
+//       dst1,
+//       dst2);
+//
+// Split form:
+//
+//   reduce_fence_proxy_async_shared_cta();
+//   reduce_add_noftz_f16_async_fanout_op_nofence(...);
+//   reduce_commit_group();
+// -----------------------------------------------------------------------------
+
+template <TmaReduceScope ScopeValue>
+struct TmaReduceFanoutTarget {
+    static constexpr TmaReduceScope scope = ScopeValue;
+    void* dst_gmem = nullptr;
+};
+
+template <TmaReduceScope Scope>
+__device__ __forceinline__ TmaReduceFanoutTarget<Scope> reduce_fanout_target(
+    void* dst_gmem) {
+    TmaReduceFanoutTarget<Scope> target{};
+    target.dst_gmem = dst_gmem;
+    return target;
+}
+
+#define OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(BASE_NAME)                         \
+template <typename... Targets>                                                \
+__device__ __forceinline__ void BASE_NAME##_fanout_op_nofence(                \
+    void* src_smem,                                                           \
+    uint32_t size_bytes,                                                       \
+    Targets... targets) {                                                     \
+    static_assert(                                                            \
+        sizeof...(Targets) > 0,                                                \
+        #BASE_NAME "_fanout_op_nofence requires at least one destination");    \
+                                                                              \
+    if (size_bytes == 0) {                                                     \
+        return;                                                               \
+    }                                                                         \
+                                                                              \
+    (BASE_NAME##_op_nofence<Targets::scope>(                                  \
+         targets.dst_gmem,                                                     \
+         src_smem,                                                             \
+         size_bytes),                                                          \
+     ...);                                                                    \
+}                                                                             \
+                                                                              \
+template <typename... Targets>                                                \
+__device__ __forceinline__ void BASE_NAME##_fanout_op(                        \
+    void* src_smem,                                                           \
+    uint32_t size_bytes,                                                       \
+    Targets... targets) {                                                     \
+    static_assert(                                                            \
+        sizeof...(Targets) > 0,                                                \
+        #BASE_NAME "_fanout_op requires at least one destination");            \
+                                                                              \
+    if (size_bytes == 0) {                                                     \
+        return;                                                               \
+    }                                                                         \
+                                                                              \
+    reduce_fence_proxy_async_shared_cta();                                    \
+                                                                              \
+    BASE_NAME##_fanout_op_nofence(                                            \
+        src_smem,                                                             \
+        size_bytes,                                                           \
+        targets...);                                                          \
+}                                                                             \
+                                                                              \
+template <typename... Targets>                                                \
+__device__ __forceinline__ void BASE_NAME##_fanout_commit(                    \
+    void* src_smem,                                                           \
+    uint32_t size_bytes,                                                       \
+    Targets... targets) {                                                     \
+    static_assert(                                                            \
+        sizeof...(Targets) > 0,                                                \
+        #BASE_NAME "_fanout_commit requires at least one destination");        \
+                                                                              \
+    BASE_NAME##_fanout_op(                                                    \
+        src_smem,                                                             \
+        size_bytes,                                                           \
+        targets...);                                                          \
+                                                                              \
+    if (size_bytes != 0) {                                                     \
+        reduce_commit_group();                                                \
+    }                                                                         \
+}                                                                             \
+                                                                              \
+template <TmaReduceScope Scope, typename... DstPtrs>                          \
+__device__ __forceinline__ void BASE_NAME##_fanout_same_scope_op_nofence(     \
+    void* src_smem,                                                           \
+    uint32_t size_bytes,                                                       \
+    DstPtrs... dst_gmems) {                                                   \
+    static_assert(                                                            \
+        sizeof...(DstPtrs) > 0,                                                \
+        #BASE_NAME "_fanout_same_scope_op_nofence requires at least one "      \
+        "destination");                                                       \
+                                                                              \
+    if (size_bytes == 0) {                                                     \
+        return;                                                               \
+    }                                                                         \
+                                                                              \
+    (BASE_NAME##_op_nofence<Scope>(                                           \
+         dst_gmems,                                                            \
+         src_smem,                                                             \
+         size_bytes),                                                          \
+     ...);                                                                    \
+}                                                                             \
+                                                                              \
+template <TmaReduceScope Scope, typename... DstPtrs>                          \
+__device__ __forceinline__ void BASE_NAME##_fanout_same_scope_op(             \
+    void* src_smem,                                                           \
+    uint32_t size_bytes,                                                       \
+    DstPtrs... dst_gmems) {                                                   \
+    static_assert(                                                            \
+        sizeof...(DstPtrs) > 0,                                                \
+        #BASE_NAME "_fanout_same_scope_op requires at least one destination"); \
+                                                                              \
+    if (size_bytes == 0) {                                                     \
+        return;                                                               \
+    }                                                                         \
+                                                                              \
+    reduce_fence_proxy_async_shared_cta();                                    \
+                                                                              \
+    BASE_NAME##_fanout_same_scope_op_nofence<Scope>(                          \
+        src_smem,                                                             \
+        size_bytes,                                                           \
+        dst_gmems...);                                                        \
+}                                                                             \
+                                                                              \
+template <TmaReduceScope Scope, typename... DstPtrs>                          \
+__device__ __forceinline__ void BASE_NAME##_fanout_same_scope_commit(         \
+    void* src_smem,                                                           \
+    uint32_t size_bytes,                                                       \
+    DstPtrs... dst_gmems) {                                                   \
+    static_assert(                                                            \
+        sizeof...(DstPtrs) > 0,                                                \
+        #BASE_NAME "_fanout_same_scope_commit requires at least one "          \
+        "destination");                                                       \
+                                                                              \
+    BASE_NAME##_fanout_same_scope_op<Scope>(                                  \
+        src_smem,                                                             \
+        size_bytes,                                                           \
+        dst_gmems...);                                                        \
+                                                                              \
+    if (size_bytes != 0) {                                                     \
+        reduce_commit_group();                                                \
+    }                                                                         \
+}
+
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_add_f16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_add_noftz_f16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_add_noftz_bf16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_add_bf16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_add_f32_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_min_f16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_min_bf16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_max_f16_async)
+OOVERLAP_TMA_DEFINE_REDUCE_FANOUT(reduce_max_bf16_async)
+
+#undef OOVERLAP_TMA_DEFINE_REDUCE_FANOUT
+
 #undef OOVERLAP_TMA_DEFINE_REDUCE_OP
 #undef OOVERLAP_TMA_REDUCE_EMIT_EXPLICIT_SCOPE
 #undef OOVERLAP_TMA_REDUCE_EMIT_SCOPED
