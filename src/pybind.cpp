@@ -23,6 +23,7 @@
 #include "test/tma_efficiency_vs_best_2gpu.h"
 #include "test/persistent_external_p2p_collective_2gpu_sm90.h"
 #include "test/host_mapped_ready_microtest.h"
+#include "test/ipc_external_p2p_collective_2gpu_sm90.h"
 
 namespace py = pybind11;
 
@@ -408,6 +409,42 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("warmup"),
         py::arg("dev0") = 0,
         py::arg("dev1") = 1);
+
+  m.def("ipc_external_p2p_two_gpu_collective_smoke_rank_sm90",
+      &ooverlap::ipc_external_p2p_two_gpu_collective_smoke_rank_sm90,
+      py::arg("collective"),
+      py::arg("numel"),
+      py::arg("local_rank"),
+      py::arg("dev0"),
+      py::arg("dev1"),
+      py::arg("broker_key"),
+      py::arg("nccl_unique_id_bytes"),
+      py::arg("verify") = true);
+
+  m.def("benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90",
+      &ooverlap::benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90,
+      py::arg("collective"),
+      py::arg("numel"),
+      py::arg("local_rank"),
+      py::arg("dev0"),
+      py::arg("dev1"),
+      py::arg("broker_key"),
+      py::arg("nccl_unique_id_bytes"),
+      py::arg("iters"),
+      py::arg("warmup"),
+      py::arg("verify"));
+
+  m.def("benchmark_ipc_external_p2p_two_gpu_allreduce_rank_sm90",
+      &ooverlap::benchmark_ipc_external_p2p_two_gpu_allreduce_rank_sm90,
+      py::arg("numel"),
+      py::arg("local_rank"),
+      py::arg("dev0"),
+      py::arg("dev1"),
+      py::arg("broker_key"),
+      py::arg("nccl_unique_id_bytes"),
+      py::arg("iters"),
+      py::arg("warmup"),
+      py::arg("verify"));
 
   /*m.def(*/
     /*"benchmark_tma_efficiency_vs_best_2gpu_json",*/
