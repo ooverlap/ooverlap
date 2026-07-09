@@ -171,6 +171,47 @@ __device__ __forceinline__ void execute_window_task(
             return;
 
 
+        /*
+         * OOVERLAP_FANOUT_EXECUTOR_CASES_PATCH:
+         * Execute lowered one-source/many-destination fanout tasks.
+         */
+        case task::WindowTaskOp::CopyTMAFanout:
+            pipeline::copy_window_range_tma_fanout<
+                StageDepth,
+                FillDepth,
+                ChunkBytes,
+                LoadFillDepth>(
+                    task.src,
+                    task.fanout_dsts,
+                    static_cast<int>(task.fanout_dst_count),
+                    task.total_bytes,
+                    task.begin_window,
+                    task.end_window,
+                    task.window_chunks,
+                    shared_raw,
+                    barriers);
+            return;
+
+        case task::WindowTaskOp::ReduceTMAFanout:
+            pipeline::reduce_window_range_tma_fanout<
+                StageDepth,
+                FillDepth,
+                ChunkBytes,
+                LoadFillDepth>(
+                    task.src,
+                    task.fanout_dsts,
+                    task.fanout_reduce_scope,
+                    static_cast<int>(task.fanout_dst_count),
+                    task.total_bytes,
+                    task.begin_window,
+                    task.end_window,
+                    task.window_chunks,
+                    shared_raw,
+                    barriers);
+            return;
+
+
+
         case task::WindowTaskOp::ReadyPublish:
             if (threadIdx.x == 0) {
                 publish_ready_signal(

@@ -5,7 +5,11 @@
 #include "comm/pipeline/pipeline_stage.h"
 #include "comm/pipeline/pipeline_tma_copy.h"
 #include "comm/pipeline/pipeline_tma_load.h"
+#include "ooverlap/tma/tma.cuh"
+#include "ooverlap/tma/tma_reduce.cuh"
+
 #include "comm/utils/utils.h"
+#include "comm/params.h"
 
 #include <cuda_runtime.h>
 
@@ -775,6 +779,620 @@ __device__ void run_chunk_range(
 
     __syncthreads();
 }
+
+
+// -----------------------------------------------------------------------------
+// TMA fanout window pipeline
+// -----------------------------------------------------------------------------
+//
+// OOVERLAP_FANOUT_WINDOW_PIPELINE_PATCH:
+//
+// First implementation for WindowTaskOp::{CopyTMAFanout, ReduceTMAFanout}.
+//
+// Deliberately minimal:
+//   - no signal variants
+//   - no small-task special path
+//   - only 16-byte aligned TMA bulk ranges
+//   - no scalar tail path
+//
+// The source SMEM tile is produced by TMA load and immediately consumed by TMA
+// store/reduce, so these helpers use *_op_nofence and one commit_group per
+// chunk.  Do not use this path if threads modify the SMEM tile between load and
+// outgoing fanout.
+// -----------------------------------------------------------------------------
+
+__device__ __forceinline__ tma::TmaReduceScope
+fanout_reduce_scope_from_u8(uint8_t scope_value) {
+    switch (static_cast<int>(scope_value)) {
+        case 1:
+            return tma::TmaReduceScope::Cta;
+        case 2:
+            return tma::TmaReduceScope::Cluster;
+        case 3:
+            return tma::TmaReduceScope::Gpu;
+        case 4:
+            return tma::TmaReduceScope::Sys;
+        case 0:
+        default:
+            return tma::TmaReduceScope::Default;
+    }
+}
+
+__device__ __forceinline__ void issue_reduce_add_noftz_f16_fanout_one_nofence(
+    void* dst_gmem,
+    void* src_smem,
+    uint32_t size_bytes,
+    tma::TmaReduceScope scope) {
+    if (dst_gmem == nullptr || src_smem == nullptr || size_bytes == 0) {
+        return;
+    }
+
+    switch (scope) {
+        case tma::TmaReduceScope::Cta:
+            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {
+                tma::reduce_add_noftz_f16_async_op_nofence<
+                    tma::TmaReduceScope::Cta>(
+                        dst_gmem,
+                        src_smem,
+                        size_bytes);
+            } else {
+                tma::reduce_add_noftz_f16_async_op_nofence<
+                    tma::TmaReduceScope::Default>(
+                        dst_gmem,
+                        src_smem,
+                        size_bytes);
+            }
+            break;
+
+        case tma::TmaReduceScope::Cluster:
+            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {
+                tma::reduce_add_noftz_f16_async_op_nofence<
+                    tma::TmaReduceScope::Cluster>(
+                        dst_gmem,
+                        src_smem,
+                        size_bytes);
+            } else {
+                tma::reduce_add_noftz_f16_async_op_nofence<
+                    tma::TmaReduceScope::Default>(
+                        dst_gmem,
+                        src_smem,
+                        size_bytes);
+            }
+            break;
+
+        case tma::TmaReduceScope::Gpu:
+            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {
+                tma::reduce_add_noftz_f16_async_op_nofence<
+                    tma::TmaReduceScope::Gpu>(
+                        dst_gmem,
+                        src_smem,
+                        size_bytes);
+            } else {
+                tma::reduce_add_noftz_f16_async_op_nofence<
+                    tma::TmaReduceScope::Default>(
+                        dst_gmem,
+                        src_smem,
+                        size_bytes);
+            }
+            break;
+
+        case tma::TmaReduceScope::Sys:
+            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {
+                tma::reduce_add_noftz_f16_async_op_nofence<
+                    tma::TmaReduceScope::Sys>(
+                        dst_gmem,
+                        src_smem,
+                        size_bytes);
+            } else {
+                tma::reduce_add_noftz_f16_async_op_nofence<
+                    tma::TmaReduceScope::Default>(
+                        dst_gmem,
+                        src_smem,
+                        size_bytes);
+            }
+            break;
+
+        case tma::TmaReduceScope::Default:
+        default:
+            tma::reduce_add_noftz_f16_async_op_nofence<
+                tma::TmaReduceScope::Default>(
+                    dst_gmem,
+                    src_smem,
+                    size_bytes);
+            break;
+    }
+}
+
+__device__ __forceinline__ void issue_reduce_add_noftz_f16_fanout_nofence(
+    void* src_smem,
+    uint32_t size_bytes,
+    void* const* dst_gmems,
+    const uint8_t* reduce_scopes,
+    int dst_count) {
+    if (src_smem == nullptr ||
+        size_bytes == 0 ||
+        dst_gmems == nullptr ||
+        dst_count <= 0) {
+        return;
+    }
+
+    for (int i = 0; i < dst_count; ++i) {
+        const tma::TmaReduceScope scope =
+            reduce_scopes != nullptr
+                ? fanout_reduce_scope_from_u8(reduce_scopes[i])
+                : tma::TmaReduceScope::Default;
+
+        issue_reduce_add_noftz_f16_fanout_one_nofence(
+            dst_gmems[i],
+            src_smem,
+            size_bytes,
+            scope);
+    }
+}
+
+template <size_t ChunkBytes>
+__device__ __forceinline__ PipelineStage make_fanout_stage_for_abs_chunk(
+    const unsigned char* src_base,
+    size_t total_bytes,
+    int abs_chunk_idx,
+    int slot,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    const size_t offset =
+        chunk_offset_bytes<ChunkBytes>(abs_chunk_idx);
+
+    const size_t bytes =
+        chunk_size_bytes_abs<ChunkBytes>(
+            abs_chunk_idx,
+            total_bytes);
+
+    return make_pipeline_stage(
+        make_pipeline_chunk(
+            src_base + offset,
+            nullptr,
+            bytes),
+        stage_smem_ptr<ChunkBytes>(shared_raw, slot),
+        &barriers[slot]);
+}
+
+template <int MaxFanoutDsts>
+__device__ __forceinline__ int clamp_fanout_dst_count(int dst_count) {
+    if (dst_count < 0) {
+        return 0;
+    }
+
+    return dst_count > MaxFanoutDsts ? MaxFanoutDsts : dst_count;
+}
+
+template <
+    int StageDepth,
+    int FillDepth,
+    size_t ChunkBytes,
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void run_chunk_range_tma_copy_fanout_16b_aligned_thread0(
+    const void* src_base,
+    void* const* fanout_dsts,
+    int fanout_dst_count,
+    size_t total_bytes,
+    int begin_chunk,
+    int end_chunk,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    static_assert(StageDepth > 0, "StageDepth must be > 0");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
+    static_assert(LoadFillDepth + FillDepth <= StageDepth,
+                  "LoadFillDepth + FillDepth must be <= StageDepth");
+    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int dst_count =
+        clamp_fanout_dst_count<TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS>(
+            fanout_dst_count);
+
+    if (begin_chunk >= end_chunk ||
+        total_bytes == 0 ||
+        src_base == nullptr ||
+        fanout_dsts == nullptr ||
+        dst_count <= 0) {
+        return;
+    }
+
+    const unsigned char* src_bytes =
+        reinterpret_cast<const unsigned char*>(src_base);
+
+    PipelineTMALoad load{};
+
+    const int total_range_chunks =
+        end_chunk - begin_chunk;
+
+    #pragma unroll 16
+    for (int warm = 0; warm < LoadFillDepth; ++warm) {
+        if (warm >= total_range_chunks) {
+            break;
+        }
+
+        const int abs_chunk =
+            begin_chunk + warm;
+
+        PipelineStage stage =
+            make_fanout_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                total_bytes,
+                abs_chunk,
+                warm,
+                shared_raw,
+                barriers);
+
+        load.issue(&stage);
+    }
+
+    #pragma unroll 8
+    for (int iter = 0; iter < total_range_chunks; ++iter) {
+        const int abs_chunk =
+            begin_chunk + iter;
+
+        const int cur_slot =
+            iter % StageDepth;
+
+        PipelineStage cur_stage =
+            make_fanout_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                total_bytes,
+                abs_chunk,
+                cur_slot,
+                shared_raw,
+                barriers);
+
+        load.wait_ready(&cur_stage);
+
+        const int future_iter =
+            iter + LoadFillDepth;
+
+        if (future_iter < total_range_chunks) {
+            const int future_abs_chunk =
+                begin_chunk + future_iter;
+
+            const int future_slot =
+                future_iter % StageDepth;
+
+            PipelineStage future_stage =
+                make_fanout_stage_for_abs_chunk<ChunkBytes>(
+                    src_bytes,
+                    total_bytes,
+                    future_abs_chunk,
+                    future_slot,
+                    shared_raw,
+                    barriers);
+
+            if (future_iter >= StageDepth) {
+                tma::store_async_read_wait<FillDepth - 1>();
+            }
+
+            load.issue(&future_stage);
+        }
+
+        const size_t bulk_bytes =
+            pipeline_stage_bulk_bytes(&cur_stage);
+
+        if (bulk_bytes != 0) {
+            void* chunk_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+            const size_t offset =
+                chunk_offset_bytes<ChunkBytes>(abs_chunk);
+
+
+            #pragma unroll 4
+            for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
+                if (fanout_dsts[dst_idx] == nullptr) {
+                    chunk_dsts[dst_idx] = nullptr;
+                } else {
+                    chunk_dsts[dst_idx] =
+                        reinterpret_cast<unsigned char*>(
+                            fanout_dsts[dst_idx]) + offset;
+                }
+            }
+
+            tma::store_async_fanout_array_op_nofence(
+                cur_stage.smem,
+                static_cast<uint32_t>(bulk_bytes),
+                chunk_dsts,
+                dst_count);
+
+            tma::store_commit_group();
+        }
+    }
+
+    tma::store_async_wait<0>();
+}
+
+template <
+    int StageDepth,
+    int FillDepth,
+    size_t ChunkBytes,
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void run_chunk_range_tma_reduce_fanout_16b_aligned_thread0(
+    const void* src_base,
+    void* const* fanout_dsts,
+    const uint8_t* fanout_reduce_scope,
+    int fanout_dst_count,
+    size_t total_bytes,
+    int begin_chunk,
+    int end_chunk,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    static_assert(StageDepth > 0, "StageDepth must be > 0");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
+    static_assert(LoadFillDepth + FillDepth <= StageDepth,
+                  "LoadFillDepth + FillDepth must be <= StageDepth");
+    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int dst_count =
+        clamp_fanout_dst_count<TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS>(
+            fanout_dst_count);
+
+    if (begin_chunk >= end_chunk ||
+        total_bytes == 0 ||
+        src_base == nullptr ||
+        fanout_dsts == nullptr ||
+        dst_count <= 0) {
+        return;
+    }
+
+    const unsigned char* src_bytes =
+        reinterpret_cast<const unsigned char*>(src_base);
+
+    PipelineTMALoad load{};
+
+    const int total_range_chunks =
+        end_chunk - begin_chunk;
+
+    #pragma unroll 16
+    for (int warm = 0; warm < LoadFillDepth; ++warm) {
+        if (warm >= total_range_chunks) {
+            break;
+        }
+
+        const int abs_chunk =
+            begin_chunk + warm;
+
+        PipelineStage stage =
+            make_fanout_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                total_bytes,
+                abs_chunk,
+                warm,
+                shared_raw,
+                barriers);
+
+        load.issue(&stage);
+    }
+
+    #pragma unroll 8
+    for (int iter = 0; iter < total_range_chunks; ++iter) {
+        const int abs_chunk =
+            begin_chunk + iter;
+
+        const int cur_slot =
+            iter % StageDepth;
+
+        PipelineStage cur_stage =
+            make_fanout_stage_for_abs_chunk<ChunkBytes>(
+                src_bytes,
+                total_bytes,
+                abs_chunk,
+                cur_slot,
+                shared_raw,
+                barriers);
+
+        load.wait_ready(&cur_stage);
+
+        const int future_iter =
+            iter + LoadFillDepth;
+
+        if (future_iter < total_range_chunks) {
+            const int future_abs_chunk =
+                begin_chunk + future_iter;
+
+            const int future_slot =
+                future_iter % StageDepth;
+
+            PipelineStage future_stage =
+                make_fanout_stage_for_abs_chunk<ChunkBytes>(
+                    src_bytes,
+                    total_bytes,
+                    future_abs_chunk,
+                    future_slot,
+                    shared_raw,
+                    barriers);
+
+            if (future_iter >= StageDepth) {
+                tma::reduce_async_read_wait<FillDepth - 1>();
+            }
+
+            load.issue(&future_stage);
+        }
+
+        const size_t bulk_bytes =
+            pipeline_stage_bulk_bytes(&cur_stage);
+
+        if (bulk_bytes != 0) {
+            void* chunk_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+            const size_t offset =
+                chunk_offset_bytes<ChunkBytes>(abs_chunk);
+
+            #pragma unroll 4
+            for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
+                if (fanout_dsts[dst_idx] == nullptr) {
+                    chunk_dsts[dst_idx] = nullptr;
+                } else {
+                    chunk_dsts[dst_idx] =
+                        reinterpret_cast<unsigned char*>(
+                            fanout_dsts[dst_idx]) + offset;
+                }
+            }
+
+            issue_reduce_add_noftz_f16_fanout_nofence(
+                cur_stage.smem,
+                static_cast<uint32_t>(bulk_bytes),
+                chunk_dsts,
+                fanout_reduce_scope,
+                dst_count);
+
+            tma::reduce_commit_group();
+        }
+    }
+
+    tma::reduce_async_wait<0>();
+}
+
+template <
+    int StageDepth,
+    int FillDepth,
+    size_t ChunkBytes,
+    int LoadFillDepth = FillDepth>
+__device__ void copy_window_range_tma_fanout(
+    const void* src_base,
+    void* const* fanout_dsts,
+    int fanout_dst_count,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    static_assert(StageDepth > 0, "StageDepth must be > 0");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
+    static_assert(LoadFillDepth + FillDepth <= StageDepth,
+                  "LoadFillDepth + FillDepth must be <= StageDepth");
+    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+
+    if (begin_window >= end_window ||
+        window_chunks <= 0 ||
+        total_bytes == 0 ||
+        fanout_dst_count <= 0) {
+        return;
+    }
+
+    const int total_chunks =
+        chunk_count_for_bytes<ChunkBytes>(total_bytes);
+
+    const ChunkRange chunks =
+        chunk_range_for_window_range(
+            begin_window,
+            end_window,
+            total_chunks,
+            window_chunks);
+
+    if (chunks.begin >= chunks.end) {
+        return;
+    }
+
+    /*
+     * First pass: only support pure bulk-aligned fanout.  Tail handling for
+     * fanout copy/reduce can be added later if needed.
+     */
+    if (!chunk_range_is_16b_bulk_aligned<ChunkBytes>(
+            total_bytes,
+            chunks.begin,
+            chunks.end)) {
+        return;
+    }
+
+    run_chunk_range_tma_copy_fanout_16b_aligned_thread0<
+        StageDepth,
+        FillDepth,
+        ChunkBytes,
+        LoadFillDepth>(
+            src_base,
+            fanout_dsts,
+            fanout_dst_count,
+            total_bytes,
+            chunks.begin,
+            chunks.end,
+            shared_raw,
+            barriers);
+}
+
+template <
+    int StageDepth,
+    int FillDepth,
+    size_t ChunkBytes,
+    int LoadFillDepth = FillDepth>
+__device__ void reduce_window_range_tma_fanout(
+    const void* src_base,
+    void* const* fanout_dsts,
+    const uint8_t* fanout_reduce_scope,
+    int fanout_dst_count,
+    size_t total_bytes,
+    int begin_window,
+    int end_window,
+    int window_chunks,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    static_assert(StageDepth > 0, "StageDepth must be > 0");
+    static_assert(FillDepth > 0, "FillDepth must be > 0");
+    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
+    static_assert(LoadFillDepth + FillDepth <= StageDepth,
+                  "LoadFillDepth + FillDepth must be <= StageDepth");
+    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+
+    if (begin_window >= end_window ||
+        window_chunks <= 0 ||
+        total_bytes == 0 ||
+        fanout_dst_count <= 0) {
+        return;
+    }
+
+    const int total_chunks =
+        chunk_count_for_bytes<ChunkBytes>(total_bytes);
+
+    const ChunkRange chunks =
+        chunk_range_for_window_range(
+            begin_window,
+            end_window,
+            total_chunks,
+            window_chunks);
+
+    if (chunks.begin >= chunks.end) {
+        return;
+    }
+
+    /*
+     * First pass: only support pure bulk-aligned fanout.  Tail handling for
+     * reduce fanout is more delicate because scalar tails are not TMA atomics.
+     */
+    if (!chunk_range_is_16b_bulk_aligned<ChunkBytes>(
+            total_bytes,
+            chunks.begin,
+            chunks.end)) {
+        return;
+    }
+
+    run_chunk_range_tma_reduce_fanout_16b_aligned_thread0<
+        StageDepth,
+        FillDepth,
+        ChunkBytes,
+        LoadFillDepth>(
+            src_base,
+            fanout_dsts,
+            fanout_reduce_scope,
+            fanout_dst_count,
+            total_bytes,
+            chunks.begin,
+            chunks.end,
+            shared_raw,
+            barriers);
+}
+
 
 template <
     int StageDepth,
