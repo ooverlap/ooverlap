@@ -29,6 +29,8 @@
 
 #define TMA_TWO_GPU_PEER_SMALL_TASK_BYTES (200 * 1024)
 
+#define TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS 4
+
 static_assert(TMA_TWO_GPU_PEER_DEFAULT_THREADS >= 32,
               "default thread count must be >= 32");
 static_assert(TMA_TWO_GPU_PEER_DEFAULT_THREADS <= 1024,

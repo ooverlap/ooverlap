@@ -71,6 +71,9 @@ enum class WindowTaskOp : uint8_t {
      * ready_owner_cta   = CTA that performs the publish; all CTAs wait
      */
     ReadyPublishWait = 10,
+
+    CopyTMAFanout = 11,
+    ReduceTMAFanout = 12,
 };
 
 struct WindowTask {
@@ -78,6 +81,10 @@ struct WindowTask {
 
     const void* src = nullptr;
     void* dst = nullptr;
+    
+    void* fanout_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+    uint8_t fanout_dst_count = 0;
+    uint8_t fanout_reduce_scope[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
 
     /*
      * total_bytes is the logical span of src/dst. Window indices are absolute
@@ -373,6 +380,15 @@ __host__ __device__ __forceinline__ bool window_task_has_work(
         task.op == WindowTaskOp::ReadyWait) {
         return task.signal_flags != nullptr &&
                task.ready_epoch > 0;
+    }
+
+    if (task.op == WindowTaskOp::CopyTMAFanout ||
+        task.op == WindowTaskOp::ReduceTMAFanout) {
+        return task.src != nullptr &&
+               task.fanout_dst_count > 0 &&
+               task.total_bytes > 0 &&
+               task.window_chunks > 0 &&
+               task.begin_window < task.end_window;
     }
 
     return task.op != WindowTaskOp::None &&

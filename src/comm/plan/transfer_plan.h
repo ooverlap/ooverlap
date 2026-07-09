@@ -26,6 +26,9 @@ enum class TransferOp : std::uint8_t {
 
     ReadyPublish = 3,
     ReadyWait = 4,
+
+    CopyFanout = 5,
+    ReduceFanout = 6,
 };
 
 /*
@@ -143,6 +146,11 @@ struct TransferTask {
 
     LogicalBufferRef src{};
     LogicalBufferRef dst{};
+
+    LogicalBufferRef fanout_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS];
+    int fanout_dst_count = 0;
+    int fanout_dst_rank[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+    int fanout_reduce_scope[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
 
     /*
      * Number of bytes in the logical transfer after src/dst byte_offset.
