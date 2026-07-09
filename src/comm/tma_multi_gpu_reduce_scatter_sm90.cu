@@ -250,24 +250,27 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
 
     system::runtime::set_device(launch.local_device);
 
-    comm::kernels::multi_gpu_window_task_executor_kernel_sm90<
+    /*
+     * OOVERLAP_WINDOW_PLAN_DEVICE_LAUNCH_HELPER_PATCH:
+     * Pass the large WindowTaskExecutorPlan through device memory instead of
+     * CUDA kernel formal parameter space.
+     */
+    return comm::kernels::launch_multi_gpu_window_task_executor_sm90<
         ReduceApply,
         ChunkBytes,
         StageDepth,
         MaxTasks,
         MaxPeers,
         Variant::fill_depth,
-        Variant::load_fill_depth><<<
+        Variant::load_fill_depth>(
+            window_plan,
             num_blocks,
             launch_config.threads,
             Variant::dynamic_shared_bytes,
-            stream>>>(
-                window_plan,
-                launch.local_ready_signal,
-                ready_plan,
-                launch.collective_epoch);
-
-    return cudaGetLastError();
+            stream,
+            launch.local_ready_signal,
+            ready_plan,
+            launch.collective_epoch);
 }
 
 template <

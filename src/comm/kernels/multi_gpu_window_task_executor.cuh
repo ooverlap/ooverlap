@@ -29,7 +29,7 @@ template <
     int LoadFillDepth = FillDepth,
     int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
 __global__ void multi_gpu_window_task_executor_kernel_sm90(
-    comm::plan::WindowTaskExecutorPlan<MaxTasks> plan,
+    const comm::plan::WindowTaskExecutorPlan<MaxTasks>* plan,
     int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch) {
@@ -45,6 +45,10 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
+
+    if (plan == nullptr) {
+        return;
+    }
 
     extern __shared__ uint4 shared_storage_u4[];
 
@@ -66,13 +70,100 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
         LoadFillDepth,
         SmallTaskBytes>(
-            plan.tasks,
-            plan.total_tasks,
-            plan.tasks_per_cta,
+            plan->tasks,
+            plan->total_tasks,
+            plan->tasks_per_cta,
             static_cast<int>(blockIdx.x),
             shared_raw,
             barriers);
 }
+
+
+/*
+ * OOVERLAP_WINDOW_PLAN_DEVICE_LAUNCH_HELPER_PATCH:
+ *
+ * WindowTaskExecutorPlan can be too large to pass by value as a CUDA kernel
+ * parameter after WindowTask grows fanout metadata.  Keep the host-side lowering
+ * path unchanged, but copy the final plan to device memory and pass only a
+ * pointer to the kernel.
+ */
+template <
+    typename ReduceApply,
+    int ChunkBytes,
+    int StageDepth,
+    int MaxTasks,
+    int MaxPeers,
+    int FillDepth = StageDepth / 2,
+    int LoadFillDepth = FillDepth,
+    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+cudaError_t launch_multi_gpu_window_task_executor_sm90(
+    const comm::plan::WindowTaskExecutorPlan<MaxTasks>& window_plan,
+    int num_blocks,
+    int threads,
+    size_t dynamic_shared_bytes,
+    cudaStream_t stream,
+    int* local_ready_signal,
+    MultiGpuReadySignalPlan<MaxPeers> ready_plan,
+    int collective_epoch) {
+    if (num_blocks <= 0 || threads <= 0 || window_plan.total_tasks <= 0) {
+        return cudaSuccess;
+    }
+
+    comm::plan::WindowTaskExecutorPlan<MaxTasks>* device_window_plan = nullptr;
+
+    cudaError_t err =
+        cudaMallocAsync(
+            reinterpret_cast<void**>(&device_window_plan),
+            sizeof(*device_window_plan),
+            stream);
+
+    if (err != cudaSuccess) {
+        return err;
+    }
+
+    err =
+        cudaMemcpyAsync(
+            device_window_plan,
+            &window_plan,
+            sizeof(window_plan),
+            cudaMemcpyHostToDevice,
+            stream);
+
+    if (err != cudaSuccess) {
+        cudaFreeAsync(device_window_plan, stream);
+        return err;
+    }
+
+    multi_gpu_window_task_executor_kernel_sm90<
+        ReduceApply,
+        ChunkBytes,
+        StageDepth,
+        MaxTasks,
+        MaxPeers,
+        FillDepth,
+        LoadFillDepth,
+        SmallTaskBytes><<<
+            num_blocks,
+            threads,
+            dynamic_shared_bytes,
+            stream>>>(
+                device_window_plan,
+                local_ready_signal,
+                ready_plan,
+                collective_epoch);
+
+    const cudaError_t launch_err = cudaGetLastError();
+
+    const cudaError_t free_err =
+        cudaFreeAsync(device_window_plan, stream);
+
+    if (launch_err != cudaSuccess) {
+        return launch_err;
+    }
+
+    return free_err;
+}
+
 
 template <
     typename ReduceApply,

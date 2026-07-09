@@ -249,24 +249,27 @@ cudaError_t launch_allreduce_rank_variant_sm90(
             launch.local_device,
             "tma_multi_gpu_allreduce: requested shared memory exceeds opt-in limit");
 
-    comm::kernels::multi_gpu_window_task_executor_kernel_sm90<
+    /*
+     * OOVERLAP_WINDOW_PLAN_DEVICE_LAUNCH_HELPER_PATCH:
+     * Pass the large WindowTaskExecutorPlan through device memory instead of
+     * CUDA kernel formal parameter space.
+     */
+    return comm::kernels::launch_multi_gpu_window_task_executor_sm90<
         ReduceApply,
         ChunkBytes,
         StageDepth,
         MaxTasks,
         MaxPeers,
         Variant::fill_depth,
-        Variant::load_fill_depth><<<
+        Variant::load_fill_depth>(
+            window_plan,
             num_blocks,
             launch_config.threads,
             Variant::dynamic_shared_bytes,
-            stream>>>(
-                window_plan,
-                launch.local_ready_signal,
-                ready_plan,
-                launch.collective_epoch);
-
-    return cudaSuccess;
+            stream,
+            launch.local_ready_signal,
+            ready_plan,
+            launch.collective_epoch);
 }
 
 template <
