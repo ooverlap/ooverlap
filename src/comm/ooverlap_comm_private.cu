@@ -244,6 +244,160 @@ LaunchConfig select_public_launch_config(
         tuning_preference_from_public(tuning_mode));
 }
 
+
+/*
+ * OOVERLAP_IPC_LEGACY_BUFFER_REGISTRATION_HELPER_PATCH:
+ *
+ * Multiprocess p2p/legacy CUDA IPC buffer registration for public collectives.
+ *
+ * This path intentionally ignores VMM buffers.  The expected public IPC use is:
+ *   - user / framework owns a cudaMalloc-like allocation
+ *   - caller wraps it with oo_buffer_wrap(...)
+ *   - before each collective, every rank exports its wrapped pointer as a
+ *     cudaIpcMemHandle_t descriptor through Broker::exchange_data
+ *   - every rank imports all peer descriptors and stores the imported mappings in
+ *     group-owned ipc_imported_collective_buffers[]
+ *
+ * Same-process groups never call this helper.
+ */
+oo_status_t reset_ipc_imported_collective_buffer(
+    oo_group_t* group,
+    int rank) {
+    if (group == nullptr ||
+        rank < 0 ||
+        rank >= kOoMaxLocalDevices) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_buffer_t* old_buffer =
+        group->ipc_imported_collective_buffers[rank].get();
+
+    if (old_buffer != nullptr &&
+        group->collective_buffers[rank] == old_buffer) {
+        group->collective_buffers[rank] = nullptr;
+    }
+
+    group->ipc_imported_collective_buffers[rank].reset();
+    return OO_SUCCESS;
+}
+
+oo_status_t ensure_ipc_legacy_collective_buffers_registered(
+    oo_node_t* node,
+    oo_buffer_t* local) {
+    if (node == nullptr ||
+        node->group == nullptr ||
+        local == nullptr ||
+        local->ptr == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_group_t* group = node->group;
+
+    if (group->bootstrap_kind != oo_group_bootstrap_kind::multiprocess_ipc) {
+        return OO_SUCCESS;
+    }
+
+    if (group->broker == nullptr ||
+        group->memory_kind != oo_group_memory_kind::multiprocess_legacy_ipc ||
+        group->num_devices <= 0 ||
+        group->num_devices > kOoMaxLocalDevices ||
+        group->local_world_size != group->num_devices ||
+        group->local_rank != node->rank ||
+        node->rank < 0 ||
+        node->rank >= group->num_devices ||
+        node->device != group->devices[node->rank] ||
+        local->group != group ||
+        local->owner_rank != node->rank ||
+        local->owner_device != node->device ||
+        local->bytes == 0 ||
+        local->mapped_bytes == 0) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    /*
+     * First p2p IPC implementation only supports externally owned cudaMalloc /
+     * framework pointers registered via oo_buffer_wrap().  VMM-owned buffers use
+     * a different FD-based import path and are intentionally excluded here.
+     */
+    if (local->system_kind != ooverlap::system::peer_buffer_kind::wrapped) {
+        return OO_ERROR_UNSUPPORTED;
+    }
+
+    try {
+        
+        cudaSetDevice(node->device);
+        const ooverlap::system::legacy_peer_buffer_descriptor local_desc =
+            ooverlap::system::export_legacy_peer_buffer(
+                local->ptr,
+                local->bytes,
+                local->owner_device,
+                local->mapped_bytes != 0 ? local->mapped_bytes : local->bytes);
+
+        std::vector<ooverlap::system::legacy_peer_buffer_descriptor> descs(
+            static_cast<std::size_t>(group->num_devices));
+
+        group->broker->exchange_data(
+            descs.data(),
+            &local_desc,
+            sizeof(local_desc));
+
+        group->collective_buffers[node->rank] = local;
+
+        for (int rank = 0; rank < group->num_devices; ++rank) {
+            if (rank == node->rank) {
+                continue;
+            }
+
+            oo_status_t status =
+                reset_ipc_imported_collective_buffer(
+                    group,
+                    rank);
+
+            if (status != OO_SUCCESS) {
+                return status;
+            }
+
+            const ooverlap::system::legacy_peer_buffer_descriptor& desc =
+                descs[static_cast<std::size_t>(rank)];
+
+            if (desc.bytes == 0 ||
+                desc.mapped_size == 0 ||
+                desc.owner_device != group->devices[rank]) {
+                return OO_ERROR_INVALID_ARGUMENT;
+            }
+
+            ooverlap::system::imported_peer_buffer imported =
+                ooverlap::system::import_legacy_peer_buffer(
+                    desc,
+                    std::vector<int>{node->device});
+
+            std::unique_ptr<oo_buffer_t> imported_buffer(new oo_buffer_t{});
+
+            imported_buffer->ptr = imported.ptr;
+            imported_buffer->bytes = imported.bytes;
+            imported_buffer->mapped_bytes = imported.mapped_size;
+            imported_buffer->kind = OO_BUFFER_KIND_WRAPPED;
+            imported_buffer->group = group;
+            imported_buffer->owner_rank = rank;
+            imported_buffer->owner_device = desc.owner_device;
+            imported_buffer->system_kind =
+                ooverlap::system::peer_buffer_kind::imported_legacy;
+            imported_buffer->imported = std::move(imported);
+
+            group->ipc_imported_collective_buffers[rank] =
+                std::move(imported_buffer);
+
+            group->collective_buffers[rank] =
+                group->ipc_imported_collective_buffers[rank].get();
+        }
+
+        return OO_SUCCESS;
+    } catch (...) {
+        return exception_to_status();
+    }
+}
+
+
 oo_status_t prepare_collective_launch(
     oo_node_t* node,
     oo_buffer_t* local,
@@ -309,11 +463,26 @@ oo_status_t prepare_collective_launch(
     }
 
     /*
-     * Refresh this rank's current collective buffer.  This lets callers wrap or
-     * allocate once and then call collectives sequentially without explicitly
-     * passing peer buffers.
+     * OOVERLAP_IPC_LEGACY_BUFFER_PREPARE_PATCH:
+     *
+     * Same-process behavior is unchanged: refresh this rank's local pointer and
+     * immediately consume existing group->collective_buffers[].
+     *
+     * Multiprocess IPC behavior: exchange legacy CUDA IPC descriptors every
+     * collective and refresh imported peer pointers before reading peers below.
      */
-    group->collective_buffers[node->rank] = local;
+    if (group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc) {
+        status =
+            ensure_ipc_legacy_collective_buffers_registered(
+                node,
+                local);
+
+        if (status != OO_SUCCESS) {
+            return status;
+        }
+    } else {
+        group->collective_buffers[node->rank] = local;
+    }
 
     const int world_size = group->num_devices;
     const int peer_count = world_size - 1;

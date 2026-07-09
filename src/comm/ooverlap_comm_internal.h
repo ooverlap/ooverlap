@@ -243,6 +243,22 @@ struct oo_group {
     oo_buffer_t* collective_buffers[kOoMaxLocalDevices] = {};
 
     /*
+     * OOVERLAP_IPC_LEGACY_BUFFER_IMPORT_STORAGE_PATCH:
+     *
+     * Group-owned imported peer buffers for multiprocess legacy CUDA IPC.
+     *
+     * collective_buffers[] stays the non-owning rank -> current buffer view.
+     * For IPC peers, those views point into this owning storage.  The local
+     * rank still points at the caller's local oo_buffer_t.
+     *
+     * First implementation deliberately does not cache across collectives:
+     * every IPC collective re-exchanges legacy CUDA IPC descriptors and refreshes
+     * these imports, because the registered tensor may be different each call.
+     */
+    std::unique_ptr<oo_buffer_t>
+        ipc_imported_collective_buffers[kOoMaxLocalDevices] = {};
+
+    /*
      * Topology is the source of truth for transport capability.
      *
      * Do not store a separate peer_access_enabled matrix in oo_group. Peer
