@@ -4,6 +4,7 @@
 
 #include "comm/kernels/multi_gpu_ready_signal.cuh"
 #include "comm/kernels/window_task_executor.cuh"
+#include "comm/plan/transfer_plan.h"
 #include "comm/plan/window_plan.cuh"
 #include "comm/tma_variant_config.h"
 #include "comm/params.h"
@@ -57,6 +58,34 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         reinterpret_cast<unsigned char*>(shared_storage_u4);
 
     __shared__ sync::semaphore barriers[Variant::barrier_count];
+
+    
+    if (collective_epoch > 0 &&
+        local_ready_signal != nullptr &&
+        ready_plan.protocol != MultiGpuReadySignalProtocol::Disabled) {
+        const int entry_ready_value =
+            collective_epoch * comm::plan::kReadySignalPhaseStride;
+
+        if (threadIdx.x == 0) {
+            if (blockIdx.x == 0) {
+                publish_ready_signal(
+                    local_ready_signal,
+                    entry_ready_value,
+                    ready_plan.protocol);
+            }
+
+            for (int peer_idx = 0;
+                 peer_idx < ready_plan.peer_count;
+                 ++peer_idx) {
+                wait_until_ready_signal_at_least(
+                    ready_plan.peer_ready_signals[peer_idx],
+                    entry_ready_value,
+                    ready_plan.poll_sleep_cycles);
+            }
+        }
+
+        __syncthreads();
+    }
 
     /*
      * All-gather uses only copy tasks, but the task executor template still

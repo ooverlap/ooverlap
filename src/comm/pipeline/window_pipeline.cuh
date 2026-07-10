@@ -427,10 +427,9 @@ __device__ __forceinline__ void run_byte_range_single_tma_16b_aligned_thread0(
             shared_raw,
             &barriers[0]);
 
-    return;
-
     load.issue(&stage);
     load.wait_ready(&stage);
+
     apply.issue_bulk(&stage);
     apply.wait_complete();
 }
@@ -555,7 +554,6 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
     const int total_range_chunks =
         end_chunk - begin_chunk;
 
-    #pragma unroll 16
     for (int warm = 0; warm < LoadFillDepth; ++warm) {
         if (warm >= total_range_chunks) {
             break;
@@ -577,7 +575,6 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
         load.issue(&stage);
     }
 
-    #pragma unroll 8
     for (int iter = 0; iter < total_range_chunks; ++iter) {
         const int abs_chunk =
             begin_chunk + iter;
@@ -1413,8 +1410,6 @@ __device__ void run_window_range(
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
     static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
-
-    return;
 
     if (SmallTaskBytes > 0) {
         const ByteRange byte_range =

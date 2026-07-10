@@ -898,6 +898,64 @@ inline bool pass_drop_disabled_ready_tasks(
 }
 
 template <int MaxTransferTasks, int MaxRanks>
+inline bool pass_drop_hardcoded_entry_ready_pair(
+    const LoweringContext<MaxRanks>& ctx,
+    RankTransferTaskBuffer<MaxTransferTasks>* tasks) {
+    if (tasks == nullptr) {
+        return false;
+    }
+
+    if (!ctx.lower_ready_tasks || tasks->count < 2) {
+        return true;
+    }
+
+    const TransferTask& publish =
+        tasks->tasks[0];
+    const TransferTask& wait =
+        tasks->tasks[1];
+
+    const int device_channel =
+        static_cast<int>(ReadySignalChannel::DeviceMemory);
+
+    /*
+     * OOVERLAP_HARDCODED_ENTRY_READY_RENDEZVOUS_PATCH:
+     *
+     * The executor kernel now performs the common entry ReadyPublish+ReadyWait
+     * directly before execute_window_task_stripe().  Drop only the exact phase-0
+     * device-memory pair at the front of this rank's task list.  Leave all other
+     * ready tasks in the plan so later multi-phase algorithms keep working.
+     *
+     * This is intentionally narrow: if a future planner emits host-mapped entry
+     * ready, a non-zero entry phase, or a different ordering, this pass will not
+     * drop it.  In that case update the kernel launch args with an explicit
+     * entry-ready descriptor before removing those tasks.
+     */
+    const bool is_entry_pair =
+        publish.op == TransferOp::ReadyPublish &&
+        wait.op == TransferOp::ReadyWait &&
+        publish.executor_rank == ctx.current_rank &&
+        wait.executor_rank == ctx.current_rank &&
+        publish.ready_rank == ctx.current_rank &&
+        publish.ready_phase == 0 &&
+        wait.ready_phase == 0 &&
+        publish.ready_channel == device_channel &&
+        wait.ready_channel == device_channel &&
+        !publish.terminal;
+
+    if (!is_entry_pair) {
+        return true;
+    }
+
+    for (int i = 2; i < tasks->count; ++i) {
+        tasks->tasks[i - 2] = tasks->tasks[i];
+    }
+
+    tasks->count -= 2;
+
+    return recompute_rank_transfer_task_stats(tasks);
+}
+
+template <int MaxTransferTasks, int MaxRanks>
 inline bool pass_placeholder_optimize_transfer_tasks(
     const LoweringContext<MaxRanks>& /* ctx */,
     RankTransferTaskBuffer<MaxTransferTasks>* tasks) {
@@ -929,6 +987,10 @@ inline bool run_transfer_task_lowering_passes(
     }
 
     if (!pass_drop_disabled_ready_tasks(ctx, tasks)) {
+        return false;
+    }
+
+    if (!pass_drop_hardcoded_entry_ready_pair(ctx, tasks)) {
         return false;
     }
 

@@ -142,10 +142,16 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         binding.shm_staging[slot] = launch.staging_ptrs[slot];
     }
 
+    const int device_ready_channel =
+        ::kOoReadySignalChannelDeviceMemory;
+
     const auto ready_plan =
         comm::kernels::make_multi_gpu_ready_signal_plan<MaxPeers>(
             launch.peer_count,
-            launch.peer_ready_signals);
+            launch.peer_ready_signals,
+            static_cast<comm::kernels::MultiGpuReadySignalProtocol>(
+                launch.ready_signal_protocol_by_channel[device_ready_channel]),
+            launch.ready_signal_poll_sleep_cycles_by_channel[device_ready_channel]);
 
     comm::plan::ReadySignalBinding<MaxRanks> ready_binding{};
     ready_binding.epoch = launch.collective_epoch;
