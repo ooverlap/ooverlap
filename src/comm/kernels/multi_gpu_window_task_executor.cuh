@@ -80,6 +80,132 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
 }
 
 
+
+/*
+ * OOVERLAP_MAPPED_WINDOW_PLAN_SCRATCH_PATCH:
+ *
+ * YAGNI path to remove both per-launch device allocation and cudaMemcpyAsync for
+ * WindowTaskExecutorPlan.
+ *
+ * lower_transfer_plan_for_rank() is host code: it writes ordinary C++ pointers
+ * and structs.  A cudaMalloc pointer cannot be filled directly by the CPU.  So
+ * this uses one persistent cudaHostAllocMapped buffer per device and MaxTasks
+ * template instantiation:
+ *
+ *   CPU lowering writes scratch.host_plan
+ *   GPU kernel reads scratch.device_plan
+ *
+ * This is intentionally a simple benchmark-oriented fast path.  The GPU reads
+ * the plan from mapped pinned host memory, so this avoids copy overhead but may
+ * be slower than device DRAM if the kernel rereads many task fields.  Later, if
+ * plan reads become the bottleneck, use a persistent device buffer plus async
+ * copy, or move lowering onto the GPU.
+ *
+ * Also assumes one outstanding collective per device/template.  If we need
+ * concurrent streams with different plans, replace this single slot with a tiny
+ * ring indexed by stream/event.
+ */
+template <int MaxTasks>
+struct WindowPlanMappedScratch {
+    comm::plan::WindowTaskExecutorPlan<MaxTasks>* host_plan = nullptr;
+    const comm::plan::WindowTaskExecutorPlan<MaxTasks>* device_plan = nullptr;
+};
+
+template <int MaxTasks>
+cudaError_t get_mapped_window_plan_scratch(
+    int device,
+    WindowPlanMappedScratch<MaxTasks>* out) {
+    if (out == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    *out = WindowPlanMappedScratch<MaxTasks>{};
+
+    if (device < 0 || device >= 32) {
+        return cudaErrorInvalidDevice;
+    }
+
+    static std::mutex mutex;
+    static void* host_buffers[32] = {};
+    static void* device_buffers[32] = {};
+
+    if (host_buffers[device] != nullptr &&
+        device_buffers[device] != nullptr) {
+        out->host_plan =
+            reinterpret_cast<comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
+                host_buffers[device]);
+        out->device_plan =
+            reinterpret_cast<const comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
+                device_buffers[device]);
+        return cudaSuccess;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (host_buffers[device] == nullptr ||
+        device_buffers[device] == nullptr) {
+        cudaError_t err =
+            cudaSetDevice(device);
+
+        if (err != cudaSuccess) {
+            return err;
+        }
+
+        int can_map_host = 0;
+        err =
+            cudaDeviceGetAttribute(
+                &can_map_host,
+                cudaDevAttrCanMapHostMemory,
+                device);
+
+        if (err != cudaSuccess) {
+            return err;
+        }
+
+        if (can_map_host == 0) {
+            return cudaErrorInvalidDevice;
+        }
+
+        void* host_ptr = nullptr;
+
+        err =
+            cudaHostAlloc(
+                &host_ptr,
+                sizeof(comm::plan::WindowTaskExecutorPlan<MaxTasks>),
+                cudaHostAllocMapped | cudaHostAllocPortable);
+
+        if (err != cudaSuccess) {
+            return err;
+        }
+
+        void* device_ptr = nullptr;
+
+        err =
+            cudaHostGetDevicePointer(
+                &device_ptr,
+                host_ptr,
+                0);
+
+        if (err != cudaSuccess) {
+            cudaFreeHost(host_ptr);
+            return err;
+        }
+
+        host_buffers[device] = host_ptr;
+        device_buffers[device] = device_ptr;
+    }
+
+    out->host_plan =
+        reinterpret_cast<comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
+            host_buffers[device]);
+    out->device_plan =
+        reinterpret_cast<const comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
+            device_buffers[device]);
+
+    return cudaSuccess;
+}
+
+
 /*
  * OOVERLAP_WINDOW_PLAN_DEVICE_LAUNCH_HELPER_PATCH:
  *
@@ -98,7 +224,7 @@ template <
     int LoadFillDepth = FillDepth,
     int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
 cudaError_t launch_multi_gpu_window_task_executor_sm90(
-    const comm::plan::WindowTaskExecutorPlan<MaxTasks>& window_plan,
+    const comm::plan::WindowTaskExecutorPlan<MaxTasks>* window_plan,
     int num_blocks,
     int threads,
     size_t dynamic_shared_bytes,
@@ -106,33 +232,8 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
     int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch) {
-    if (num_blocks <= 0 || threads <= 0 || window_plan.total_tasks <= 0) {
+    if (num_blocks <= 0 || threads <= 0 || window_plan == nullptr) {
         return cudaSuccess;
-    }
-
-    comm::plan::WindowTaskExecutorPlan<MaxTasks>* device_window_plan = nullptr;
-
-    cudaError_t err =
-        cudaMallocAsync(
-            reinterpret_cast<void**>(&device_window_plan),
-            sizeof(*device_window_plan),
-            stream);
-
-    if (err != cudaSuccess) {
-        return err;
-    }
-
-    err =
-        cudaMemcpyAsync(
-            device_window_plan,
-            &window_plan,
-            sizeof(window_plan),
-            cudaMemcpyHostToDevice,
-            stream);
-
-    if (err != cudaSuccess) {
-        cudaFreeAsync(device_window_plan, stream);
-        return err;
     }
 
     multi_gpu_window_task_executor_kernel_sm90<
@@ -148,21 +249,12 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
             threads,
             dynamic_shared_bytes,
             stream>>>(
-                device_window_plan,
+                window_plan,
                 local_ready_signal,
                 ready_plan,
                 collective_epoch);
 
-    const cudaError_t launch_err = cudaGetLastError();
-
-    const cudaError_t free_err =
-        cudaFreeAsync(device_window_plan, stream);
-
-    if (launch_err != cudaSuccess) {
-        return launch_err;
-    }
-
-    return free_err;
+    return cudaGetLastError();
 }
 
 

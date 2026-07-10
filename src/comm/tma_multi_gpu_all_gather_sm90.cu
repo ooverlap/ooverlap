@@ -314,7 +314,24 @@ cudaError_t launch_all_gather_rank_variant_sm90(
     const comm::plan::ReadySignalBinding<MaxRanks>* ready_binding_ptr =
         use_ready_binding ? &ready_binding : nullptr;
 
-    comm::plan::WindowTaskExecutorPlan<MaxTasks> window_plan{};
+    comm::kernels::WindowPlanMappedScratch<MaxTasks> window_plan_scratch{};
+
+    const cudaError_t window_plan_scratch_err =
+        comm::kernels::get_mapped_window_plan_scratch<MaxTasks>(
+            launch.local_device,
+            &window_plan_scratch);
+
+    if (window_plan_scratch_err != cudaSuccess ||
+        window_plan_scratch.host_plan == nullptr ||
+        window_plan_scratch.device_plan == nullptr) {
+        return window_plan_scratch_err != cudaSuccess
+            ? window_plan_scratch_err
+            : cudaErrorInvalidValue;
+    }
+
+    comm::plan::WindowTaskExecutorPlan<MaxTasks>& window_plan =
+        *window_plan_scratch.host_plan;
+
     int num_blocks = 0;
 
     const bool plan_ok =
@@ -373,7 +390,7 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         MaxPeers,
         Variant::fill_depth,
         Variant::load_fill_depth>(
-            window_plan,
+            window_plan_scratch.device_plan,
             num_blocks,
             launch_config.threads,
             Variant::dynamic_shared_bytes,
