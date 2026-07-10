@@ -43,11 +43,42 @@ __device__ __forceinline__ void execute_window_task(
     static_assert(FastCopyUnroll > 0, "FastCopyUnroll must be > 0");
     static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
-    if (!window_task_has_work(task)) {
-        return;
-    }
-
     switch (task.op) {
+        case task::WindowTaskOp::ReadyPublish:
+            if (threadIdx.x == 0) {
+                publish_ready_signal(
+                    task.signal_flags,
+                    task.ready_epoch,
+                    static_cast<MultiGpuReadySignalProtocol>(
+                        task.ready_protocol));
+            }
+            return;
+        
+        case task::WindowTaskOp::ReadyWait:
+            if (threadIdx.x == 0) {
+                wait_until_ready_signal_at_least(
+                    task.signal_flags,
+                    task.ready_epoch,
+                    task.ready_poll_sleep_cycles);
+            }
+            return;
+
+        case task::WindowTaskOp::ReadyPublishWait:
+            if (threadIdx.x == 0) {
+                publish_then_wait_ready_signal_for_cta(
+                    static_cast<int>(blockIdx.x),
+                    task.ready_owner_cta,
+                    task.signal_flags,
+                    task.ready_epoch,
+                    static_cast<MultiGpuReadySignalProtocol>(
+                        task.ready_protocol),
+                    task.ready_wait_signal,
+                    task.ready_wait_epoch,
+                    task.ready_poll_sleep_cycles);
+            }
+            return;
+
+
         case task::WindowTaskOp::ReduceTMA:
             pipeline::run_window_range<
                 StageDepth,
@@ -62,26 +93,6 @@ __device__ __forceinline__ void execute_window_task(
                     task.begin_window,
                     task.end_window,
                     task.window_chunks,
-                    shared_raw,
-                    barriers);
-            return;
-
-        case task::WindowTaskOp::ReduceTMASignal:
-            pipeline::run_window_range_signal<
-                StageDepth,
-                FillDepth,
-                ChunkBytes,
-                ReduceApply,
-                LoadFillDepth,
-                SmallTaskBytes>(
-                    task.src,
-                    task.dst,
-                    task.total_bytes,
-                    task.begin_window,
-                    task.end_window,
-                    task.window_chunks,
-                    task.signal_flags,
-                    task.signal_base_window,
                     shared_raw,
                     barriers);
             return;
@@ -103,78 +114,6 @@ __device__ __forceinline__ void execute_window_task(
                     barriers);
             return;
 
-        case task::WindowTaskOp::CopyFast:
-            pipeline::copy_window_range_gmem<
-                FastCopyVecT,
-                FastCopyUnroll,
-                ChunkBytes>(
-                    task.src,
-                    task.dst,
-                    task.total_bytes,
-                    task.begin_window,
-                    task.end_window,
-                    task.window_chunks);
-            return;
-
-        case task::WindowTaskOp::CopyFastAfterSignal:
-            pipeline::copy_window_range_gmem_after_ready<
-                FastCopyVecT,
-                FastCopyUnroll,
-                ChunkBytes>(
-                    task.src,
-                    task.dst,
-                    task.total_bytes,
-                    task.begin_window,
-                    task.end_window,
-                    task.window_chunks,
-                    task.signal_flags,
-                    task.signal_base_window);
-            return;
-
-        case task::WindowTaskOp::CopyTMASignal:
-            pipeline::copy_window_range_tma_signal<
-                StageDepth,
-                FillDepth,
-                ChunkBytes,
-                LoadFillDepth,
-                SmallTaskBytes>(
-                    task.src,
-                    task.dst,
-                    task.total_bytes,
-                    task.begin_window,
-                    task.end_window,
-                    task.window_chunks,
-                    task.signal_flags,
-                    task.signal_base_window,
-                    shared_raw,
-                    barriers);
-            return;
-
-        case task::WindowTaskOp::ReduceTMAAfterSignal:
-            pipeline::reduce_window_range_tma_after_ready<
-                StageDepth,
-                FillDepth,
-                ChunkBytes,
-                ReduceApply,
-                LoadFillDepth,
-                SmallTaskBytes>(
-                    task.src,
-                    task.dst,
-                    task.total_bytes,
-                    task.begin_window,
-                    task.end_window,
-                    task.window_chunks,
-                    task.signal_flags,
-                    task.signal_base_window,
-                    shared_raw,
-                    barriers);
-            return;
-
-
-        /*
-         * OOVERLAP_FANOUT_EXECUTOR_CASES_PATCH:
-         * Execute lowered one-source/many-destination fanout tasks.
-         */
         case task::WindowTaskOp::CopyTMAFanout:
             pipeline::copy_window_range_tma_fanout<
                 StageDepth,
@@ -210,43 +149,6 @@ __device__ __forceinline__ void execute_window_task(
                     barriers);
             return;
 
-
-
-        case task::WindowTaskOp::ReadyPublish:
-            if (threadIdx.x == 0) {
-                publish_ready_signal(
-                    task.signal_flags,
-                    task.ready_epoch,
-                    static_cast<MultiGpuReadySignalProtocol>(
-                        task.ready_protocol));
-            }
-            return;
-        
-        case task::WindowTaskOp::ReadyWait:
-            if (threadIdx.x == 0) {
-                wait_until_ready_signal_at_least(
-                    task.signal_flags,
-                    task.ready_epoch,
-                    task.ready_poll_sleep_cycles);
-            }
-            return;
-
-        case task::WindowTaskOp::ReadyPublishWait:
-            if (threadIdx.x == 0) {
-                publish_then_wait_ready_signal_for_cta(
-                    static_cast<int>(blockIdx.x),
-                    task.ready_owner_cta,
-                    task.signal_flags,
-                    task.ready_epoch,
-                    static_cast<MultiGpuReadySignalProtocol>(
-                        task.ready_protocol),
-                    task.ready_wait_signal,
-                    task.ready_wait_epoch,
-                    task.ready_poll_sleep_cycles);
-            }
-            return;
-
-        /* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: end merged ready task case. */
         case task::WindowTaskOp::None:
         default:
             return;

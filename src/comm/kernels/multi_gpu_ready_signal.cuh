@@ -157,9 +157,6 @@ __device__ __forceinline__ void publish_ready_signal(
 
 __device__ __forceinline__ int load_ready_signal(
     const int* ready_signal) {
-    if (ready_signal == nullptr) {
-        return 0;
-    }
 
     const volatile int* ready =
         reinterpret_cast<const volatile int*>(ready_signal);
@@ -171,13 +168,10 @@ __device__ __forceinline__ void wait_until_ready_signal_at_least(
     const int* ready_signal,
     int collective_epoch,
     int poll_sleep_cycles) {
-    if (ready_signal == nullptr || collective_epoch <= 0) {
-        return;
-    }
 
     while (load_ready_signal(ready_signal) < collective_epoch) {
 #if defined(__CUDA_ARCH__)
-        __nanosleep(32);
+        __nanosleep(512);
 #endif
     }
 }

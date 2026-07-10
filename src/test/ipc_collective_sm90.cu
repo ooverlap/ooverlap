@@ -24,6 +24,81 @@ namespace {
 
 using testing::TestCollective;
 
+void nccl_mem_alloc_half_on_device(
+    int device,
+    half** ptr,
+    size_t bytes,
+    const char* label) {
+    if (ptr == nullptr) {
+        throw std::invalid_argument(
+            "nccl_mem_alloc_half_on_device: ptr must not be null");
+    }
+
+    *ptr = nullptr;
+
+    system::runtime::set_device(device);
+
+    void* raw = nullptr;
+
+    OOVERLAP_TEST_NCCL_CHECK(
+        ncclMemAlloc(
+            &raw,
+            bytes));
+
+    if (raw == nullptr) {
+        throw std::runtime_error(
+            std::string(label != nullptr ? label : "ncclMemAlloc") +
+            ": ncclMemAlloc returned nullptr");
+    }
+
+    *ptr =
+        reinterpret_cast<half*>(raw);
+}
+
+void nccl_mem_free_on_device(
+    int device,
+    half*& ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+
+    (void)cudaSetDevice(device);
+    (void)ncclMemFree(static_cast<void*>(ptr));
+    ptr = nullptr;
+}
+
+void register_nccl_symmetric_window(
+    ncclComm_t comm,
+    half* buf,
+    size_t bytes,
+    ncclWindow_t& win) {
+    win = nullptr;
+
+    if (comm == nullptr || buf == nullptr || bytes == 0) {
+        throw std::invalid_argument(
+            "register_nccl_symmetric_window: invalid argument");
+    }
+
+    OOVERLAP_TEST_NCCL_CHECK(
+        ncclCommWindowRegister(
+            comm,
+            buf,
+            bytes,
+            &win,
+            NCCL_WIN_COLL_SYMMETRIC));
+}
+
+void deregister_nccl_window_best_effort(
+    ncclComm_t comm,
+    ncclWindow_t& win) {
+    if (comm == nullptr || win == nullptr) {
+        return;
+    }
+
+    (void)ncclCommWindowDeregister(comm, win);
+    win = nullptr;
+}
+
 struct IpcOoContext {
     oo_group_t* group = nullptr;
     oo_node_t* node = nullptr;
@@ -505,6 +580,8 @@ std::map<std::string, double> run_one_size(
 
     half* local_src = nullptr;
     half* nccl_work = nullptr;
+    half* nccl_symmetric_work = nullptr;
+    ncclWindow_t nccl_symmetric_win = nullptr;
     cudaStream_t stream = nullptr;
 
     try {
@@ -525,6 +602,12 @@ std::map<std::string, double> run_one_size(
                 bytes),
             "cudaMalloc(nccl_work)");
 
+        nccl_mem_alloc_half_on_device(
+            local_device,
+            &nccl_symmetric_work,
+            bytes,
+            "ncclMemAlloc(ipc nccl_symmetric_work)");
+
         testing::fill_rank_source_fp16(
             local_src,
             numel,
@@ -539,6 +622,22 @@ std::map<std::string, double> run_one_size(
                 dev0,
                 dev1,
                 broker_key);
+
+        broker_sync(ctx);
+
+        /*
+         * Symmetric NCCL baseline for the IPC benchmark.
+         *
+         * Each OS process owns one rank and registers only its local
+         * ncclMemAlloc buffer.  All ranks execute this same registration point
+         * before any benchmarked collectives, with Broker syncs around it to keep
+         * the host-side sequence matched.
+         */
+        register_nccl_symmetric_window(
+            nccl_comm,
+            nccl_symmetric_work,
+            bytes,
+            nccl_symmetric_win);
 
         broker_sync(ctx);
 
@@ -588,6 +687,31 @@ std::map<std::string, double> run_one_size(
                 ctx,
                 iters);
 
+        warmup_nccl(
+            collective,
+            nccl_comm,
+            nccl_symmetric_work,
+            local_src,
+            static_cast<size_t>(numel),
+            local_rank,
+            local_device,
+            stream,
+            ctx,
+            warmup);
+
+        const double nccl_symmetric_total_ms =
+            benchmark_nccl_total_ms(
+                collective,
+                nccl_comm,
+                nccl_symmetric_work,
+                local_src,
+                static_cast<size_t>(numel),
+                local_rank,
+                local_device,
+                stream,
+                ctx,
+                iters);
+
         if (verify) {
             verify_ooverlap_once(
                 collective,
@@ -608,6 +732,17 @@ std::map<std::string, double> run_one_size(
                 local_device,
                 stream,
                 ctx);
+
+            verify_nccl_once(
+                collective,
+                nccl_comm,
+                nccl_symmetric_work,
+                local_src,
+                numel,
+                local_rank,
+                local_device,
+                stream,
+                ctx);
         }
 
         broker_sync(ctx);
@@ -619,10 +754,20 @@ std::map<std::string, double> run_one_size(
             local_src = nullptr;
         }
 
+        deregister_nccl_window_best_effort(
+            nccl_comm,
+            nccl_symmetric_win);
+
         if (nccl_work != nullptr) {
             system::runtime::set_device(local_device);
             cudaFree(nccl_work);
             nccl_work = nullptr;
+        }
+
+        if (nccl_symmetric_work != nullptr) {
+            nccl_mem_free_on_device(
+                local_device,
+                nccl_symmetric_work);
         }
 
         destroy_ipc_oo_context(ctx);
@@ -651,6 +796,7 @@ std::map<std::string, double> run_one_size(
              static_cast<double>(local_shard_count * sizeof(half))},
             {"oo_total_ms", oo_total_ms},
             {"nccl_total_ms", nccl_total_ms},
+            {"nccl_symmetric_total_ms", nccl_symmetric_total_ms},
             {"iters", static_cast<double>(iters)},
             {"warmup", static_cast<double>(warmup)},
             {"verify", verify ? 1.0 : 0.0},

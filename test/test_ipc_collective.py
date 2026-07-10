@@ -213,15 +213,21 @@ def combine_rank_rows(collective, rank_rows):
     rows = []
     for a, b in zip(rank_rows[0], rank_rows[1]):
         iters = int(a["iters"])
-        rows.append(
-            {
-                "bytes": int(a["bytes"]),
-                "bandwidth_bytes_per_rank": per_rank_bandwidth_bytes(collective, a, b),
-                "iters": iters,
-                "oo_latency_ms": max(float(a["oo_total_ms"]), float(b["oo_total_ms"])) / iters,
-                "nccl_latency_ms": max(float(a["nccl_total_ms"]), float(b["nccl_total_ms"])) / iters,
-            }
-        )
+        row = {
+            "bytes": int(a["bytes"]),
+            "bandwidth_bytes_per_rank": per_rank_bandwidth_bytes(collective, a, b),
+            "iters": iters,
+            "oo_latency_ms": max(float(a["oo_total_ms"]), float(b["oo_total_ms"])) / iters,
+            "nccl_latency_ms": max(float(a["nccl_total_ms"]), float(b["nccl_total_ms"])) / iters,
+        }
+
+        if "nccl_symmetric_total_ms" in a and "nccl_symmetric_total_ms" in b:
+            row["nccl_symmetric_latency_ms"] = (
+                max(float(a["nccl_symmetric_total_ms"]),
+                    float(b["nccl_symmetric_total_ms"])) / iters
+            )
+
+        rows.append(row)
     return rows
 
 
@@ -230,16 +236,22 @@ def bandwidth_gbps(size_bytes: int, latency_ms: float) -> float:
 
 
 def metric_values(metric: str, rows):
+    have_symmetric = all("nccl_symmetric_latency_ms" in r for r in rows)
+
     if metric == "latency":
         return (
             [r["oo_latency_ms"] * 1000.0 for r in rows],
             [r["nccl_latency_ms"] * 1000.0 for r in rows],
+            [r["nccl_symmetric_latency_ms"] * 1000.0 for r in rows] if have_symmetric else None,
             "Latency (µs)",
         )
     if metric == "bandwidth":
+        bytes_per_rank = [r.get("bandwidth_bytes_per_rank", r["bytes"]) for r in rows]
         return (
-            [bandwidth_gbps(r.get("bandwidth_bytes_per_rank", r["bytes"]), r["oo_latency_ms"]) for r in rows],
-            [bandwidth_gbps(r.get("bandwidth_bytes_per_rank", r["bytes"]), r["nccl_latency_ms"]) for r in rows],
+            [bandwidth_gbps(b, r["oo_latency_ms"]) for b, r in zip(bytes_per_rank, rows)],
+            [bandwidth_gbps(b, r["nccl_latency_ms"]) for b, r in zip(bytes_per_rank, rows)],
+            [bandwidth_gbps(b, r["nccl_symmetric_latency_ms"]) for b, r in zip(bytes_per_rank, rows)]
+            if have_symmetric else None,
             "Per-rank bandwidth (GB/s)",
         )
     if metric == "speedup":
@@ -250,7 +262,12 @@ def metric_values(metric: str, rows):
                 for r in rows
             ],
             None,
-            "Speedup relative to NCCL (×)",
+            [
+                r["nccl_latency_ms"] / r["nccl_symmetric_latency_ms"]
+                if r.get("nccl_symmetric_latency_ms", 0.0) > 0.0 else 0.0
+                for r in rows
+            ] if have_symmetric else None,
+            "Speedup relative to normal NCCL (×)",
         )
     raise ValueError(f"unknown metric: {metric}")
 
@@ -311,16 +328,32 @@ def plot_metric(metric, all_rows, out_path: Path):
     for ax, collective in zip(axes, COLLECTIVES):
         for ctas, rows in all_rows[collective].items():
             x = [r["bytes"] for r in rows]
-            y_oo, y_nccl, ylabel = metric_values(metric, rows)
+            y_oo, y_nccl, y_nccl_symmetric, ylabel = metric_values(metric, rows)
 
             if metric == "speedup":
-                ax.plot(x, y_oo, marker="o", label="OOverlap / NCCL")
+                ax.plot(x, y_oo, marker="o", label="OOverlap / normal NCCL")
+                if y_nccl_symmetric is not None:
+                    ax.plot(
+                        x,
+                        y_nccl_symmetric,
+                        marker="^",
+                        linestyle=":",
+                        label="symmetric NCCL / normal NCCL",
+                    )
             else:
                 ax.plot(x, y_oo, marker="o", label=label_with_cta("OOverlap", ctas))
                 ax.plot(x, y_nccl, marker="s", linestyle="--", label=label_with_cta("NCCL", ctas))
+                if y_nccl_symmetric is not None:
+                    ax.plot(
+                        x,
+                        y_nccl_symmetric,
+                        marker="^",
+                        linestyle=":",
+                        label=label_with_cta("symmetric NCCL", ctas),
+                    )
 
         if metric == "speedup":
-            ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.0, label="NCCL baseline")
+            ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.0, label="normal NCCL baseline")
 
         if legend_handles is None:
             legend_handles, legend_labels = ax.get_legend_handles_labels()
