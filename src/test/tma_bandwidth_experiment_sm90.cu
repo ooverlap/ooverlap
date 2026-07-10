@@ -33,6 +33,29 @@ constexpr int kBarrierCount = TMA_TWO_GPU_PEER_BARRIER_COUNT;
 constexpr size_t kTmaSmemBytes =
     static_cast<size_t>(kStageDepth) * static_cast<size_t>(kChunkBytes);
 
+
+/*
+ * OOVERLAP_OLD_CUDA_TMA_REDUCE_SCOPE_PATCH:
+ *
+ * Older CUDA/PTX toolchains reject the explicit PTX 9.3 spelling
+ *   cp.reduce.async.bulk.relaxed.<scope>...
+ *
+ * The experiment kernels used TmaReduceScope::Gpu unconditionally, which forces
+ * that explicit spelling and trips the static_assert in tma_reduce.cuh when
+ * OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE=0.  Use GPU scope only when the toolchain
+ * says it supports explicit scopes; otherwise compile the experiment with the
+ * legacy/default no-.relaxed.<scope> instruction spelling.
+ */
+#if OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE
+constexpr tma::TmaReduceScope kExperimentTmaReduceScope =
+    tma::TmaReduceScope::Gpu;
+constexpr bool kExperimentUsesExplicitGpuReduceScope = true;
+#else
+constexpr tma::TmaReduceScope kExperimentTmaReduceScope =
+    tma::TmaReduceScope::Default;
+constexpr bool kExperimentUsesExplicitGpuReduceScope = false;
+#endif
+
 static_assert(kStageDepth > 0, "stage depth must be positive");
 static_assert(kFillDepth > 0, "fill depth must be positive");
 static_assert(kFillDepth <= kStageDepth, "fill depth must be <= stage depth");
@@ -606,7 +629,7 @@ __global__ void tma_reduce_add_f16_gpu_scope_kernel(
 
     __shared__ sync::semaphore barriers[kBarrierCount];
 
-    run_tma_reduce_one_range_thread0_only<tma::TmaReduceScope::Gpu, false>(
+    run_tma_reduce_one_range_thread0_only<kExperimentTmaReduceScope, false>(
         src,
         dst,
         total_bytes,
@@ -673,7 +696,7 @@ __global__ void tma_reduce_add_f16_split2_gpu_scope_kernel(
     __shared__ sync::semaphore barriers[kBarrierCount];
 
     if (!use_src0 && OppositeDirections) {
-        run_tma_reduce_one_range_thread0_only<tma::TmaReduceScope::Gpu, true>(
+        run_tma_reduce_one_range_thread0_only<kExperimentTmaReduceScope, true>(
             src,
             dst,
             total_bytes,
@@ -681,7 +704,7 @@ __global__ void tma_reduce_add_f16_split2_gpu_scope_kernel(
             shared_raw,
             barriers);
     } else {
-        run_tma_reduce_one_range_thread0_only<tma::TmaReduceScope::Gpu, false>(
+        run_tma_reduce_one_range_thread0_only<kExperimentTmaReduceScope, false>(
             src,
             dst,
             total_bytes,
@@ -868,7 +891,7 @@ __global__ void tma_reduce_fanout2_gpu_scope_kernel(
 
     __shared__ sync::semaphore barriers[kBarrierCount];
 
-    run_tma_reduce_fanout2_range_thread0_only<tma::TmaReduceScope::Gpu>(
+    run_tma_reduce_fanout2_range_thread0_only<kExperimentTmaReduceScope>(
         src,
         dst0,
         dst1,
@@ -1505,6 +1528,8 @@ void add_batch_result(
         {"split1_ctas", static_cast<double>(split1_ctas)},
         {"latency_ms", latency_ms},
         {"gbps", gbps},
+        {"explicit_gpu_reduce_scope",
+         kExperimentUsesExplicitGpuReduceScope ? 1.0 : 0.0},
     });
 }
 
