@@ -1,6 +1,7 @@
 #include "comm/ooverlap_comm_private.h"
 
 #include "comm/tuning/tuning_policy.h"
+#include "ooverlap/comm.h"
 
 #include <cuda_runtime.h>
 
@@ -366,10 +367,13 @@ oo_status_t ensure_ipc_legacy_collective_buffers_registered(
                 return OO_ERROR_INVALID_ARGUMENT;
             }
 
+
             ooverlap::system::imported_peer_buffer imported =
                 ooverlap::system::import_legacy_peer_buffer(
                     desc,
                     std::vector<int>{node->device});
+
+return OO_SUCCESS;
 
             std::unique_ptr<oo_buffer_t> imported_buffer(new oo_buffer_t{});
 
@@ -423,6 +427,7 @@ oo_status_t prepare_collective_launch(
 
     oo_group_t* group = node->group;
 
+    // We don't need this
     if (!valid_group_size(group->num_devices) ||
         group->num_devices > kOoMaxLocalDevices ||
         node->rank < 0 ||
@@ -457,6 +462,7 @@ oo_status_t prepare_collective_launch(
         return status;
     }
 
+    // This one either
     if (offset_bytes > local->bytes ||
         bytes > local->bytes - offset_bytes) {
         return OO_ERROR_INVALID_ARGUMENT;
@@ -476,6 +482,8 @@ oo_status_t prepare_collective_launch(
             ensure_ipc_legacy_collective_buffers_registered(
                 node,
                 local);
+
+        return OO_SUCCESS;
 
         if (status != OO_SUCCESS) {
             return status;

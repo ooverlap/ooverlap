@@ -36,13 +36,15 @@ class NcclUniqueId(ctypes.Structure):
 
 
 def make_nccl_id_bytes():
-    libname = ctypes.util.find_library("nccl") or "libnccl.so"
-    nccl = ctypes.CDLL(libname)
-    uid = NcclUniqueId()
-    rc = nccl.ncclGetUniqueId(ctypes.byref(uid))
-    if rc != 0:
-        raise RuntimeError(f"ncclGetUniqueId failed: {rc}")
-    return list(bytearray(uid.internal))
+    # Match test/test_ipc_collective.py: use the extension helper, which returns
+    # NCCL_UNIQUE_ID_BYTES / sizeof(int64_t) packed int64 values.
+    #
+    # Do not read ncclUniqueId.internal through ctypes.c_char * 128 here:
+    # ctypes exposes c_char arrays as NUL-terminated bytes, so IDs containing a
+    # zero byte can be truncated before reaching the C++ make_nccl_unique_id(...)
+    # helper.
+    ext = load_ooverlap_ext()
+    return [int(x) for x in ext.generate_nccl_id()]
 
 
 def print_speedup_line(label: str, baseline_label: str, baseline: float, value: float):
