@@ -9,8 +9,10 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -41,6 +43,14 @@ std::vector<int> devices_vector(
     }
 
     return out;
+}
+
+std::uint64_t next_buffer_ipc_cache_token() {
+    static std::atomic<std::uint64_t> next{1};
+
+    return next.fetch_add(
+        1,
+        std::memory_order_relaxed);
 }
 
 /*
@@ -895,7 +905,17 @@ void oo_group_destroy(oo_group_t* group) {
 
     for (int rank = 0; rank < kOoMaxLocalDevices; ++rank) {
         group->collective_buffers[rank] = nullptr;
+
+        for (int slot = 0; slot < kOoIpcImportCacheEntriesPerRank; ++slot) {
+            auto& entry = group->ipc_import_cache[rank][slot];
+            entry.buffer.reset();
+            entry.key = {};
+            entry.valid = false;
+            entry.last_used = 0;
+        }
     }
+
+    group->ipc_import_cache_clock = 0;
 
     destroy_group_staging_buffers(group);
     destroy_group_ready_signals(group);
@@ -1001,6 +1021,7 @@ oo_status_t oo_buffer_alloc(
         buffer->group = node->group;
         buffer->owner_rank = node->rank;
         buffer->owner_device = node->device;
+        buffer->ipc_cache_token = next_buffer_ipc_cache_token();
         buffer->system_kind = ooverlap::system::peer_buffer_kind::owned_vmm;
         buffer->mapped = mapped;
 
@@ -1040,6 +1061,7 @@ oo_status_t oo_buffer_wrap(
         buffer->group = node->group;
         buffer->owner_rank = node->rank;
         buffer->owner_device = node->device;
+        buffer->ipc_cache_token = next_buffer_ipc_cache_token();
         buffer->system_kind = ooverlap::system::peer_buffer_kind::wrapped;
 
         register_collective_buffer(buffer.get());
@@ -1049,6 +1071,21 @@ oo_status_t oo_buffer_wrap(
     } catch (...) {
         return ooverlap::comm::api::exception_to_status();
     }
+}
+
+oo_status_t oo_buffer_register_ipc(
+    oo_node_t* node,
+    oo_buffer_t* buffer) {
+    if (node == nullptr ||
+        node->group == nullptr ||
+        buffer == nullptr ||
+        buffer->ptr == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    return ooverlap::comm::api::register_ipc_collective_buffers(
+        node,
+        buffer);
 }
 
 void oo_buffer_destroy(oo_buffer_t* buffer) {

@@ -2,6 +2,7 @@
 
 #include "comm/tuning/tuning_policy.h"
 #include "ooverlap/comm.h"
+#include "ooverlap/system/runtime_utils.cuh"
 
 #include <cuda_runtime.h>
 
@@ -247,158 +248,330 @@ LaunchConfig select_public_launch_config(
 
 
 /*
- * OOVERLAP_IPC_LEGACY_BUFFER_REGISTRATION_HELPER_PATCH:
+ * OOVERLAP_IPC_MULTI_ENTRY_IMPORT_CACHE_PATCH:
  *
- * Multiprocess p2p/legacy CUDA IPC buffer registration for public collectives.
- *
- * This path intentionally ignores VMM buffers.  The expected public IPC use is:
- *   - user / framework owns a cudaMalloc-like allocation
- *   - caller wraps it with oo_buffer_wrap(...)
- *   - before each collective, every rank exports its wrapped pointer as a
- *     cudaIpcMemHandle_t descriptor through Broker::exchange_data
- *   - every rank imports all peer descriptors and stores the imported mappings in
- *     group-owned ipc_imported_collective_buffers[]
- *
- * Same-process groups never call this helper.
+ * Simple YAGNI IPC import cache:
+ *   - oo_buffer_wrap() remains local and cheap.
+ *   - oo_buffer_register_ipc() pre-fills this cache.
+ *   - public collectives call the same helper and import on cache miss.
+ *   - cache key is an owner-rank token exchanged through Broker, never the
+ *     process-local imported pointer value.
  */
-oo_status_t reset_ipc_imported_collective_buffer(
-    oo_group_t* group,
+oo_group::ipc_import_key make_ipc_import_key(
+    const oo_buffer_t* buffer) {
+    oo_group::ipc_import_key key{};
+
+    if (buffer == nullptr) {
+        return key;
+    }
+
+    key.owner_ptr_value =
+        reinterpret_cast<std::uintptr_t>(buffer->ptr);
+    key.bytes =
+        static_cast<std::uint64_t>(buffer->bytes);
+    key.mapped_bytes =
+        static_cast<std::uint64_t>(buffer->mapped_bytes);
+    key.cache_token =
+        static_cast<std::uint64_t>(buffer->ipc_cache_token);
+    key.owner_rank = buffer->owner_rank;
+    key.owner_device = buffer->owner_device;
+    return key;
+}
+
+bool same_ipc_import_key(
+    const oo_group::ipc_import_key& a,
+    const oo_group::ipc_import_key& b) {
+    return a.owner_ptr_value == b.owner_ptr_value &&
+           a.bytes == b.bytes &&
+           a.mapped_bytes == b.mapped_bytes &&
+           a.cache_token == b.cache_token &&
+           a.owner_rank == b.owner_rank &&
+           a.owner_device == b.owner_device;
+}
+
+bool valid_ipc_import_key_for_rank(
+    const oo_group_t* group,
+    const oo_group::ipc_import_key& key,
     int rank) {
+    return group != nullptr &&
+           rank >= 0 &&
+           rank < group->num_devices &&
+           key.owner_ptr_value != 0 &&
+           key.bytes != 0 &&
+           key.mapped_bytes != 0 &&
+           key.cache_token != 0 &&
+           key.owner_rank == rank &&
+           key.owner_device == group->devices[rank];
+}
+
+oo_group::ipc_import_cache_entry* find_ipc_import_cache_entry(
+    oo_group_t* group,
+    int owner_rank,
+    const oo_group::ipc_import_key& key) {
     if (group == nullptr ||
-        rank < 0 ||
-        rank >= kOoMaxLocalDevices) {
+        owner_rank < 0 ||
+        owner_rank >= group->num_devices) {
+        return nullptr;
+    }
+
+    for (int slot = 0; slot < kOoIpcImportCacheEntriesPerRank; ++slot) {
+        oo_group::ipc_import_cache_entry& entry =
+            group->ipc_import_cache[owner_rank][slot];
+
+        if (!entry.valid ||
+            entry.buffer == nullptr ||
+            entry.buffer->ptr == nullptr) {
+            continue;
+        }
+
+        if (same_ipc_import_key(entry.key, key)) {
+            entry.last_used = ++group->ipc_import_cache_clock;
+            return &entry;
+        }
+    }
+
+    return nullptr;
+}
+
+void clear_ipc_import_cache_entry(
+    oo_group_t* group,
+    int owner_rank,
+    oo_group::ipc_import_cache_entry& entry) {
+    if (group != nullptr &&
+        owner_rank >= 0 &&
+        owner_rank < kOoMaxLocalDevices &&
+        entry.buffer != nullptr &&
+        group->collective_buffers[owner_rank] == entry.buffer.get()) {
+        group->collective_buffers[owner_rank] = nullptr;
+    }
+
+    entry.buffer.reset();
+    entry.key = {};
+    entry.valid = false;
+    entry.last_used = 0;
+}
+
+oo_group::ipc_import_cache_entry* select_ipc_import_cache_slot(
+    oo_group_t* group,
+    int owner_rank) {
+    if (group == nullptr ||
+        owner_rank < 0 ||
+        owner_rank >= group->num_devices) {
+        return nullptr;
+    }
+
+    oo_group::ipc_import_cache_entry* best =
+        &group->ipc_import_cache[owner_rank][0];
+
+    for (int slot = 0; slot < kOoIpcImportCacheEntriesPerRank; ++slot) {
+        oo_group::ipc_import_cache_entry& entry =
+            group->ipc_import_cache[owner_rank][slot];
+
+        if (!entry.valid || entry.buffer == nullptr) {
+            return &entry;
+        }
+
+        if (entry.last_used < best->last_used) {
+            best = &entry;
+        }
+    }
+
+    clear_ipc_import_cache_entry(
+        group,
+        owner_rank,
+        *best);
+
+    return best;
+}
+
+oo_status_t import_peer_into_cache(
+    oo_group_t* group,
+    int owner_rank,
+    const oo_group::ipc_import_key& key,
+    const ooverlap::system::legacy_peer_buffer_descriptor& desc,
+    oo_group::ipc_import_cache_entry** out_entry) {
+    if (out_entry == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    oo_buffer_t* old_buffer =
-        group->ipc_imported_collective_buffers[rank].get();
+    *out_entry = nullptr;
 
-    if (old_buffer != nullptr &&
-        group->collective_buffers[rank] == old_buffer) {
-        group->collective_buffers[rank] = nullptr;
+    if (group == nullptr ||
+        !valid_ipc_import_key_for_rank(group, key, owner_rank) ||
+        desc.bytes == 0 ||
+        desc.mapped_size == 0 ||
+        desc.owner_device != key.owner_device) {
+        return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    group->ipc_imported_collective_buffers[rank].reset();
+    oo_group::ipc_import_cache_entry* entry =
+        select_ipc_import_cache_slot(
+            group,
+            owner_rank);
+
+    if (entry == nullptr) {
+        return OO_ERROR_INTERNAL;
+    }
+
+    ooverlap::system::imported_peer_buffer imported =
+        ooverlap::system::import_legacy_peer_buffer(
+            desc,
+            1);
+
+    std::unique_ptr<oo_buffer_t> imported_buffer(new oo_buffer_t{});
+
+    imported_buffer->ptr = imported.ptr;
+    imported_buffer->bytes = imported.bytes;
+    imported_buffer->mapped_bytes = imported.mapped_size;
+    imported_buffer->kind = OO_BUFFER_KIND_WRAPPED;
+    imported_buffer->group = group;
+    imported_buffer->owner_rank = owner_rank;
+    imported_buffer->owner_device = desc.owner_device;
+    imported_buffer->ipc_cache_token = key.cache_token;
+    imported_buffer->system_kind =
+        ooverlap::system::peer_buffer_kind::imported_legacy;
+    imported_buffer->imported = std::move(imported);
+
+    entry->buffer =
+        std::move(imported_buffer);
+    entry->key = key;
+    entry->valid = true;
+    entry->last_used = ++group->ipc_import_cache_clock;
+
+    *out_entry = entry;
     return OO_SUCCESS;
 }
 
 oo_status_t ensure_ipc_legacy_collective_buffers_registered(
     oo_node_t* node,
     oo_buffer_t* local) {
-    if (node == nullptr ||
-        node->group == nullptr ||
-        local == nullptr ||
-        local->ptr == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
+    
     oo_group_t* group = node->group;
 
-    if (group->bootstrap_kind != oo_group_bootstrap_kind::multiprocess_ipc) {
-        return OO_SUCCESS;
-    }
-
-    if (group->broker == nullptr ||
-        group->memory_kind != oo_group_memory_kind::multiprocess_legacy_ipc ||
-        group->num_devices <= 0 ||
-        group->num_devices > kOoMaxLocalDevices ||
-        group->local_world_size != group->num_devices ||
-        group->local_rank != node->rank ||
-        node->rank < 0 ||
-        node->rank >= group->num_devices ||
-        node->device != group->devices[node->rank] ||
-        local->group != group ||
-        local->owner_rank != node->rank ||
-        local->owner_device != node->device ||
-        local->bytes == 0 ||
-        local->mapped_bytes == 0) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    /*
-     * First p2p IPC implementation only supports externally owned cudaMalloc /
-     * framework pointers registered via oo_buffer_wrap().  VMM-owned buffers use
-     * a different FD-based import path and are intentionally excluded here.
-     */
     if (local->system_kind != ooverlap::system::peer_buffer_kind::wrapped) {
         return OO_ERROR_UNSUPPORTED;
     }
 
     try {
-        
         cudaSetDevice(node->device);
-        const ooverlap::system::legacy_peer_buffer_descriptor local_desc =
-            ooverlap::system::export_legacy_peer_buffer(
-                local->ptr,
-                local->bytes,
-                local->owner_device,
-                local->mapped_bytes != 0 ? local->mapped_bytes : local->bytes);
 
-        std::vector<ooverlap::system::legacy_peer_buffer_descriptor> descs(
+        const oo_group::ipc_import_key local_key =
+            make_ipc_import_key(local);
+
+        std::vector<oo_group::ipc_import_key> keys(
             static_cast<std::size_t>(group->num_devices));
 
         group->broker->exchange_data(
-            descs.data(),
-            &local_desc,
-            sizeof(local_desc));
+            keys.data(),
+            &local_key,
+            sizeof(local_key));
 
         group->collective_buffers[node->rank] = local;
+
+        oo_group::ipc_import_cache_entry* hits[kOoMaxLocalDevices] = {};
+        std::uint32_t local_miss_mask = 0;
+
+        for (int rank = 0; rank < group->num_devices; ++rank) {
+            const oo_group::ipc_import_key& key =
+                keys[static_cast<std::size_t>(rank)];
+            
+            if (rank == node->rank) {
+                continue;
+            }
+
+            hits[rank] =
+                find_ipc_import_cache_entry(
+                    group,
+                    rank,
+                    key);
+
+            if (hits[rank] == nullptr) {
+                local_miss_mask |= (std::uint32_t{1} << rank);
+            }
+        }
+
+
+        std::vector<std::uint32_t> miss_masks(
+            static_cast<std::size_t>(group->num_devices),
+            0);
+
+        group->broker->exchange_data(
+            miss_masks.data(),
+            &local_miss_mask,
+            sizeof(local_miss_mask));
+
+        std::uint32_t global_miss_mask = 0;
+        for (int rank = 0; rank < group->num_devices; ++rank) {
+            global_miss_mask |=
+                miss_masks[static_cast<std::size_t>(rank)];
+        }
+
+        std::vector<ooverlap::system::legacy_peer_buffer_descriptor> descs;
+
+        if (global_miss_mask != 0) {
+            const ooverlap::system::legacy_peer_buffer_descriptor local_desc =
+                ooverlap::system::export_legacy_peer_buffer(
+                    local->ptr,
+                    local->bytes,
+                    local->owner_device,
+                    local->mapped_bytes != 0 ? local->mapped_bytes : local->bytes);
+
+            descs.resize(
+                static_cast<std::size_t>(group->num_devices));
+
+            group->broker->exchange_data(
+                descs.data(),
+                &local_desc,
+                sizeof(local_desc));
+        }
 
         for (int rank = 0; rank < group->num_devices; ++rank) {
             if (rank == node->rank) {
                 continue;
             }
 
-            oo_status_t status =
-                reset_ipc_imported_collective_buffer(
-                    group,
-                    rank);
+            oo_group::ipc_import_cache_entry* entry = hits[rank];
 
-            if (status != OO_SUCCESS) {
-                return status;
+            if (entry == nullptr) {
+                if (descs.empty()) {
+                    return OO_ERROR_INTERNAL;
+                }
+
+                oo_status_t status =
+                    import_peer_into_cache(
+                        group,
+                        rank,
+                        keys[static_cast<std::size_t>(rank)],
+                        descs[static_cast<std::size_t>(rank)],
+                        &entry);
+
+                if (status != OO_SUCCESS) {
+                    return status;
+                }
             }
 
-            const ooverlap::system::legacy_peer_buffer_descriptor& desc =
-                descs[static_cast<std::size_t>(rank)];
-
-            if (desc.bytes == 0 ||
-                desc.mapped_size == 0 ||
-                desc.owner_device != group->devices[rank]) {
-                return OO_ERROR_INVALID_ARGUMENT;
+            if (entry == nullptr ||
+                entry->buffer == nullptr ||
+                entry->buffer->ptr == nullptr) {
+                return OO_ERROR_INTERNAL;
             }
-
-
-            ooverlap::system::imported_peer_buffer imported =
-                ooverlap::system::import_legacy_peer_buffer(
-                    desc,
-                    std::vector<int>{node->device});
-
-return OO_SUCCESS;
-
-            std::unique_ptr<oo_buffer_t> imported_buffer(new oo_buffer_t{});
-
-            imported_buffer->ptr = imported.ptr;
-            imported_buffer->bytes = imported.bytes;
-            imported_buffer->mapped_bytes = imported.mapped_size;
-            imported_buffer->kind = OO_BUFFER_KIND_WRAPPED;
-            imported_buffer->group = group;
-            imported_buffer->owner_rank = rank;
-            imported_buffer->owner_device = desc.owner_device;
-            imported_buffer->system_kind =
-                ooverlap::system::peer_buffer_kind::imported_legacy;
-            imported_buffer->imported = std::move(imported);
-
-            group->ipc_imported_collective_buffers[rank] =
-                std::move(imported_buffer);
 
             group->collective_buffers[rank] =
-                group->ipc_imported_collective_buffers[rank].get();
+                entry->buffer.get();
         }
 
         return OO_SUCCESS;
     } catch (...) {
         return exception_to_status();
     }
+}
+
+oo_status_t register_ipc_collective_buffers(
+    oo_node_t* node,
+    oo_buffer_t* local) {
+    return ensure_ipc_legacy_collective_buffers_registered(
+        node,
+        local);
 }
 
 
@@ -483,6 +656,7 @@ oo_status_t prepare_collective_launch(
                 node,
                 local);
 
+        // HERE
         return OO_SUCCESS;
 
         if (status != OO_SUCCESS) {
