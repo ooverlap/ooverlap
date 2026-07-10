@@ -93,6 +93,14 @@ LaunchConfig select_public_launch_config(
     oo_tuning_mode_t tuning_mode);
 
 /*
+ * Optional explicit IPC buffer registration.
+ * This fills the same import cache used by prepare_collective_launch().
+ */
+oo_status_t register_ipc_collective_buffers(
+    oo_node_t* node,
+    oo_buffer_t* local);
+
+/*
  * Build a rank-local collective launch state from the group-owned current
  * collective buffer registry.
  *

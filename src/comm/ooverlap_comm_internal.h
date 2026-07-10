@@ -12,9 +12,11 @@
 #include "ooverlap/system/broker.cuh"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 constexpr int kOoMaxLocalDevices = 16;
+constexpr int kOoIpcImportCacheEntriesPerRank = 16;
 
 enum class oo_ready_signal_channel : int {
     device_memory = 0,
@@ -243,20 +245,32 @@ struct oo_group {
     oo_buffer_t* collective_buffers[kOoMaxLocalDevices] = {};
 
     /*
-     * OOVERLAP_IPC_LEGACY_BUFFER_IMPORT_STORAGE_PATCH:
+     * OOVERLAP_IPC_MULTI_ENTRY_IMPORT_CACHE_PATCH:
      *
-     * Group-owned imported peer buffers for multiprocess legacy CUDA IPC.
-     *
-     * collective_buffers[] stays the non-owning rank -> current buffer view.
-     * For IPC peers, those views point into this owning storage.  The local
-     * rank still points at the caller's local oo_buffer_t.
-     *
-     * First implementation deliberately does not cache across collectives:
-     * every IPC collective re-exchanges legacy CUDA IPC descriptors and refreshes
-     * these imports, because the registered tensor may be different each call.
+     * Per-peer legacy CUDA IPC import cache.  Keys are owner-side tokens
+     * exchanged through Broker.  Imported ptr values are process-local and are
+     * never used as cross-process identities.
      */
-    std::unique_ptr<oo_buffer_t>
-        ipc_imported_collective_buffers[kOoMaxLocalDevices] = {};
+    struct ipc_import_key {
+        std::uintptr_t owner_ptr_value = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t mapped_bytes = 0;
+        std::uint64_t cache_token = 0;
+        int owner_rank = -1;
+        int owner_device = -1;
+    };
+
+    struct ipc_import_cache_entry {
+        bool valid = false;
+        ipc_import_key key{};
+        std::unique_ptr<oo_buffer_t> buffer{};
+        std::uint64_t last_used = 0;
+    };
+
+    ipc_import_cache_entry
+        ipc_import_cache[kOoMaxLocalDevices][kOoIpcImportCacheEntriesPerRank] = {};
+
+    std::uint64_t ipc_import_cache_clock = 0;
 
     /*
      * Topology is the source of truth for transport capability.
@@ -316,6 +330,13 @@ struct oo_buffer {
     oo_group_t* group = nullptr;
     int owner_rank = -1;
     int owner_device = -1;
+
+    /*
+     * Stable identity for the lifetime of this oo_buffer wrapper.  This protects
+     * the IPC import cache from pointer-address reuse after a buffer is destroyed
+     * and a new wrapper is created.
+     */
+    std::uint64_t ipc_cache_token = 0;
 
     /*
      * Internal precise provenance.

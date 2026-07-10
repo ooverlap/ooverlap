@@ -132,6 +132,17 @@ oo_status_t oo_buffer_wrap(
     size_t bytes,
     oo_buffer_t** out_buffer);
 
+/*
+ * Optional collective pre-registration for multiprocess IPC buffers.
+ *
+ * oo_buffer_wrap() stays cheap/local.  This call is collective in IPC groups:
+ * every rank calls it with its local wrapped buffer to pre-fill peer imports.
+ * Same-process groups treat it as a no-op.
+ */
+oo_status_t oo_buffer_register_ipc(
+    oo_node_t* node,
+    oo_buffer_t* buffer);
+
 void oo_buffer_destroy(
     oo_buffer_t* buffer);
 
