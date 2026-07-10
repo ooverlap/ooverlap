@@ -400,7 +400,7 @@ __device__ __forceinline__ void run_byte_range_single_tma_16b_aligned_thread0(
     size_t byte_count,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    
+
     if (threadIdx.x != 0) {
         return;
     }

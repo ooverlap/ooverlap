@@ -49,6 +49,7 @@ __device__ __forceinline__ void execute_window_task(
 
     switch (task.op) {
         case task::WindowTaskOp::ReduceTMA:
+            return;
             pipeline::run_window_range<
                 StageDepth,
                 FillDepth,
@@ -317,7 +318,7 @@ __device__ __forceinline__ void execute_window_task_stripe(
             return;
         }
 
-/*        if (local_task >= 1) {*/
+        /*if (local_task >= 1) {*/
             /*return;*/
         /*}*/
 
