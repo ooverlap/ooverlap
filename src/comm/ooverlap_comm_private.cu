@@ -14,14 +14,6 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
-bool valid_group_size(int num_devices) {
-    return num_devices > 0 && num_devices <= kOoMaxLocalDevices;
-}
-
-} // namespace
-
 namespace ooverlap {
 namespace comm {
 namespace api {
