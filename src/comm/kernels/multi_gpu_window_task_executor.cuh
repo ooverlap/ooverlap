@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <driver_types.h>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>

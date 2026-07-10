@@ -41,8 +41,6 @@ oo_status_t allreduce_impl(
         return status;
     }
 
-    return OO_SUCCESS;
-
     ooverlap::comm::LaunchConfig config =
         ooverlap::comm::api::select_public_launch_config(
             ooverlap::comm::CollectivePlanFor::AllReduce,

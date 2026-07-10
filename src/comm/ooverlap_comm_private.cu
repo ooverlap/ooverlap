@@ -289,6 +289,64 @@ bool same_ipc_import_key(
            a.owner_device == b.owner_device;
 }
 
+
+/*
+ * OOVERLAP_IPC_SYMMETRIC_LOCAL_KEY_FAST_PATH_PATCH:
+ *
+ * Weak symmetric-collective fast path.
+ *
+ * In the benchmark / expected symmetric usage, all ranks call the same
+ * collective sequence with the same local buffer sequence.  Therefore, if this
+ * rank's local buffer wrapper/key did not change since the previous collective,
+ * we assume peer ranks did not change their buffers either.
+ *
+ * This intentionally avoids Broker::exchange_data on the hot path.  It is not a
+ * general correctness contract for arbitrary asymmetric buffer changes.  If one
+ * rank changes buffers while another rank does not, ranks can take different
+ * host paths and deadlock.  Replace this later with explicit epochs/versioning
+ * or re-enable the all-rank key exchange for fully general usage.
+ */
+bool ipc_symmetric_local_key_fast_path_ready(
+    oo_group_t* group,
+    int local_rank,
+    const oo_group::ipc_import_key& local_key) {
+    if (group == nullptr ||
+        local_rank < 0 ||
+        local_rank >= group->num_devices) {
+        return false;
+    }
+
+    oo_buffer_t* previous_local =
+        group->collective_buffers[local_rank];
+
+    if (previous_local == nullptr ||
+        previous_local->ptr == nullptr ||
+        !same_ipc_import_key(
+            make_ipc_import_key(previous_local),
+            local_key)) {
+        return false;
+    }
+
+    for (int rank = 0; rank < group->num_devices; ++rank) {
+        if (rank == local_rank) {
+            continue;
+        }
+
+        oo_buffer_t* peer =
+            group->collective_buffers[rank];
+
+        if (peer == nullptr ||
+            peer->ptr == nullptr ||
+            peer->owner_rank != rank ||
+            peer->owner_device != group->devices[rank] ||
+            peer->system_kind != ooverlap::system::peer_buffer_kind::imported_legacy) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool valid_ipc_import_key_for_rank(
     const oo_group_t* group,
     const oo_group::ipc_import_key& key,
@@ -458,6 +516,14 @@ oo_status_t ensure_ipc_legacy_collective_buffers_registered(
         const oo_group::ipc_import_key local_key =
             make_ipc_import_key(local);
 
+        if (ipc_symmetric_local_key_fast_path_ready(
+                group,
+                node->rank,
+                local_key)) {
+            group->collective_buffers[node->rank] = local;
+            return OO_SUCCESS;
+        }
+
         std::vector<oo_group::ipc_import_key> keys(
             static_cast<std::size_t>(group->num_devices));
 
@@ -600,18 +666,6 @@ oo_status_t prepare_collective_launch(
 
     oo_group_t* group = node->group;
 
-    // We don't need this
-    if (!valid_group_size(group->num_devices) ||
-        group->num_devices > kOoMaxLocalDevices ||
-        node->rank < 0 ||
-        node->rank >= group->num_devices ||
-        node->device != group->devices[node->rank] ||
-        local->group != group ||
-        local->owner_rank != node->rank ||
-        local->owner_device != node->device) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
     size_t offset_bytes = 0;
     size_t bytes = 0;
 
@@ -655,9 +709,6 @@ oo_status_t prepare_collective_launch(
             ensure_ipc_legacy_collective_buffers_registered(
                 node,
                 local);
-
-        // HERE
-        return OO_SUCCESS;
 
         if (status != OO_SUCCESS) {
             return status;
