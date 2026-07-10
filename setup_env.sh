@@ -2,8 +2,9 @@
 set -Eeuo pipefail
 
 # -------- user-tunable defaults --------
-MODULE_SETUP="${MODULE_SETUP:-$HOME/modules-conf/setup_env_gcore14-2.sh}"
-INSTALL_TORCH="${INSTALL_TORCH:-$HOME/scripts/install_torch_14.sh}"
+MODULE_SETUP="${MODULE_SETUP:-$HOME/modules-conf/setup_env_gcore13-2.sh}"
+#INSTALL_TORCH="${INSTALL_TORCH:-$HOME/scripts/install_torch_14.sh}"
+INSTALL_TORCH="${INSTALL_TORCH:-$HOME/scripts/install_torch.sh}"
 BUILD_DIR="${BUILD_DIR:-$HOME/ooverlap/build}"
 JOBS="${JOBS:-12}"
 CUDA_ARCH="${CUDA_ARCH:-90a}"

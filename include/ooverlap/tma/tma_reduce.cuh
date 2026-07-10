@@ -51,7 +51,7 @@ namespace tma {
  * Existing old call sites still default to the old no-.sem.scope instruction
  * spelling through OOVERLAP_TMA_REDUCE_DEFAULT_SCOPE=0.
  */
-#define OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE 1
+#define OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE 0
 #endif
 
 #ifndef OOVERLAP_TMA_REDUCE_DEFAULT_SCOPE
