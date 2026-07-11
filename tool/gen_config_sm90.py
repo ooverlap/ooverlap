@@ -414,6 +414,14 @@ def parse_args():
     ap.add_argument("--check-atol", type=float, default=8.0)
     ap.add_argument("--reject-failed-check", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--cpp-cublas-reference",
+        action="store_true",
+        help=(
+            "Use the extension's baseline_gemm_col/cublasGemmEx reference. "
+            "Default uses torch.mm so PyTorch owns cuBLAS/cuBLASLt end-to-end."
+        ),
+    )
     ap.add_argument("--csv-a-dtype", choices=["f16"], default="f16")
     ap.add_argument("--csv-b-dtype", choices=["f16"], default="f16")
     ap.add_argument("--csv-accum-dtype", choices=["f16", "f32"], default="f16")
@@ -466,7 +474,8 @@ def main():
     print(f"matched:        {len(matched)}")
     print(f"missing:        {len(missing)}")
     print("timing:         eager, MM reset outside measurement")
-    print("reference:      baseline_gemm_col")
+    reference_name = "baseline_gemm_col" if args.cpp_cublas_reference else "torch_mm"
+    print(f"reference:      {reference_name}")
     for k, v in counts.items():
         print(f"  {k:18s}: {v}")
     print("========================================")
@@ -476,15 +485,24 @@ def main():
         return
 
     ext = load_ext(root)
-    baseline = getattr(ext, "baseline_gemm_col", None)
-    if baseline is None:
-        raise RuntimeError("baseline_gemm_col not found in ooverlap_ext")
 
     M, N, K = args.m, args.n, args.k
     A = torch.randn((M, K), device=device, dtype=torch.float16)
     B = torch.randn((N, K), device=device, dtype=torch.float16)
     D_ref = torch.empty((N, M), device=device, dtype=torch.float16)
-    baseline(A, B, D_ref)
+
+    if args.cpp_cublas_reference:
+        baseline = getattr(ext, "baseline_gemm_col", None)
+        if baseline is None:
+            raise RuntimeError("baseline_gemm_col not found in ooverlap_ext")
+        baseline(A, B, D_ref)
+    else:
+        # Match baseline_gemm_col's physical output layout: D_ref is [N, M].
+        # This avoids the extension's direct cublasGemmEx path, which can
+        # segfault when its linked cuBLAS symbols do not match the cuBLAS
+        # handle/runtime owned by PyTorch.
+        torch.mm(B, A.t(), out=D_ref)
+
     torch.cuda.synchronize()
     ref = D_ref.t().contiguous()
 
@@ -527,7 +545,7 @@ def main():
             if args.reject_failed_check and not check_ok:
                 raise RuntimeError(f"check failed: max_abs={err['max_abs']} > {args.check_atol}")
 
-            rr = {**r, **err, "signal_gemm_ms": float(ms), "measured_ms": float(ms), "timing_used": "eager", "layout": args.layout, "reorder": reorder, "reldn": int(reldn), "check_ref": "baseline_gemm_col", "check_ok": bool(check_ok)}
+            rr = {**r, **err, "signal_gemm_ms": float(ms), "measured_ms": float(ms), "timing_used": "eager", "layout": args.layout, "reorder": reorder, "reldn": int(reldn), "check_ref": reference_name, "check_ok": bool(check_ok)}
             ok_rows.append(rr)
             print(f"  signal={ms:.6f} ms err max={err['max_abs']:.6f} mean={err['mean_abs']:.6f} p99={err['p99_abs']:.6f} ok={check_ok}")
         except KeyboardInterrupt:
@@ -546,7 +564,7 @@ def main():
         "description": "ooverlap signal SM90 configs selected from CUTLASS CSV then benchmarked",
         "M": M, "N": N, "K": K, "gpu": gpu, "csv": str(csv_path), "algo_dict": str(algo_path),
         "layout": args.layout, "warmup": args.warmup, "iters": args.iters,
-        "timing_mode": "eager", "reference": "baseline_gemm_col", "check_atol": args.check_atol,
+        "timing_mode": "eager", "reference": reference_name, "check_atol": args.check_atol,
         "reset_mm": True, "reset_mm_timing": "excluded",
         "BM": [int(x["tile_m"]) for x in selected],
         "BN": [int(x["tile_n"]) for x in selected],

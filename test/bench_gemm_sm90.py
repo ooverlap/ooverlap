@@ -101,17 +101,30 @@ def check_shape(m, n, k, tile_m, tile_n, label):
 def bench_baseline(ext, a, b, ref, args):
     d = torch.empty((args.n, args.m), device=a.device, dtype=torch.float16)
 
-    def run():
-        ext.baseline_gemm_col(a, b, d)
+    if args.cpp_cublas_baseline:
+        label = "cpp_cublasGemmEx_baseline"
+
+        def run():
+            ext.baseline_gemm_col(a, b, d)
+    else:
+        label = "torch_mm_baseline"
+
+        def run():
+            # D_col is physical shape (N, M). This is the same logical result as
+            # the C++ cublas path, but it lets PyTorch own its cuBLAS/cuBLASLt
+            # handle and library selection end-to-end. It avoids crashes caused
+            # by mixing a PyTorch cuBLAS handle with extension-linked cuBLAS
+            # symbols from a different CUDA toolkit/runtime.
+            torch.mm(b, a.t(), out=d)
 
     ms = time_cuda(run, args.warmup, args.iters)
     got = d.t().contiguous()
 
     if args.check:
         mx, mean = max_mean_abs(got, ref)
-        print(f"baseline_gemm_col: {ms:.4f} ms  {tflops(args.m, args.n, args.k, ms):.2f} TFLOP/s  max={mx:.5f} mean={mean:.5f}")
+        print(f"{label}: {ms:.4f} ms  {tflops(args.m, args.n, args.k, ms):.2f} TFLOP/s  max={mx:.5f} mean={mean:.5f}")
     else:
-        print(f"baseline_gemm_col: {ms:.4f} ms  {tflops(args.m, args.n, args.k, ms):.2f} TFLOP/s")
+        print(f"{label}: {ms:.4f} ms  {tflops(args.m, args.n, args.k, ms):.2f} TFLOP/s")
 
 
 def bench_plain(ext, a, b, ref, args):
@@ -203,6 +216,14 @@ def main():
     parser.add_argument("--monitor", action="store_true")
     parser.add_argument("--no-check", dest="check", action="store_false")
     parser.add_argument("--with-baseline", action="store_true")
+    parser.add_argument(
+        "--cpp-cublas-baseline",
+        action="store_true",
+        help=(
+            "Use the extension's direct cublasGemmEx baseline. "
+            "Default uses torch.mm so PyTorch owns the cuBLAS/cuBLASLt handle."
+        ),
+    )
     parser.add_argument("--ext-dir", type=str, default=None)
 
     parser.set_defaults(check=True)
