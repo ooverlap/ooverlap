@@ -167,7 +167,7 @@ def sync_and_release_overlap_backend(obj, comm_backend: str):
     try:
         torch.cuda.synchronize()
     finally:
-        sync_and_release_overlap_backend(obj, comm_backend)
+        release_overlap_backend(obj, comm_backend)
 
 
 def init_baseline_nccl(obj, rank, world_size, nccl_id):
@@ -295,6 +295,27 @@ def mean_timed(fn):
     torch.cuda.synchronize()
 
     vals = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    if os.environ.get("OOVERLAP_TEST_PRINT_STATS", "0") == "1":
+        sv = sorted(vals)
+
+        def pct(p):
+            if len(sv) == 1:
+                return sv[0]
+            idx = int(round((p / 100.0) * (len(sv) - 1)))
+            return sv[max(0, min(idx, len(sv) - 1))]
+
+        print(
+            "timing_stats "
+            f"n={len(sv)} "
+            f"mean={sum(sv) / len(sv):.4f} "
+            f"min={sv[0]:.4f} "
+            f"p50={pct(50):.4f} "
+            f"p90={pct(90):.4f} "
+            f"p99={pct(99):.4f} "
+            f"max={sv[-1]:.4f}",
+            flush=True,
+        )
+
     return float(sum(vals)) / float(len(vals))
 
 
