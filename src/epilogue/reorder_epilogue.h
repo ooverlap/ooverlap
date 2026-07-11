@@ -93,7 +93,11 @@ struct SignalingEpilogueParams {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <class BaseEpilogue, class ThreadblockShape>
+template <
+  class BaseEpilogue,
+  class ThreadblockShape,
+  bool DeepCoopSignal = false
+>
 struct ReorderSignalEpilogue {
 
   using ElementC         = typename BaseEpilogue::ElementC;
@@ -228,6 +232,25 @@ struct ReorderSignalEpilogue {
     return base_.load_tail(static_cast<Args&&>(args)...);
   }
 
+  // HERE extract cooperative subtile_idx if present
+  OOVERLAP_DEVICE_INLINE
+  static int get_subtile_idx() {
+    return -1;
+  }
+
+  template <class T>
+  OOVERLAP_DEVICE_INLINE
+  static int get_subtile_idx(T const& x) {
+    return int(x);
+  }
+
+  template <class T, class... Rest>
+  OOVERLAP_DEVICE_INLINE
+  static int get_subtile_idx(T const& x, Rest const&...) {
+    return int(x);
+  }
+
+
   //
   // NOTE:
   //   The normal WS/pingpong SM90 kernels call epilogue.store with:
@@ -314,37 +337,97 @@ struct ReorderSignalEpilogue {
     cute::get<0>(packed_tile_coord) = packed_cta_m;
     cute::get<1>(packed_tile_coord) = packed_cta_n;
 
-    return base_.store(
-      static_cast<EpiLoadPipe&&>(epi_load_pipe),
-      static_cast<EpiLoadState&&>(epi_load_state),
-      static_cast<EpiStorePipe&&>(epi_store_pipe),
-      static_cast<EpiStoreState&&>(epi_store_state),
-      packed_problem_shape,
-      tile_shape,
-      packed_tile_coord,
-      accum,
-      tiled_mma,
-      thread_idx,
-      shared_storage,
-      static_cast<ExtraArgs&&>(extra_args)...
-    );
+    if constexpr (DeepCoopSignal) {
+      // HERE pass packed tile to CUTLASS TMA-subtile signal path
+      typename BaseEpilogue::OoverlapCoopSignal sig;
+      sig.MM = params_.signal.ptr_Monitored_Matrix;
+      sig.cseg = params_.signal.kCommu_Seg_Array;
+      sig.debug = params_.signal.ptr_Debug_Arrivals;
+      sig.num_segments = params_.signal.num_segments;
+      sig.tile = packed_tile;
+      sig.expected = BaseEpilogue::get_store_pipe_increment(tile_shape);
+
+      int subtile_idx = get_subtile_idx(static_cast<ExtraArgs&&>(extra_args)...);
+
+      return base_.store(
+        static_cast<EpiLoadPipe&&>(epi_load_pipe),
+        static_cast<EpiLoadState&&>(epi_load_state),
+        static_cast<EpiStorePipe&&>(epi_store_pipe),
+        static_cast<EpiStoreState&&>(epi_store_state),
+        packed_problem_shape,
+        tile_shape,
+        packed_tile_coord,
+        accum,
+        tiled_mma,
+        thread_idx,
+        shared_storage,
+        subtile_idx,
+        sig
+      );
+    }
+    else {
+      return base_.store(
+        static_cast<EpiLoadPipe&&>(epi_load_pipe),
+        static_cast<EpiLoadState&&>(epi_load_state),
+        static_cast<EpiStorePipe&&>(epi_store_pipe),
+        static_cast<EpiStoreState&&>(epi_store_state),
+        packed_problem_shape,
+        tile_shape,
+        packed_tile_coord,
+        accum,
+        tiled_mma,
+        thread_idx,
+        shared_storage,
+        static_cast<ExtraArgs&&>(extra_args)...
+      );
+    }
 
 #else
 
-    return base_.store(
-      static_cast<EpiLoadPipe&&>(epi_load_pipe),
-      static_cast<EpiLoadState&&>(epi_load_state),
-      static_cast<EpiStorePipe&&>(epi_store_pipe),
-      static_cast<EpiStoreState&&>(epi_store_state),
-      problem_shape,
-      tile_shape,
-      tile_coord,
-      accum,
-      tiled_mma,
-      thread_idx,
-      shared_storage,
-      static_cast<ExtraArgs&&>(extra_args)...
-    );
+    if constexpr (DeepCoopSignal) {
+      // HERE pass logical tile to CUTLASS TMA-subtile signal path
+      typename BaseEpilogue::OoverlapCoopSignal sig;
+      sig.MM = params_.signal.ptr_Monitored_Matrix;
+      sig.cseg = params_.signal.kCommu_Seg_Array;
+      sig.debug = params_.signal.ptr_Debug_Arrivals;
+      sig.num_segments = params_.signal.num_segments;
+      sig.tile = packed_tile;
+      sig.expected = BaseEpilogue::get_store_pipe_increment(tile_shape);
+
+      int subtile_idx = get_subtile_idx(static_cast<ExtraArgs&&>(extra_args)...);
+
+      return base_.store(
+        static_cast<EpiLoadPipe&&>(epi_load_pipe),
+        static_cast<EpiLoadState&&>(epi_load_state),
+        static_cast<EpiStorePipe&&>(epi_store_pipe),
+        static_cast<EpiStoreState&&>(epi_store_state),
+        problem_shape,
+        tile_shape,
+        tile_coord,
+        accum,
+        tiled_mma,
+        thread_idx,
+        shared_storage,
+        subtile_idx,
+        sig
+      );
+    }
+    else {
+      return base_.store(
+        static_cast<EpiLoadPipe&&>(epi_load_pipe),
+        static_cast<EpiLoadState&&>(epi_load_state),
+        static_cast<EpiStorePipe&&>(epi_store_pipe),
+        static_cast<EpiStoreState&&>(epi_store_state),
+        problem_shape,
+        tile_shape,
+        tile_coord,
+        accum,
+        tiled_mma,
+        thread_idx,
+        shared_storage,
+        static_cast<ExtraArgs&&>(extra_args)...
+      );
+    }
 
 #endif
   }
@@ -355,98 +438,100 @@ struct ReorderSignalEpilogue {
     auto ret = base_.store_tail(static_cast<Args&&>(args)...);
 
 #if OOVERLAP_ENABLE_EPILOGUE_SIGNAL
+    // HERE old wrapper signal is disabled for cooperative deep path
+    if constexpr (!DeepCoopSignal) {
 
-    int linear_tid =
-      int(threadIdx.x) +
-      int(blockDim.x) * (int(threadIdx.y) + int(blockDim.y) * int(threadIdx.z));
+      int linear_tid =
+        int(threadIdx.x) +
+        int(blockDim.x) * (int(threadIdx.y) + int(blockDim.y) * int(threadIdx.z));
 
-    int lane_idx = linear_tid & 31;
-    int warp_idx = linear_tid >> 5;
+      int lane_idx = linear_tid & 31;
+      int warp_idx = linear_tid >> 5;
 
-    constexpr int kWarpsPerWarpGroup = 4;
-    int warp_idx_in_wg = warp_idx & (kWarpsPerWarpGroup - 1);
+      constexpr int kWarpsPerWarpGroup = 4;
+      int warp_idx_in_wg = warp_idx & (kWarpsPerWarpGroup - 1);
 
-    bool one_thread_per_warpgroup = (lane_idx == 0) && (warp_idx_in_wg == 0);
+      bool one_thread_per_warpgroup = (lane_idx == 0) && (warp_idx_in_wg == 0);
 
-    if (one_thread_per_warpgroup) {
+      if (one_thread_per_warpgroup) {
 
-      int tile = reordered_tile_;
+        int tile = reordered_tile_;
 
 #if OOVERLAP_ENABLE_EPILOGUE_DEBUG
-      if (params_.signal.ptr_Debug_Arrivals) {
-        atomicAdd(&params_.signal.ptr_Debug_Arrivals[tile], 1);
-      }
+        if (params_.signal.ptr_Debug_Arrivals) {
+          atomicAdd(&params_.signal.ptr_Debug_Arrivals[tile], 1);
+        }
 #endif
 
-      int* tile_done = params_.signal.ptr_Monitored_Matrix + params_.signal.num_segments;
+        int* tile_done = params_.signal.ptr_Monitored_Matrix + params_.signal.num_segments;
 
-      int expected_arrivals =
-          (params_.signal.kEpilogueArrivalsPerTile > 0)
-              ? params_.signal.kEpilogueArrivalsPerTile
-              : kNumEpilogueWarpGroups;
+        int expected_arrivals =
+            (params_.signal.kEpilogueArrivalsPerTile > 0)
+                ? params_.signal.kEpilogueArrivalsPerTile
+                : kNumEpilogueWarpGroups;
 
-      if (expected_arrivals <= 0) {
-        expected_arrivals = 1;
-      }
-
-      int old = atomicAdd(&tile_done[tile], 1);
-
-      if (old == (expected_arrivals - 1)) {
-        __threadfence();
-
-        int idx_bound = params_.signal.kCommu_Seg_Array[0];
-        int seg = 0;
-
-        while (idx_bound <= tile) {
-          ++seg;
-          idx_bound += params_.signal.kCommu_Seg_Array[seg];
+        if (expected_arrivals <= 0) {
+          expected_arrivals = 1;
         }
 
-        atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);
+        int old = atomicAdd(&tile_done[tile], 1);
+
+        if (old == (expected_arrivals - 1)) {
+          __threadfence();
+
+          int idx_bound = params_.signal.kCommu_Seg_Array[0];
+          int seg = 0;
+
+          while (idx_bound <= tile) {
+            ++seg;
+            idx_bound += params_.signal.kCommu_Seg_Array[seg];
+          }
+
+          atomicAdd(&params_.signal.ptr_Monitored_Matrix[seg], 1);
 
 #if OOVERLAP_ENABLE_EPILOGUE_MONITOR
-        if (params_.signal.if_monitor) {
-          // MM layout used by the SM90 port:
-          //   MM[0 : num_segments]
-          //       per-segment ready counters, consumed by comm stream
-          //   MM[num_segments : num_segments + tile_num]
-          //       per-tile epilogue arrival counters, used internally here
-          //   MM[num_segments + tile_num]
-          //       global monitor/order counter, only used when if_monitor=true
-          //   MM[num_segments + tile_num + 1 : num_segments + tile_num + 1 + tile_num]
-          //       monitor output: monitor_order[tile] = tile completion order
-          //
-          // Do not store monitor data in tile_done. tile_done is live
-          // synchronization state and must remain arrival counts.
-          int tile_cols =
-            (N_ + params_.signal.ThreadblockN - 1) /
-            params_.signal.ThreadblockN;
+          if (params_.signal.if_monitor) {
+            // MM layout used by the SM90 port:
+            //   MM[0 : num_segments]
+            //       per-segment ready counters, consumed by comm stream
+            //   MM[num_segments : num_segments + tile_num]
+            //       per-tile epilogue arrival counters, used internally here
+            //   MM[num_segments + tile_num]
+            //       global monitor/order counter, only used when if_monitor=true
+            //   MM[num_segments + tile_num + 1 : num_segments + tile_num + 1 + tile_num]
+            //       monitor output: monitor_order[tile] = tile completion order
+            //
+            // Do not store monitor data in tile_done. tile_done is live
+            // synchronization state and must remain arrival counts.
+            int tile_cols =
+              (N_ + params_.signal.ThreadblockN - 1) /
+              params_.signal.ThreadblockN;
 
-          int tile_rows =
-            (M_ + params_.signal.ThreadblockM - 1) /
-            params_.signal.ThreadblockM;
+            int tile_rows =
+              (M_ + params_.signal.ThreadblockM - 1) /
+              params_.signal.ThreadblockM;
 
-          int tile_num = tile_rows * tile_cols;
+            int tile_num = tile_rows * tile_cols;
 
-          int* monitor_counter =
-            params_.signal.ptr_Monitored_Matrix +
-            params_.signal.num_segments + tile_num;
+            int* monitor_counter =
+              params_.signal.ptr_Monitored_Matrix +
+              params_.signal.num_segments + tile_num;
 
-          int* monitor_order = monitor_counter + 1;
+            int* monitor_order = monitor_counter + 1;
 
-          int global_order =
-            atomicAdd(monitor_counter, 1);
+            int global_order =
+              atomicAdd(monitor_counter, 1);
 
-          cutlass::arch::global_store<int, sizeof(int)>(
-            global_order,
-            (void*)(monitor_order + tile),
-            true
-          );
-        }
+            cutlass::arch::global_store<int, sizeof(int)>(
+              global_order,
+              (void*)(monitor_order + tile),
+              true
+            );
+          }
 #endif
+        }
       }
     }
-
 #endif
 
     return ret;

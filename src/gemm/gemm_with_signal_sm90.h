@@ -88,6 +88,13 @@ struct IsStreamK : std::false_type {};
 template <>
 struct IsStreamK<cutlass::gemm::StreamKScheduler> : std::true_type {};
 
+template <typename Schedule>
+struct IsCooperativeMainloop : std::false_type {};
+
+template <>
+struct IsCooperativeMainloop<
+    cutlass::gemm::KernelTmaWarpSpecializedCooperative> : std::true_type {};
+
 }  // namespace ooverlap_sm90_detail
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -196,8 +203,16 @@ public:
 #if defined(OOVERLAP_USE_BASE_EPILOGUE_ONLY) && OOVERLAP_USE_BASE_EPILOGUE_ONLY
   using CollectiveEpilogue = BaseCollectiveEpilogue;
 #else
+  // HERE cooperative kernels use deep CUTLASS TMA-subtile signaling
+  static constexpr bool kDeepCoopSignal =
+      cutlass::ooverlap_sm90_detail::IsCooperativeMainloop<
+          MainloopSchedule>::value;
+
   using CollectiveEpilogue =
-      ReorderSignalEpilogue<BaseCollectiveEpilogue, ThreadblockShape>;
+      ReorderSignalEpilogue<
+          BaseCollectiveEpilogue,
+          ThreadblockShape,
+          kDeepCoopSignal>;
 #endif
 
   using GemmKernel =
