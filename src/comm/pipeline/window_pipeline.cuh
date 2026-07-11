@@ -615,7 +615,7 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
                     barriers);
 
             if (future_iter >= StageDepth) {
-                //apply.wait_before_stage_reuse();
+                apply.wait_before_stage_reuse();
             }
 
             load.issue(&future_stage);
@@ -624,7 +624,7 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
         apply.issue_bulk(&cur_stage);
     }
 
-    //apply.wait_complete();
+    apply.wait_complete();
 }
 
 template <
