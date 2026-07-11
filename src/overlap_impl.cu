@@ -270,14 +270,6 @@ void OverlapImpl::OoverlapUnregisterBuffer() {
         oo_group_sync(oo_group_);
     }
 
-    for (int i = 0; i < oo_peer_count_; ++i) {
-        if (oo_peer_bufs_[i] != nullptr) {
-            oo_buffer_destroy(oo_peer_bufs_[i]);
-            oo_peer_bufs_[i] = nullptr;
-        }
-    }
-    oo_peer_count_ = 0;
-
     if (oo_local_buf_ != nullptr) {
         oo_buffer_destroy(oo_local_buf_);
         oo_local_buf_ = nullptr;

@@ -20,7 +20,6 @@
 #include "test/tma_bandwidth_experiment_sm90.h"
 #include "test/ipc_collective_sm90.h"
 //#include "test/tma_collective_sweep_2gpu.h"
-#include "test/tma_efficiency_vs_best_2gpu.h"
 #include "test/persistent_external_p2p_collective_2gpu_sm90.h"
 #include "test/host_mapped_ready_microtest.h"
 #include "test/ipc_external_p2p_collective_2gpu_sm90.h"
