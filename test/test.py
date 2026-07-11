@@ -58,7 +58,13 @@ def load_ooverlap_ext():
     return mod
 
 
-ext = load_ooverlap_ext()
+ext = None
+
+def ensure_ext():
+    global ext
+    if ext is None:
+        ext = load_ooverlap_ext()
+    return ext
 
 
 @contextmanager
@@ -161,7 +167,7 @@ def sync_and_release_overlap_backend(obj, comm_backend: str):
     try:
         torch.cuda.synchronize()
     finally:
-        release_overlap_backend(obj, comm_backend)
+        sync_and_release_overlap_backend(obj, comm_backend)
 
 
 def init_baseline_nccl(obj, rank, world_size, nccl_id):
@@ -309,6 +315,7 @@ def call_ooverlap_allreduce(obj, C):
 
 
 def call_module_cublas_gemm(A, B, C_col):
+    ensure_ext()
     fn = getattr(ext, "baseline_gemm_col", None)
     if fn is None:
         raise RuntimeError("ooverlap_ext.baseline_gemm_col was not found")
@@ -316,6 +323,7 @@ def call_module_cublas_gemm(A, B, C_col):
 
 
 def call_module_plain_gemm(A, B, C_col, Algo):
+    ensure_ext()
     fn = getattr(ext, "gemm_plain_sm90", None)
     if fn is None:
         raise RuntimeError("ooverlap_ext.gemm_plain_sm90 was not found")
@@ -389,6 +397,7 @@ def call_baseline_plain_reducescatter(obj, A, B, C, D, Algo):
 
 def perf_comm_process(rank, world_size, nccl_id, broker_key, comm_backend, M, N, comm_op, result_dict):
     torch.cuda.set_device(rank)
+    ensure_ext()
     validate_backend(comm_backend, comm_op, world_size)
     clear_comm_cta_env_in_child()
 
@@ -423,6 +432,7 @@ def perf_comm(M, N, comm_op, comm_backend):
     world_size = torch.cuda.device_count()
     validate_backend(comm_backend, comm_op, world_size)
 
+    ensure_ext()
     nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
     broker_key = make_broker_key() if comm_backend == "ooverlap" else ""
 
@@ -461,6 +471,7 @@ def perf_overlap_process(
     result_dict,
 ):
     torch.cuda.set_device(rank)
+    ensure_ext()
     validate_backend(comm_backend, comm_op, world_size)
 
     if set_overlap_comm_ctas:
@@ -537,7 +548,7 @@ def perf_overlap_process(
         result_dict[rank] = mean_timed(run)
 
     finally:
-        release_overlap_backend(obj, comm_backend)
+        sync_and_release_overlap_backend(obj, comm_backend)
 
 
 def perf_overlap(
@@ -562,6 +573,7 @@ def perf_overlap(
     if set_overlap_comm_ctas and int(overlap_comm_ctas) <= 0:
         raise ValueError(f"overlap_comm_ctas must be > 0, got {overlap_comm_ctas}")
 
+    ensure_ext()
     nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
     broker_key = make_broker_key() if comm_backend == "ooverlap" else ""
 
@@ -619,6 +631,7 @@ def perf_baseline_process(
     result_dict,
 ):
     torch.cuda.set_device(rank)
+    ensure_ext()
     validate_backend(comm_backend, comm_op, world_size)
     clear_comm_cta_env_in_child()
 
@@ -685,6 +698,7 @@ def perf_baseline(M, N, K, Algo, comm_op, comm_backend, baseline_kind):
     world_size = torch.cuda.device_count()
     validate_backend(comm_backend, comm_op, world_size)
 
+    ensure_ext()
     nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
     broker_key = make_broker_key() if comm_backend == "ooverlap" else ""
 
@@ -797,7 +811,6 @@ def run_backend(args, comm_backend: str):
 
     if args.run_cublas_baseline:
         print("[phase] cublas baseline", flush=True)
-    if args.run_cublas_baseline:
         baselines["cublas"] = perf_baseline(
             M,
             N,
@@ -810,7 +823,6 @@ def run_backend(args, comm_backend: str):
 
     if args.run_plain_baseline:
         print("[phase] plain baseline", flush=True)
-    if args.run_plain_baseline:
         baselines["plain"] = perf_baseline(
             M,
             N,

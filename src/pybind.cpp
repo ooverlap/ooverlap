@@ -99,6 +99,30 @@ const char* cublas_status_to_string(cublasStatus_t status) {
   }
 }
 
+
+struct OoverlapThreadLocalCublasHandle {
+  cublasHandle_t handle = nullptr;
+
+  ~OoverlapThreadLocalCublasHandle() {
+    if (handle != nullptr) {
+      cublasDestroy(handle);
+      handle = nullptr;
+    }
+  }
+};
+
+cublasHandle_t ooverlap_thread_local_cublas_handle() {
+  static thread_local OoverlapThreadLocalCublasHandle holder;
+
+  if (holder.handle == nullptr) {
+    cublasStatus_t st = cublasCreate(&holder.handle);
+    TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS, "cublasCreate failed: ",
+                cublas_status_to_string(st));
+  }
+
+  return holder.handle;
+}
+
 void gemm_signal_sm90(
     torch::Tensor A,
     torch::Tensor B,
@@ -262,7 +286,7 @@ void baseline_gemm_col(
   const int K = static_cast<int>(K64);
 
   cudaStream_t stream = current_stream_for(A);
-  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  cublasHandle_t handle = ooverlap_thread_local_cublas_handle();
 
   cublasStatus_t st = cublasSetStream(handle, stream);
   TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS, "cublasSetStream failed: ",
