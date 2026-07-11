@@ -42,12 +42,14 @@ class ShapePlot:
 # Keep this list for explicit report figures.
 # Use --all-shapes to ignore this and plot every measured M,N in the JSON.
 PLOT_SHAPES: List[ShapePlot] = [
+    ShapePlot(16384, 2048, "x"),
     ShapePlot(16384, 4096, "x"),
     ShapePlot(16384, 8192, "x"),
+    ShapePlot(32768, 2048, "x"),
     ShapePlot(32768, 4096, "x"),
     ShapePlot(32768, 8192, "x"),
-    ShapePlot(49152, 4096, "x"),
-    ShapePlot(49152, 8192, "x"),
+    # ShapePlot(49152, 4096, "x"),
+    # ShapePlot(49152, 8192, "x"),
 ]
 
 DEFAULT_JSON = "results/eval_sm90/evaluation_result.json"
