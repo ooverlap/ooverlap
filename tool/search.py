@@ -31,6 +31,16 @@ import torch.multiprocessing as mp
 DEFAULT_EXHAUSTIVE_ALGOS = 5
 DEFAULT_PREDICTIVE_ALGOS = 10
 
+# The ooverlap IPC backend is safest when each high-level overlap call has
+# completed before the next one starts. search.py can otherwise queue many
+# overlap calls back-to-back during hint collection and candidate timing.
+SYNC_EACH_OVERLAP = os.environ.get("OOVERLAP_SEARCH_SYNC_EACH_OVERLAP", "1") != "0"
+
+
+def maybe_sync_after_overlap() -> None:
+    if SYNC_EACH_OVERLAP:
+        torch.cuda.synchronize()
+
 
 def repo_root() -> Path:
     p = Path(__file__).resolve()
@@ -572,6 +582,8 @@ def collect_monitor_samples(
         else:
             raise ValueError(f"Unknown comm_op={comm_op}")
 
+        maybe_sync_after_overlap()
+
         order = monitor_order_view(MM, tile_num, len(cSeg))
         missing = int((order < 0).sum().item())
         if missing:
@@ -776,6 +788,8 @@ def compute_hint_process(
                 )
             else:
                 raise ValueError(f"Unknown comm_op={comm_op}")
+
+            maybe_sync_after_overlap()
 
         samples_first = collect_monitor_samples(
             gemm_class,
@@ -1129,6 +1143,8 @@ def perf_running_process(
             else:
                 raise ValueError(f"Unknown comm_op={comm_op}")
 
+            maybe_sync_after_overlap()
+
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
         ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
 
@@ -1146,6 +1162,7 @@ def perf_running_process(
                 )
 
             ends[i].record()
+            maybe_sync_after_overlap()
 
         torch.cuda.synchronize()
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(starts, ends)], dtype=torch.float)

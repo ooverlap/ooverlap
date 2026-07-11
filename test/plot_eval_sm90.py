@@ -54,7 +54,7 @@ DEFAULT_JSON = "results/eval_sm90/evaluation_result.json"
 DEFAULT_OUT_DIR = "results/eval_sm90/operator_speedup"
 DEFAULT_PLOT_NAME = "operator_overlap_speedup_by_shape"
 
-DEFAULT_BASELINE_SOURCE = "nccl_plain"
+DEFAULT_BASELINE_SOURCE = "nccl_cublas"
 DEFAULT_TEST_MODE = "both"
 
 
