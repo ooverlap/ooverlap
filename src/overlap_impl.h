@@ -28,6 +28,18 @@ public:
         const std::vector<int64_t> devices,
         const std::string broker_key);
 
+    /*
+     * Same-process direct CUDA P2P mode for FlashOverlap tests.
+     *
+     * This uses oo_group_create_p2p, not VMM allocation. Multiple OverlapImpl
+     * instances in one Python process share one direct-P2P group so rank0/rank1
+     * wrappers land in the same group->collective_buffers[] table.
+     */
+    void OoverlapP2pInit(
+        const int64_t tp_rank,
+        const int64_t tp_size,
+        const std::vector<int64_t> devices);
+
     void OoverlapRelease();
     void OverlapInit();
 
@@ -68,8 +80,6 @@ private:
     oo_group_t* oo_group_;
     oo_node_t* oo_node_;
     oo_buffer_t* oo_local_buf_;
-    oo_buffer_t* oo_peer_bufs_[1];
-    int oo_peer_count_;
 
     void* oo_registered_ptr_;
     size_t oo_registered_bytes_;
@@ -78,6 +88,7 @@ private:
     int64_t oo_size_;
     int oo_devices_[2];
     bool oo_initialized_;
+    bool oo_owns_group_;
 
     cudaStream_t gemm_stream_;
     cudaStream_t comm_stream_;

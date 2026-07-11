@@ -471,6 +471,7 @@ PYBIND11_MODULE(ooverlap_ext, m) {
       .def("cutlass_init", &OverlapImpl::CutlassInit)
       .def("nccl_init", &OverlapImpl::NcclInit)
       .def("ooverlap_ipc_init", &OverlapImpl::OoverlapIpcInit)
+      .def("ooverlap_p2p_init", &OverlapImpl::OoverlapP2pInit)
       .def("ooverlap_release", &OverlapImpl::OoverlapRelease)
       .def("overlap_init", &OverlapImpl::OverlapInit)
       .def("gemm_allreduce_overlap", &OverlapImpl::GemmAllReduceOverlap)

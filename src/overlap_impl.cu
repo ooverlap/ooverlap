@@ -14,6 +14,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <mutex>
 
 namespace {
 constexpr int kTileM = 128;
@@ -64,20 +65,92 @@ size_t tensor_bytes(at::Tensor T) {
 oo_tuning_mode_t default_oo_tuning_mode() {
     return OO_TUNING_BEST_PERFORMANCE;
 }
+
+struct SharedDirectP2pGroup {
+    std::mutex mutex;
+    oo_group_t* group = nullptr;
+    int devices[2] = {-1, -1};
+    int refcount = 0;
+};
+
+SharedDirectP2pGroup& shared_direct_p2p_group() {
+    static SharedDirectP2pGroup state;
+    return state;
+}
+
+oo_group_t* acquire_shared_direct_p2p_group(const int devices[2]) {
+    SharedDirectP2pGroup& state = shared_direct_p2p_group();
+
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    if (state.group != nullptr) {
+        TORCH_CHECK(
+            state.devices[0] == devices[0] && state.devices[1] == devices[1],
+            "direct P2P ooverlap group already exists for devices [",
+            state.devices[0],
+            ", ",
+            state.devices[1],
+            "], requested [",
+            devices[0],
+            ", ",
+            devices[1],
+            "]");
+
+        ++state.refcount;
+        return state.group;
+    }
+
+    OO_CHECK(
+        oo_group_create_p2p(
+            devices,
+            2,
+            &state.group),
+        "oo_group_create_p2p");
+
+    state.devices[0] = devices[0];
+    state.devices[1] = devices[1];
+    state.refcount = 1;
+
+    return state.group;
+}
+
+void release_shared_direct_p2p_group(oo_group_t* group) {
+    if (group == nullptr) {
+        return;
+    }
+
+    SharedDirectP2pGroup& state = shared_direct_p2p_group();
+
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    if (state.group != group) {
+        return;
+    }
+
+    if (state.refcount > 0) {
+        --state.refcount;
+    }
+
+    if (state.refcount == 0) {
+        oo_group_destroy(state.group);
+        state.group = nullptr;
+        state.devices[0] = -1;
+        state.devices[1] = -1;
+    }
+}
 } // namespace
 
 OverlapImpl::OverlapImpl()
     : oo_group_(nullptr),
       oo_node_(nullptr),
       oo_local_buf_(nullptr),
-      oo_peer_bufs_{nullptr},
-      oo_peer_count_(0),
       oo_registered_ptr_(nullptr),
       oo_registered_bytes_(0),
       oo_rank_(-1),
       oo_size_(0),
       oo_devices_{-1, -1},
       oo_initialized_(false),
+      oo_owns_group_(false),
       gemm_stream_(nullptr),
       comm_stream_(nullptr),
       mm_ready_(nullptr),
@@ -145,6 +218,46 @@ void OverlapImpl::OoverlapIpcInit(
         oo_group_create_ipc(devs, 2, static_cast<int>(oo_rank_), broker_key.c_str(), &oo_group_),
         "oo_group_create_ipc");
 
+    oo_owns_group_ = true;
+
+    OO_CHECK(
+        oo_node_create(oo_group_, static_cast<int>(oo_rank_), &oo_node_),
+        "oo_node_create");
+
+    oo_initialized_ = true;
+}
+
+void OverlapImpl::OoverlapP2pInit(
+    const int64_t tp_rank,
+    const int64_t tp_size,
+    const std::vector<int64_t> devices) {
+
+    TORCH_CHECK(tp_size == 2, "ooverlap P2P currently supports exactly 2 ranks");
+    TORCH_CHECK(devices.size() == 2, "devices must contain exactly 2 CUDA device ids");
+    TORCH_CHECK(tp_rank >= 0 && tp_rank < tp_size, "invalid P2P rank");
+
+    OoverlapRelease();
+
+    oo_rank_ = tp_rank;
+    oo_size_ = tp_size;
+    oo_devices_[0] = static_cast<int>(devices[0]);
+    oo_devices_[1] = static_cast<int>(devices[1]);
+
+    int devs[2] = {oo_devices_[0], oo_devices_[1]};
+
+    CUDA_CHECK(cudaSetDevice(oo_devices_[oo_rank_]), "cudaSetDevice");
+
+    /*
+     * OOVERLAP_FLASHOVERLAP_DIRECT_P2P_API_PATCH:
+     *
+     * Same-process FlashOverlap tests should use the direct CUDA peer-access
+     * backend, not VMM allocation and not the multiprocess IPC broker. The
+     * shared group is process-local; each OverlapImpl rank creates its own node
+     * in that common group.
+     */
+    oo_group_ = acquire_shared_direct_p2p_group(devs);
+    oo_owns_group_ = false;
+
     OO_CHECK(
         oo_node_create(oo_group_, static_cast<int>(oo_rank_), &oo_node_),
         "oo_node_create");
@@ -187,9 +300,16 @@ void OverlapImpl::OoverlapRelease() {
     }
 
     if (oo_group_ != nullptr) {
-        oo_group_destroy(oo_group_);
+        if (oo_owns_group_) {
+            oo_group_destroy(oo_group_);
+        } else {
+            release_shared_direct_p2p_group(oo_group_);
+        }
+
         oo_group_ = nullptr;
     }
+
+    oo_owns_group_ = false;
 
     oo_rank_ = -1;
     oo_size_ = 0;
@@ -207,9 +327,7 @@ void OverlapImpl::OoverlapEnsureBuffer(at::Tensor C) {
 
     if (oo_registered_ptr_ == c_ptr &&
         oo_registered_bytes_ == bytes &&
-        oo_local_buf_ != nullptr &&
-        oo_peer_count_ == 1 &&
-        oo_peer_bufs_[0] != nullptr) {
+        oo_local_buf_ != nullptr) {
         return;
     }
 
@@ -218,12 +336,17 @@ void OverlapImpl::OoverlapEnsureBuffer(at::Tensor C) {
     CUDA_CHECK(cudaSetDevice(oo_devices_[oo_rank_]), "cudaSetDevice");
     OO_CHECK(oo_buffer_wrap(oo_node_, c_ptr, bytes, &oo_local_buf_), "oo_buffer_wrap");
 
-    /*OO_CHECK(*/
-        /*oo_buffer_exchange_ipc_peers(oo_node_, oo_local_buf_, oo_peer_bufs_, &oo_peer_count_),*/
-        /*"oo_buffer_exchange_ipc_peers");*/
-
-    //TORCH_CHECK(oo_peer_count_ == 1, "expected exactly one ooverlap peer");
-
+    /*
+     * The current public collective API resolves peers from the group at launch.
+     *
+     * Direct P2P mode:
+     *   oo_buffer_wrap() registers this local external pointer in the shared
+     *   same-process group. Peer access comes from oo_group_create_p2p().
+     *
+     * IPC mode:
+     *   the collective lazily imports peer wrapped pointers through the broker
+     *   and then reuses the IPC import cache.
+     */
     oo_registered_ptr_ = c_ptr;
     oo_registered_bytes_ = bytes;
 }
@@ -237,14 +360,12 @@ void OverlapImpl::OoverlapAllReduceSlice(
         return;
     }
 
-    TORCH_CHECK(oo_local_buf_ != nullptr && oo_peer_count_ == 1, "ooverlap buffer is not registered");
+    TORCH_CHECK(oo_local_buf_ != nullptr, "ooverlap buffer is not registered");
 
     OO_CHECK(
         oo_allreduce_offset_tuned(
             oo_node_,
             oo_local_buf_,
-            oo_peer_bufs_,
-            oo_peer_count_,
             element_offset,
             count,
             OO_DTYPE_FLOAT16,
@@ -263,8 +384,6 @@ void OverlapImpl::OoverlapAllReduce(at::Tensor C) {
         oo_allreduce_tuned(
             oo_node_,
             oo_local_buf_,
-            oo_peer_bufs_,
-            oo_peer_count_,
             static_cast<size_t>(C.numel()),
             OO_DTYPE_FLOAT16,
             OO_REDUCE_SUM,
