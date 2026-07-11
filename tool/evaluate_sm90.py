@@ -159,7 +159,7 @@ TEST_EXTRA_ARGS = [
 
 # If non-empty, this is injected into test.py env.
 # Set to "" if you do not want it.
-OOVERLAP_TUNING_POLICY = "results/tma_collective_sweep_result.json"
+OOVERLAP_TUNING_POLICY = ""
 
 # If non-empty, overrides CUDA_VISIBLE_DEVICES for all child commands.
 # Otherwise the parent environment is preserved.

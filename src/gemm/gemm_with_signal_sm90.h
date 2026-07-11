@@ -45,14 +45,14 @@
 #define OOVERLAP_USE_BASE_EPILOGUE_ONLY 0
 #endif
 
-#define CUTLASS_CHECK_SM90(status)                                                 \
-  {                                                                                \
-    cutlass::Status error = status;                                                \
-    if (error != cutlass::Status::kSuccess) {                                      \
-      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error)          \
-                << " at line " << __LINE__ << std::endl;                          \
-      std::exit(EXIT_FAILURE);                                                     \
-    }                                                                              \
+#define CUTLASS_CHECK_SM90(status)                                                   \
+  {                                                                                  \
+    cutlass::Status error = status;                                                  \
+    if (error != cutlass::Status::kSuccess) {                                        \
+      throw std::runtime_error(                                                      \
+          std::string("Got cutlass error: ") + cutlassGetStatusString(error) +       \
+          " at line " + std::to_string(__LINE__));                                   \
+    }                                                                                \
   }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
