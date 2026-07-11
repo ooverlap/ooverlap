@@ -135,8 +135,8 @@ def load_candidates(cfg_path, top_k):
     seen_algos = set()
 
     for idx, entry in enumerate(top):
-        if is_cooperative(entry):
-            continue
+        # if is_cooperative(entry):
+            # continue
 
         algo = explicit_algo(entry)
 

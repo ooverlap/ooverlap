@@ -1259,9 +1259,9 @@ def choose_candidate(
         gemm_dur = float(gemm_dur_list[t])
         Algo = int(Algo_list[t])
 
-        if is_cooperative_algo(Algo):
-            print(f"Skip cooperative algo={Algo}")
-            continue
+        # if is_cooperative_algo(Algo):
+            # print(f"Skip cooperative algo={Algo}")
+            # continue
 
         tile_num = div_up(M, BM) * div_up(N, BN)
         wave_num = div_up(tile_num, compute_sms)

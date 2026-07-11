@@ -56,6 +56,7 @@ CURATED_SHAPES = [
     ("cooperative", 128, 128, 64, 6),
     ("cooperative", 128, 256, 64, 4),
     ("cooperative", 256, 128, 64, 4),
+    ("cooperative", 256, 256, 64, 3),
 ]
 
 SCHEDULERS = [
