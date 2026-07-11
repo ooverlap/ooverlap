@@ -40,6 +40,28 @@ void CUDA_CHECK(cudaError_t err, const char* what) {
     TORCH_CHECK(err == cudaSuccess, what, " failed with ", cudaGetErrorString(err));
 }
 
+
+struct ScopedCudaEvent {
+    cudaEvent_t event = nullptr;
+
+    explicit ScopedCudaEvent(const char* what) {
+        CUDA_CHECK(
+            cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+            what);
+    }
+
+    ~ScopedCudaEvent() {
+        if (event != nullptr) {
+            cudaEventDestroy(event);
+            event = nullptr;
+        }
+    }
+
+    operator cudaEvent_t() const {
+        return event;
+    }
+};
+
 void check_half_cuda(at::Tensor T, const char* name) {
     TORCH_CHECK(T.is_cuda(), name, " must be CUDA");
     TORCH_CHECK(T.scalar_type() == torch::kFloat16, name, " must be float16");
@@ -464,6 +486,9 @@ void OverlapImpl::GemmAllReduceOverlap(
 
     gemm_stream_ = at::cuda::getCurrentCUDAStream(A.get_device()).stream();
 
+    ScopedCudaEvent mm_ready_local("cudaEventCreateWithFlags(mm_ready_local)");
+    ScopedCudaEvent gemm_finished_local("cudaEventCreateWithFlags(gemm_finished_local)");
+
     if (oo_initialized_) {
         OoverlapEnsureBuffer(C);
     }
@@ -475,8 +500,8 @@ void OverlapImpl::GemmAllReduceOverlap(
     int* ra_ptr = RA.data_ptr<int>();
     int* cseg_gpu_ptr = cSEG_GPU.data_ptr<int>();
 
-    CUDA_CHECK(cudaEventRecord(mm_ready_, gemm_stream_), "cudaEventRecord(mm_ready)");
-    CUDA_CHECK(cudaStreamWaitEvent(comm_stream_, mm_ready_, 0), "cudaStreamWaitEvent(mm_ready)");
+    CUDA_CHECK(cudaEventRecord(mm_ready_local, gemm_stream_), "cudaEventRecord(mm_ready_local)");
+    CUDA_CHECK(cudaStreamWaitEvent(comm_stream_, mm_ready_local, 0), "cudaStreamWaitEvent(mm_ready_local)");
 
     bool ok = ooverlap::gemm_signal_sm90_dispatch(
         static_cast<int>(Algo),
@@ -530,8 +555,8 @@ void OverlapImpl::GemmAllReduceOverlap(
         acc_addr += comm_elems;
     }
 
-    CUDA_CHECK(cudaEventRecord(gemm_finished_, comm_stream_), "cudaEventRecord(gemm_finished)");
-    CUDA_CHECK(cudaStreamWaitEvent(gemm_stream_, gemm_finished_, 0), "cudaStreamWaitEvent(gemm_finished)");
+    CUDA_CHECK(cudaEventRecord(gemm_finished_local, comm_stream_), "cudaEventRecord(gemm_finished_local)");
+    CUDA_CHECK(cudaStreamWaitEvent(gemm_stream_, gemm_finished_local, 0), "cudaStreamWaitEvent(gemm_finished_local)");
 }
 
 void OverlapImpl::GemmReduceScatterOverlap(
@@ -576,6 +601,8 @@ void OverlapImpl::GemmReduceScatterOverlap(
 
     OverlapInit();
     gemm_stream_ = at::cuda::getCurrentCUDAStream(A.get_device()).stream();
+
+    ScopedCudaEvent gemm_finished_local("cudaEventCreateWithFlags(gemm_finished_local)");
 
     half* a_ptr = reinterpret_cast<half*>(A.data_ptr<at::Half>());
     half* b_ptr = reinterpret_cast<half*>(B.data_ptr<at::Half>());
@@ -653,6 +680,6 @@ void OverlapImpl::GemmReduceScatterOverlap(
         acc_addr += comm_size;
     }
 
-    CUDA_CHECK(cudaEventRecord(gemm_finished_, comm_stream_), "cudaEventRecord(gemm_finished)");
-    CUDA_CHECK(cudaStreamWaitEvent(gemm_stream_, gemm_finished_, 0), "cudaStreamWaitEvent(gemm_finished)");
+    CUDA_CHECK(cudaEventRecord(gemm_finished_local, comm_stream_), "cudaEventRecord(gemm_finished_local)");
+    CUDA_CHECK(cudaStreamWaitEvent(gemm_stream_, gemm_finished_local, 0), "cudaStreamWaitEvent(gemm_finished_local)");
 }
