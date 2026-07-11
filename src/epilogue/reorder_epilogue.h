@@ -358,6 +358,7 @@ struct ReorderSignalEpilogue {
       sig.num_segments = params_.signal.num_segments;
       sig.tile = packed_tile;
       sig.expected = BaseEpilogue::get_store_pipe_increment(tile_shape);
+      sig.if_monitor = params_.signal.if_monitor;
 
       int subtile_idx = get_subtile_idx(static_cast<ExtraArgs&&>(extra_args)...);
 

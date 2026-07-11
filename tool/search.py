@@ -237,9 +237,9 @@ def monitor_size(tile_num: int, seg_size: int, monitor: bool):
 def reset_monitor_matrix(MM, tile_num: int, seg_size: int, monitor: bool):
     if monitor:
         MM[: seg_size + tile_num + 1] = 0
+        MM[seg_size + tile_num + 1 : seg_size + tile_num + 1 + tile_num] = -1
     else:
         MM[: seg_size + tile_num] = 0
-
 
 def monitor_order_view(MM, tile_num: int, seg_size: int):
     offset = seg_size + tile_num + 1
@@ -572,7 +572,15 @@ def collect_monitor_samples(
         else:
             raise ValueError(f"Unknown comm_op={comm_op}")
 
-        samples[i, :] = monitor_order_view(MM, tile_num, len(cSeg))
+        order = monitor_order_view(MM, tile_num, len(cSeg))
+        missing = int((order < 0).sum().item())
+        if missing:
+            raise RuntimeError(
+                f"monitor_order missing {missing}/{tile_num} entries; "
+                "deep signal path probably did not write monitor output"
+            )
+        
+        samples[i, :] = order
 
     return samples
 
