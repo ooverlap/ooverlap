@@ -135,6 +135,9 @@ struct ReorderSignalEpilogue {
   struct Params {
     typename BaseEpilogue::Params base;
     SignalingEpilogueParams signal;
+
+    // HERE forward CUTLASS TMA epilogue transaction bytes
+    uint32_t tma_transaction_bytes;
   };
 
   template <class ProblemShape>
@@ -164,6 +167,14 @@ struct ReorderSignalEpilogue {
     Params p;
     p.base   = BaseEpilogue::to_underlying_arguments(problem_shape, args.base, workspace);
     p.signal = args.signal;
+
+    if constexpr (BaseEpilogue::RequiresTransactionBytes) {
+      p.tma_transaction_bytes = BaseEpilogue::get_transaction_bytes(p.base);
+    }
+    else {
+      p.tma_transaction_bytes = 0;
+    }
+
     return p;
   }
 
@@ -184,7 +195,8 @@ struct ReorderSignalEpilogue {
 
   OOVERLAP_DEVICE_INLINE
   static int get_transaction_bytes(Params const& params) {
-    return BaseEpilogue::get_transaction_bytes(params.base);
+    return params.tma_transaction_bytes;
+    //return BaseEpilogue::get_transaction_bytes(params.base);
   }
 
   template<class TileShapeMNK>
