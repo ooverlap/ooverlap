@@ -26,8 +26,8 @@ import torch
 import torch.multiprocessing as mp
 
 
-WARM_UP = 20
-REP = 200
+WARM_UP = int(os.environ.get("OOVERLAP_TEST_WARMUP", "20"))
+REP = int(os.environ.get("OOVERLAP_TEST_REP", "200"))
 COMM_CTA_ENV_KEYS = ("OOVERLAP_MAX_CTAS", "NCCL_MAX_CTAS")
 
 
@@ -156,6 +156,12 @@ def init_overlap_backend(obj, rank, world_size, nccl_id, broker_key, comm_backen
 def release_overlap_backend(obj, comm_backend: str):
     if comm_backend == "ooverlap" and hasattr(obj, "ooverlap_release"):
         obj.ooverlap_release()
+
+def sync_and_release_overlap_backend(obj, comm_backend: str):
+    try:
+        torch.cuda.synchronize()
+    finally:
+        release_overlap_backend(obj, comm_backend)
 
 
 def init_baseline_nccl(obj, rank, world_size, nccl_id):
@@ -410,7 +416,7 @@ def perf_comm_process(rank, world_size, nccl_id, broker_key, comm_backend, M, N,
             result_dict[rank] = mean_timed(lambda: call_ooverlap_allreduce(obj, C))
 
         finally:
-            release_overlap_backend(obj, comm_backend)
+            sync_and_release_overlap_backend(obj, comm_backend)
 
 
 def perf_comm(M, N, comm_op, comm_backend):
@@ -420,17 +426,17 @@ def perf_comm(M, N, comm_op, comm_backend):
     nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
     broker_key = make_broker_key() if comm_backend == "ooverlap" else ""
 
-    manager = mp.Manager()
-    result_dict = manager.dict()
+    with mp.Manager() as manager:
+        result_dict = manager.dict()
 
-    with scoped_env(unset_keys=COMM_CTA_ENV_KEYS):
-        mp.spawn(
-            perf_comm_process,
-            args=(world_size, nccl_id, broker_key, comm_backend, M, N, comm_op, result_dict),
-            nprocs=world_size,
-        )
+        with scoped_env(unset_keys=COMM_CTA_ENV_KEYS):
+            mp.spawn(
+                perf_comm_process,
+                args=(world_size, nccl_id, broker_key, comm_backend, M, N, comm_op, result_dict),
+                nprocs=world_size,
+            )
 
-    return max(float(result_dict[r]) for r in range(world_size))
+        return max(float(result_dict[r]) for r in range(world_size))
 
 
 def perf_overlap_process(
@@ -559,43 +565,43 @@ def perf_overlap(
     nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
     broker_key = make_broker_key() if comm_backend == "ooverlap" else ""
 
-    manager = mp.Manager()
-    result_dict = manager.dict()
+    with mp.Manager() as manager:
+        result_dict = manager.dict()
 
-    if set_overlap_comm_ctas:
-        set_values = comm_cta_env_values(overlap_comm_ctas)
-        unset_keys = []
-    else:
-        set_values = {}
-        unset_keys = COMM_CTA_ENV_KEYS
+        if set_overlap_comm_ctas:
+            set_values = comm_cta_env_values(overlap_comm_ctas)
+            unset_keys = []
+        else:
+            set_values = {}
+            unset_keys = COMM_CTA_ENV_KEYS
 
-    with scoped_env(set_values=set_values, unset_keys=unset_keys):
-        mp.spawn(
-            perf_overlap_process,
-            args=(
-                world_size,
-                nccl_id,
-                broker_key,
-                comm_backend,
-                M,
-                N,
-                K,
-                BM,
-                BN,
-                Algo,
-                cSeg,
-                hint,
-                reorder_map,
-                comm_op,
-                active_sm_count,
-                set_overlap_comm_ctas,
-                int(overlap_comm_ctas),
-                result_dict,
-            ),
-            nprocs=world_size,
-        )
+        with scoped_env(set_values=set_values, unset_keys=unset_keys):
+            mp.spawn(
+                perf_overlap_process,
+                args=(
+                    world_size,
+                    nccl_id,
+                    broker_key,
+                    comm_backend,
+                    M,
+                    N,
+                    K,
+                    BM,
+                    BN,
+                    Algo,
+                    cSeg,
+                    hint,
+                    reorder_map,
+                    comm_op,
+                    active_sm_count,
+                    set_overlap_comm_ctas,
+                    int(overlap_comm_ctas),
+                    result_dict,
+                ),
+                nprocs=world_size,
+            )
 
-    return max(float(result_dict[r]) for r in range(world_size))
+        return max(float(result_dict[r]) for r in range(world_size))
 
 
 def perf_baseline_process(
@@ -672,7 +678,7 @@ def perf_baseline_process(
             result_dict[rank] = mean_timed(run)
 
         finally:
-            release_overlap_backend(obj, comm_backend)
+            sync_and_release_overlap_backend(obj, comm_backend)
 
 
 def perf_baseline(M, N, K, Algo, comm_op, comm_backend, baseline_kind):
@@ -682,29 +688,29 @@ def perf_baseline(M, N, K, Algo, comm_op, comm_backend, baseline_kind):
     nccl_id = ext.generate_nccl_id() if comm_backend == "nccl" else []
     broker_key = make_broker_key() if comm_backend == "ooverlap" else ""
 
-    manager = mp.Manager()
-    result_dict = manager.dict()
+    with mp.Manager() as manager:
+        result_dict = manager.dict()
 
-    with scoped_env(unset_keys=COMM_CTA_ENV_KEYS):
-        mp.spawn(
-            perf_baseline_process,
-            args=(
-                world_size,
-                nccl_id,
-                broker_key,
-                comm_backend,
-                baseline_kind,
-                M,
-                N,
-                K,
-                Algo,
-                comm_op,
-                result_dict,
-            ),
-            nprocs=world_size,
-        )
+        with scoped_env(unset_keys=COMM_CTA_ENV_KEYS):
+            mp.spawn(
+                perf_baseline_process,
+                args=(
+                    world_size,
+                    nccl_id,
+                    broker_key,
+                    comm_backend,
+                    baseline_kind,
+                    M,
+                    N,
+                    K,
+                    Algo,
+                    comm_op,
+                    result_dict,
+                ),
+                nprocs=world_size,
+            )
 
-    return max(float(result_dict[r]) for r in range(world_size))
+        return max(float(result_dict[r]) for r in range(world_size))
 
 
 def should_set_overlap_comm_ctas(args, comm_backend: str):
@@ -766,8 +772,10 @@ def run_backend(args, comm_backend: str):
     else:
         print("overlap CTA env:   cleared")
 
+    print("[phase] perf_comm", flush=True)
     comm_dur = perf_comm(M, N, args.comm_op, comm_backend)
 
+    print("[phase] perf_overlap", flush=True)
     overlap_dur = perf_overlap(
         M,
         N,
@@ -788,6 +796,8 @@ def run_backend(args, comm_backend: str):
     baselines = {}
 
     if args.run_cublas_baseline:
+        print("[phase] cublas baseline", flush=True)
+    if args.run_cublas_baseline:
         baselines["cublas"] = perf_baseline(
             M,
             N,
@@ -798,6 +808,8 @@ def run_backend(args, comm_backend: str):
             "cublas",
         )
 
+    if args.run_plain_baseline:
+        print("[phase] plain baseline", flush=True)
     if args.run_plain_baseline:
         baselines["plain"] = perf_baseline(
             M,
@@ -1011,10 +1023,12 @@ def parse_args():
 
 
 def main():
-    args = parse_args()
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
 
-    if not args.run_cublas_baseline and not args.run_plain_baseline:
-        raise RuntimeError("Both baselines are disabled. Keep at least one baseline enabled.")
+    args = parse_args()
 
     world_size = torch.cuda.device_count()
     if world_size < 2:
