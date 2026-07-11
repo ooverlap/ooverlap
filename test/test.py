@@ -28,6 +28,7 @@ import torch.multiprocessing as mp
 
 WARM_UP = int(os.environ.get("OOVERLAP_TEST_WARMUP", "20"))
 REP = int(os.environ.get("OOVERLAP_TEST_REP", "200"))
+SYNC_EACH_ITER = os.environ.get("OOVERLAP_TEST_SYNC_EACH_ITER", "1") != "0"
 COMM_CTA_ENV_KEYS = ("OOVERLAP_MAX_CTAS", "NCCL_MAX_CTAS")
 
 
@@ -278,9 +279,13 @@ def generate_row_remap_array(M, N, BM, BN, cSeg, world_size, device="cuda"):
     return remap
 
 
-def mean_timed(fn):
+def mean_timed(fn, pre_fn = None):
     for _ in range(WARM_UP):
+        if pre_fn != None:
+            pre_fn()
         fn()
+        if SYNC_EACH_ITER:
+            torch.cuda.synchronize()
 
     torch.cuda.synchronize()
 
@@ -288,9 +293,18 @@ def mean_timed(fn):
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
 
     for i in range(REP):
+        if pre_fn != None:
+            pre_fn()
         starts[i].record()
         fn()
         ends[i].record()
+
+        # Keep only one benchmark iteration in flight.  This is important for
+        # the ooverlap IPC backend: its collectives/imported IPC resources are
+        # stream-ordered, but queuing many API calls before any host/device sync
+        # can leave multiple IPC collective generations alive at once.
+        if SYNC_EACH_ITER:
+            torch.cuda.synchronize()
 
     torch.cuda.synchronize()
 
@@ -533,8 +547,10 @@ def perf_overlap_process(
             D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
             RowArray = generate_row_remap_array(M, N, BM, BN, cSeg, world_size)
 
-        def run():
+        def pre_run():
             reset_monitor_matrix(MM, tile_num, len(cSeg), False)
+            
+        def run():
 
             if comm_op == "all_reduce":
                 call_overlap_allreduce(
@@ -566,7 +582,7 @@ def perf_overlap_process(
             else:
                 raise ValueError(f"Unknown comm_op={comm_op}")
 
-        result_dict[rank] = mean_timed(run)
+        result_dict[rank] = mean_timed(run, pre_run)
 
     finally:
         sync_and_release_overlap_backend(obj, comm_backend)
