@@ -169,7 +169,7 @@ struct ReorderSignalEpilogue {
     p.signal = args.signal;
 
     if constexpr (BaseEpilogue::RequiresTransactionBytes) {
-      p.tma_transaction_bytes = BaseEpilogue::get_transaction_bytes(p.base);
+      p.tma_transaction_bytes = p.base.tma_transaction_bytes;
     }
     else {
       p.tma_transaction_bytes = 0;
