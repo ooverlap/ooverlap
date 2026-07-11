@@ -140,19 +140,60 @@ struct ReorderSignalEpilogue {
     uint32_t tma_transaction_bytes;
   };
 
+
+  // Return the epilogue/output problem shape that the base epilogue should use
+  // when building descriptors.  For packed/reordered output this is different
+  // from the logical GEMM MxN problem shape.
+  template <class ProblemShape>
+  CUTLASS_HOST_DEVICE
+  static ProblemShape epilogue_problem_shape(
+      ProblemShape problem_shape,
+      SignalingEpilogueParams const& signal) {
+#if OOVERLAP_ENABLE_EPILOGUE_REORDER
+    int tile_m = signal.ThreadblockM;
+    int tile_n = signal.ThreadblockN;
+
+    int original_tile_cols = signal.kMonitoredColumn;
+    int packed_tile_cols = signal.kReorderedColumn;
+
+    if (packed_tile_cols <= 0) {
+      packed_tile_cols = original_tile_cols;
+    }
+
+    if (tile_m <= 0 || tile_n <= 0 || original_tile_cols <= 0 || packed_tile_cols <= 0) {
+      return problem_shape;
+    }
+
+    int M = int(cute::get<0>(problem_shape));
+
+    int original_tile_rows = (M + tile_m - 1) / tile_m;
+    int original_tile_num = original_tile_rows * original_tile_cols;
+
+    int packed_tile_rows = (original_tile_num + packed_tile_cols - 1) / packed_tile_cols;
+
+    cute::get<0>(problem_shape) = packed_tile_rows * tile_m;
+    cute::get<1>(problem_shape) = packed_tile_cols * tile_n;
+#endif
+
+    return problem_shape;
+  }
+
   template <class ProblemShape>
   static bool can_implement(ProblemShape const& problem_shape, Arguments const& args) {
-    return BaseEpilogue::can_implement(problem_shape, args.base);
+    auto epi_shape = epilogue_problem_shape(problem_shape, args.signal);
+    return BaseEpilogue::can_implement(epi_shape, args.base);
   }
 
   template <class ProblemShape>
   static size_t get_workspace_size(ProblemShape const& problem_shape, Arguments const& args) {
-    return BaseEpilogue::get_workspace_size(problem_shape, args.base);
+    auto epi_shape = epilogue_problem_shape(problem_shape, args.signal);
+    return BaseEpilogue::get_workspace_size(epi_shape, args.base);
   }
 
   template <class ProblemShape>
   static size_t get_workspace_size(ProblemShape const& problem_shape, Arguments const& args, int sm_count) {
-    return BaseEpilogue::get_workspace_size(problem_shape, args.base, sm_count);
+    auto epi_shape = epilogue_problem_shape(problem_shape, args.signal);
+    return BaseEpilogue::get_workspace_size(epi_shape, args.base, sm_count);
   }
 
   static size_t get_workspace_alignment() {
@@ -165,7 +206,8 @@ struct ReorderSignalEpilogue {
       Arguments const& args,
       void* workspace) {
     Params p;
-    p.base   = BaseEpilogue::to_underlying_arguments(problem_shape, args.base, workspace);
+    auto epi_shape = epilogue_problem_shape(problem_shape, args.signal);
+    p.base   = BaseEpilogue::to_underlying_arguments(epi_shape, args.base, workspace);
     p.signal = args.signal;
 
     if constexpr (BaseEpilogue::RequiresTransactionBytes) {
@@ -185,7 +227,8 @@ struct ReorderSignalEpilogue {
       void* workspace,
       cudaStream_t stream,
       cutlass::CudaHostAdapter* cuda_adapter = nullptr) {
-    return BaseEpilogue::initialize_workspace(problem_shape, args.base, workspace, stream, cuda_adapter);
+    auto epi_shape = epilogue_problem_shape(problem_shape, args.signal);
+    return BaseEpilogue::initialize_workspace(epi_shape, args.base, workspace, stream, cuda_adapter);
   }
 
   OOVERLAP_DEVICE_INLINE
@@ -406,6 +449,7 @@ struct ReorderSignalEpilogue {
       sig.num_segments = params_.signal.num_segments;
       sig.tile = packed_tile;
       sig.expected = BaseEpilogue::get_store_pipe_increment(tile_shape);
+      sig.if_monitor = params_.signal.if_monitor;
 
       int subtile_idx = get_subtile_idx(static_cast<ExtraArgs&&>(extra_args)...);
 
