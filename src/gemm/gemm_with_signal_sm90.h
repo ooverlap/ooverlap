@@ -141,8 +141,22 @@ public:
   using StageCountType   = StageCountType_;
   using ClusterShape     = ClusterShape_;
   using MainloopSchedule = MainloopSchedule_;
-  using EpilogueSchedule = EpilogueSchedule_;
+  using RequestedEpilogueSchedule = EpilogueSchedule_;
   using TileScheduler    = TileScheduler_;
+  
+  // HERE cooperative signal kernels must use TMA epilogue, not Auto/no-smem
+  static constexpr bool kDeepCoopSignal =
+      cutlass::ooverlap_sm90_detail::IsCooperativeMainloop<
+          MainloopSchedule>::value;
+  
+  using EpilogueSchedule = std::conditional_t<
+      kDeepCoopSignal &&
+      std::is_same<
+          RequestedEpilogueSchedule,
+          cutlass::epilogue::collective::EpilogueScheduleAuto>::value,
+      cutlass::epilogue::TmaWarpSpecializedCooperative,
+      RequestedEpilogueSchedule>;
+
 
   static_assert(
     cutlass::platform::is_same<LayoutInputA, cutlass::layout::RowMajor>::value,
@@ -204,9 +218,6 @@ public:
   using CollectiveEpilogue = BaseCollectiveEpilogue;
 #else
   // HERE cooperative kernels use deep CUTLASS TMA-subtile signaling
-  static constexpr bool kDeepCoopSignal =
-      cutlass::ooverlap_sm90_detail::IsCooperativeMainloop<
-          MainloopSchedule>::value;
 
   using CollectiveEpilogue =
       ReorderSignalEpilogue<
