@@ -30,8 +30,15 @@ static void check_status(oo_status_t st, const char* what) {
 }
 
 struct ScratchEntry {
+  // OOVERLAP_TORCH_RAW_CUDAMALLOC_SCRATCH_PATCH
+  //
+  // Keep the scratch memory as a raw cudaMalloc allocation, not a PyTorch
+  // caching-allocator allocation. The tensor is only a non-owning Python/Torch
+  // view over cuda_ptr; this communicator owns cuda_ptr and frees it in destroy().
   torch::Tensor tensor;
   oo_buffer_t* buffer = nullptr;
+  void* cuda_ptr = nullptr;
+  int device = -1;
   bool registered = false;
   size_t bytes = 0;
 };
@@ -70,11 +77,32 @@ class OoTorchCommunicator {
 
   void destroy() {
     for (auto& kv : scratch_) {
-      if (kv.second.buffer) {
-        oo_buffer_destroy(kv.second.buffer);
-        kv.second.buffer = nullptr;
+      ScratchEntry& entry = kv.second;
+
+      if (entry.buffer) {
+        oo_buffer_destroy(entry.buffer);
+        entry.buffer = nullptr;
       }
+
+      // Drop the non-owning Tensor view before freeing its backing allocation.
+      entry.tensor = torch::Tensor();
+
+      if (entry.cuda_ptr != nullptr) {
+        if (entry.device >= 0) {
+          (void)cudaSetDevice(entry.device);
+        }
+
+        // destroy() is also called from the destructor, so keep cleanup best-effort
+        // and non-throwing.
+        (void)cudaFree(entry.cuda_ptr);
+        entry.cuda_ptr = nullptr;
+      }
+
+      entry.bytes = 0;
+      entry.device = -1;
+      entry.registered = false;
     }
+
     scratch_.clear();
 
     if (node_) {
@@ -165,48 +193,57 @@ class OoTorchCommunicator {
   }
 
   ScratchEntry& get_scratch(torch::Tensor input, const std::string& role) {
-   validate(input);
- 
-   c10::cuda::CUDAGuard guard(input.device());
- 
-   const std::string key = scratch_key(input, role);
-   auto it = scratch_.find(key);
-   if (it != scratch_.end()) return it->second;
- 
-   ScratchEntry entry;
- 
-   entry.tensor = torch::empty(
-       input.sizes(),
-       input.options()
-            .device(input.device())
-            .layout(torch::kStrided)
-            .requires_grad(false),
-       torch::MemoryFormat::Contiguous);
- 
-   TORCH_CHECK(entry.tensor.defined(), "scratch tensor is undefined");
-   TORCH_CHECK(entry.tensor.is_cuda(), "scratch tensor must be CUDA");
-   TORCH_CHECK(entry.tensor.is_contiguous(), "scratch tensor must be contiguous");
-   TORCH_CHECK(entry.tensor.numel() == input.numel(), "scratch numel mismatch");
- 
-   entry.bytes = entry.tensor.nbytes();
-   TORCH_CHECK(entry.bytes == input.nbytes(), "scratch byte size mismatch");
- 
-   void* scratch_ptr = entry.tensor.data_ptr();
-   TORCH_CHECK(scratch_ptr != nullptr, "scratch data_ptr is null");
- 
-   check_status(
-     oo_buffer_wrap(node_, scratch_ptr, entry.bytes, &entry.buffer),
-     "oo_buffer_wrap");
- 
-   check_status(
-     oo_buffer_register_ipc(node_, entry.buffer),
-     "oo_buffer_register_ipc");
- 
-   entry.registered = true;
- 
-   auto inserted = scratch_.emplace(key, std::move(entry));
-   return inserted.first->second;
- } 
+    validate(input);
+
+    c10::cuda::CUDAGuard guard(input.device());
+
+    const std::string key = scratch_key(input, role);
+    auto it = scratch_.find(key);
+    if (it != scratch_.end()) return it->second;
+
+    ScratchEntry entry;
+    entry.device = input.get_device();
+    entry.bytes = input.nbytes();
+
+    TORCH_CHECK(entry.bytes > 0, "scratch byte size must be non-zero");
+
+    cudaError_t alloc_err = cudaMalloc(&entry.cuda_ptr, entry.bytes);
+    TORCH_CHECK(
+        alloc_err == cudaSuccess,
+        "cudaMalloc scratch failed: ",
+        cudaGetErrorString(alloc_err));
+
+    TORCH_CHECK(entry.cuda_ptr != nullptr, "cudaMalloc scratch returned null");
+
+    // Non-owning view over the raw cudaMalloc allocation. The communicator owns
+    // entry.cuda_ptr and frees it in destroy().
+    entry.tensor = torch::from_blob(
+        entry.cuda_ptr,
+        input.sizes().vec(),
+        input.options()
+             .device(input.device())
+             .layout(torch::kStrided)
+             .requires_grad(false));
+
+    TORCH_CHECK(entry.tensor.defined(), "scratch tensor is undefined");
+    TORCH_CHECK(entry.tensor.is_cuda(), "scratch tensor must be CUDA");
+    TORCH_CHECK(entry.tensor.is_contiguous(), "scratch tensor must be contiguous");
+    TORCH_CHECK(entry.tensor.numel() == input.numel(), "scratch numel mismatch");
+    TORCH_CHECK(entry.tensor.nbytes() == input.nbytes(), "scratch byte size mismatch");
+
+    check_status(
+      oo_buffer_wrap(node_, entry.cuda_ptr, entry.bytes, &entry.buffer),
+      "oo_buffer_wrap");
+
+    check_status(
+      oo_buffer_register_ipc(node_, entry.buffer),
+      "oo_buffer_register_ipc");
+
+    entry.registered = true;
+
+    auto inserted = scratch_.emplace(key, std::move(entry));
+    return inserted.first->second;
+  } 
 
  private:
   std::vector<int> devices_;
