@@ -35,6 +35,7 @@ option(OOVERLAP_BUILD_TESTS "Build benchmark/test helper translation units" ${OO
 option(OOVERLAP_BUILD_GEMM "Build GEMM/CUTLASS helper libraries" ${OOVERLAP_BUILD_PYTHON})
 option(OOVERLAP_BUILD_LEGACY_OVERLAP "Build legacy overlap/NCCL/Torch integration" ${OOVERLAP_BUILD_PYTHON})
 option(OOVERLAP_BUILD_RMSNORM "Build RMSNorm helpers" ${OOVERLAP_BUILD_PYTHON})
+option(OOVERLAP_BUILD_TORCH_COLLECTIVES "Build minimal PyTorch wrapper for public ooverlap collectives" OFF)
 option(OOVERLAP_USE_BUNDLED_NCCL "Build and link NCCL from src/third-party/nccl" ON)
 
 unset(CMAKE_CUDA_ARCHITECTURES CACHE)
@@ -65,7 +66,7 @@ if(OOVERLAP_BUILD_GEMM OR OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_LEGACY_OVERLAP
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/third_party/cutlass.cmake)
 endif()
 
-if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_LEGACY_OVERLAP)
+if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_LEGACY_OVERLAP OR OOVERLAP_BUILD_TORCH_COLLECTIVES)
   set(ENV{TORCH_CUDA_ARCH_LIST} "9.0")
   find_package(Torch REQUIRED)
 

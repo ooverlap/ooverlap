@@ -79,12 +79,12 @@ endfunction()
 # -------------------------
 
 set(OOVERLAP_NEED_CORE OFF)
-if(OOVERLAP_BUILD_CORE OR OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_TESTS)
+if(OOVERLAP_BUILD_CORE OR OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_TESTS OR OOVERLAP_BUILD_TORCH_COLLECTIVES)
   set(OOVERLAP_NEED_CORE ON)
 endif()
 
 set(OOVERLAP_NEED_TORCH OFF)
-if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_RMSNORM)
+if(OOVERLAP_BUILD_PYTHON OR OOVERLAP_BUILD_RMSNORM OR OOVERLAP_BUILD_TORCH_COLLECTIVES)
   set(OOVERLAP_NEED_TORCH ON)
 endif()
 
@@ -503,6 +503,70 @@ target_link_libraries(ooverlap_topology_cli PRIVATE
   ooverlap_topology
   CUDA::cudart
 )
+
+# -------------------------
+# Minimal PyTorch collective wrapper
+# -------------------------
+#
+# This target is intentionally separate from ooverlap_ext.
+# ooverlap_ext is the legacy/demo Python extension and pulls in benchmark,
+# GEMM, NCCL-helper, and test sources.  ooverlap_torch_ext is the small
+# PyTorch-facing wrapper around the public include/ooverlap/comm.h API.
+#
+if(OOVERLAP_BUILD_TORCH_COLLECTIVES)
+  if(NOT EXISTS ${OOVERLAP_SRC_DIR}/torch_collectives_pybind.cpp)
+    message(FATAL_ERROR "src/torch_collectives_pybind.cpp not found")
+  endif()
+
+  add_library(ooverlap_torch_ext MODULE
+    ${OOVERLAP_SRC_DIR}/torch_collectives_pybind.cpp)
+
+  ooverlap_force_sm90a(ooverlap_torch_ext)
+  ooverlap_enable_pic(ooverlap_torch_ext)
+  ooverlap_enable_release_opts(ooverlap_torch_ext)
+
+  set_target_properties(ooverlap_torch_ext PROPERTIES
+    PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib
+    LINKER_LANGUAGE CUDA
+  )
+
+  set_property(TARGET ooverlap_torch_ext PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+  set_property(TARGET ooverlap_torch_ext PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+  target_include_directories(ooverlap_torch_ext PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${OOVERLAP_SRC_DIR}
+    ${Python3_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(ooverlap_torch_ext PRIVATE
+    ooverlap_comm
+    CUDA::cudart
+    CUDA::cuda_driver
+  )
+
+  ooverlap_apply_torch(ooverlap_torch_ext)
+
+  if(EXISTS "${TORCH_PYTHON_SO}")
+    message(STATUS "Linking libtorch_python for ooverlap_torch_ext: ${TORCH_PYTHON_SO}")
+    target_link_options(ooverlap_torch_ext PRIVATE "-Wl,--no-as-needed")
+    target_link_libraries(ooverlap_torch_ext PRIVATE "${TORCH_PYTHON_SO}")
+  else()
+    message(FATAL_ERROR "libtorch_python.so not found at: ${TORCH_PYTHON_SO}")
+  endif()
+
+  ooverlap_link_cudadevrt(ooverlap_torch_ext PRIVATE)
+
+  if(TORCH_PY_LIBDIR)
+    message(STATUS "Torch libdir for ooverlap_torch_ext RPATH: ${TORCH_PY_LIBDIR}")
+    set_target_properties(ooverlap_torch_ext PROPERTIES
+      BUILD_RPATH "${TORCH_PY_LIBDIR}"
+      INSTALL_RPATH "${TORCH_PY_LIBDIR};\$ORIGIN"
+    )
+    target_link_options(ooverlap_torch_ext PRIVATE "-Wl,-rpath,${TORCH_PY_LIBDIR}")
+  endif()
+endif()
 
 # -------------------------
 # Python extension module
