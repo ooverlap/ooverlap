@@ -133,6 +133,33 @@ oo_status_t oo_buffer_wrap(
     oo_buffer_t** out_buffer);
 
 /*
+ * OOVERLAP_OFFSET_AWARE_IPC_RANGE_PATCH
+ *
+ * Optional range metadata for wrapped buffers whose logical pointer is a
+ * subrange of a larger exportable CUDA allocation.
+ *
+ * Existing oo_buffer_wrap() remains source-compatible and is equivalent to:
+ *   allocation_base_ptr = ptr
+ *   allocation_bytes = bytes
+ *   logical_offset_bytes = 0
+ *
+ * For PyTorch/caching-allocator suballocations, callers can pass the allocator
+ * base pointer and logical offset while kernels still use logical ptr.
+ */
+typedef struct {
+    void* allocation_base_ptr;
+    size_t allocation_bytes;
+    size_t logical_offset_bytes;
+} oo_buffer_ipc_range_t;
+
+oo_status_t oo_buffer_wrap_ipc_range(
+    oo_node_t* node,
+    void* ptr,
+    size_t bytes,
+    const oo_buffer_ipc_range_t* range,
+    oo_buffer_t** out_buffer);
+
+/*
  * Optional collective pre-registration for multiprocess IPC buffers.
  *
  * oo_buffer_wrap() stays cheap/local.  This call is collective in IPC groups:

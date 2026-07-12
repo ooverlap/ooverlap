@@ -1039,6 +1039,20 @@ oo_status_t oo_buffer_wrap(
     void* ptr,
     size_t bytes,
     oo_buffer_t** out_buffer) {
+    return oo_buffer_wrap_ipc_range(
+        node,
+        ptr,
+        bytes,
+        nullptr,
+        out_buffer);
+}
+
+oo_status_t oo_buffer_wrap_ipc_range(
+    oo_node_t* node,
+    void* ptr,
+    size_t bytes,
+    const oo_buffer_ipc_range_t* range,
+    oo_buffer_t** out_buffer) {
     if (out_buffer == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
@@ -1052,11 +1066,43 @@ oo_status_t oo_buffer_wrap(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
+    void* ipc_base_ptr = ptr;
+    size_t ipc_base_bytes = bytes;
+    size_t ipc_logical_offset_bytes = 0;
+
+    if (range != nullptr) {
+        ipc_base_ptr = range->allocation_base_ptr;
+        ipc_base_bytes = range->allocation_bytes;
+        ipc_logical_offset_bytes = range->logical_offset_bytes;
+
+        if (ipc_base_ptr == nullptr ||
+            ipc_base_bytes == 0 ||
+            ipc_logical_offset_bytes > ipc_base_bytes ||
+            bytes > ipc_base_bytes - ipc_logical_offset_bytes) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        const std::uintptr_t base_addr =
+            reinterpret_cast<std::uintptr_t>(ipc_base_ptr);
+        const std::uintptr_t logical_addr =
+            reinterpret_cast<std::uintptr_t>(ptr);
+        const std::uintptr_t expected_addr =
+            base_addr + static_cast<std::uintptr_t>(ipc_logical_offset_bytes);
+
+        if (expected_addr < base_addr ||
+            expected_addr != logical_addr) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+    }
+
     try {
         std::unique_ptr<oo_buffer_t> buffer(new oo_buffer_t{});
         buffer->ptr = ptr;
         buffer->bytes = bytes;
-        buffer->mapped_bytes = bytes;
+        buffer->mapped_bytes = ipc_base_bytes;
+        buffer->ipc_base_ptr = ipc_base_ptr;
+        buffer->ipc_base_bytes = ipc_base_bytes;
+        buffer->ipc_logical_offset_bytes = ipc_logical_offset_bytes;
         buffer->kind = OO_BUFFER_KIND_WRAPPED;
         buffer->group = node->group;
         buffer->owner_rank = node->rank;

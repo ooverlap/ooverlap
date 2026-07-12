@@ -255,6 +255,7 @@ struct oo_group {
         std::uintptr_t owner_ptr_value = 0;
         std::uint64_t bytes = 0;
         std::uint64_t mapped_bytes = 0;
+        std::uint64_t logical_offset_bytes = 0;
         std::uint64_t cache_token = 0;
         int owner_rank = -1;
         int owner_device = -1;
@@ -314,6 +315,23 @@ struct oo_buffer {
     void* ptr = nullptr;
     size_t bytes = 0;
     size_t mapped_bytes = 0;
+
+    /*
+     * OOVERLAP_OFFSET_AWARE_IPC_RANGE_PATCH
+     *
+     * ptr/bytes are the logical buffer consumed by kernels.
+     * ipc_base_ptr/ipc_base_bytes identify the exportable allocation to share
+     * through legacy CUDA IPC, and ipc_logical_offset_bytes maps the imported
+     * base back to the logical peer pointer.
+     *
+     * Backward-compatible default:
+     *   ipc_base_ptr == ptr
+     *   ipc_base_bytes == bytes
+     *   ipc_logical_offset_bytes == 0
+     */
+    void* ipc_base_ptr = nullptr;
+    size_t ipc_base_bytes = 0;
+    size_t ipc_logical_offset_bytes = 0;
 
     /*
      * Public coarse kind.

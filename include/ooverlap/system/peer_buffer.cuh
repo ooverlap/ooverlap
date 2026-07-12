@@ -259,30 +259,65 @@ struct legacy_peer_buffer_descriptor {
     ipc::legacy_handle handle{};
     std::uint64_t bytes = 0;
     std::uint64_t mapped_size = 0;
+
+    /*
+     * OOVERLAP_OFFSET_AWARE_IPC_RANGE_PATCH
+     *
+     * bytes is the logical visible range. mapped_size is the full imported base
+     * allocation size. logical_offset maps the imported base to the logical ptr.
+     */
+    std::uint64_t logical_offset = 0;
+    std::uint64_t flags = 0;
+
     int owner_device = -1;
 };
+
+inline legacy_peer_buffer_descriptor export_legacy_peer_buffer_range(
+    void* allocation_base_ptr,
+    size_t allocation_bytes,
+    size_t logical_offset_bytes,
+    size_t logical_bytes,
+    int owner_device) {
+    if (allocation_base_ptr == nullptr) {
+        throw std::invalid_argument("export_legacy_peer_buffer_range: base ptr is null");
+    }
+    if (allocation_bytes == 0) {
+        throw std::invalid_argument("export_legacy_peer_buffer_range: allocation_bytes must be > 0");
+    }
+    if (logical_bytes == 0) {
+        throw std::invalid_argument("export_legacy_peer_buffer_range: logical_bytes must be > 0");
+    }
+    if (owner_device < 0) {
+        throw std::invalid_argument("export_legacy_peer_buffer_range: owner_device must be >= 0");
+    }
+    if (logical_offset_bytes > allocation_bytes ||
+        logical_bytes > allocation_bytes - logical_offset_bytes) {
+        throw std::out_of_range("export_legacy_peer_buffer_range: logical range exceeds base allocation");
+    }
+
+    legacy_peer_buffer_descriptor out{};
+    ipc::export_handle(&out.handle, allocation_base_ptr);
+    out.bytes = static_cast<std::uint64_t>(logical_bytes);
+    out.mapped_size = static_cast<std::uint64_t>(allocation_bytes);
+    out.logical_offset = static_cast<std::uint64_t>(logical_offset_bytes);
+    out.flags = 0;
+    out.owner_device = owner_device;
+    return out;
+}
 
 inline legacy_peer_buffer_descriptor export_legacy_peer_buffer(
     void* ptr,
     size_t bytes,
     int owner_device,
     size_t mapped_size = 0) {
-    if (ptr == nullptr) {
-        throw std::invalid_argument("export_legacy_peer_buffer: ptr is null");
-    }
-    if (bytes == 0) {
-        throw std::invalid_argument("export_legacy_peer_buffer: bytes must be > 0");
-    }
-    if (owner_device < 0) {
-        throw std::invalid_argument("export_legacy_peer_buffer: owner_device must be >= 0");
-    }
+    const size_t full_size = mapped_size != 0 ? mapped_size : bytes;
 
-    legacy_peer_buffer_descriptor out{};
-    ipc::export_handle(&out.handle, ptr);
-    out.bytes = static_cast<std::uint64_t>(bytes);
-    out.mapped_size = static_cast<std::uint64_t>(mapped_size != 0 ? mapped_size : bytes);
-    out.owner_device = owner_device;
-    return out;
+    return export_legacy_peer_buffer_range(
+        ptr,
+        full_size,
+        0,
+        bytes,
+        owner_device);
 }
 
 /*
@@ -349,6 +384,17 @@ inline ipc::vmm_handle export_vmm_peer_buffer_fd(const mapped_peer_buffer& buf) 
  * the mapping knows how it was imported and how it must be closed.
  */
 struct imported_peer_buffer {
+    /*
+     * mapping_base_ptr is the pointer returned by cudaIpcOpenMemHandle or VMM
+     * import/map. ptr is the logical pointer exposed to kernels.
+     *
+     * For non-offset imports:
+     *   mapping_base_ptr == ptr
+     *
+     * For subrange imports:
+     *   ptr == (uint8_t*)mapping_base_ptr + logical_offset
+     */
+    void* mapping_base_ptr = nullptr;
     void* ptr = nullptr;
 
     // Requested/user-visible byte size.
@@ -356,6 +402,8 @@ struct imported_peer_buffer {
 
     // Actual import/map size.
     size_t mapped_size = 0;
+
+    size_t logical_offset = 0;
 
     int owner_device = -1;
     peer_buffer_kind kind = peer_buffer_kind::empty;
@@ -366,14 +414,18 @@ struct imported_peer_buffer {
     imported_peer_buffer& operator=(const imported_peer_buffer&) = delete;
 
     imported_peer_buffer(imported_peer_buffer&& other) noexcept
-        : ptr(other.ptr),
+        : mapping_base_ptr(other.mapping_base_ptr),
+          ptr(other.ptr),
           bytes(other.bytes),
           mapped_size(other.mapped_size),
+          logical_offset(other.logical_offset),
           owner_device(other.owner_device),
           kind(other.kind) {
+        other.mapping_base_ptr = nullptr;
         other.ptr = nullptr;
         other.bytes = 0;
         other.mapped_size = 0;
+        other.logical_offset = 0;
         other.owner_device = -1;
         other.kind = peer_buffer_kind::empty;
     }
@@ -382,15 +434,19 @@ struct imported_peer_buffer {
         if (this != &other) {
             reset();
 
+            mapping_base_ptr = other.mapping_base_ptr;
             ptr = other.ptr;
             bytes = other.bytes;
             mapped_size = other.mapped_size;
+            logical_offset = other.logical_offset;
             owner_device = other.owner_device;
             kind = other.kind;
 
+            other.mapping_base_ptr = nullptr;
             other.ptr = nullptr;
             other.bytes = 0;
             other.mapped_size = 0;
+            other.logical_offset = 0;
             other.owner_device = -1;
             other.kind = peer_buffer_kind::empty;
         }
@@ -406,6 +462,8 @@ struct imported_peer_buffer {
         return ptr != nullptr &&
                bytes != 0 &&
                mapped_size != 0 &&
+               logical_offset <= mapped_size &&
+               bytes <= mapped_size - logical_offset &&
                owner_device >= 0 &&
                is_imported_peer_buffer(view());
     }
@@ -421,17 +479,22 @@ struct imported_peer_buffer {
     }
 
     void reset() {
-        if (ptr != nullptr) {
+        void* free_ptr =
+            mapping_base_ptr != nullptr ? mapping_base_ptr : ptr;
+
+        if (free_ptr != nullptr) {
             if (kind == peer_buffer_kind::imported_legacy) {
-                ipc::free_handle<ipc::flavor::legacy>(ptr, mapped_size);
+                ipc::free_handle<ipc::flavor::legacy>(free_ptr, mapped_size);
             } else if (kind == peer_buffer_kind::imported_vmm) {
-                ipc::free_handle<ipc::flavor::vmm>(ptr, mapped_size);
+                ipc::free_handle<ipc::flavor::vmm>(free_ptr, mapped_size);
             }
         }
 
+        mapping_base_ptr = nullptr;
         ptr = nullptr;
         bytes = 0;
         mapped_size = 0;
+        logical_offset = 0;
         owner_device = -1;
         kind = peer_buffer_kind::empty;
     }
@@ -447,15 +510,35 @@ inline imported_peer_buffer import_legacy_peer_buffer(
         throw std::invalid_argument("import_legacy_peer_buffer: owner_device is invalid");
     }
 
-    imported_peer_buffer out{};
+    const size_t mapped_size =
+        static_cast<size_t>(desc.mapped_size);
+    const size_t logical_bytes =
+        static_cast<size_t>(desc.bytes);
+    const size_t logical_offset =
+        static_cast<size_t>(desc.logical_offset);
+
+    if (logical_offset > mapped_size ||
+        logical_bytes > mapped_size - logical_offset) {
+        throw std::invalid_argument("import_legacy_peer_buffer: logical range exceeds mapping");
+    }
+
+    void* imported_base = nullptr;
+
     ipc::import_handle(
-        &out.ptr,
+        &imported_base,
         desc.handle,
-        static_cast<size_t>(desc.mapped_size),
+        mapped_size,
         accessible_device_ids);
 
-    out.bytes = static_cast<size_t>(desc.bytes);
-    out.mapped_size = static_cast<size_t>(desc.mapped_size);
+    imported_peer_buffer out{};
+    out.mapping_base_ptr = imported_base;
+    out.ptr =
+        reinterpret_cast<void*>(
+            reinterpret_cast<std::uint8_t*>(imported_base) +
+            logical_offset);
+    out.bytes = logical_bytes;
+    out.mapped_size = mapped_size;
+    out.logical_offset = logical_offset;
     out.owner_device = desc.owner_device;
     out.kind = peer_buffer_kind::imported_legacy;
     return out;
@@ -471,15 +554,35 @@ inline imported_peer_buffer import_legacy_peer_buffer(
         throw std::invalid_argument("import_legacy_peer_buffer: owner_device is invalid");
     }
 
-    imported_peer_buffer out{};
+    const size_t mapped_size =
+        static_cast<size_t>(desc.mapped_size);
+    const size_t logical_bytes =
+        static_cast<size_t>(desc.bytes);
+    const size_t logical_offset =
+        static_cast<size_t>(desc.logical_offset);
+
+    if (logical_offset > mapped_size ||
+        logical_bytes > mapped_size - logical_offset) {
+        throw std::invalid_argument("import_legacy_peer_buffer: logical range exceeds mapping");
+    }
+
+    void* imported_base = nullptr;
+
     ipc::import_handle(
-        &out.ptr,
+        &imported_base,
         desc.handle,
-        static_cast<size_t>(desc.mapped_size),
+        mapped_size,
         num_devices);
 
-    out.bytes = static_cast<size_t>(desc.bytes);
-    out.mapped_size = static_cast<size_t>(desc.mapped_size);
+    imported_peer_buffer out{};
+    out.mapping_base_ptr = imported_base;
+    out.ptr =
+        reinterpret_cast<void*>(
+            reinterpret_cast<std::uint8_t*>(imported_base) +
+            logical_offset);
+    out.bytes = logical_bytes;
+    out.mapped_size = mapped_size;
+    out.logical_offset = logical_offset;
     out.owner_device = desc.owner_device;
     out.kind = peer_buffer_kind::imported_legacy;
     return out;

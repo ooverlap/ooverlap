@@ -257,12 +257,21 @@ oo_group::ipc_import_key make_ipc_import_key(
         return key;
     }
 
+    void* base_ptr =
+        buffer->ipc_base_ptr != nullptr ? buffer->ipc_base_ptr : buffer->ptr;
+    const size_t base_bytes =
+        buffer->ipc_base_bytes != 0
+            ? buffer->ipc_base_bytes
+            : (buffer->mapped_bytes != 0 ? buffer->mapped_bytes : buffer->bytes);
+
     key.owner_ptr_value =
-        reinterpret_cast<std::uintptr_t>(buffer->ptr);
+        reinterpret_cast<std::uintptr_t>(base_ptr);
     key.bytes =
         static_cast<std::uint64_t>(buffer->bytes);
     key.mapped_bytes =
-        static_cast<std::uint64_t>(buffer->mapped_bytes);
+        static_cast<std::uint64_t>(base_bytes);
+    key.logical_offset_bytes =
+        static_cast<std::uint64_t>(buffer->ipc_logical_offset_bytes);
     key.cache_token =
         static_cast<std::uint64_t>(buffer->ipc_cache_token);
     key.owner_rank = buffer->owner_rank;
@@ -276,6 +285,7 @@ bool same_ipc_import_key(
     return a.owner_ptr_value == b.owner_ptr_value &&
            a.bytes == b.bytes &&
            a.mapped_bytes == b.mapped_bytes &&
+           a.logical_offset_bytes == b.logical_offset_bytes &&
            a.cache_token == b.cache_token &&
            a.owner_rank == b.owner_rank &&
            a.owner_device == b.owner_device;
@@ -349,6 +359,8 @@ bool valid_ipc_import_key_for_rank(
            key.owner_ptr_value != 0 &&
            key.bytes != 0 &&
            key.mapped_bytes != 0 &&
+           key.logical_offset_bytes <= key.mapped_bytes &&
+           key.bytes <= key.mapped_bytes - key.logical_offset_bytes &&
            key.cache_token != 0 &&
            key.owner_rank == rank &&
            key.owner_device == group->devices[rank];
@@ -473,6 +485,10 @@ oo_status_t import_peer_into_cache(
     imported_buffer->ptr = imported.ptr;
     imported_buffer->bytes = imported.bytes;
     imported_buffer->mapped_bytes = imported.mapped_size;
+    imported_buffer->ipc_base_ptr =
+        imported.mapping_base_ptr != nullptr ? imported.mapping_base_ptr : imported.ptr;
+    imported_buffer->ipc_base_bytes = imported.mapped_size;
+    imported_buffer->ipc_logical_offset_bytes = imported.logical_offset;
     imported_buffer->kind = OO_BUFFER_KIND_WRAPPED;
     imported_buffer->group = group;
     imported_buffer->owner_rank = owner_rank;
@@ -567,12 +583,20 @@ oo_status_t ensure_ipc_legacy_collective_buffers_registered(
         std::vector<ooverlap::system::legacy_peer_buffer_descriptor> descs;
 
         if (global_miss_mask != 0) {
+            void* local_base_ptr =
+                local->ipc_base_ptr != nullptr ? local->ipc_base_ptr : local->ptr;
+            const size_t local_base_bytes =
+                local->ipc_base_bytes != 0
+                    ? local->ipc_base_bytes
+                    : (local->mapped_bytes != 0 ? local->mapped_bytes : local->bytes);
+
             const ooverlap::system::legacy_peer_buffer_descriptor local_desc =
-                ooverlap::system::export_legacy_peer_buffer(
-                    local->ptr,
+                ooverlap::system::export_legacy_peer_buffer_range(
+                    local_base_ptr,
+                    local_base_bytes,
+                    local->ipc_logical_offset_bytes,
                     local->bytes,
-                    local->owner_device,
-                    local->mapped_bytes != 0 ? local->mapped_bytes : local->bytes);
+                    local->owner_device);
 
             descs.resize(
                 static_cast<std::size_t>(group->num_devices));
@@ -853,12 +877,20 @@ oo_status_t oo_buffer_export_legacy_descriptor(
     }
 
     try {
+        void* base_ptr =
+            buffer->ipc_base_ptr != nullptr ? buffer->ipc_base_ptr : buffer->ptr;
+        const size_t base_bytes =
+            buffer->ipc_base_bytes != 0
+                ? buffer->ipc_base_bytes
+                : (buffer->mapped_bytes != 0 ? buffer->mapped_bytes : buffer->bytes);
+
         *out_desc =
-            ooverlap::system::export_legacy_peer_buffer(
-                buffer->ptr,
+            ooverlap::system::export_legacy_peer_buffer_range(
+                base_ptr,
+                base_bytes,
+                buffer->ipc_logical_offset_bytes,
                 buffer->bytes,
-                buffer->owner_device,
-                buffer->mapped_bytes != 0 ? buffer->mapped_bytes : buffer->bytes);
+                buffer->owner_device);
 
         return OO_SUCCESS;
     } catch (...) {
@@ -890,6 +922,10 @@ oo_status_t oo_buffer_adopt_imported_peer_buffer(
         buffer->ptr = imported.ptr;
         buffer->bytes = imported.bytes;
         buffer->mapped_bytes = imported.mapped_size;
+        buffer->ipc_base_ptr =
+            imported.mapping_base_ptr != nullptr ? imported.mapping_base_ptr : imported.ptr;
+        buffer->ipc_base_bytes = imported.mapped_size;
+        buffer->ipc_logical_offset_bytes = imported.logical_offset;
         buffer->kind = OO_BUFFER_KIND_WRAPPED;
         buffer->group = node->group;
         buffer->owner_rank = -1;
