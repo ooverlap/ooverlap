@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include "ooverlap/comm.h"
 
@@ -11,8 +12,9 @@
 namespace py = pybind11;
 
 static cudaStream_t current_stream_for(const torch::Tensor& t) {
-  int dev = t.get_device();
-  cudaSetDevice(dev);
+  TORCH_CHECK(t.is_cuda(), "tensor must be CUDA");
+  const int dev = t.get_device();
+  c10::cuda::CUDAGuard guard(t.device());
   return at::cuda::getCurrentCUDAStream(dev).stream();
 }
 
@@ -45,6 +47,8 @@ class OoTorchCommunicator {
     TORCH_CHECK(!devices_.empty(), "devices cannot be empty");
     TORCH_CHECK(local_rank_ >= 0 && local_rank_ < (int)devices_.size(),
                 "invalid local_rank");
+
+    c10::cuda::CUDAGuard guard(torch::Device(torch::kCUDA, devices_[local_rank_]));
 
     check_status(
       oo_group_create_ipc(
@@ -85,6 +89,8 @@ class OoTorchCommunicator {
 
   torch::Tensor all_reduce(torch::Tensor input) {
     validate(input);
+
+    c10::cuda::CUDAGuard guard(input.device());
 
     auto& entry = get_scratch(input, "allreduce");
 
@@ -136,9 +142,15 @@ class OoTorchCommunicator {
   }
 
  private:
+ 
   void validate(const torch::Tensor& t) {
+    TORCH_CHECK(t.defined(), "tensor must be defined");
     TORCH_CHECK(t.is_cuda(), "tensor must be CUDA");
     TORCH_CHECK(t.is_contiguous(), "tensor must be contiguous");
+    TORCH_CHECK(t.numel() > 0, "tensor must be non-empty");
+    TORCH_CHECK(t.get_device() == devices_[local_rank_],
+                "tensor device does not match communicator local rank device: tensor device=",
+                t.get_device(), " expected=", devices_[local_rank_]);
     TORCH_CHECK(t.scalar_type() == torch::kFloat16 ||
                 t.scalar_type() == torch::kBFloat16 ||
                 t.scalar_type() == torch::kFloat32,
@@ -153,27 +165,48 @@ class OoTorchCommunicator {
   }
 
   ScratchEntry& get_scratch(torch::Tensor input, const std::string& role) {
-    const std::string key = scratch_key(input, role);
-    auto it = scratch_.find(key);
-    if (it != scratch_.end()) return it->second;
-
-    ScratchEntry entry;
-    entry.tensor = torch::empty_like(input);
-    entry.bytes = entry.tensor.nbytes();
-
-    check_status(
-      oo_buffer_wrap(node_, entry.tensor.data_ptr(), entry.bytes, &entry.buffer),
-      "oo_buffer_wrap");
-
-    check_status(
-      oo_buffer_register_ipc(node_, entry.buffer),
-      "oo_buffer_register_ipc");
-
-    entry.registered = true;
-
-    auto inserted = scratch_.emplace(key, std::move(entry));
-    return inserted.first->second;
-  }
+   validate(input);
+ 
+   c10::cuda::CUDAGuard guard(input.device());
+ 
+   const std::string key = scratch_key(input, role);
+   auto it = scratch_.find(key);
+   if (it != scratch_.end()) return it->second;
+ 
+   ScratchEntry entry;
+ 
+   entry.tensor = torch::empty(
+       input.sizes(),
+       input.options()
+            .device(input.device())
+            .layout(torch::kStrided)
+            .requires_grad(false),
+       torch::MemoryFormat::Contiguous);
+ 
+   TORCH_CHECK(entry.tensor.defined(), "scratch tensor is undefined");
+   TORCH_CHECK(entry.tensor.is_cuda(), "scratch tensor must be CUDA");
+   TORCH_CHECK(entry.tensor.is_contiguous(), "scratch tensor must be contiguous");
+   TORCH_CHECK(entry.tensor.numel() == input.numel(), "scratch numel mismatch");
+ 
+   entry.bytes = entry.tensor.nbytes();
+   TORCH_CHECK(entry.bytes == input.nbytes(), "scratch byte size mismatch");
+ 
+   void* scratch_ptr = entry.tensor.data_ptr();
+   TORCH_CHECK(scratch_ptr != nullptr, "scratch data_ptr is null");
+ 
+   check_status(
+     oo_buffer_wrap(node_, scratch_ptr, entry.bytes, &entry.buffer),
+     "oo_buffer_wrap");
+ 
+   check_status(
+     oo_buffer_register_ipc(node_, entry.buffer),
+     "oo_buffer_register_ipc");
+ 
+   entry.registered = true;
+ 
+   auto inserted = scratch_.emplace(key, std::move(entry));
+   return inserted.first->second;
+ } 
 
  private:
   std::vector<int> devices_;
