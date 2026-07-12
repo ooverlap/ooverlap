@@ -22,7 +22,7 @@
 #include <vector>
 
 #ifndef OOVERLAP_BENCH_VERIFY_RESULTS
-#define OOVERLAP_BENCH_VERIFY_RESULTS 0
+#define OOVERLAP_BENCH_VERIFY_RESULTS 1
 #endif
 
 namespace ooverlap {
@@ -224,7 +224,7 @@ void verify_collective_result_rank(
         return;
     }
 
-    return;
+    //return;
 
     testing::verify_collective_fp16(
         collective,
