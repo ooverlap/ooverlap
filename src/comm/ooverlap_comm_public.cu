@@ -1110,7 +1110,27 @@ oo_status_t oo_buffer_wrap_ipc_range(
         buffer->ipc_cache_token = next_buffer_ipc_cache_token();
         buffer->system_kind = ooverlap::system::peer_buffer_kind::wrapped;
 
-        register_collective_buffer(buffer.get());
+        /*
+         * OOVERLAP_IPC_WRAP_NO_PREREGISTER_PATCH:
+         *
+         * Same-process public collectives expect oo_buffer_wrap() to publish the
+         * local rank's current buffer immediately.
+         *
+         * Multiprocess IPC is different: ensure_ipc_legacy_collective_buffers_registered()
+         * uses group->collective_buffers[local_rank] as the previous local key
+         * for its symmetric fast-path check.  If wrap() publishes a newly-created
+         * IPC buffer here, that new buffer incorrectly appears to be the previous
+         * buffer.  Then a new tensor size can reuse stale imported peer buffers
+         * from the prior size and fail prepare_collective_launch() with
+         * OO_ERROR_INVALID_ARGUMENT.
+         *
+         * In IPC mode, publish the local buffer only after the key exchange/import
+         * path has decided whether peers need to be refreshed.
+         */
+        if (node->group->bootstrap_kind !=
+            oo_group_bootstrap_kind::multiprocess_ipc) {
+            register_collective_buffer(buffer.get());
+        }
 
         *out_buffer = buffer.release();
         return OO_SUCCESS;
