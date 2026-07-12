@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OOVERLAP_WRAPPER_TEST_V2_WITH_VLLM_NCCL_SYMMETRIC
+OOVERLAP_WRAPPER_TEST_V2_WITH_VLLM_NCCL_SYMMETRIC\nOOVERLAP_WRAPPER_TEST_V3_WITH_VLLM_CUSTOM_AR
 
 Smoke/correctness + benchmark for the minimal ooverlap PyTorch wrapper.
 
@@ -339,6 +339,56 @@ def maybe_make_vllm_nccl_symmetric(enabled: bool, device: torch.device):
         return None
 
 
+class VllmCustomAllReduce:
+    # Runtime wrapper around vLLM's world-size-2/TP custom all-reduce path.
+
+    def __init__(self, cpu_group, device: torch.device):
+        try:
+            import vllm  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import vllm. Install a recent vLLM first."
+            ) from exc
+
+        try:
+            from vllm.distributed.device_communicators.custom_all_reduce import (
+                CustomAllreduce,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Installed vLLM does not expose CustomAllreduce."
+            ) from exc
+
+        self.ca = CustomAllreduce(group=cpu_group, device=device)
+        if getattr(self.ca, "disabled", True):
+            raise RuntimeError("vLLM CustomAllreduce is disabled for this group/device")
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.ca.custom_all_reduce(x)
+        if out is None:
+            raise RuntimeError(
+                "vLLM CustomAllreduce rejected tensor: "
+                f"dtype={x.dtype}, shape={tuple(x.shape)}, "
+                f"numel={x.numel()}, nbytes={x.numel() * x.element_size()}"
+            )
+        return out
+
+    def destroy(self) -> None:
+        if getattr(self, "ca", None) is not None:
+            self.ca.close()
+
+
+def maybe_make_vllm_custom_ar(enabled: bool, device: torch.device):
+    if not enabled:
+        return None
+    try:
+        return VllmCustomAllReduce(dist.group.WORLD, device)
+    except Exception as exc:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[rank {rank}] [skip] vLLM CustomAllreduce benchmark unavailable: {exc}")
+        return None
+
+
 def run_vllm_symm_correctness(
     vllm_symm,
     numel: int,
@@ -354,6 +404,31 @@ def run_vllm_symm_correctness(
     y = vllm_symm.all_reduce(x)
     torch.cuda.synchronize(device)
     assert_allclose(f"vLLM NCCL symmetric all_reduce numel={numel}", y, expected_rank_sum(world, base))
+
+
+def run_vllm_custom_ar_correctness(
+    vllm_custom_ar,
+    numel: int,
+    dtype: torch.dtype,
+    rank: int,
+    world: int,
+    device: torch.device,
+) -> None:
+    if vllm_custom_ar is None:
+        return
+    base = 7.0
+    x = torch.full((numel,), base + rank, device=device, dtype=dtype)
+    try:
+        y = vllm_custom_ar.all_reduce(x)
+    except Exception as exc:
+        rank_id = dist.get_rank() if dist.is_initialized() else rank
+        print(
+            f"[rank {rank_id}] [skip] vLLM CustomAllreduce correctness "
+            f"numel={numel} dtype={dtype_label(dtype)}: {exc}"
+        )
+        return
+    torch.cuda.synchronize(device)
+    assert_allclose(f"vLLM CustomAllreduce all_reduce numel={numel}", y, expected_rank_sum(world, base))
 
 
 def benchmark_callable(
@@ -384,6 +459,7 @@ def benchmark_callable(
 def run_benchmarks(
     comm,
     vllm_symm,
+    vllm_custom_ar,
     numel: int,
     dtype: torch.dtype,
     rank: int,
@@ -417,6 +493,23 @@ def run_benchmarks(
             iters,
         )
 
+    if vllm_custom_ar is not None:
+        try:
+            results["vllm_custom_ar_ms"] = benchmark_callable(
+                "vllm_custom_ar",
+                lambda t: vllm_custom_ar.all_reduce(t),
+                x,
+                device,
+                warmup,
+                iters,
+            )
+        except Exception as exc:
+            rank_id = dist.get_rank() if dist.is_initialized() else rank
+            print(
+                f"[rank {rank_id}] [skip] vLLM CustomAllreduce benchmark "
+                f"numel={numel} dtype={dtype_label(dtype)}: {exc}"
+            )
+
     rank0 = dist.get_rank() == 0 if dist.is_initialized() else True
     if rank0:
         print(
@@ -429,6 +522,10 @@ def run_benchmarks(
         symm = results.get("vllm_nccl_symmetric_copy_ms")
         if symm is not None and symm > 0:
             print(f"  ooverlap_speedup_over_vllm_nccl_symmetric_copy: {symm / results['ooverlap_ms']:.6f}x")
+
+        custom_ar = results.get("vllm_custom_ar_ms")
+        if custom_ar is not None and custom_ar > 0:
+            print(f"  ooverlap_speedup_over_vllm_custom_ar: {custom_ar / results['ooverlap_ms']:.6f}x")
 
 
 def parse_args() -> argparse.Namespace:
@@ -448,6 +545,11 @@ def parse_args() -> argparse.Namespace:
         "--enable-vllm-nccl-symm",
         action="store_true",
         help="Benchmark vLLM NCCL symmetric-memory all_reduce_with_copy if available",
+    )
+    parser.add_argument(
+        "--enable-vllm-custom-ar",
+        action="store_true",
+        help="Benchmark vLLM CustomAllreduce if available; this is the usual vLLM TP=2 custom collective path",
     )
     return parser.parse_args()
 
@@ -493,10 +595,12 @@ def main() -> None:
         print("[info] dtypes:", args.dtypes)
         print("[info] dist_backend:", args.dist_backend)
         print("[info] enable_vllm_nccl_symm:", args.enable_vllm_nccl_symm)
+        print("[info] enable_vllm_custom_ar:", args.enable_vllm_custom_ar)
 
     barrier()
 
     vllm_symm = maybe_make_vllm_nccl_symmetric(args.enable_vllm_nccl_symm, device)
+    vllm_custom_ar = maybe_make_vllm_custom_ar(args.enable_vllm_custom_ar, device)
 
     if global_rank == 0:
         print(
@@ -513,6 +617,7 @@ def main() -> None:
             for numel in parse_numels(args.numels):
                 run_ooverlap_correctness(comm, numel, dtype, local_rank, local_world_size, device)
                 run_vllm_symm_correctness(vllm_symm, numel, dtype, local_rank, local_world_size, device)
+                run_vllm_custom_ar_correctness(vllm_custom_ar, numel, dtype, local_rank, local_world_size, device)
 
                 if args.test_inplace:
                     run_ooverlap_inplace_correctness(comm, numel, dtype, local_rank, local_world_size, device)
@@ -520,6 +625,7 @@ def main() -> None:
                 run_benchmarks(
                     comm=comm,
                     vllm_symm=vllm_symm,
+                    vllm_custom_ar=vllm_custom_ar,
                     numel=numel,
                     dtype=dtype,
                     rank=local_rank,
@@ -535,6 +641,8 @@ def main() -> None:
             comm.destroy()
         if vllm_symm is not None:
             vllm_symm.destroy()
+        if vllm_custom_ar is not None:
+            vllm_custom_ar.destroy()
 
     barrier()
 
