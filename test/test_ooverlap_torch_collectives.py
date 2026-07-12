@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OOVERLAP_WRAPPER_TEST_V2_WITH_VLLM_NCCL_SYMMETRIC\nOOVERLAP_WRAPPER_TEST_V3_WITH_VLLM_CUSTOM_AR
+OOVERLAP_WRAPPER_TEST_V2_WITH_VLLM_NCCL_SYMMETRIC\nOOVERLAP_WRAPPER_TEST_V3_WITH_VLLM_CUSTOM_AR\nOOVERLAP_WRAPPER_TEST_V4_WITH_VLLM_PYNCCL_AND_CUDA_COMM
 
 Smoke/correctness + benchmark for the minimal ooverlap PyTorch wrapper.
 
@@ -389,6 +389,105 @@ def maybe_make_vllm_custom_ar(enabled: bool, device: torch.device):
         return None
 
 
+class VllmPyNcclAllReduce:
+    # Direct vLLM PyNcclCommunicator backend. This is the normal NCCL
+    # fallback path inside vLLM CudaCommunicator when faster custom/symm
+    # backends do not accept the tensor.
+
+    def __init__(self, cpu_group, device: torch.device):
+        try:
+            import vllm  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import vllm. Install a recent vLLM first."
+            ) from exc
+
+        try:
+            from vllm.distributed.device_communicators.pynccl import (
+                PyNcclCommunicator,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Installed vLLM does not expose PyNcclCommunicator."
+            ) from exc
+
+        self.pynccl_comm = PyNcclCommunicator(group=cpu_group, device=device)
+        if getattr(self.pynccl_comm, "disabled", True):
+            raise RuntimeError("vLLM PyNcclCommunicator is disabled")
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.pynccl_comm.all_reduce(x)
+        if out is None:
+            raise RuntimeError("vLLM PyNcclCommunicator returned None")
+        return out
+
+    def destroy(self) -> None:
+        if getattr(self, "pynccl_comm", None) is not None:
+            self.pynccl_comm.destroy()
+
+
+def maybe_make_vllm_pynccl(enabled: bool, device: torch.device):
+    if not enabled:
+        return None
+    try:
+        return VllmPyNcclAllReduce(dist.group.WORLD, device)
+    except Exception as exc:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[rank {rank}] [skip] vLLM PyNCCL benchmark unavailable: {exc}")
+        return None
+
+
+class VllmCudaCommunicatorAllReduce:
+    # vLLM production dispatcher path. The unique_name intentionally contains
+    # "tp" because vLLM only enables custom all-reduce / related TP backends
+    # for TP communicators.
+
+    def __init__(self, cpu_group, device: torch.device):
+        try:
+            import vllm  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import vllm. Install a recent vLLM first."
+            ) from exc
+
+        try:
+            from vllm.distributed.device_communicators.cuda_communicator import (
+                CudaCommunicator,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Installed vLLM does not expose CudaCommunicator."
+            ) from exc
+
+        self.comm = CudaCommunicator(
+            cpu_group=cpu_group,
+            device=device,
+            device_group=None,
+            unique_name="tp_ooverlap_bench",
+        )
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.comm.all_reduce(x)
+        if out is None:
+            raise RuntimeError("vLLM CudaCommunicator returned None")
+        return out
+
+    def destroy(self) -> None:
+        if getattr(self, "comm", None) is not None and hasattr(self.comm, "destroy"):
+            self.comm.destroy()
+
+
+def maybe_make_vllm_cuda_comm(enabled: bool, device: torch.device):
+    if not enabled:
+        return None
+    try:
+        return VllmCudaCommunicatorAllReduce(dist.group.WORLD, device)
+    except Exception as exc:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[rank {rank}] [skip] vLLM CudaCommunicator benchmark unavailable: {exc}")
+        return None
+
+
 def run_vllm_symm_correctness(
     vllm_symm,
     numel: int,
@@ -431,6 +530,32 @@ def run_vllm_custom_ar_correctness(
     assert_allclose(f"vLLM CustomAllreduce all_reduce numel={numel}", y, expected_rank_sum(world, base))
 
 
+def run_optional_backend_correctness(
+    backend,
+    label: str,
+    base: float,
+    numel: int,
+    dtype: torch.dtype,
+    rank: int,
+    world: int,
+    device: torch.device,
+) -> None:
+    if backend is None:
+        return
+    x = torch.full((numel,), base + rank, device=device, dtype=dtype)
+    try:
+        y = backend.all_reduce(x)
+    except Exception as exc:
+        rank_id = dist.get_rank() if dist.is_initialized() else rank
+        print(
+            f"[rank {rank_id}] [skip] {label} correctness "
+            f"numel={numel} dtype={dtype_label(dtype)}: {exc}"
+        )
+        return
+    torch.cuda.synchronize(device)
+    assert_allclose(f"{label} all_reduce numel={numel}", y, expected_rank_sum(world, base))
+
+
 def benchmark_callable(
     label: str,
     fn: Callable[[torch.Tensor], torch.Tensor],
@@ -460,6 +585,8 @@ def run_benchmarks(
     comm,
     vllm_symm,
     vllm_custom_ar,
+    vllm_pynccl,
+    vllm_cuda_comm,
     numel: int,
     dtype: torch.dtype,
     rank: int,
@@ -510,6 +637,40 @@ def run_benchmarks(
                 f"numel={numel} dtype={dtype_label(dtype)}: {exc}"
             )
 
+    if vllm_pynccl is not None:
+        try:
+            results["vllm_pynccl_ms"] = benchmark_callable(
+                "vllm_pynccl",
+                lambda t: vllm_pynccl.all_reduce(t),
+                x,
+                device,
+                warmup,
+                iters,
+            )
+        except Exception as exc:
+            rank_id = dist.get_rank() if dist.is_initialized() else rank
+            print(
+                f"[rank {rank_id}] [skip] vLLM PyNCCL benchmark "
+                f"numel={numel} dtype={dtype_label(dtype)}: {exc}"
+            )
+
+    if vllm_cuda_comm is not None:
+        try:
+            results["vllm_cuda_comm_ms"] = benchmark_callable(
+                "vllm_cuda_comm",
+                lambda t: vllm_cuda_comm.all_reduce(t),
+                x,
+                device,
+                warmup,
+                iters,
+            )
+        except Exception as exc:
+            rank_id = dist.get_rank() if dist.is_initialized() else rank
+            print(
+                f"[rank {rank_id}] [skip] vLLM CudaCommunicator benchmark "
+                f"numel={numel} dtype={dtype_label(dtype)}: {exc}"
+            )
+
     rank0 = dist.get_rank() == 0 if dist.is_initialized() else True
     if rank0:
         print(
@@ -526,6 +687,14 @@ def run_benchmarks(
         custom_ar = results.get("vllm_custom_ar_ms")
         if custom_ar is not None and custom_ar > 0:
             print(f"  ooverlap_speedup_over_vllm_custom_ar: {custom_ar / results['ooverlap_ms']:.6f}x")
+
+        pynccl = results.get("vllm_pynccl_ms")
+        if pynccl is not None and pynccl > 0:
+            print(f"  ooverlap_speedup_over_vllm_pynccl: {pynccl / results['ooverlap_ms']:.6f}x")
+
+        cuda_comm = results.get("vllm_cuda_comm_ms")
+        if cuda_comm is not None and cuda_comm > 0:
+            print(f"  ooverlap_speedup_over_vllm_cuda_comm: {cuda_comm / results['ooverlap_ms']:.6f}x")
 
 
 def parse_args() -> argparse.Namespace:
@@ -550,6 +719,16 @@ def parse_args() -> argparse.Namespace:
         "--enable-vllm-custom-ar",
         action="store_true",
         help="Benchmark vLLM CustomAllreduce if available; this is the usual vLLM TP=2 custom collective path",
+    )
+    parser.add_argument(
+        "--enable-vllm-pynccl",
+        action="store_true",
+        help="Benchmark vLLM PyNcclCommunicator.all_reduce, the regular NCCL fallback path",
+    )
+    parser.add_argument(
+        "--enable-vllm-cuda-comm",
+        action="store_true",
+        help="Benchmark vLLM CudaCommunicator.all_reduce production dispatcher path",
     )
     return parser.parse_args()
 
@@ -596,11 +775,15 @@ def main() -> None:
         print("[info] dist_backend:", args.dist_backend)
         print("[info] enable_vllm_nccl_symm:", args.enable_vllm_nccl_symm)
         print("[info] enable_vllm_custom_ar:", args.enable_vllm_custom_ar)
+        print("[info] enable_vllm_pynccl:", args.enable_vllm_pynccl)
+        print("[info] enable_vllm_cuda_comm:", args.enable_vllm_cuda_comm)
 
     barrier()
 
     vllm_symm = maybe_make_vllm_nccl_symmetric(args.enable_vllm_nccl_symm, device)
     vllm_custom_ar = maybe_make_vllm_custom_ar(args.enable_vllm_custom_ar, device)
+    vllm_pynccl = maybe_make_vllm_pynccl(args.enable_vllm_pynccl, device)
+    vllm_cuda_comm = maybe_make_vllm_cuda_comm(args.enable_vllm_cuda_comm, device)
 
     if global_rank == 0:
         print(
@@ -618,6 +801,26 @@ def main() -> None:
                 run_ooverlap_correctness(comm, numel, dtype, local_rank, local_world_size, device)
                 run_vllm_symm_correctness(vllm_symm, numel, dtype, local_rank, local_world_size, device)
                 run_vllm_custom_ar_correctness(vllm_custom_ar, numel, dtype, local_rank, local_world_size, device)
+                run_optional_backend_correctness(
+                    vllm_pynccl,
+                    "vLLM PyNCCL",
+                    9.0,
+                    numel,
+                    dtype,
+                    local_rank,
+                    local_world_size,
+                    device,
+                )
+                run_optional_backend_correctness(
+                    vllm_cuda_comm,
+                    "vLLM CudaCommunicator",
+                    13.0,
+                    numel,
+                    dtype,
+                    local_rank,
+                    local_world_size,
+                    device,
+                )
 
                 if args.test_inplace:
                     run_ooverlap_inplace_correctness(comm, numel, dtype, local_rank, local_world_size, device)
@@ -626,6 +829,8 @@ def main() -> None:
                     comm=comm,
                     vllm_symm=vllm_symm,
                     vllm_custom_ar=vllm_custom_ar,
+                    vllm_pynccl=vllm_pynccl,
+                    vllm_cuda_comm=vllm_cuda_comm,
                     numel=numel,
                     dtype=dtype,
                     rank=local_rank,
@@ -643,6 +848,10 @@ def main() -> None:
             vllm_symm.destroy()
         if vllm_custom_ar is not None:
             vllm_custom_ar.destroy()
+        if vllm_pynccl is not None:
+            vllm_pynccl.destroy()
+        if vllm_cuda_comm is not None:
+            vllm_cuda_comm.destroy()
 
     barrier()
 
