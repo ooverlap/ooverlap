@@ -356,6 +356,66 @@ inline TransferTask make_reduce_transfer_task(
     return task;
 }
 
+
+/*
+ * OOVERLAP_OUT_OF_PLACE_ALLREDUCE_REDUCE_FANOUT_PATCH
+ *
+ * Logical helper for one source rank that TMA-loads one input buffer and
+ * reduce-fanouts the tile into multiple output buffers.
+ */
+inline TransferTask make_reduce_fanout_transfer_task(
+    int executor_rank,
+    int src_rank,
+    const int* dst_ranks,
+    LogicalBufferRef src,
+    const LogicalBufferRef* fanout_dsts,
+    int fanout_dst_count,
+    std::size_t bytes,
+    int num_windows,
+    int window_chunks,
+    topology::TransportKind transport,
+    bool terminal,
+    int phase) {
+    const bool direct_tma =
+        transport_uses_direct_tma(transport);
+
+    TransferTask task{};
+    task.op = TransferOp::ReduceFanout;
+    task.executor_rank = executor_rank;
+    task.src_rank = src_rank;
+    task.dst_rank =
+        (dst_ranks != nullptr && fanout_dst_count > 0)
+            ? dst_ranks[0]
+            : -1;
+    task.src = src;
+    task.bytes = bytes;
+    task.begin_window = 0;
+    task.end_window = num_windows;
+    task.window_chunks = window_chunks;
+    task.transport = transport;
+    task.requires_tma_load = direct_tma;
+    task.requires_tma_store = false;
+    task.requires_tma_reduce = direct_tma;
+    task.requires_native_atomic = direct_tma;
+    task.terminal = terminal;
+    task.phase = phase;
+    task.fanout_dst_count = fanout_dst_count;
+
+    const int clamped =
+        fanout_dst_count < TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS
+            ? fanout_dst_count
+            : TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS;
+
+    for (int i = 0; i < clamped; ++i) {
+        task.fanout_dsts[i] = fanout_dsts[i];
+        task.fanout_dst_rank[i] =
+            dst_ranks != nullptr ? dst_ranks[i] : -1;
+        task.fanout_reduce_scope[i] = 0;
+    }
+
+    return task;
+}
+
 inline TransferTask make_ready_publish_transfer_task(
     int executor_rank,
     ReadySignalChannel channel,
@@ -613,6 +673,10 @@ inline const char* debug_transfer_op_name(
             return "ReadyPublish";
         case TransferOp::ReadyWait:
             return "ReadyWait";
+        case TransferOp::CopyFanout:
+            return "CopyFanout";
+        case TransferOp::ReduceFanout:
+            return "ReduceFanout";
         default:
             return "UnknownTransferOp";
     }

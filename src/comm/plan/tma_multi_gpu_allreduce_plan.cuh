@@ -162,6 +162,55 @@ bool push_reduce_task(
     return push_task_or_abort(plan, reduce);
 }
 
+
+/*
+ * OOVERLAP_OUT_OF_PLACE_ALLREDUCE_REDUCE_FANOUT_PATCH
+ *
+ * Push a ReduceFanout task for out-of-place allreduce.
+ */
+template <int MaxTransferTasks>
+bool push_reduce_fanout_task(
+    TransferPlan<MaxTransferTasks>* plan,
+    const TransferPlanBuildInput& input,
+    int executor_rank,
+    int src_rank,
+    const int* dst_ranks,
+    LogicalBufferRef src,
+    const LogicalBufferRef* fanout_dsts,
+    int fanout_dst_count,
+    std::size_t bytes,
+    int num_windows,
+    topology::TransportKind transport,
+    int* task_phase) {
+    if (task_phase == nullptr ||
+        dst_ranks == nullptr ||
+        fanout_dsts == nullptr ||
+        fanout_dst_count <= 0 ||
+        fanout_dst_count > TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS ||
+        bytes == 0 ||
+        num_windows <= 0) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
+
+    const TransferTask reduce_fanout =
+        make_reduce_fanout_transfer_task(
+            executor_rank,
+            src_rank,
+            dst_ranks,
+            src,
+            fanout_dsts,
+            fanout_dst_count,
+            bytes,
+            num_windows,
+            input.launch_config.window_chunks,
+            transport,
+            false,
+            (*task_phase)++);
+
+    return push_task_or_abort(plan, reduce_fanout);
+}
+
 template <int MaxTransferTasks>
 bool push_ready_publish_task(
     TransferPlan<MaxTransferTasks>* plan,
@@ -463,6 +512,98 @@ bool emit_allreduce_entry_rendezvous(
         }
     }
 
+    return true;
+}
+
+
+/*
+ * OOVERLAP_OUT_OF_PLACE_ALLREDUCE_REDUCE_FANOUT_PATCH
+ *
+ * Direct out-of-place allreduce fast path:
+ *   for each source rank S:
+ *       TMA load rank_input[S]
+ *       TMA reduce-fanout into rank_output[0..world_size)
+ *
+ * Destination output buffers must already contain the reduction identity.
+ * For the current f16 add/sum fanout implementation, that means zeroed output.
+ */
+template <int MaxTransferTasks>
+bool build_out_of_place_direct_allreduce_fanout_plan(
+    TransferPlan<MaxTransferTasks>* plan,
+    const TransferPlanBuildInput& input,
+    const TransportMatrix& transports) {
+    if (plan == nullptr || !input.out_of_place) {
+        return false;
+    }
+
+    if (input.world_size <= 0 ||
+        input.world_size > TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS ||
+        input.dtype_size == 0 ||
+        input.count > static_cast<std::size_t>(-1) / input.dtype_size) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
+
+    const std::size_t total_bytes = input.count * input.dtype_size;
+    const int num_windows =
+        window_count_for_transfer_bytes(
+            total_bytes,
+            input.launch_config);
+
+    if (total_bytes == 0 || num_windows <= 0) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
+
+    int task_phase[kPlannerMaxRanks] = {};
+
+    if (!emit_allreduce_entry_rendezvous(
+            plan,
+            input,
+            task_phase)) {
+        return false;
+    }
+
+    for (int src_rank = 0; src_rank < input.world_size; ++src_rank) {
+        int dst_ranks[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+        LogicalBufferRef dst_refs[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+
+        topology::TransportKind selected_transport =
+            topology::TransportKind::DirectNvlink;
+
+        for (int dst_rank = 0; dst_rank < input.world_size; ++dst_rank) {
+            if (!allreduce_transport_is_direct(
+                    transports.kind[src_rank][dst_rank])) {
+                transfer_plan_abort_build(plan);
+                return false;
+            }
+
+            if (src_rank != dst_rank) {
+                selected_transport = transports.kind[src_rank][dst_rank];
+            }
+
+            dst_ranks[dst_rank] = dst_rank;
+            dst_refs[dst_rank] = rank_output_ref(dst_rank, 0);
+        }
+
+        if (!push_reduce_fanout_task(
+                plan,
+                input,
+                src_rank,
+                src_rank,
+                dst_ranks,
+                rank_input_ref(src_rank, 0),
+                dst_refs,
+                input.world_size,
+                total_bytes,
+                num_windows,
+                selected_transport,
+                &task_phase[src_rank])) {
+            return false;
+        }
+    }
+
+    mark_last_task_per_rank_terminal(plan, input.world_size);
     return true;
 }
 
@@ -967,16 +1108,26 @@ bool build_allreduce_transfer_plan(
 
     if (islands.island_count <= 1) {
         const bool ok =
-            allreduce_detail::build_direct_allreduce_plan(
-                plan,
-                input,
-                transports);
+            input.out_of_place
+                ? allreduce_detail::build_out_of_place_direct_allreduce_fanout_plan(
+                    plan,
+                    input,
+                    transports)
+                : allreduce_detail::build_direct_allreduce_plan(
+                    plan,
+                    input,
+                    transports);
 
         if (ok) {
             debug_print_transfer_plan_if_enabled("allreduce", *plan);
         }
 
         return ok;
+    }
+
+    if (input.out_of_place) {
+        transfer_plan_abort_build(plan);
+        return false;
     }
 
     const bool ok =

@@ -768,6 +768,18 @@ oo_status_t prepare_collective_launch(
     out->local_ptr =
         reinterpret_cast<void*>(
             reinterpret_cast<std::uint8_t*>(local->ptr) + offset_bytes);
+
+    /*
+     * OOVERLAP_OUT_OF_PLACE_ALLREDUCE_REDUCE_FANOUT_PATCH
+     *
+     * Default public path is still in-place. Dedicated out-of-place plumbing can
+     * overwrite these fields after prepare_collective_launch() or use a separate
+     * prepare helper later.
+     */
+    out->out_of_place = false;
+    out->local_input_ptr = out->local_ptr;
+    out->local_output_ptr = out->local_ptr;
+
     out->peer_count = peer_count;
     out->rank = node->rank;
     out->world_size = world_size;
@@ -827,6 +839,9 @@ oo_status_t prepare_collective_launch(
         out->peer_ptrs[peer_idx] =
             reinterpret_cast<void*>(
                 reinterpret_cast<std::uint8_t*>(peer->ptr) + offset_bytes);
+        out->peer_input_ptrs[peer_idx] = out->peer_ptrs[peer_idx];
+        out->peer_output_ptrs[peer_idx] = out->peer_ptrs[peer_idx];
+
         out->peer_ranks[peer_idx] = rank;
         out->peer_devices[peer_idx] = peer->owner_device;
 

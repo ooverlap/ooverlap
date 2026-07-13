@@ -26,7 +26,10 @@ namespace {
 template <int MaxPeers>
 bool validate_allreduce_launch(
     const comm::api::CollectiveLaunchState& launch) {
-    if (launch.local_ptr == nullptr ||
+    if (((!launch.out_of_place && launch.local_ptr == nullptr) ||
+         (launch.out_of_place &&
+          (launch.local_input_ptr == nullptr ||
+           launch.local_output_ptr == nullptr))) ||
         launch.peer_count < 0 ||
         launch.peer_count > MaxPeers ||
         launch.world_size != launch.peer_count + 1 ||
@@ -43,7 +46,10 @@ bool validate_allreduce_launch(
     for (int peer_idx = 0; peer_idx < launch.peer_count; ++peer_idx) {
         const int peer_rank = launch.peer_ranks[peer_idx];
 
-        if (launch.peer_ptrs[peer_idx] == nullptr ||
+        if (((!launch.out_of_place && launch.peer_ptrs[peer_idx] == nullptr) ||
+             (launch.out_of_place &&
+              (launch.peer_input_ptrs[peer_idx] == nullptr ||
+               launch.peer_output_ptrs[peer_idx] == nullptr))) ||
             peer_rank < 0 ||
             peer_rank >= launch.world_size ||
             peer_rank == launch.rank ||
@@ -115,25 +121,39 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     }
 
     /*
-     * The public allreduce API is currently in-place over one full logical
-     * buffer per rank.  The TransferPlan itself is pointer-free; this is the
-     * only place where logical rank buffers are bound to the rank-local raw
-     * pointer view.
+     * OOVERLAP_OUT_OF_PLACE_ALLREDUCE_REDUCE_FANOUT_PATCH
+     *
+     * Bind logical RankInput/RankOutput separately when an out-of-place API
+     * supplies those pointers. In-place behavior remains unchanged.
      */
     comm::plan::RankPointerBinding<MaxRanks, MaxStagingSlots> binding{};
     binding.current_rank = launch.rank;
     binding.world_size = launch.world_size;
 
-    binding.rank_buffer[launch.rank] = launch.local_ptr;
-    binding.rank_input[launch.rank] = launch.local_ptr;
-    binding.rank_output[launch.rank] = launch.local_ptr;
+    void* local_input_ptr =
+        launch.out_of_place ? launch.local_input_ptr : launch.local_ptr;
+    void* local_output_ptr =
+        launch.out_of_place ? launch.local_output_ptr : launch.local_ptr;
+
+    binding.rank_buffer[launch.rank] = local_output_ptr;
+    binding.rank_input[launch.rank] = local_input_ptr;
+    binding.rank_output[launch.rank] = local_output_ptr;
 
     for (int peer_idx = 0; peer_idx < launch.peer_count; ++peer_idx) {
         const int peer_rank = launch.peer_ranks[peer_idx];
 
-        binding.rank_buffer[peer_rank] = launch.peer_ptrs[peer_idx];
-        binding.rank_input[peer_rank] = launch.peer_ptrs[peer_idx];
-        binding.rank_output[peer_rank] = launch.peer_ptrs[peer_idx];
+        void* peer_input_ptr =
+            launch.out_of_place
+                ? launch.peer_input_ptrs[peer_idx]
+                : launch.peer_ptrs[peer_idx];
+        void* peer_output_ptr =
+            launch.out_of_place
+                ? launch.peer_output_ptrs[peer_idx]
+                : launch.peer_ptrs[peer_idx];
+
+        binding.rank_buffer[peer_rank] = peer_output_ptr;
+        binding.rank_input[peer_rank] = peer_input_ptr;
+        binding.rank_output[peer_rank] = peer_output_ptr;
     }
 
     for (int slot = 0;
@@ -448,7 +468,10 @@ cudaError_t enqueue_tma_multi_gpu_allreduce_rank_sm90(
         return cudaSuccess;
     }
 
-    if (launch.local_ptr == nullptr) {
+    if ((!launch.out_of_place && launch.local_ptr == nullptr) ||
+        (launch.out_of_place &&
+         (launch.local_input_ptr == nullptr ||
+          launch.local_output_ptr == nullptr))) {
         return cudaErrorInvalidValue;
     }
 

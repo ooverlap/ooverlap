@@ -61,6 +61,9 @@ struct TransferPlanRequestKey {
     oo_dtype_t dtype = OO_DTYPE_FLOAT16;
     oo_reduce_op_t op = OO_REDUCE_ADD;
 
+    /* OOVERLAP_OUT_OF_PLACE_ALLREDUCE_REDUCE_FANOUT_PATCH: out-of-place plans differ from in-place plans. */
+    bool out_of_place = false;
+
     LaunchConfig config{};
 };
 
@@ -73,6 +76,7 @@ bool same_request_key(
            a.dtype_size == b.dtype_size &&
            a.dtype == b.dtype &&
            a.op == b.op &&
+           a.out_of_place == b.out_of_place &&
            same_launch_config(a.config, b.config);
 }
 
@@ -90,6 +94,7 @@ TransferPlanRequestKey make_request_key(
     key.dtype_size = launch.dtype_size;
     key.dtype = dtype;
     key.op = op;
+    key.out_of_place = launch.out_of_place;
     key.config = config;
     return key;
 }
@@ -111,7 +116,7 @@ TransferPlanBuildInput make_build_input(
     input.world_size = launch.world_size;
     input.count = count;
     input.dtype_size = launch.dtype_size;
-    input.out_of_place = false;
+    input.out_of_place = launch.out_of_place;
 
     input.staging_slot_count =
         launch.staging_slot_count < kPlannerMaxStagingSlots

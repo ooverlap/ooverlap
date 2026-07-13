@@ -17,6 +17,19 @@ constexpr int kMaxPublicPeers = kOoMaxLocalDevices - 1;
 struct CollectiveLaunchState {
     void* local_ptr = nullptr;
 
+    /*
+     * OOVERLAP_OUT_OF_PLACE_ALLREDUCE_REDUCE_FANOUT_PATCH
+     *
+     * Optional out-of-place binding. Existing in-place public APIs leave
+     * out_of_place=false and use local_ptr/peer_ptrs for all logical roles.
+     */
+    bool out_of_place = false;
+    void* local_input_ptr = nullptr;
+    void* local_output_ptr = nullptr;
+
+    void* peer_input_ptrs[kMaxPublicPeers] = {};
+    void* peer_output_ptrs[kMaxPublicPeers] = {};
+
     void* peer_ptrs[kMaxPublicPeers] = {};
     int peer_ranks[kMaxPublicPeers] = {};
     int peer_devices[kMaxPublicPeers] = {};
