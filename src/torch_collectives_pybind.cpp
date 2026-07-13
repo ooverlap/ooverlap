@@ -7,14 +7,20 @@
 #include "ooverlap/comm.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
+#include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -73,16 +79,6 @@ static TensorIpcRange tensor_ipc_range(const torch::Tensor& t) {
   TORCH_CHECK(out.logical_ptr != nullptr, "tensor data_ptr is null");
   TORCH_CHECK(out.logical_bytes > 0, "tensor byte size must be non-zero");
 
-  /*
-   * Normal PyTorch CUDA tensors are allocated by CUDACachingAllocator.  The
-   * data_ptr can be a suballocation inside a larger cached block, so use
-   * getBaseAllocation() to recover the exportable CUDA allocation base and byte
-   * size.  This is exactly the metadata oo_buffer_wrap_ipc_range needs.
-   *
-   * If the pointer is not owned by CUDACachingAllocator, for example a
-   * torch::from_blob view over raw cudaMalloc memory, getBaseAllocation throws.
-   * In that case, fall back to treating logical_ptr as the allocation base.
-   */
   size_t base_bytes = 0;
   void* base_ptr = nullptr;
 
@@ -104,30 +100,24 @@ static TensorIpcRange tensor_ipc_range(const torch::Tensor& t) {
     base_bytes = out.logical_bytes;
   }
 
-  const auto logical_addr =
-      reinterpret_cast<std::uintptr_t>(out.logical_ptr);
-  const auto base_addr =
-      reinterpret_cast<std::uintptr_t>(base_ptr);
+  const auto logical_addr = reinterpret_cast<std::uintptr_t>(out.logical_ptr);
+  const auto base_addr = reinterpret_cast<std::uintptr_t>(base_ptr);
 
-  TORCH_CHECK(
-      logical_addr >= base_addr,
-      "tensor logical pointer is before allocation base");
+  TORCH_CHECK(logical_addr >= base_addr,
+              "tensor logical pointer is before allocation base");
 
-  const size_t offset =
-      static_cast<size_t>(logical_addr - base_addr);
+  const size_t offset = static_cast<size_t>(logical_addr - base_addr);
 
-  TORCH_CHECK(
-      offset <= base_bytes,
-      "tensor logical offset exceeds allocation size");
+  TORCH_CHECK(offset <= base_bytes,
+              "tensor logical offset exceeds allocation size");
 
-  TORCH_CHECK(
-      out.logical_bytes <= base_bytes - offset,
-      "tensor logical range exceeds allocation base: logical_bytes=",
-      out.logical_bytes,
-      " base_bytes=",
-      base_bytes,
-      " offset=",
-      offset);
+  TORCH_CHECK(out.logical_bytes <= base_bytes - offset,
+              "tensor logical range exceeds allocation base: logical_bytes=",
+              out.logical_bytes,
+              " base_bytes=",
+              base_bytes,
+              " offset=",
+              offset);
 
   out.base_ptr = base_ptr;
   out.base_bytes = base_bytes;
@@ -175,13 +165,6 @@ static size_t dtype_size(torch::ScalarType dtype) {
 }
 
 struct ScratchEntry {
-  /*
-   * OOVERLAP_TORCH_OFFSET_AWARE_IPC_RANGE_SCRATCH
-   *
-   * The scratch tensor is a normal PyTorch CUDA tensor.  We register it through
-   * oo_buffer_wrap_ipc_range(), using CUDACachingAllocator::getBaseAllocation()
-   * to provide allocation-base + logical-offset metadata to ooverlap.
-   */
   torch::Tensor tensor;
   oo_buffer_t* buffer = nullptr;
   int device = -1;
@@ -211,6 +194,11 @@ struct LoanedSlot {
   torch::ScalarType dtype = torch::kFloat32;
   size_t capacity_bytes = 0;
   size_t capacity_elems = 0;
+};
+
+struct LoanedReplenishRequest {
+  torch::ScalarType dtype = torch::kBFloat16;
+  size_t capacity_bytes = 0;
 };
 
 class OoTorchCommunicator {
@@ -247,6 +235,11 @@ class OoTorchCommunicator {
   }
 
   void destroy() {
+    stop_loaned_replenisher();
+
+    std::lock_guard<std::mutex> oo_lock(oo_mutex_);
+    std::lock_guard<std::mutex> loaned_lock(loaned_mutex_);
+
     for (auto& kv : scratch_) {
       ScratchEntry& entry = kv.second;
 
@@ -265,6 +258,9 @@ class OoTorchCommunicator {
     registered_tensors_.clear();
     loaned_ready_.clear();
     loaned_retired_buffers_.clear();
+    loaned_specs_.clear();
+    loaned_replenish_queue_.clear();
+    loaned_replenisher_error_ = nullptr;
 
     if (node_ != nullptr) {
       oo_node_destroy(node_);
@@ -285,16 +281,19 @@ class OoTorchCommunicator {
 
     entry.tensor.copy_(input);
 
-    check_status(
-      oo_allreduce_tuned(
-        node_,
-        entry.buffer,
-        input.numel(),
-        to_oo_dtype(input.scalar_type()),
-        OO_REDUCE_SUM,
-        OO_TUNING_BEST_PERFORMANCE,
-        current_stream_for(input)),
-      "oo_allreduce_tuned");
+    {
+      std::lock_guard<std::mutex> lock(oo_mutex_);
+      check_status(
+        oo_allreduce_tuned(
+          node_,
+          entry.buffer,
+          input.numel(),
+          to_oo_dtype(input.scalar_type()),
+          OO_REDUCE_SUM,
+          OO_TUNING_BEST_PERFORMANCE,
+          current_stream_for(input)),
+        "oo_allreduce_tuned");
+    }
 
     return entry.tensor;
   }
@@ -311,22 +310,26 @@ class OoTorchCommunicator {
 
     output.copy_(input);
 
-    OoBufferPtr buf(wrap_tensor(output, "oo_buffer_wrap_ipc_range(output)"));
+    OoBufferPtr buf;
+    {
+      std::lock_guard<std::mutex> lock(oo_mutex_);
+      buf.reset(wrap_tensor(output, "oo_buffer_wrap_ipc_range(output)"));
 
-    check_status(
-      oo_buffer_register_ipc(node_, buf.get()),
-      "oo_buffer_register_ipc(output)");
+      check_status(
+        oo_buffer_register_ipc(node_, buf.get()),
+        "oo_buffer_register_ipc(output)");
 
-    check_status(
-      oo_allreduce_tuned(
-        node_,
-        buf.get(),
-        output.numel(),
-        to_oo_dtype(output.scalar_type()),
-        OO_REDUCE_SUM,
-        OO_TUNING_BEST_PERFORMANCE,
-        current_stream_for(output)),
-      "oo_allreduce_tuned");
+      check_status(
+        oo_allreduce_tuned(
+          node_,
+          buf.get(),
+          output.numel(),
+          to_oo_dtype(output.scalar_type()),
+          OO_REDUCE_SUM,
+          OO_TUNING_BEST_PERFORMANCE,
+          current_stream_for(output)),
+        "oo_allreduce_tuned");
+    }
 
     return output;
   }
@@ -336,22 +339,26 @@ class OoTorchCommunicator {
 
     c10::cuda::CUDAGuard guard(tensor.device());
 
-    OoBufferPtr buf(wrap_tensor(tensor, "oo_buffer_wrap_ipc_range(inplace)"));
+    OoBufferPtr buf;
+    {
+      std::lock_guard<std::mutex> lock(oo_mutex_);
+      buf.reset(wrap_tensor(tensor, "oo_buffer_wrap_ipc_range(inplace)"));
 
-    check_status(
-      oo_buffer_register_ipc(node_, buf.get()),
-      "oo_buffer_register_ipc(inplace)");
+      check_status(
+        oo_buffer_register_ipc(node_, buf.get()),
+        "oo_buffer_register_ipc(inplace)");
 
-    check_status(
-      oo_allreduce_tuned(
-        node_,
-        buf.get(),
-        tensor.numel(),
-        to_oo_dtype(tensor.scalar_type()),
-        OO_REDUCE_SUM,
-        OO_TUNING_BEST_PERFORMANCE,
-        current_stream_for(tensor)),
-      "oo_allreduce_tuned");
+      check_status(
+        oo_allreduce_tuned(
+          node_,
+          buf.get(),
+          tensor.numel(),
+          to_oo_dtype(tensor.scalar_type()),
+          OO_REDUCE_SUM,
+          OO_TUNING_BEST_PERFORMANCE,
+          current_stream_for(tensor)),
+        "oo_allreduce_tuned");
+    }
 
     return tensor;
   }
@@ -363,25 +370,36 @@ class OoTorchCommunicator {
 
     RegisteredTensorEntry& entry = get_registered_tensor_by_ptr(tensor, "inplace_cached");
 
-    check_status(
-      oo_allreduce_tuned(
-        node_,
-        entry.buffer.get(),
-        tensor.numel(),
-        to_oo_dtype(tensor.scalar_type()),
-        OO_REDUCE_SUM,
-        OO_TUNING_BEST_PERFORMANCE,
-        current_stream_for(tensor)),
-      "oo_allreduce_tuned");
+    {
+      std::lock_guard<std::mutex> lock(oo_mutex_);
+      check_status(
+        oo_allreduce_tuned(
+          node_,
+          entry.buffer.get(),
+          tensor.numel(),
+          to_oo_dtype(tensor.scalar_type()),
+          OO_REDUCE_SUM,
+          OO_TUNING_BEST_PERFORMANCE,
+          current_stream_for(tensor)),
+        "oo_allreduce_tuned");
+    }
 
     return tensor;
   }
 
   void init_loaned_slots(const std::string& spec) {
+    check_replenisher_error();
     std::vector<LoanedSlotSpec> specs = parse_loaned_slot_spec(spec);
+    {
+      std::lock_guard<std::mutex> lock(loaned_mutex_);
+      loaned_specs_.insert(loaned_specs_.end(), specs.begin(), specs.end());
+    }
+
     for (const LoanedSlotSpec& s : specs) {
       for (size_t i = 0; i < s.count; ++i) {
-        loaned_ready_.push_back(make_loaned_slot(s.dtype, s.capacity_bytes));
+        LoanedSlot slot = make_loaned_slot(s.dtype, s.capacity_bytes);
+        std::lock_guard<std::mutex> lock(loaned_mutex_);
+        loaned_ready_.push_back(std::move(slot));
       }
     }
   }
@@ -393,7 +411,86 @@ class OoTorchCommunicator {
     init_loaned_slots(std::string(env));
   }
 
+  void start_loaned_replenisher() {
+    std::lock_guard<std::mutex> lock(loaned_mutex_);
+    if (loaned_replenisher_started_) {
+      loaned_replenish_enabled_ = true;
+      return;
+    }
+    loaned_replenisher_stop_ = false;
+    loaned_replenish_enabled_ = true;
+    loaned_replenisher_error_ = nullptr;
+    loaned_replenisher_started_ = true;
+    loaned_replenisher_running_.store(true, std::memory_order_release);
+    loaned_replenisher_ = std::thread(&OoTorchCommunicator::loaned_replenisher_loop, this);
+  }
+
+  void stop_loaned_replenisher() {
+    bool should_join = false;
+    {
+      std::lock_guard<std::mutex> lock(loaned_mutex_);
+      if (loaned_replenisher_started_) {
+        loaned_replenisher_stop_ = true;
+        loaned_replenish_enabled_ = false;
+        should_join = true;
+      }
+    }
+    loaned_cv_.notify_all();
+
+    if (should_join && loaned_replenisher_.joinable()) {
+      loaned_replenisher_.join();
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(loaned_mutex_);
+      loaned_replenisher_started_ = false;
+      loaned_replenisher_stop_ = false;
+      loaned_replenisher_running_.store(false, std::memory_order_release);
+    }
+  }
+
+  void set_loaned_replenish_enabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(loaned_mutex_);
+    loaned_replenish_enabled_ = enabled;
+    if (enabled) {
+      loaned_cv_.notify_all();
+    }
+  }
+
+  bool loaned_replenisher_running() const {
+    return loaned_replenisher_running_.load(std::memory_order_acquire);
+  }
+
+  size_t loaned_replenish_queue_count() const {
+    std::lock_guard<std::mutex> lock(loaned_mutex_);
+    return loaned_replenish_queue_.size();
+  }
+
+  void replenish_loaned_slots_sync(int64_t max_items = -1) {
+    check_replenisher_error();
+    int64_t done = 0;
+    while (max_items < 0 || done < max_items) {
+      LoanedReplenishRequest req;
+      {
+        std::lock_guard<std::mutex> lock(loaned_mutex_);
+        if (loaned_replenish_queue_.empty()) {
+          break;
+        }
+        req = loaned_replenish_queue_.front();
+        loaned_replenish_queue_.pop_front();
+      }
+
+      LoanedSlot slot = make_loaned_slot(req.dtype, req.capacity_bytes);
+      {
+        std::lock_guard<std::mutex> lock(loaned_mutex_);
+        loaned_ready_.push_back(std::move(slot));
+      }
+      ++done;
+    }
+  }
+
   torch::Tensor all_reduce_loaned(torch::Tensor input, bool fallback_to_out = true) {
+    check_replenisher_error();
     validate(input);
     c10::cuda::CUDAGuard guard(input.device());
 
@@ -403,37 +500,54 @@ class OoTorchCommunicator {
 
     int best_idx = -1;
     size_t best_capacity = std::numeric_limits<size_t>::max();
+    size_t replenish_capacity = 0;
 
-    for (size_t i = 0; i < loaned_ready_.size(); ++i) {
-      const LoanedSlot& slot = loaned_ready_[i];
-      if (!slot.tensor.defined() || slot.buffer == nullptr) {
-        continue;
-      }
-      if (slot.device != device || slot.dtype != dtype) {
-        continue;
-      }
-      if (slot.capacity_bytes < bytes) {
-        continue;
-      }
-      if (slot.capacity_bytes < best_capacity) {
-        best_capacity = slot.capacity_bytes;
-        best_idx = static_cast<int>(i);
+    {
+      std::lock_guard<std::mutex> lock(loaned_mutex_);
+      replenish_capacity = choose_loaned_capacity_locked(dtype, bytes);
+
+      for (size_t i = 0; i < loaned_ready_.size(); ++i) {
+        const LoanedSlot& slot = loaned_ready_[i];
+        if (!slot.tensor.defined() || slot.buffer == nullptr) {
+          continue;
+        }
+        if (slot.device != device || slot.dtype != dtype) {
+          continue;
+        }
+        if (slot.capacity_bytes < bytes) {
+          continue;
+        }
+        if (slot.capacity_bytes < best_capacity) {
+          best_capacity = slot.capacity_bytes;
+          best_idx = static_cast<int>(i);
+        }
       }
     }
 
     if (best_idx < 0) {
+      torch::Tensor out;
       if (!fallback_to_out) {
         TORCH_CHECK(false,
                     "no loaned slot available for tensor: bytes=", bytes,
                     " dtype=", static_cast<int>(dtype),
                     " device=", device);
       }
-      torch::Tensor out = torch::empty_like(input);
-      return all_reduce_out(input, out);
+      out = torch::empty_like(input);
+      torch::Tensor result = all_reduce_out(input, out);
+      if (replenish_capacity != 0) {
+        enqueue_loaned_replenish(dtype, replenish_capacity);
+      }
+      return result;
     }
 
-    LoanedSlot slot = std::move(loaned_ready_[static_cast<size_t>(best_idx)]);
-    loaned_ready_.erase(loaned_ready_.begin() + best_idx);
+    LoanedSlot slot;
+    {
+      std::lock_guard<std::mutex> lock(loaned_mutex_);
+      TORCH_CHECK(static_cast<size_t>(best_idx) < loaned_ready_.size(),
+                  "loaned slot index changed unexpectedly");
+      slot = std::move(loaned_ready_[static_cast<size_t>(best_idx)]);
+      loaned_ready_.erase(loaned_ready_.begin() + best_idx);
+    }
 
     TORCH_CHECK(slot.tensor.defined(), "loaned slot tensor is undefined");
     TORCH_CHECK(slot.buffer != nullptr, "loaned slot buffer is null");
@@ -452,38 +566,42 @@ class OoTorchCommunicator {
 
     view.copy_(input);
 
-    check_status(
-      oo_allreduce_tuned(
-        node_,
-        slot.buffer.get(),
-        input.numel(),
-        to_oo_dtype(input.scalar_type()),
-        OO_REDUCE_SUM,
-        OO_TUNING_BEST_PERFORMANCE,
-        current_stream_for(view)),
-      "oo_allreduce_tuned(loaned)");
+    {
+      std::lock_guard<std::mutex> lock(oo_mutex_);
+      check_status(
+        oo_allreduce_tuned(
+          node_,
+          slot.buffer.get(),
+          input.numel(),
+          to_oo_dtype(input.scalar_type()),
+          OO_REDUCE_SUM,
+          OO_TUNING_BEST_PERFORMANCE,
+          current_stream_for(view)),
+        "oo_allreduce_tuned(loaned)");
+    }
 
-    /*
-     * One-shot loaning semantics:
-     *   - return a view that keeps the underlying torch storage alive in Python;
-     *   - drop C++'s torch::Tensor reference by letting `slot.tensor` die;
-     *   - keep only the tiny oo_buffer_t wrapper until communicator destruction.
-     *
-     * This intentionally does not reuse the slot and does not try to deregister
-     * it while vLLM may still own the returned tensor.
-     */
     torch::Tensor result = view;
-    loaned_retired_buffers_.push_back(std::move(slot.buffer));
+    const torch::ScalarType used_dtype = slot.dtype;
+    const size_t used_capacity = slot.capacity_bytes;
+
+    {
+      std::lock_guard<std::mutex> lock(loaned_mutex_);
+      loaned_retired_buffers_.push_back(std::move(slot.buffer));
+    }
     slot.tensor = torch::Tensor();
+
+    enqueue_loaned_replenish(used_dtype, used_capacity);
 
     return result;
   }
 
   size_t loaned_ready_count() const {
+    std::lock_guard<std::mutex> lock(loaned_mutex_);
     return loaned_ready_.size();
   }
 
   size_t loaned_retired_count() const {
+    std::lock_guard<std::mutex> lock(loaned_mutex_);
     return loaned_retired_buffers_.size();
   }
 
@@ -502,6 +620,17 @@ class OoTorchCommunicator {
         t.scalar_type() == torch::kBFloat16 ||
         t.scalar_type() == torch::kFloat32,
         "unsupported dtype");
+  }
+
+  void check_replenisher_error() {
+    std::exception_ptr err;
+    {
+      std::lock_guard<std::mutex> lock(loaned_mutex_);
+      err = loaned_replenisher_error_;
+    }
+    if (err) {
+      std::rethrow_exception(err);
+    }
   }
 
   std::string scratch_key(const torch::Tensor& t, const std::string& role) {
@@ -585,11 +714,14 @@ class OoTorchCommunicator {
     TORCH_CHECK(entry.tensor.numel() == input.numel(), "scratch numel mismatch");
     TORCH_CHECK(entry.tensor.nbytes() == input.nbytes(), "scratch byte size mismatch");
 
-    entry.buffer = wrap_tensor(entry.tensor, "oo_buffer_wrap_ipc_range(scratch)");
+    {
+      std::lock_guard<std::mutex> lock(oo_mutex_);
+      entry.buffer = wrap_tensor(entry.tensor, "oo_buffer_wrap_ipc_range(scratch)");
 
-    check_status(
-      oo_buffer_register_ipc(node_, entry.buffer),
-      "oo_buffer_register_ipc(scratch)");
+      check_status(
+        oo_buffer_register_ipc(node_, entry.buffer),
+        "oo_buffer_register_ipc(scratch)");
+    }
 
     entry.registered = true;
 
@@ -613,11 +745,15 @@ class OoTorchCommunicator {
     entry.dtype = tensor.scalar_type();
     entry.bytes = tensor.nbytes();
     entry.numel = tensor.numel();
-    entry.buffer.reset(wrap_tensor(tensor, "oo_buffer_wrap_ipc_range(registered_tensor)"));
 
-    check_status(
-      oo_buffer_register_ipc(node_, entry.buffer.get()),
-      "oo_buffer_register_ipc(registered_tensor)");
+    {
+      std::lock_guard<std::mutex> lock(oo_mutex_);
+      entry.buffer.reset(wrap_tensor(tensor, "oo_buffer_wrap_ipc_range(registered_tensor)"));
+
+      check_status(
+        oo_buffer_register_ipc(node_, entry.buffer.get()),
+        "oo_buffer_register_ipc(registered_tensor)");
+    }
 
     auto inserted = registered_tensors_.emplace(key, std::move(entry));
     return inserted.first->second;
@@ -670,6 +806,31 @@ class OoTorchCommunicator {
     return out;
   }
 
+  size_t choose_loaned_capacity_locked(torch::ScalarType dtype, size_t bytes) const {
+    size_t best = std::numeric_limits<size_t>::max();
+    for (const LoanedSlotSpec& spec : loaned_specs_) {
+      if (spec.dtype != dtype) {
+        continue;
+      }
+      if (spec.capacity_bytes < bytes) {
+        continue;
+      }
+      if (spec.capacity_bytes < best) {
+        best = spec.capacity_bytes;
+      }
+    }
+    return best == std::numeric_limits<size_t>::max() ? 0 : best;
+  }
+
+  void enqueue_loaned_replenish(torch::ScalarType dtype, size_t capacity_bytes) {
+    std::lock_guard<std::mutex> lock(loaned_mutex_);
+    if (!loaned_replenish_enabled_ || capacity_bytes == 0) {
+      return;
+    }
+    loaned_replenish_queue_.push_back(LoanedReplenishRequest{dtype, capacity_bytes});
+    loaned_cv_.notify_one();
+  }
+
   LoanedSlot make_loaned_slot(torch::ScalarType dtype, size_t capacity_bytes) {
     const size_t elem_size = dtype_size(dtype);
     TORCH_CHECK(capacity_bytes % elem_size == 0,
@@ -705,13 +866,51 @@ class OoTorchCommunicator {
     TORCH_CHECK(slot.tensor.nbytes() == capacity_bytes,
                 "loaned slot tensor byte size mismatch");
 
-    slot.buffer.reset(wrap_tensor(slot.tensor, "oo_buffer_wrap_ipc_range(loaned_slot)"));
+    {
+      std::lock_guard<std::mutex> lock(oo_mutex_);
+      slot.buffer.reset(wrap_tensor(slot.tensor, "oo_buffer_wrap_ipc_range(loaned_slot)"));
 
-    check_status(
-      oo_buffer_register_ipc(node_, slot.buffer.get()),
-      "oo_buffer_register_ipc(loaned_slot)");
+      check_status(
+        oo_buffer_register_ipc(node_, slot.buffer.get()),
+        "oo_buffer_register_ipc(loaned_slot)");
+    }
 
     return slot;
+  }
+
+  void loaned_replenisher_loop() {
+    try {
+      while (true) {
+        LoanedReplenishRequest req;
+        {
+          std::unique_lock<std::mutex> lock(loaned_mutex_);
+          loaned_cv_.wait(lock, [&] {
+            return loaned_replenisher_stop_ || !loaned_replenish_queue_.empty();
+          });
+
+          if (loaned_replenisher_stop_ && loaned_replenish_queue_.empty()) {
+            break;
+          }
+
+          req = loaned_replenish_queue_.front();
+          loaned_replenish_queue_.pop_front();
+        }
+
+        LoanedSlot slot = make_loaned_slot(req.dtype, req.capacity_bytes);
+
+        {
+          std::lock_guard<std::mutex> lock(loaned_mutex_);
+          loaned_ready_.push_back(std::move(slot));
+        }
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(loaned_mutex_);
+      loaned_replenisher_error_ = std::current_exception();
+      loaned_replenisher_stop_ = true;
+      loaned_replenish_enabled_ = false;
+    }
+
+    loaned_replenisher_running_.store(false, std::memory_order_release);
   }
 
  private:
@@ -724,8 +923,20 @@ class OoTorchCommunicator {
 
   std::unordered_map<std::string, ScratchEntry> scratch_;
   std::unordered_map<std::string, RegisteredTensorEntry> registered_tensors_;
+
+  mutable std::mutex oo_mutex_;
+  mutable std::mutex loaned_mutex_;
+  std::condition_variable loaned_cv_;
   std::vector<LoanedSlot> loaned_ready_;
   std::vector<OoBufferPtr> loaned_retired_buffers_;
+  std::vector<LoanedSlotSpec> loaned_specs_;
+  std::deque<LoanedReplenishRequest> loaned_replenish_queue_;
+  std::thread loaned_replenisher_;
+  bool loaned_replenisher_started_ = false;
+  bool loaned_replenisher_stop_ = false;
+  bool loaned_replenish_enabled_ = false;
+  std::exception_ptr loaned_replenisher_error_ = nullptr;
+  std::atomic<bool> loaned_replenisher_running_{false};
 };
 
 PYBIND11_MODULE(ooverlap_torch_ext, m) {
@@ -741,6 +952,14 @@ PYBIND11_MODULE(ooverlap_torch_ext, m) {
       .def("init_loaned_slots", &OoTorchCommunicator::init_loaned_slots,
            py::arg("spec"))
       .def("init_loaned_slots_from_env", &OoTorchCommunicator::init_loaned_slots_from_env)
+      .def("start_loaned_replenisher", &OoTorchCommunicator::start_loaned_replenisher)
+      .def("stop_loaned_replenisher", &OoTorchCommunicator::stop_loaned_replenisher)
+      .def("set_loaned_replenish_enabled", &OoTorchCommunicator::set_loaned_replenish_enabled,
+           py::arg("enabled"))
+      .def("loaned_replenisher_running", &OoTorchCommunicator::loaned_replenisher_running)
+      .def("loaned_replenish_queue_count", &OoTorchCommunicator::loaned_replenish_queue_count)
+      .def("replenish_loaned_slots_sync", &OoTorchCommunicator::replenish_loaned_slots_sync,
+           py::arg("max_items") = -1)
       .def("all_reduce_loaned", &OoTorchCommunicator::all_reduce_loaned,
            py::arg("input"), py::arg("fallback_to_out") = true)
       .def("loaned_ready_count", &OoTorchCommunicator::loaned_ready_count)
