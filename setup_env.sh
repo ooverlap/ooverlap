@@ -70,6 +70,44 @@ log "Using venv dir: $VENV_DIR"
 
 mkdir -p "$(dirname "$VENV_DIR")"
 
+# -------- local tmp/cache environment --------
+# VENV_DIR is usually /local/tmp.xxxxx/$USER/torch_venv
+# so dirname(VENV_DIR) is /local/tmp.xxxxx/$USER
+OOTMP="${OOTMP:-$(dirname "$VENV_DIR")}"
+
+mkdir -p \
+  "$OOTMP/tmp" \
+  "$OOTMP/uv-cache" \
+  "$OOTMP/pip-cache" \
+  "$OOTMP/torch-extensions" \
+  "$OOTMP/hf-cache" \
+  "$OOTMP/xdg-cache" \
+  "$OOTMP/xdg-config" \
+  "$OOTMP/vllm-cache" \
+  "$OOTMP/vllm-config" \
+  "$OOTMP/nccl-link"
+
+export OOTMP
+export TMPDIR="$OOTMP/tmp"
+export UV_CACHE_DIR="$OOTMP/uv-cache"
+export PIP_CACHE_DIR="$OOTMP/pip-cache"
+export TORCH_EXTENSIONS_DIR="$OOTMP/torch-extensions"
+
+export XDG_CACHE_HOME="$OOTMP/xdg-cache"
+export XDG_CONFIG_HOME="$OOTMP/xdg-config"
+
+export HF_HOME="$OOTMP/hf-cache"
+export HF_HUB_CACHE="$OOTMP/hf-cache/hub"
+export TRANSFORMERS_CACHE="$OOTMP/hf-cache/transformers"
+
+export VLLM_CACHE_ROOT="$OOTMP/vllm-cache"
+export VLLM_CONFIG_ROOT="$OOTMP/vllm-config"
+export VLLM_NO_USAGE_STATS=1
+export VLLM_DO_NOT_TRACK=1
+
+# Useful only if building vLLM from source later.
+export FETCHCONTENT_BASE_DIR="$OOTMP/vllm-deps"
+
 # -------- install torch venv if needed --------
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
   log "Creating torch venv"
@@ -86,11 +124,60 @@ PYTHON_BIN="$VENV_DIR/bin/python3.13"
 [[ -x "$PYTHON_BIN" ]] || PYTHON_BIN="$VENV_DIR/bin/python"
 [[ -x "$PYTHON_BIN" ]] || die "No Python found in venv"
 
+# -------- install/check vLLM --------
+INSTALL_VLLM="${INSTALL_VLLM:-1}"
+VLLM_VER="${VLLM_VER:-0.25.0}"
+
+if [[ "$INSTALL_VLLM" == "1" ]]; then
+  if ! "$PYTHON_BIN" -c 'import vllm' >/dev/null 2>&1; then
+    log "Installing vLLM==${VLLM_VER}"
+    uv pip install "vllm==${VLLM_VER}"
+  else
+    log "vLLM already installed"
+  fi
+
+  "$PYTHON_BIN" - <<'PY'
+import vllm
+from pathlib import Path
+print("vllm:", getattr(vllm, "__version__", "unknown"))
+print("vllm path:", Path(vllm.__file__).resolve())
+PY
+fi
+
+# -------- vLLM/NCCL paths from active venv --------
+NCCL_PKG_DIR="$("$PYTHON_BIN" - <<'PY'
+from pathlib import Path
+import nvidia.nccl
+
+paths = list(getattr(nvidia.nccl, "__path__", []))
+if not paths:
+    raise RuntimeError("nvidia.nccl has no __path__; is nvidia-nccl-cu12 installed?")
+print(Path(paths[0]).resolve())
+PY
+)"
+
+export NCCL_PKG_DIR
+export VLLM_NCCL_INCLUDE_PATH="$NCCL_PKG_DIR/include"
+export VLLM_NCCL_SO_PATH="$NCCL_PKG_DIR/lib/libnccl.so.2"
+
+ln -sf "$NCCL_PKG_DIR/lib/libnccl.so.2" "$OOTMP/nccl-link/libnccl.so"
+
+export LIBRARY_PATH="$OOTMP/nccl-link:$NCCL_PKG_DIR/lib:${LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$OOTMP/nccl-link:$NCCL_PKG_DIR/lib:${LD_LIBRARY_PATH:-}"
+
+log "NCCL package dir: $NCCL_PKG_DIR"
+log "VLLM_NCCL_SO_PATH: $VLLM_NCCL_SO_PATH"
+
+########## CHECL torch
+
 log "Checking torch"
 "$PYTHON_BIN" -c 'import torch; print("torch:", torch.__version__)'
 
 TORCH_PREFIX_PATH="$("$PYTHON_BIN" -c 'import torch; print(torch.utils.cmake_prefix_path)')"
 log "Torch CMake prefix path: $TORCH_PREFIX_PATH"
+
+#######patch
+"$PYTHON_BIN" patch_gcc_typename.py
 
 # -------- prepare build dir --------
 mkdir -p "$BUILD_DIR"
@@ -126,5 +213,36 @@ cmake -S .. -B . \
 log "Building with $JOBS jobs"
 cmake --build . -j "$JOBS"
 
+export VLLM_OOVERLAP_TORCH_EXT="$BUILD_DIR/lib/ooverlap_torch_ext.so"
+log "VLLM_OOVERLAP_TORCH_EXT: $VLLM_OOVERLAP_TORCH_EXT"
+
 log "Done"
 log "Venv used: $VENV_DIR"
+
+ENV_OUT="${ENV_OUT:-$OOTMP/ooverlap_vllm_env.sh}"
+cat > "$ENV_OUT" <<EOF
+source "$VENV_DIR/bin/activate"
+export OOTMP="$OOTMP"
+export TMPDIR="$TMPDIR"
+export UV_CACHE_DIR="$UV_CACHE_DIR"
+export PIP_CACHE_DIR="$PIP_CACHE_DIR"
+export TORCH_EXTENSIONS_DIR="$TORCH_EXTENSIONS_DIR"
+export XDG_CACHE_HOME="$XDG_CACHE_HOME"
+export XDG_CONFIG_HOME="$XDG_CONFIG_HOME"
+export HF_HOME="$HF_HOME"
+export HF_HUB_CACHE="$HF_HUB_CACHE"
+export TRANSFORMERS_CACHE="$TRANSFORMERS_CACHE"
+export VLLM_CACHE_ROOT="$VLLM_CACHE_ROOT"
+export VLLM_CONFIG_ROOT="$VLLM_CONFIG_ROOT"
+export VLLM_NO_USAGE_STATS=1
+export VLLM_DO_NOT_TRACK=1
+export NCCL_PKG_DIR="$NCCL_PKG_DIR"
+export VLLM_NCCL_INCLUDE_PATH="$VLLM_NCCL_INCLUDE_PATH"
+export VLLM_NCCL_SO_PATH="$VLLM_NCCL_SO_PATH"
+export LIBRARY_PATH="$LIBRARY_PATH"
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH"
+export VLLM_OOVERLAP_TORCH_EXT="$VLLM_OOVERLAP_TORCH_EXT"
+EOF
+
+log "Wrote runtime env file: $ENV_OUT"
+log "Use later with: source $ENV_OUT"
