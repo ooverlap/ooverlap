@@ -10,6 +10,7 @@ extern "C" {
 typedef struct oo_group oo_group_t;
 typedef struct oo_node oo_node_t;
 typedef struct oo_buffer oo_buffer_t;
+typedef struct oo_ipc_slot_set oo_ipc_slot_set_t;
 
 typedef enum {
     OO_SUCCESS = 0,
@@ -170,6 +171,26 @@ oo_status_t oo_buffer_register_ipc(
     oo_node_t* node,
     oo_buffer_t* buffer);
 
+
+/*
+ * OOVERLAP_ROUND_ROBIN_SLOT_POOL_PATCH_V1
+ *
+ * A fixed set of local CUDA buffers is exchanged/imported once during setup.
+ * The set owns peer IPC mappings and borrows the caller-owned local buffers.
+ * All ranks must call create with the same slot count, slot order, and sizes.
+ */
+oo_status_t oo_ipc_slot_set_create(
+    oo_node_t* node,
+    oo_buffer_t* const* local_slots,
+    int slot_count,
+    oo_ipc_slot_set_t** out_set);
+
+void oo_ipc_slot_set_destroy(
+    oo_ipc_slot_set_t* set);
+
+int oo_ipc_slot_set_count(
+    const oo_ipc_slot_set_t* set);
+
 void oo_buffer_destroy(
     oo_buffer_t* buffer);
 
@@ -227,6 +248,22 @@ oo_status_t oo_allreduce_offset_tuned(
 oo_status_t oo_allreduce_tuned(
     oo_node_t* node,
     oo_buffer_t* local,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream);
+
+
+/*
+ * Launch from a setup-time pre-registered slot. This bypasses the normal
+ * per-call IPC key/descriptor exchange and directly uses the slot's rank-indexed
+ * local/imported buffer table.
+ */
+oo_status_t oo_allreduce_slot_tuned(
+    oo_node_t* node,
+    oo_ipc_slot_set_t* set,
+    int slot_index,
     size_t count,
     oo_dtype_t dtype,
     oo_reduce_op_t op,

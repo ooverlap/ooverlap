@@ -133,6 +133,18 @@ oo_status_t prepare_collective_launch(
     oo_dtype_t dtype,
     CollectiveLaunchState* out);
 
+
+/* OOVERLAP_ROUND_ROBIN_SLOT_POOL_PATCH_V1: skip IPC discovery and use an explicit rank-indexed buffer row. */
+oo_status_t prepare_collective_launch_prebound(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    CollectivePlanFor collective,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    CollectiveLaunchState* out);
+
 } // namespace api
 } // namespace comm
 } // namespace ooverlap

@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 constexpr int kOoMaxLocalDevices = 16;
 constexpr int kOoIpcImportCacheEntriesPerRank = 16;
@@ -372,6 +373,24 @@ struct oo_buffer {
      * Valid for system_kind == imported_legacy/imported_vmm.
      */
     ooverlap::system::imported_peer_buffer imported{};
+};
+
+
+/*
+ * OOVERLAP_ROUND_ROBIN_SLOT_POOL_PATCH_V1
+ *
+ * Persistent rank-indexed buffers for a fixed round-robin slot pool.
+ * rank_buffers[slot * world_size + rank] is the pointer view used by the
+ * current process for that logical rank. Local buffers are borrowed;
+ * imported_buffers owns all peer cudaIpcOpenMemHandle mappings.
+ */
+struct oo_ipc_slot_set {
+    oo_group_t* group = nullptr;
+    int world_size = 0;
+    int slot_count = 0;
+    size_t slot_bytes = 0;
+    std::vector<oo_buffer_t*> rank_buffers{};
+    std::vector<std::unique_ptr<oo_buffer_t>> imported_buffers{};
 };
 
 /*

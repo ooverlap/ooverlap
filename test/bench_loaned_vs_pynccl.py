@@ -14,308 +14,323 @@ import torch
 import torch.distributed as dist
 
 
-def _load_ext(path: str | None):
-    if path is None:
-        path = os.environ.get("VLLM_OOVERLAP_TORCH_EXT") or os.environ.get("OOVERLAP_TORCH_EXT")
+def load_extension(path: str | None):
+    path = path or os.environ.get("VLLM_OOVERLAP_TORCH_EXT") or os.environ.get("OOVERLAP_TORCH_EXT")
     if not path:
-        raise RuntimeError("pass --extension-so or set VLLM_OOVERLAP_TORCH_EXT/OOVERLAP_TORCH_EXT")
+        raise RuntimeError("pass --extension-so or set VLLM_OOVERLAP_TORCH_EXT")
     so = Path(path).expanduser().resolve()
-    if not so.exists():
+    if not so.is_file():
         raise FileNotFoundError(f"extension not found: {so}")
     spec = importlib.util.spec_from_file_location("ooverlap_torch_ext", str(so))
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load extension spec: {so}")
+        raise RuntimeError(f"could not load extension: {so}")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["ooverlap_torch_ext"] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-def parse_numels(s: str) -> list[int]:
-    out = [int(x) for x in s.split(",") if x.strip()]
-    if not out or any(x <= 0 for x in out):
-        raise ValueError("--numels must be positive comma-separated ints")
-    return out
+def parse_numels(text: str) -> list[int]:
+    values = [int(x.strip()) for x in text.split(",") if x.strip()]
+    if not values or any(x <= 0 for x in values):
+        raise ValueError("--numels must contain positive comma-separated integers")
+    return values
 
 
-def parse_dtypes(s: str) -> list[torch.dtype]:
-    m = {
+def parse_devices(text: str) -> list[int]:
+    values = [int(x.strip()) for x in text.split(",") if x.strip()]
+    if not values or any(x < 0 for x in values):
+        raise ValueError("--devices must contain non-negative comma-separated integers")
+    return values
+
+
+def parse_dtypes(text: str) -> list[torch.dtype]:
+    aliases = {
         "fp16": torch.float16,
         "f16": torch.float16,
         "float16": torch.float16,
-        "half": torch.float16,
         "bf16": torch.bfloat16,
         "bfloat16": torch.bfloat16,
         "fp32": torch.float32,
         "f32": torch.float32,
         "float32": torch.float32,
-        "float": torch.float32,
     }
-    out = []
-    for raw in s.split(","):
-        k = raw.strip().lower()
-        if not k:
+    result: list[torch.dtype] = []
+    for raw in text.split(","):
+        key = raw.strip().lower()
+        if not key:
             continue
-        if k not in m:
-            raise ValueError(f"bad dtype {raw!r}; choices={sorted(m)}")
-        out.append(m[k])
-    if not out:
-        raise ValueError("empty --dtypes")
-    return out
+        if key not in aliases:
+            raise ValueError(f"unsupported dtype: {raw!r}")
+        result.append(aliases[key])
+    if not result:
+        raise ValueError("--dtypes cannot be empty")
+    return result
 
 
-def dtype_label(dtype: torch.dtype) -> str:
-    if dtype is torch.float16:
+def dtype_name(dtype: torch.dtype) -> str:
+    if dtype == torch.float16:
         return "fp16"
-    if dtype is torch.bfloat16:
+    if dtype == torch.bfloat16:
         return "bf16"
-    if dtype is torch.float32:
-        return "fp32"
-    return str(dtype).replace("torch.", "")
-
-
-def dtype_spec(dtype: torch.dtype) -> str:
-    if dtype is torch.float16:
-        return "fp16"
-    if dtype is torch.bfloat16:
-        return "bf16"
-    if dtype is torch.float32:
+    if dtype == torch.float32:
         return "fp32"
     raise ValueError(dtype)
 
 
-def sanitize_key(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", s)[:180]
+def sanitize_key(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", text)[:160]
 
 
-def local_rank() -> int:
-    return int(os.environ.get("LOCAL_RANK", "0"))
+def expected_sum(world_size: int) -> float:
+    # Rank r contributes 1 + r.
+    return world_size + world_size * (world_size - 1) / 2.0
 
 
-def local_world_size() -> int:
-    return int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
-
-
-def expected_sum(world: int, base: float) -> float:
-    return world * base + (world * (world - 1)) / 2.0
-
-
-def assert_close(name: str, y: torch.Tensor, expected: float):
-    exp = torch.full_like(y, expected)
-    if y.dtype is torch.float32:
-        rtol = atol = 1e-5
-    else:
-        rtol = atol = 1e-2
-    torch.testing.assert_close(y, exp, rtol=rtol, atol=atol)
+def check_result(label: str, result: torch.Tensor, expected: float) -> None:
+    torch.cuda.synchronize(result.device)
+    reference = torch.full_like(result, expected)
+    tol = 1e-5 if result.dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(result, reference, rtol=tol, atol=tol)
     if dist.get_rank() == 0:
-        print(f"[pass] {name}: first={y.flatten()[0].item()} shape={tuple(y.shape)} dtype={y.dtype}", flush=True)
+        print(
+            f"[pass] {label}: first={result.flatten()[0].item()} "
+            f"shape={tuple(result.shape)} dtype={result.dtype}",
+            flush=True,
+        )
 
 
-class VllmPyNcclAllReduce:
-    def __init__(self, cpu_group, device: torch.device):
+class VllmPyNccl:
+    def __init__(self, group, device: torch.device):
         try:
             from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         except Exception as exc:
-            raise RuntimeError("Could not import vLLM PyNcclCommunicator") from exc
-        self.pynccl_comm = PyNcclCommunicator(group=cpu_group, device=device)
-        if getattr(self.pynccl_comm, "disabled", True):
+            raise RuntimeError("could not import vLLM PyNcclCommunicator") from exc
+        self.comm = PyNcclCommunicator(group=group, device=device)
+        if getattr(self.comm, "disabled", True):
             raise RuntimeError("vLLM PyNcclCommunicator is disabled")
 
-    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.pynccl_comm.all_reduce(x)
-        if out is None:
+    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        # Exact vLLM API: output allocation and return happen inside this call.
+        result = self.comm.all_reduce(tensor)
+        if result is None:
             raise RuntimeError("vLLM PyNcclCommunicator returned None")
-        return out
+        return result
 
-    def destroy(self):
-        if getattr(self, "pynccl_comm", None) is not None:
-            self.pynccl_comm.destroy()
-            self.pynccl_comm = None
+    def destroy(self) -> None:
+        if self.comm is not None:
+            self.comm.destroy()
+            self.comm = None
 
 
-def bench(label: str, fn: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor, device: torch.device, warmup: int, iters: int) -> tuple[float, float]:
+def benchmark(
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    tensor: torch.Tensor,
+    warmup: int,
+    iterations: int,
+) -> tuple[float, float]:
+    # Match normal API usage: each call returns a tensor and the local Python
+    # reference is replaced by the next call. No copy or allocation is added
+    # outside either implementation.
+    result: torch.Tensor | None = None
     for _ in range(warmup):
-        _ = fn(x)
-    torch.cuda.synchronize(device)
+        result = fn(tensor)
+    torch.cuda.synchronize(tensor.device)
 
-    start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev = torch.cuda.Event(enable_timing=True)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
     start_wall = time.perf_counter()
-    start_ev.record()
-    for _ in range(iters):
-        _ = fn(x)
-    end_ev.record()
-    torch.cuda.synchronize(device)
+    start_event.record()
+    for _ in range(iterations):
+        result = fn(tensor)
+    end_event.record()
+    torch.cuda.synchronize(tensor.device)
     end_wall = time.perf_counter()
-    cuda_ms = start_ev.elapsed_time(end_ev) / float(iters)
-    wall_ms = (end_wall - start_wall) * 1000.0 / float(iters)
+
+    cuda_ms = start_event.elapsed_time(end_event) / iterations
+    wall_ms = (end_wall - start_wall) * 1000.0 / iterations
+    # Keep the final returned tensor alive until after synchronization above.
+    assert result is not None
     return cuda_ms, wall_ms
 
 
-def make_comm(ext, devices: list[int], rank: int, base_key: str, suffix: str):
-    key = sanitize_key(f"{base_key}_{suffix}")
-    return ext.Communicator(devices, rank, key)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Benchmark fixed ooverlap round-robin IPC buffers vs vLLM PyNCCL"
+    )
+    parser.add_argument("--extension-so", default=None)
+    parser.add_argument("--dist-backend", default="gloo", choices=("gloo", "nccl"))
+    parser.add_argument("--devices", default=None, help="physical CUDA IDs, e.g. 0,1")
+    parser.add_argument("--broker-key", default=None)
+    parser.add_argument(
+        "--numels",
+        default="3584,14336,57344,229376,1048576,2097152,3670016",
+    )
+    parser.add_argument("--dtypes", default="bf16")
+    parser.add_argument("--slots", type=int, default=8)
+    parser.add_argument(
+        "--capacity-bytes",
+        type=int,
+        default=0,
+        help="0 uses the largest requested tensor for each dtype",
+    )
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--iters", type=int, default=100)
+    args = parser.parse_args()
 
-
-def init_loaned_exact(comm, dtype: torch.dtype, nbytes: int, count: int):
-    spec = f"{dtype_spec(dtype)}:{nbytes}:{count}"
-    comm.init_loaned_slots(spec)
-
-
-def main():
-    p = argparse.ArgumentParser(description="Benchmark ooverlap loaned slots vs vLLM PyNCCL")
-    p.add_argument("--extension-so", default=None)
-    p.add_argument("--dist-backend", default="gloo", choices=("gloo", "nccl"))
-    p.add_argument("--devices", default=None, help="visible device ids, e.g. 0,1; default 0..LOCAL_WORLD_SIZE-1")
-    p.add_argument("--broker-key", default=None)
-    p.add_argument("--numels", default="3584,14336,57344,229376,1048576,2097152,3670016")
-    p.add_argument("--dtypes", default="bf16")
-    p.add_argument("--bench-warmup", type=int, default=20)
-    p.add_argument("--bench-iters", type=int, default=100)
-    p.add_argument("--no-safe", action="store_true", help="skip ooverlap all_reduce_out safe path")
-    p.add_argument("--enable-loaned-sync-replenish", action="store_true", help="after each loaned call, replenish one slot synchronously; includes registration cost")
-    p.add_argument("--enable-loaned-bg", action="store_true", help="start C++ background replenisher and benchmark all_reduce_loaned")
-    p.add_argument("--loaned-bg-initial", type=int, default=8)
-    p.add_argument("--allow-bg-fallback", action="store_true", help="allow bg loaned mode to fall back to all_reduce_out if empty")
-    args = p.parse_args()
-
+    if args.slots <= 0:
+        raise ValueError("--slots must be positive")
+    if args.capacity_bytes < 0:
+        raise ValueError("--capacity-bytes cannot be negative")
+    if args.warmup < 0 or args.iters <= 0:
+        raise ValueError("warmup must be >= 0 and iters must be > 0")
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA required")
+        raise RuntimeError("CUDA is required")
+
     if not dist.is_initialized():
         dist.init_process_group(backend=args.dist_backend)
 
-    grank = dist.get_rank()
+    rank = dist.get_rank()
     world = dist.get_world_size()
-    lrank = local_rank()
-    lworld = local_world_size()
-    if world != lworld:
-        raise RuntimeError(f"single-node only: WORLD_SIZE={world}, LOCAL_WORLD_SIZE={lworld}")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", str(world)))
+    if world != local_world:
+        raise RuntimeError("single-node benchmark only")
 
-    devices = list(range(lworld)) if not args.devices else [int(x) for x in args.devices.split(",") if x.strip()]
-    if len(devices) != lworld:
-        raise RuntimeError(f"devices={devices} length does not match LOCAL_WORLD_SIZE={lworld}")
-    torch.cuda.set_device(devices[lrank])
-    device = torch.device("cuda", devices[lrank])
+    devices = list(range(local_world)) if args.devices is None else parse_devices(args.devices)
+    if len(devices) != local_world:
+        raise RuntimeError(f"devices={devices} does not match LOCAL_WORLD_SIZE={local_world}")
 
-    ext = _load_ext(args.extension_so)
-    base_key = args.broker_key or sanitize_key(f"loaned_vs_pynccl_{os.environ.get('MASTER_ADDR','localhost')}_{os.environ.get('MASTER_PORT','0')}_{world}")
+    torch.cuda.set_device(devices[local_rank])
+    device = torch.device("cuda", devices[local_rank])
 
-    if grank == 0:
-        print("[info] extension:", ext, flush=True)
-        print("[info] devices:", devices, "base_key:", base_key, flush=True)
-        print("[info] numels:", parse_numels(args.numels), "dtypes:", args.dtypes, flush=True)
-        print("[info] warmup/iters:", args.bench_warmup, args.bench_iters, flush=True)
-        print("[info] modes: pynccl" + ("" if args.no_safe else ", safe_out") + ", loaned_once" + (", loaned_sync" if args.enable_loaned_sync_replenish else "") + (", loaned_bg" if args.enable_loaned_bg else ""), flush=True)
+    ext = load_extension(args.extension_so)
+    for method in ("init_round_robin_slots", "all_reduce_round_robin"):
+        if not hasattr(ext.Communicator, method):
+            raise RuntimeError(f"extension is missing Communicator.{method}; rebuild after patching")
+
+    numels = parse_numels(args.numels)
+    dtypes = parse_dtypes(args.dtypes)
+    base_key = args.broker_key or sanitize_key(
+        f"rr_pynccl_{os.environ.get('MASTER_ADDR', 'localhost')}_"
+        f"{os.environ.get('MASTER_PORT', '0')}_{world}"
+    )
+
+    if rank == 0:
+        print(f"[info] extension={ext}", flush=True)
+        print(f"[info] devices={devices} broker_key={base_key}", flush=True)
+        print(f"[info] numels={numels} dtypes={[dtype_name(x) for x in dtypes]}", flush=True)
+        print(f"[info] slots={args.slots} warmup={args.warmup} iters={args.iters}", flush=True)
+        print("[info] timed APIs:", flush=True)
+        print("  pynccl: PyNcclCommunicator.all_reduce(input)", flush=True)
+        print("  ooverlap: Communicator.all_reduce_round_robin(input)", flush=True)
 
     dist.barrier()
-    pynccl = VllmPyNcclAllReduce(dist.group.WORLD, device)
+    pynccl = VllmPyNccl(dist.group.WORLD, device)
 
     try:
-        for dtype in parse_dtypes(args.dtypes):
-            for numel in parse_numels(args.numels):
-                x = torch.full((numel,), 1.0 + lrank, device=device, dtype=dtype)
-                nbytes = x.numel() * x.element_size()
-                modes: list[tuple[str, Callable[[torch.Tensor], torch.Tensor], object | None]] = []
+        for dtype in dtypes:
+            elem_size = torch.empty((), dtype=dtype).element_size()
+            required_capacity = max(numels) * elem_size
+            capacity = args.capacity_bytes or required_capacity
+            if capacity < required_capacity:
+                raise ValueError(
+                    f"capacity {capacity} is smaller than required {required_capacity} bytes"
+                )
+            if capacity % elem_size != 0:
+                raise ValueError("capacity must be divisible by dtype element size")
 
-                # Correctness and benchmark pynccl.
-                y = pynccl.all_reduce(x)
-                torch.cuda.synchronize(device)
-                assert_close(f"pynccl numel={numel} dtype={dtype_label(dtype)}", y, expected_sum(world, 1.0))
-                modes.append(("pynccl", lambda t, pynccl=pynccl: pynccl.all_reduce(t), None))
+            key = sanitize_key(f"{base_key}_{dtype_name(dtype)}")
+            round_robin = ext.Communicator(devices, local_rank, key)
+            round_robin.init_round_robin_slots(dtype_name(dtype), capacity, args.slots)
 
-                safe_comm = None
-                if not args.no_safe:
-                    safe_comm = make_comm(ext, devices, lrank, base_key, f"safe_{dtype_label(dtype)}_{numel}")
-                    def safe_fn(t, comm=safe_comm):
-                        out = torch.empty_like(t)
-                        return comm.all_reduce_out(t, out)
-                    y = safe_fn(x)
-                    torch.cuda.synchronize(device)
-                    assert_close(f"ooverlap_safe_out numel={numel} dtype={dtype_label(dtype)}", y, expected_sum(world, 1.0))
-                    modes.append(("ooverlap_safe_out", safe_fn, safe_comm))
+            if rank == 0:
+                print(
+                    f"\n[dtype] {dtype_name(dtype)} capacity_bytes={capacity} "
+                    f"slots={args.slots}",
+                    flush=True,
+                )
 
-                # loaned_once needs enough one-shot slots for correctness + warmup + timed iters.
-                loaned_once_comm = make_comm(ext, devices, lrank, base_key, f"loaned_once_{dtype_label(dtype)}_{numel}")
-                init_loaned_exact(loaned_once_comm, dtype, nbytes, args.bench_warmup + args.bench_iters + 2)
-                def loaned_once_fn(t, comm=loaned_once_comm):
-                    return comm.all_reduce_loaned(t, False)
-                y = loaned_once_fn(x)
-                torch.cuda.synchronize(device)
-                assert_close(f"ooverlap_loaned_once numel={numel} dtype={dtype_label(dtype)}", y, expected_sum(world, 1.0))
-                modes.append(("ooverlap_loaned_once", loaned_once_fn, loaned_once_comm))
+            try:
+                for numel in numels:
+                    tensor = torch.full(
+                        (numel,),
+                        1.0 + rank,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    expected = expected_sum(world)
+                    nbytes = tensor.numel() * tensor.element_size()
 
-                sync_comm = None
-                if args.enable_loaned_sync_replenish:
-                    sync_comm = make_comm(ext, devices, lrank, base_key, f"loaned_sync_{dtype_label(dtype)}_{numel}")
-                    init_loaned_exact(sync_comm, dtype, nbytes, 2)
-                    def loaned_sync_fn(t, comm=sync_comm):
-                        y = comm.all_reduce_loaned(t, False)
-                        # This is collective registration through the same sequence on all ranks.
-                        comm.replenish_loaned_slots_sync(1)
-                        return y
-                    y = loaned_sync_fn(x)
-                    torch.cuda.synchronize(device)
-                    assert_close(f"ooverlap_loaned_sync_replenish numel={numel} dtype={dtype_label(dtype)}", y, expected_sum(world, 1.0))
-                    modes.append(("ooverlap_loaned_sync_replenish", loaned_sync_fn, sync_comm))
-
-                bg_comm = None
-                if args.enable_loaned_bg:
-                    bg_comm = make_comm(ext, devices, lrank, base_key, f"loaned_bg_{dtype_label(dtype)}_{numel}")
-                    init_loaned_exact(bg_comm, dtype, nbytes, args.loaned_bg_initial)
-                    bg_comm.start_loaned_replenisher()
-                    def loaned_bg_fn(t, comm=bg_comm):
-                        return comm.all_reduce_loaned(t, bool(args.allow_bg_fallback))
-                    y = loaned_bg_fn(x)
-                    torch.cuda.synchronize(device)
-                    assert_close(f"ooverlap_loaned_bg numel={numel} dtype={dtype_label(dtype)}", y, expected_sum(world, 1.0))
-                    modes.append(("ooverlap_loaned_bg", loaned_bg_fn, bg_comm))
-
-                results: dict[str, tuple[float, float]] = {}
-                for label, fn, _owner in modes:
                     dist.barrier()
-                    cuda_ms, wall_ms = bench(label, fn, x, device, args.bench_warmup, args.bench_iters)
+                    y_pynccl = pynccl.all_reduce(tensor)
+                    check_result(
+                        f"pynccl_vllm numel={numel} dtype={dtype_name(dtype)}",
+                        y_pynccl,
+                        expected,
+                    )
+
                     dist.barrier()
-                    results[label] = (cuda_ms, wall_ms)
+                    y_rr = round_robin.all_reduce_round_robin(tensor)
+                    check_result(
+                        f"ooverlap_round_robin numel={numel} dtype={dtype_name(dtype)}",
+                        y_rr,
+                        expected,
+                    )
 
-                if grank == 0:
-                    print(f"\n[bench] numel={numel} dtype={dtype_label(dtype)} bytes_per_rank={nbytes} warmup={args.bench_warmup} iters={args.bench_iters}")
-                    for label, (cuda_ms, wall_ms) in results.items():
-                        print(f"  {label}: cuda_ms={cuda_ms:.6f} wall_ms={wall_ms:.6f}")
-                    base = results.get("pynccl")
-                    if base:
-                        pynccl_cuda, pynccl_wall = base
-                        for label, (cuda_ms, wall_ms) in results.items():
-                            if label == "pynccl":
-                                continue
-                            print(f"  {label}_speedup_vs_pynccl: cuda={pynccl_cuda/cuda_ms:.6f}x wall={pynccl_wall/wall_ms:.6f}x")
-                    for label, _fn, owner in modes:
-                        if owner is not None and hasattr(owner, "loaned_ready_count"):
-                            try:
-                                print(f"  {label}_ready={owner.loaned_ready_count()} retired={owner.loaned_retired_count()} queue={owner.loaned_replenish_queue_count() if hasattr(owner, 'loaned_replenish_queue_count') else 'NA'}")
-                            except Exception:
-                                pass
-                    print(flush=True)
+                    dist.barrier()
+                    pynccl_cuda, pynccl_wall = benchmark(
+                        pynccl.all_reduce, tensor, args.warmup, args.iters
+                    )
+                    dist.barrier()
+                    rr_cuda, rr_wall = benchmark(
+                        round_robin.all_reduce_round_robin,
+                        tensor,
+                        args.warmup,
+                        args.iters,
+                    )
+                    dist.barrier()
 
-                # Cleanup communicators for this shape before moving on.
-                for _label, _fn, owner in reversed(modes):
-                    if owner is not None:
-                        if hasattr(owner, "stop_loaned_replenisher"):
-                            try:
-                                owner.stop_loaned_replenisher()
-                            except Exception:
-                                pass
-                        if hasattr(owner, "destroy"):
-                            owner.destroy()
+                    if rank == 0:
+                        print(
+                            f"\n[bench] numel={numel} dtype={dtype_name(dtype)} "
+                            f"bytes_per_rank={nbytes}",
+                            flush=True,
+                        )
+                        print(
+                            f"  pynccl_vllm_api: cuda_ms={pynccl_cuda:.6f} "
+                            f"wall_ms={pynccl_wall:.6f}",
+                            flush=True,
+                        )
+                        print(
+                            f"  ooverlap_round_robin: cuda_ms={rr_cuda:.6f} "
+                            f"wall_ms={rr_wall:.6f}",
+                            flush=True,
+                        )
+                        print(
+                            "  ooverlap_speedup_vs_pynccl: "
+                            f"cuda={pynccl_cuda / rr_cuda:.6f}x "
+                            f"wall={pynccl_wall / rr_wall:.6f}x",
+                            flush=True,
+                        )
+                        if hasattr(round_robin, "round_robin_next_slot"):
+                            print(
+                                f"  round_robin_next_slot={round_robin.round_robin_next_slot()}",
+                                flush=True,
+                            )
+            finally:
+                round_robin.destroy()
                 dist.barrier()
 
-        if grank == 0:
-            print("[done] PASS", flush=True)
+        if rank == 0:
+            print("\n[done] PASS", flush=True)
     finally:
         try:
             pynccl.destroy()
-        except Exception:
-            pass
-        dist.barrier()
+        finally:
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

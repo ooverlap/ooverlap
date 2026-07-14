@@ -657,9 +657,12 @@ oo_status_t register_ipc_collective_buffers(
 }
 
 
-oo_status_t prepare_collective_launch(
+/* OOVERLAP_ROUND_ROBIN_SLOT_POOL_PATCH_V1 */
+oo_status_t prepare_collective_launch_impl(
     oo_node_t* node,
     oo_buffer_t* local,
+    oo_buffer_t* const* prebound_rank_buffers,
+    int prebound_rank_buffer_count,
     CollectivePlanFor collective,
     size_t element_offset,
     size_t count,
@@ -681,6 +684,26 @@ oo_status_t prepare_collective_launch(
     }
 
     oo_group_t* group = node->group;
+
+    if (prebound_rank_buffers != nullptr) {
+        if (prebound_rank_buffer_count != group->num_devices ||
+            node->rank < 0 ||
+            node->rank >= prebound_rank_buffer_count ||
+            prebound_rank_buffers[node->rank] != local) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        for (int rank = 0; rank < prebound_rank_buffer_count; ++rank) {
+            oo_buffer_t* buffer = prebound_rank_buffers[rank];
+            if (buffer == nullptr ||
+                buffer->ptr == nullptr ||
+                buffer->group != group ||
+                buffer->owner_rank != rank ||
+                buffer->owner_device != group->devices[rank]) {
+                return OO_ERROR_INVALID_ARGUMENT;
+            }
+        }
+    }
 
     size_t offset_bytes = 0;
     size_t bytes = 0;
@@ -720,17 +743,19 @@ oo_status_t prepare_collective_launch(
      * Multiprocess IPC behavior: exchange legacy CUDA IPC descriptors every
      * collective and refresh imported peer pointers before reading peers below.
      */
-    if (group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc) {
-        status =
-            ensure_ipc_legacy_collective_buffers_registered(
-                node,
-                local);
+    if (prebound_rank_buffers == nullptr) {
+        if (group->bootstrap_kind == oo_group_bootstrap_kind::multiprocess_ipc) {
+            status =
+                ensure_ipc_legacy_collective_buffers_registered(
+                    node,
+                    local);
 
-        if (status != OO_SUCCESS) {
-            return status;
+            if (status != OO_SUCCESS) {
+                return status;
+            }
+        } else {
+            group->collective_buffers[node->rank] = local;
         }
-    } else {
-        group->collective_buffers[node->rank] = local;
     }
 
     const int world_size = group->num_devices;
@@ -822,7 +847,10 @@ oo_status_t prepare_collective_launch(
             continue;
         }
 
-        oo_buffer_t* peer = group->collective_buffers[rank];
+        oo_buffer_t* peer =
+            prebound_rank_buffers != nullptr
+                ? prebound_rank_buffers[rank]
+                : group->collective_buffers[rank];
 
         if (peer == nullptr ||
             peer->ptr == nullptr ||
@@ -874,6 +902,56 @@ oo_status_t prepare_collective_launch(
     }
 
     return OO_SUCCESS;
+}
+
+oo_status_t prepare_collective_launch(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    CollectivePlanFor collective,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    CollectiveLaunchState* out) {
+    return prepare_collective_launch_impl(
+        node,
+        local,
+        nullptr,
+        0,
+        collective,
+        element_offset,
+        count,
+        dtype,
+        out);
+}
+
+oo_status_t prepare_collective_launch_prebound(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    CollectivePlanFor collective,
+    size_t element_offset,
+    size_t count,
+    oo_dtype_t dtype,
+    CollectiveLaunchState* out) {
+    if (node == nullptr ||
+        node->group == nullptr ||
+        rank_buffers == nullptr ||
+        rank_buffer_count != node->group->num_devices ||
+        node->rank < 0 ||
+        node->rank >= rank_buffer_count) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    return prepare_collective_launch_impl(
+        node,
+        rank_buffers[node->rank],
+        rank_buffers,
+        rank_buffer_count,
+        collective,
+        element_offset,
+        count,
+        dtype,
+        out);
 }
 
 } // namespace api
@@ -1010,3 +1088,151 @@ oo_status_t oo_buffer_import_legacy_descriptor(
         return ooverlap::comm::api::exception_to_status();
     }
 }
+
+/*
+ * OOVERLAP_ROUND_ROBIN_SLOT_POOL_PATCH_V1
+ *
+ * Setup-only exchange/import. There is deliberately no cache lookup and no
+ * mutation of group->collective_buffers. The returned set owns imported peer
+ * mappings for its full lifetime and borrows the local slot wrappers.
+ */
+oo_status_t oo_ipc_slot_set_create(
+    oo_node_t* node,
+    oo_buffer_t* const* local_slots,
+    int slot_count,
+    oo_ipc_slot_set_t** out_set) {
+    if (out_set == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_set = nullptr;
+
+    if (node == nullptr ||
+        node->group == nullptr ||
+        local_slots == nullptr ||
+        slot_count <= 0 ||
+        node->group->bootstrap_kind !=
+            oo_group_bootstrap_kind::multiprocess_ipc ||
+        node->group->broker == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    try {
+        oo_group_t* group = node->group;
+        const int world_size = group->num_devices;
+
+        const cudaError_t device_error = cudaSetDevice(node->device);
+        if (device_error != cudaSuccess) {
+            return ooverlap::comm::api::cuda_to_status(device_error);
+        }
+
+        std::unique_ptr<oo_ipc_slot_set_t> set(new oo_ipc_slot_set_t{});
+        set->group = group;
+        set->world_size = world_size;
+        set->slot_count = slot_count;
+        set->rank_buffers.resize(
+            static_cast<size_t>(slot_count) * static_cast<size_t>(world_size),
+            nullptr);
+        set->imported_buffers.reserve(
+            static_cast<size_t>(slot_count) *
+            static_cast<size_t>(world_size > 0 ? world_size - 1 : 0));
+
+        for (int slot_index = 0; slot_index < slot_count; ++slot_index) {
+            oo_buffer_t* local = local_slots[slot_index];
+
+            if (local == nullptr ||
+                local->ptr == nullptr ||
+                local->bytes == 0 ||
+                local->group != group ||
+                local->owner_rank != node->rank ||
+                local->owner_device != node->device ||
+                local->system_kind !=
+                    ooverlap::system::peer_buffer_kind::wrapped) {
+                return OO_ERROR_INVALID_ARGUMENT;
+            }
+
+            if (slot_index == 0) {
+                set->slot_bytes = local->bytes;
+            } else if (local->bytes != set->slot_bytes) {
+                return OO_ERROR_INVALID_ARGUMENT;
+            }
+
+            ooverlap::system::legacy_peer_buffer_descriptor local_desc{};
+            oo_status_t status =
+                oo_buffer_export_legacy_descriptor(local, &local_desc);
+            if (status != OO_SUCCESS) {
+                return status;
+            }
+
+            std::vector<ooverlap::system::legacy_peer_buffer_descriptor> descs(
+                static_cast<size_t>(world_size));
+            group->broker->exchange_data(
+                descs.data(),
+                &local_desc,
+                sizeof(local_desc));
+
+            for (int rank = 0; rank < world_size; ++rank) {
+                const auto& desc = descs[static_cast<size_t>(rank)];
+                if (desc.bytes != set->slot_bytes ||
+                    desc.mapped_size == 0 ||
+                    desc.logical_offset > desc.mapped_size ||
+                    desc.bytes > desc.mapped_size - desc.logical_offset ||
+                    desc.owner_device != group->devices[rank]) {
+                    return OO_ERROR_INVALID_ARGUMENT;
+                }
+
+                const size_t flat_index =
+                    static_cast<size_t>(slot_index) *
+                        static_cast<size_t>(world_size) +
+                    static_cast<size_t>(rank);
+
+                if (rank == node->rank) {
+                    set->rank_buffers[flat_index] = local;
+                    continue;
+                }
+
+                auto imported =
+                    ooverlap::system::import_legacy_peer_buffer(
+                        desc,
+                        std::vector<int>{node->device});
+
+                std::unique_ptr<oo_buffer_t> peer(new oo_buffer_t{});
+                peer->ptr = imported.ptr;
+                peer->bytes = imported.bytes;
+                peer->mapped_bytes = imported.mapped_size;
+                peer->ipc_base_ptr =
+                    imported.mapping_base_ptr != nullptr
+                        ? imported.mapping_base_ptr
+                        : imported.ptr;
+                peer->ipc_base_bytes = imported.mapped_size;
+                peer->ipc_logical_offset_bytes = imported.logical_offset;
+                peer->kind = OO_BUFFER_KIND_WRAPPED;
+                peer->group = group;
+                peer->owner_rank = rank;
+                peer->owner_device = desc.owner_device;
+                peer->system_kind =
+                    ooverlap::system::peer_buffer_kind::imported_legacy;
+                peer->imported = std::move(imported);
+
+                set->rank_buffers[flat_index] = peer.get();
+                set->imported_buffers.push_back(std::move(peer));
+            }
+        }
+
+        *out_set = set.release();
+        return OO_SUCCESS;
+    } catch (...) {
+        return ooverlap::comm::api::exception_to_status();
+    }
+}
+
+void oo_ipc_slot_set_destroy(
+    oo_ipc_slot_set_t* set) {
+    delete set;
+}
+
+int oo_ipc_slot_set_count(
+    const oo_ipc_slot_set_t* set) {
+    return set != nullptr ? set->slot_count : 0;
+}
+

@@ -45,6 +45,30 @@ static void check_status(oo_status_t st, const char* what) {
   TORCH_CHECK(st == OO_SUCCESS, what, " failed: ", oo_status_string(st));
 }
 
+
+/* OOVERLAP_ROUND_ROBIN_SLOT_POOL_PATCH_V1 */
+static torch::ScalarType parse_round_robin_dtype(std::string dtype) {
+  std::transform(dtype.begin(), dtype.end(), dtype.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (dtype == "fp16" || dtype == "f16" || dtype == "float16" || dtype == "half") {
+    return torch::kFloat16;
+  }
+  if (dtype == "bf16" || dtype == "bfloat16") {
+    return torch::kBFloat16;
+  }
+  if (dtype == "fp32" || dtype == "f32" || dtype == "float32" || dtype == "float") {
+    return torch::kFloat32;
+  }
+  TORCH_CHECK(false, "unsupported round-robin dtype: ", dtype);
+}
+
+static size_t round_robin_dtype_size(torch::ScalarType dtype) {
+  if (dtype == torch::kFloat16 || dtype == torch::kBFloat16) return 2;
+  if (dtype == torch::kFloat32) return 4;
+  TORCH_CHECK(false, "unsupported round-robin dtype");
+}
+
 struct OoBufferDeleter {
   void operator()(oo_buffer_t* b) const {
     if (b != nullptr) {
@@ -181,25 +205,12 @@ struct RegisteredTensorEntry {
   int64_t numel = 0;
 };
 
-struct LoanedSlotSpec {
-  torch::ScalarType dtype = torch::kBFloat16;
-  size_t capacity_bytes = 0;
-  size_t count = 0;
-};
 
-struct LoanedSlot {
+struct RoundRobinSlot {
   torch::Tensor tensor;
   OoBufferPtr buffer;
-  int device = -1;
-  torch::ScalarType dtype = torch::kFloat32;
-  size_t capacity_bytes = 0;
-  size_t capacity_elems = 0;
 };
 
-struct LoanedReplenishRequest {
-  torch::ScalarType dtype = torch::kBFloat16;
-  size_t capacity_bytes = 0;
-};
 
 class OoTorchCommunicator {
  public:
@@ -235,10 +246,15 @@ class OoTorchCommunicator {
   }
 
   void destroy() {
-    stop_loaned_replenisher();
-
     std::lock_guard<std::mutex> oo_lock(oo_mutex_);
-    std::lock_guard<std::mutex> loaned_lock(loaned_mutex_);
+
+    if (round_robin_set_ != nullptr) {
+      oo_ipc_slot_set_destroy(round_robin_set_);
+      round_robin_set_ = nullptr;
+    }
+    round_robin_slots_.clear();
+    round_robin_index_ = 0;
+    round_robin_capacity_bytes_ = 0;
 
     for (auto& kv : scratch_) {
       ScratchEntry& entry = kv.second;
@@ -256,11 +272,6 @@ class OoTorchCommunicator {
 
     scratch_.clear();
     registered_tensors_.clear();
-    loaned_ready_.clear();
-    loaned_retired_buffers_.clear();
-    loaned_specs_.clear();
-    loaned_replenish_queue_.clear();
-    loaned_replenisher_error_ = nullptr;
 
     if (node_ != nullptr) {
       oo_node_destroy(node_);
@@ -387,222 +398,128 @@ class OoTorchCommunicator {
     return tensor;
   }
 
-  void init_loaned_slots(const std::string& spec) {
-    check_replenisher_error();
-    std::vector<LoanedSlotSpec> specs = parse_loaned_slot_spec(spec);
-    {
-      std::lock_guard<std::mutex> lock(loaned_mutex_);
-      loaned_specs_.insert(loaned_specs_.end(), specs.begin(), specs.end());
+
+
+  void init_round_robin_slots(
+      const std::string& dtype_name,
+      int64_t capacity_bytes,
+      int64_t slot_count) {
+    TORCH_CHECK(round_robin_set_ == nullptr && round_robin_slots_.empty(),
+                "round-robin pool is already initialized");
+    TORCH_CHECK(capacity_bytes > 0, "capacity_bytes must be positive");
+    TORCH_CHECK(slot_count > 0, "slot_count must be positive");
+
+    const torch::ScalarType dtype = parse_round_robin_dtype(dtype_name);
+    const size_t elem_size = round_robin_dtype_size(dtype);
+    const size_t capacity = static_cast<size_t>(capacity_bytes);
+    TORCH_CHECK(capacity % elem_size == 0,
+                "capacity_bytes must be divisible by dtype size");
+
+    const size_t capacity_elems = capacity / elem_size;
+    TORCH_CHECK(capacity_elems > 0 &&
+                    capacity_elems <=
+                        static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+                "round-robin capacity is too large");
+
+    c10::cuda::CUDAGuard guard(
+        torch::Device(torch::kCUDA, devices_[local_rank_]));
+
+    std::vector<RoundRobinSlot> slots;
+    std::vector<oo_buffer_t*> local_buffers;
+    slots.reserve(static_cast<size_t>(slot_count));
+    local_buffers.reserve(static_cast<size_t>(slot_count));
+
+    const auto options = torch::TensorOptions()
+        .device(torch::Device(torch::kCUDA, devices_[local_rank_]))
+        .dtype(dtype)
+        .layout(torch::kStrided)
+        .requires_grad(false);
+
+    for (int64_t slot_index = 0; slot_index < slot_count; ++slot_index) {
+      RoundRobinSlot slot;
+      slot.tensor = torch::empty(
+          {static_cast<int64_t>(capacity_elems)},
+          options,
+          torch::MemoryFormat::Contiguous);
+      TORCH_CHECK(slot.tensor.defined() &&
+                      slot.tensor.is_cuda() &&
+                      slot.tensor.is_contiguous() &&
+                      slot.tensor.nbytes() == capacity,
+                  "failed to allocate round-robin slot");
+
+      slot.buffer.reset(
+          wrap_tensor(
+              slot.tensor,
+              "oo_buffer_wrap_ipc_range(round_robin_slot)"));
+      local_buffers.push_back(slot.buffer.get());
+      slots.push_back(std::move(slot));
     }
 
-    for (const LoanedSlotSpec& s : specs) {
-      for (size_t i = 0; i < s.count; ++i) {
-        LoanedSlot slot = make_loaned_slot(s.dtype, s.capacity_bytes);
-        std::lock_guard<std::mutex> lock(loaned_mutex_);
-        loaned_ready_.push_back(std::move(slot));
-      }
-    }
+    oo_ipc_slot_set_t* set = nullptr;
+    check_status(
+        oo_ipc_slot_set_create(
+            node_,
+            local_buffers.data(),
+            static_cast<int>(local_buffers.size()),
+            &set),
+        "oo_ipc_slot_set_create");
+
+    round_robin_slots_ = std::move(slots);
+    round_robin_set_ = set;
+    round_robin_dtype_ = dtype;
+    round_robin_capacity_bytes_ = capacity;
+    round_robin_index_ = 0;
   }
 
-  void init_loaned_slots_from_env() {
-    const char* env = std::getenv("OOVERLAP_LOANED_SLOTS");
-    TORCH_CHECK(env != nullptr && std::string(env).size() > 0,
-                "OOVERLAP_LOANED_SLOTS is not set");
-    init_loaned_slots(std::string(env));
-  }
-
-  void start_loaned_replenisher() {
-    std::lock_guard<std::mutex> lock(loaned_mutex_);
-    if (loaned_replenisher_started_) {
-      loaned_replenish_enabled_ = true;
-      return;
-    }
-    loaned_replenisher_stop_ = false;
-    loaned_replenish_enabled_ = true;
-    loaned_replenisher_error_ = nullptr;
-    loaned_replenisher_started_ = true;
-    loaned_replenisher_running_.store(true, std::memory_order_release);
-    loaned_replenisher_ = std::thread(&OoTorchCommunicator::loaned_replenisher_loop, this);
-  }
-
-  void stop_loaned_replenisher() {
-    bool should_join = false;
-    {
-      std::lock_guard<std::mutex> lock(loaned_mutex_);
-      if (loaned_replenisher_started_) {
-        loaned_replenisher_stop_ = true;
-        loaned_replenish_enabled_ = false;
-        should_join = true;
-      }
-    }
-    loaned_cv_.notify_all();
-
-    if (should_join && loaned_replenisher_.joinable()) {
-      loaned_replenisher_.join();
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(loaned_mutex_);
-      loaned_replenisher_started_ = false;
-      loaned_replenisher_stop_ = false;
-      loaned_replenisher_running_.store(false, std::memory_order_release);
-    }
-  }
-
-  void set_loaned_replenish_enabled(bool enabled) {
-    std::lock_guard<std::mutex> lock(loaned_mutex_);
-    loaned_replenish_enabled_ = enabled;
-    if (enabled) {
-      loaned_cv_.notify_all();
-    }
-  }
-
-  bool loaned_replenisher_running() const {
-    return loaned_replenisher_running_.load(std::memory_order_acquire);
-  }
-
-  size_t loaned_replenish_queue_count() const {
-    std::lock_guard<std::mutex> lock(loaned_mutex_);
-    return loaned_replenish_queue_.size();
-  }
-
-  void replenish_loaned_slots_sync(int64_t max_items = -1) {
-    check_replenisher_error();
-    int64_t done = 0;
-    while (max_items < 0 || done < max_items) {
-      LoanedReplenishRequest req;
-      {
-        std::lock_guard<std::mutex> lock(loaned_mutex_);
-        if (loaned_replenish_queue_.empty()) {
-          break;
-        }
-        req = loaned_replenish_queue_.front();
-        loaned_replenish_queue_.pop_front();
-      }
-
-      LoanedSlot slot = make_loaned_slot(req.dtype, req.capacity_bytes);
-      {
-        std::lock_guard<std::mutex> lock(loaned_mutex_);
-        loaned_ready_.push_back(std::move(slot));
-      }
-      ++done;
-    }
-  }
-
-  torch::Tensor all_reduce_loaned(torch::Tensor input, bool fallback_to_out = true) {
-    check_replenisher_error();
+  torch::Tensor all_reduce_round_robin(torch::Tensor input) {
     validate(input);
+    TORCH_CHECK(round_robin_set_ != nullptr && !round_robin_slots_.empty(),
+                "round-robin pool is not initialized");
+    TORCH_CHECK(input.scalar_type() == round_robin_dtype_,
+                "input dtype does not match round-robin pool dtype");
+    TORCH_CHECK(input.nbytes() <= round_robin_capacity_bytes_,
+                "input exceeds round-robin slot capacity: input_bytes=",
+                input.nbytes(),
+                " capacity_bytes=",
+                round_robin_capacity_bytes_);
+
     c10::cuda::CUDAGuard guard(input.device());
 
-    const int device = input.get_device();
-    const torch::ScalarType dtype = input.scalar_type();
-    const size_t bytes = input.nbytes();
-
-    int best_idx = -1;
-    size_t best_capacity = std::numeric_limits<size_t>::max();
-    size_t replenish_capacity = 0;
-
-    {
-      std::lock_guard<std::mutex> lock(loaned_mutex_);
-      replenish_capacity = choose_loaned_capacity_locked(dtype, bytes);
-
-      for (size_t i = 0; i < loaned_ready_.size(); ++i) {
-        const LoanedSlot& slot = loaned_ready_[i];
-        if (!slot.tensor.defined() || slot.buffer == nullptr) {
-          continue;
-        }
-        if (slot.device != device || slot.dtype != dtype) {
-          continue;
-        }
-        if (slot.capacity_bytes < bytes) {
-          continue;
-        }
-        if (slot.capacity_bytes < best_capacity) {
-          best_capacity = slot.capacity_bytes;
-          best_idx = static_cast<int>(i);
-        }
-      }
-    }
-
-    if (best_idx < 0) {
-      torch::Tensor out;
-      if (!fallback_to_out) {
-        TORCH_CHECK(false,
-                    "no loaned slot available for tensor: bytes=", bytes,
-                    " dtype=", static_cast<int>(dtype),
-                    " device=", device);
-      }
-      out = torch::empty_like(input);
-      torch::Tensor result = all_reduce_out(input, out);
-      if (replenish_capacity != 0) {
-        enqueue_loaned_replenish(dtype, replenish_capacity);
-      }
-      return result;
-    }
-
-    LoanedSlot slot;
-    {
-      std::lock_guard<std::mutex> lock(loaned_mutex_);
-      TORCH_CHECK(static_cast<size_t>(best_idx) < loaned_ready_.size(),
-                  "loaned slot index changed unexpectedly");
-      slot = std::move(loaned_ready_[static_cast<size_t>(best_idx)]);
-      loaned_ready_.erase(loaned_ready_.begin() + best_idx);
-    }
-
-    TORCH_CHECK(slot.tensor.defined(), "loaned slot tensor is undefined");
-    TORCH_CHECK(slot.buffer != nullptr, "loaned slot buffer is null");
-    TORCH_CHECK(slot.capacity_elems >= static_cast<size_t>(input.numel()),
-                "loaned slot capacity elements too small");
-
+    const size_t slot_index = round_robin_index_;
+    RoundRobinSlot& slot = round_robin_slots_[slot_index];
     torch::Tensor view =
         slot.tensor
             .narrow(0, 0, input.numel())
             .view(input.sizes());
 
-    TORCH_CHECK(view.is_contiguous(), "loaned slot view must be contiguous");
-    TORCH_CHECK(view.sizes() == input.sizes(), "loaned slot view shape mismatch");
-    TORCH_CHECK(view.scalar_type() == input.scalar_type(), "loaned slot view dtype mismatch");
-    TORCH_CHECK(view.get_device() == input.get_device(), "loaned slot view device mismatch");
-
     view.copy_(input);
 
-    {
-      std::lock_guard<std::mutex> lock(oo_mutex_);
-      check_status(
-        oo_allreduce_tuned(
-          node_,
-          slot.buffer.get(),
-          input.numel(),
-          to_oo_dtype(input.scalar_type()),
-          OO_REDUCE_SUM,
-          OO_TUNING_BEST_PERFORMANCE,
-          current_stream_for(view)),
-        "oo_allreduce_tuned(loaned)");
-    }
+    check_status(
+        oo_allreduce_slot_tuned(
+            node_,
+            round_robin_set_,
+            static_cast<int>(slot_index),
+            static_cast<size_t>(input.numel()),
+            to_oo_dtype(input.scalar_type()),
+            OO_REDUCE_SUM,
+            OO_TUNING_BEST_PERFORMANCE,
+            current_stream_for(view)),
+        "oo_allreduce_slot_tuned");
 
-    torch::Tensor result = view;
-    const torch::ScalarType used_dtype = slot.dtype;
-    const size_t used_capacity = slot.capacity_bytes;
+    round_robin_index_ =
+        (round_robin_index_ + 1) % round_robin_slots_.size();
 
-    {
-      std::lock_guard<std::mutex> lock(loaned_mutex_);
-      loaned_retired_buffers_.push_back(std::move(slot.buffer));
-    }
-    slot.tensor = torch::Tensor();
-
-    enqueue_loaned_replenish(used_dtype, used_capacity);
-
-    return result;
+    // Intentionally unsafe: this view aliases pool storage and is overwritten
+    // when the round-robin index wraps after N later collective calls.
+    return view;
   }
 
-  size_t loaned_ready_count() const {
-    std::lock_guard<std::mutex> lock(loaned_mutex_);
-    return loaned_ready_.size();
+  size_t round_robin_slot_count() const {
+    return round_robin_slots_.size();
   }
 
-  size_t loaned_retired_count() const {
-    std::lock_guard<std::mutex> lock(loaned_mutex_);
-    return loaned_retired_buffers_.size();
+  size_t round_robin_next_slot() const {
+    return round_robin_index_;
   }
 
  private:
@@ -622,16 +539,6 @@ class OoTorchCommunicator {
         "unsupported dtype");
   }
 
-  void check_replenisher_error() {
-    std::exception_ptr err;
-    {
-      std::lock_guard<std::mutex> lock(loaned_mutex_);
-      err = loaned_replenisher_error_;
-    }
-    if (err) {
-      std::rethrow_exception(err);
-    }
-  }
 
   std::string scratch_key(const torch::Tensor& t, const std::string& role) {
     std::ostringstream os;
@@ -759,159 +666,6 @@ class OoTorchCommunicator {
     return inserted.first->second;
   }
 
-  std::vector<LoanedSlotSpec> parse_loaned_slot_spec(const std::string& spec) {
-    std::vector<LoanedSlotSpec> out;
-    std::stringstream ss(spec);
-    std::string item;
-
-    while (std::getline(ss, item, ',')) {
-      item = trim_copy(item);
-      if (item.empty()) {
-        continue;
-      }
-
-      std::stringstream is(item);
-      std::string dtype_s;
-      std::string bytes_s;
-      std::string count_s;
-
-      TORCH_CHECK(std::getline(is, dtype_s, ':'), "bad loaned slot item: ", item);
-      TORCH_CHECK(std::getline(is, bytes_s, ':'), "bad loaned slot item: ", item);
-      TORCH_CHECK(std::getline(is, count_s, ':'), "bad loaned slot item: ", item);
-
-      dtype_s = trim_copy(dtype_s);
-      bytes_s = trim_copy(bytes_s);
-      count_s = trim_copy(count_s);
-
-      LoanedSlotSpec slot;
-      slot.dtype = parse_dtype_name(dtype_s);
-
-      try {
-        slot.capacity_bytes = static_cast<size_t>(std::stoull(bytes_s));
-        slot.count = static_cast<size_t>(std::stoull(count_s));
-      } catch (const std::exception& e) {
-        TORCH_CHECK(false, "bad loaned slot numeric field in item '", item, "': ", e.what());
-      }
-
-      const size_t elem_size = dtype_size(slot.dtype);
-      TORCH_CHECK(slot.capacity_bytes > 0, "loaned slot capacity must be > 0: ", item);
-      TORCH_CHECK(slot.capacity_bytes % elem_size == 0,
-                  "loaned slot capacity bytes must be divisible by dtype size: ", item);
-      TORCH_CHECK(slot.count > 0, "loaned slot count must be > 0: ", item);
-
-      out.push_back(slot);
-    }
-
-    TORCH_CHECK(!out.empty(), "loaned slot spec is empty");
-    return out;
-  }
-
-  size_t choose_loaned_capacity_locked(torch::ScalarType dtype, size_t bytes) const {
-    size_t best = std::numeric_limits<size_t>::max();
-    for (const LoanedSlotSpec& spec : loaned_specs_) {
-      if (spec.dtype != dtype) {
-        continue;
-      }
-      if (spec.capacity_bytes < bytes) {
-        continue;
-      }
-      if (spec.capacity_bytes < best) {
-        best = spec.capacity_bytes;
-      }
-    }
-    return best == std::numeric_limits<size_t>::max() ? 0 : best;
-  }
-
-  void enqueue_loaned_replenish(torch::ScalarType dtype, size_t capacity_bytes) {
-    std::lock_guard<std::mutex> lock(loaned_mutex_);
-    if (!loaned_replenish_enabled_ || capacity_bytes == 0) {
-      return;
-    }
-    loaned_replenish_queue_.push_back(LoanedReplenishRequest{dtype, capacity_bytes});
-    loaned_cv_.notify_one();
-  }
-
-  LoanedSlot make_loaned_slot(torch::ScalarType dtype, size_t capacity_bytes) {
-    const size_t elem_size = dtype_size(dtype);
-    TORCH_CHECK(capacity_bytes % elem_size == 0,
-                "loaned slot capacity bytes must be divisible by dtype size");
-    const size_t capacity_elems = capacity_bytes / elem_size;
-    TORCH_CHECK(capacity_elems > 0, "loaned slot capacity elements must be > 0");
-    TORCH_CHECK(capacity_elems <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
-                "loaned slot capacity too large");
-
-    c10::cuda::CUDAGuard guard(
-        torch::Device(torch::kCUDA, devices_[local_rank_]));
-
-    LoanedSlot slot;
-    slot.device = devices_[local_rank_];
-    slot.dtype = dtype;
-    slot.capacity_bytes = capacity_bytes;
-    slot.capacity_elems = capacity_elems;
-
-    auto options = torch::TensorOptions()
-        .device(torch::Device(torch::kCUDA, slot.device))
-        .dtype(dtype)
-        .layout(torch::kStrided)
-        .requires_grad(false);
-
-    slot.tensor = torch::empty(
-        {static_cast<int64_t>(capacity_elems)},
-        options,
-        torch::MemoryFormat::Contiguous);
-
-    TORCH_CHECK(slot.tensor.defined(), "loaned slot tensor is undefined");
-    TORCH_CHECK(slot.tensor.is_cuda(), "loaned slot tensor must be CUDA");
-    TORCH_CHECK(slot.tensor.is_contiguous(), "loaned slot tensor must be contiguous");
-    TORCH_CHECK(slot.tensor.nbytes() == capacity_bytes,
-                "loaned slot tensor byte size mismatch");
-
-    {
-      std::lock_guard<std::mutex> lock(oo_mutex_);
-      slot.buffer.reset(wrap_tensor(slot.tensor, "oo_buffer_wrap_ipc_range(loaned_slot)"));
-
-      check_status(
-        oo_buffer_register_ipc(node_, slot.buffer.get()),
-        "oo_buffer_register_ipc(loaned_slot)");
-    }
-
-    return slot;
-  }
-
-  void loaned_replenisher_loop() {
-    try {
-      while (true) {
-        LoanedReplenishRequest req;
-        {
-          std::unique_lock<std::mutex> lock(loaned_mutex_);
-          loaned_cv_.wait(lock, [&] {
-            return loaned_replenisher_stop_ || !loaned_replenish_queue_.empty();
-          });
-
-          if (loaned_replenisher_stop_ && loaned_replenish_queue_.empty()) {
-            break;
-          }
-
-          req = loaned_replenish_queue_.front();
-          loaned_replenish_queue_.pop_front();
-        }
-
-        LoanedSlot slot = make_loaned_slot(req.dtype, req.capacity_bytes);
-
-        {
-          std::lock_guard<std::mutex> lock(loaned_mutex_);
-          loaned_ready_.push_back(std::move(slot));
-        }
-      }
-    } catch (...) {
-      std::lock_guard<std::mutex> lock(loaned_mutex_);
-      loaned_replenisher_error_ = std::current_exception();
-      loaned_replenisher_stop_ = true;
-      loaned_replenish_enabled_ = false;
-    }
-
-    loaned_replenisher_running_.store(false, std::memory_order_release);
-  }
 
  private:
   std::vector<int> devices_;
@@ -925,18 +679,12 @@ class OoTorchCommunicator {
   std::unordered_map<std::string, RegisteredTensorEntry> registered_tensors_;
 
   mutable std::mutex oo_mutex_;
-  mutable std::mutex loaned_mutex_;
-  std::condition_variable loaned_cv_;
-  std::vector<LoanedSlot> loaned_ready_;
-  std::vector<OoBufferPtr> loaned_retired_buffers_;
-  std::vector<LoanedSlotSpec> loaned_specs_;
-  std::deque<LoanedReplenishRequest> loaned_replenish_queue_;
-  std::thread loaned_replenisher_;
-  bool loaned_replenisher_started_ = false;
-  bool loaned_replenisher_stop_ = false;
-  bool loaned_replenish_enabled_ = false;
-  std::exception_ptr loaned_replenisher_error_ = nullptr;
-  std::atomic<bool> loaned_replenisher_running_{false};
+
+  oo_ipc_slot_set_t* round_robin_set_ = nullptr;
+  std::vector<RoundRobinSlot> round_robin_slots_;
+  torch::ScalarType round_robin_dtype_ = torch::kBFloat16;
+  size_t round_robin_capacity_bytes_ = 0;
+  size_t round_robin_index_ = 0;
 };
 
 PYBIND11_MODULE(ooverlap_torch_ext, m) {
@@ -949,20 +697,11 @@ PYBIND11_MODULE(ooverlap_torch_ext, m) {
       .def("all_reduce_out", &OoTorchCommunicator::all_reduce_out)
       .def("all_reduce_inplace", &OoTorchCommunicator::all_reduce_inplace)
       .def("all_reduce_inplace_cached", &OoTorchCommunicator::all_reduce_inplace_cached)
-      .def("init_loaned_slots", &OoTorchCommunicator::init_loaned_slots,
-           py::arg("spec"))
-      .def("init_loaned_slots_from_env", &OoTorchCommunicator::init_loaned_slots_from_env)
-      .def("start_loaned_replenisher", &OoTorchCommunicator::start_loaned_replenisher)
-      .def("stop_loaned_replenisher", &OoTorchCommunicator::stop_loaned_replenisher)
-      .def("set_loaned_replenish_enabled", &OoTorchCommunicator::set_loaned_replenish_enabled,
-           py::arg("enabled"))
-      .def("loaned_replenisher_running", &OoTorchCommunicator::loaned_replenisher_running)
-      .def("loaned_replenish_queue_count", &OoTorchCommunicator::loaned_replenish_queue_count)
-      .def("replenish_loaned_slots_sync", &OoTorchCommunicator::replenish_loaned_slots_sync,
-           py::arg("max_items") = -1)
-      .def("all_reduce_loaned", &OoTorchCommunicator::all_reduce_loaned,
-           py::arg("input"), py::arg("fallback_to_out") = true)
-      .def("loaned_ready_count", &OoTorchCommunicator::loaned_ready_count)
-      .def("loaned_retired_count", &OoTorchCommunicator::loaned_retired_count)
+      .def("init_round_robin_slots", &OoTorchCommunicator::init_round_robin_slots,
+           py::arg("dtype"), py::arg("capacity_bytes"), py::arg("slot_count"))
+      .def("all_reduce_round_robin", &OoTorchCommunicator::all_reduce_round_robin,
+           py::arg("input"))
+      .def("round_robin_slot_count", &OoTorchCommunicator::round_robin_slot_count)
+      .def("round_robin_next_slot", &OoTorchCommunicator::round_robin_next_slot)
       .def("destroy", &OoTorchCommunicator::destroy);
 }
