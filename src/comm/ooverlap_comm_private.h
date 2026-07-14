@@ -66,6 +66,15 @@ struct CollectiveLaunchState {
     int local_device = -1;
     int collective_epoch = 0;
 
+    /*
+     * OOVERLAP_ROUND_ROBIN_PLAN_SCRATCH_RING_V1
+     *
+     * Selects the persistent mapped WindowTaskExecutorPlan scratch entry.
+     * Round-robin collectives use their data slot index here, so the CPU never
+     * overwrites a plan that an earlier asynchronous kernel is still reading.
+     */
+    int plan_scratch_index = 0;
+
     size_t dtype_size = 0;
     size_t bytes = 0;
 };

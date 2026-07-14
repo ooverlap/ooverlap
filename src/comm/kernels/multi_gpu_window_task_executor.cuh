@@ -111,38 +111,30 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
 
 
 /*
- * OOVERLAP_MAPPED_WINDOW_PLAN_SCRATCH_PATCH:
+ * OOVERLAP_MAPPED_WINDOW_PLAN_SCRATCH_PATCH
+ * OOVERLAP_ROUND_ROBIN_PLAN_SCRATCH_RING_V1
  *
- * YAGNI path to remove both per-launch device allocation and cudaMemcpyAsync for
- * WindowTaskExecutorPlan.
+ * The GPU reads WindowTaskExecutorPlan directly from mapped pinned host memory.
+ * Therefore the CPU must not rewrite a plan entry until the prior kernel using
+ * that exact entry has completed.
  *
- * lower_transfer_plan_for_rank() is host code: it writes ordinary C++ pointers
- * and structs.  A cudaMalloc pointer cannot be filled directly by the CPU.  So
- * this uses one persistent cudaHostAllocMapped buffer per device and MaxTasks
- * template instantiation:
- *
- *   CPU lowering writes scratch.host_plan
- *   GPU kernel reads scratch.device_plan
- *
- * This is intentionally a simple benchmark-oriented fast path.  The GPU reads
- * the plan from mapped pinned host memory, so this avoids copy overhead but may
- * be slower than device DRAM if the kernel rereads many task fields.  Later, if
- * plan reads become the bottleneck, use a persistent device buffer plus async
- * copy, or move lowering onto the GPU.
- *
- * Also assumes one outstanding collective per device/template.  If we need
- * concurrent streams with different plans, replace this single slot with a tiny
- * ring indexed by stream/event.
+ * Each round-robin data slot gets a matching plan-scratch entry and completion
+ * event. On reuse, only that slot is queried/synchronized. Other slots remain
+ * available and there is no device-wide synchronization.
  */
+constexpr int kOoMappedWindowPlanScratchSlots = 257;
+
 template <int MaxTasks>
 struct WindowPlanMappedScratch {
     comm::plan::WindowTaskExecutorPlan<MaxTasks>* host_plan = nullptr;
     const comm::plan::WindowTaskExecutorPlan<MaxTasks>* device_plan = nullptr;
+    cudaEvent_t completion_event = nullptr;
 };
 
 template <int MaxTasks>
 cudaError_t get_mapped_window_plan_scratch(
     int device,
+    int scratch_index,
     WindowPlanMappedScratch<MaxTasks>* out) {
     if (out == nullptr) {
         return cudaErrorInvalidValue;
@@ -154,47 +146,32 @@ cudaError_t get_mapped_window_plan_scratch(
         return cudaErrorInvalidDevice;
     }
 
-    static std::mutex mutex;
-    static void* host_buffers[32] = {};
-    static void* device_buffers[32] = {};
+    if (scratch_index < 0 ||
+        scratch_index >= kOoMappedWindowPlanScratchSlots) {
+        return cudaErrorInvalidValue;
+    }
 
-    if (host_buffers[device] != nullptr &&
-        device_buffers[device] != nullptr) {
-        out->host_plan =
-            reinterpret_cast<comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
-                host_buffers[device]);
-        out->device_plan =
-            reinterpret_cast<const comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
-                device_buffers[device]);
-        return cudaSuccess;
+    static std::mutex mutex;
+    static void* host_buffers[32][kOoMappedWindowPlanScratchSlots] = {};
+    static void* device_buffers[32][kOoMappedWindowPlanScratchSlots] = {};
+    static cudaEvent_t completion_events
+        [32][kOoMappedWindowPlanScratchSlots] = {};
+
+    cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess) {
+        return err;
     }
 
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (host_buffers[device] == nullptr ||
-        device_buffers[device] == nullptr) {
-        cudaError_t err =
-            cudaSetDevice(device);
+    void*& host_buffer = host_buffers[device][scratch_index];
+    void*& device_buffer = device_buffers[device][scratch_index];
+    cudaEvent_t& completion_event =
+        completion_events[device][scratch_index];
 
-        if (err != cudaSuccess) {
-            return err;
-        }
-
-        int can_map_host = 0;
-        err =
-            cudaDeviceGetAttribute(
-                &can_map_host,
-                cudaDevAttrCanMapHostMemory,
-                device);
-
-        if (err != cudaSuccess) {
-            return err;
-        }
-
-        if (can_map_host == 0) {
-            return cudaErrorInvalidDevice;
-        }
-
+    if (host_buffer == nullptr ||
+        device_buffer == nullptr ||
+        completion_event == nullptr) {
         void* host_ptr = nullptr;
 
         err =
@@ -220,18 +197,65 @@ cudaError_t get_mapped_window_plan_scratch(
             return err;
         }
 
-        host_buffers[device] = host_ptr;
-        device_buffers[device] = device_ptr;
+        cudaEvent_t event = nullptr;
+        err =
+            cudaEventCreateWithFlags(
+                &event,
+                cudaEventDisableTiming);
+
+        if (err != cudaSuccess) {
+            cudaFreeHost(host_ptr);
+            return err;
+        }
+
+        host_buffer = host_ptr;
+        device_buffer = device_ptr;
+        completion_event = event;
+    } else {
+        /*
+         * The CPU is about to overwrite mapped host memory. A stream wait is not
+         * sufficient for that: it orders GPU work but does not stop this CPU
+         * write. Query first; block the host only if this exact slot is still
+         * being read by its previous kernel.
+         */
+        err = cudaEventQuery(completion_event);
+
+        if (err == cudaErrorNotReady) {
+            err = cudaEventSynchronize(completion_event);
+        }
+
+        if (err != cudaSuccess) {
+            return err;
+        }
     }
 
     out->host_plan =
         reinterpret_cast<comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
-            host_buffers[device]);
+            host_buffer);
     out->device_plan =
         reinterpret_cast<const comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
-            device_buffers[device]);
+            device_buffer);
+    out->completion_event = completion_event;
 
     return cudaSuccess;
+}
+
+
+/*
+ * OOVERLAP_PLAN_SCRATCH_LEGACY_CALLER_OVERLOAD_V1
+ *
+ * Backward-compatible entry point for all-gather and reduce-scatter. Those
+ * paths keep their previous single-outstanding-plan behavior in reserved entry
+ * 256. Round-robin all-reduce uses explicit indices 0..255.
+ */
+template <int MaxTasks>
+cudaError_t get_mapped_window_plan_scratch(
+    int device,
+    WindowPlanMappedScratch<MaxTasks>* out) {
+    return get_mapped_window_plan_scratch<MaxTasks>(
+        device,
+        kOoMappedWindowPlanScratchSlots - 1,
+        out);
 }
 
 

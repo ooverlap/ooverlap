@@ -16,8 +16,10 @@ oo_status_t allreduce_impl(
     oo_tuning_mode_t tuning_mode,
     cudaStream_t stream,
     oo_buffer_t* const* prebound_rank_buffers = nullptr,
-    int prebound_rank_buffer_count = 0) {
+    int prebound_rank_buffer_count = 0,
+    int plan_scratch_index = 0) {
     /* OOVERLAP_ROUND_ROBIN_SLOT_POOL_PATCH_V1 */
+    /* OOVERLAP_ROUND_ROBIN_PLAN_SCRATCH_RING_V1 */
     if (!oo_allreduce_supported(dtype, op)) {
         return OO_ERROR_UNSUPPORTED;
     }
@@ -58,6 +60,8 @@ oo_status_t allreduce_impl(
     if (status != OO_SUCCESS) {
         return status;
     }
+
+    launch.plan_scratch_index = plan_scratch_index;
 
     ooverlap::comm::LaunchConfig config =
         ooverlap::comm::api::select_public_launch_config(
@@ -211,6 +215,7 @@ extern "C" oo_status_t oo_allreduce_slot_tuned(
         tuning_mode,
         stream,
         rank_buffers,
-        set->world_size);
+        set->world_size,
+        slot_index);
 }
 

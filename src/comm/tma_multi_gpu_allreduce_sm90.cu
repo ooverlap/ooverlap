@@ -241,7 +241,8 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     const cudaError_t window_plan_scratch_err =
         comm::kernels::get_mapped_window_plan_scratch<MaxTasks>(
             launch.local_device,
-            &window_plan_scratch);
+            launch.plan_scratch_index,
+            &window_plan_scratch);  // OOVERLAP_ROUND_ROBIN_PLAN_SCRATCH_RING_V1
 
     if (window_plan_scratch_err != cudaSuccess ||
         window_plan_scratch.host_plan == nullptr ||
@@ -296,22 +297,36 @@ cudaError_t launch_allreduce_rank_variant_sm90(
      * Pass the large WindowTaskExecutorPlan through device memory instead of
      * CUDA kernel formal parameter space.
      */
-    return comm::kernels::launch_multi_gpu_window_task_executor_sm90<
-        ReduceApply,
-        ChunkBytes,
-        StageDepth,
-        MaxTasks,
-        MaxPeers,
-        Variant::fill_depth,
-        Variant::load_fill_depth>(
-            window_plan_scratch.device_plan,
-            num_blocks,
-            launch_config.threads,
-            Variant::dynamic_shared_bytes,
-            stream,
-            launch.local_ready_signal,
-            ready_plan,
-            launch.collective_epoch);
+    const cudaError_t launch_error =
+        comm::kernels::launch_multi_gpu_window_task_executor_sm90<
+            ReduceApply,
+            ChunkBytes,
+            StageDepth,
+            MaxTasks,
+            MaxPeers,
+            Variant::fill_depth,
+            Variant::load_fill_depth>(
+                window_plan_scratch.device_plan,
+                num_blocks,
+                launch_config.threads,
+                Variant::dynamic_shared_bytes,
+                stream,
+                launch.local_ready_signal,
+                ready_plan,
+                launch.collective_epoch);
+
+    if (launch_error != cudaSuccess) {
+        return launch_error;
+    }
+
+    /*
+     * The event is queued after the kernel on the same stream. The next use of
+     * this exact plan slot may rewrite its mapped host memory only after this
+     * event has completed.
+     */
+    return cudaEventRecord(
+        window_plan_scratch.completion_event,
+        stream);
 }
 
 template <
