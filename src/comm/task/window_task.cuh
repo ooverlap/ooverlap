@@ -20,8 +20,6 @@ constexpr WindowTaskCtaMask kWindowTaskAllCtas = ~WindowTaskCtaMask{0};
 enum class WindowTaskOp : uint8_t {
     None = 0,
 
-    uint32_t barrier_target = 0;
-
     /*
      * TMA load from task.src into shared memory, then reduce/apply into
      * task.dst. No inter-CTA window signal.
@@ -89,6 +87,8 @@ struct WindowTask {
     WindowTaskOp op = WindowTaskOp::None;
 
     WindowTaskCtaMask cta_mask = kWindowTaskAllCtas;
+
+    uint32_t barrier_target = 0;
 
     const void* src = nullptr;
     void* dst = nullptr;

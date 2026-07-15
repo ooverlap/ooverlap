@@ -13,6 +13,41 @@ namespace ooverlap {
 namespace comm {
 namespace kernels {
 
+__device__ __forceinline__ void wait_until_cta_barrier_counter_at_least(
+    unsigned int* counter,
+    unsigned int target) {
+    if (counter == nullptr || target == 0) {
+        return;
+    }
+
+    cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
+
+    while (state.load(cuda::memory_order_acquire) < target) {
+        __nanosleep(64);
+    }
+}
+
+__device__ __forceinline__ void advance_cta_barrier_counter(
+    unsigned int* counter,
+    unsigned int increment) {
+    if (counter == nullptr || increment == 0) {
+        return;
+    }
+
+    cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
+    state.fetch_add(increment, cuda::memory_order_release);
+}
+
+__device__ __forceinline__ void reset_cta_barrier_counter(
+    unsigned int* counter) {
+    if (counter == nullptr) {
+        return;
+    }
+
+    cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
+    state.store(0u, cuda::memory_order_release);
+}
+
 __device__ __forceinline__ void arrive_and_wait_cta_barrier(
     unsigned int* counter,
     unsigned int target) {
@@ -22,9 +57,9 @@ __device__ __forceinline__ void arrive_and_wait_cta_barrier(
 
     if (threadIdx.x == 0) {
         cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
-        state.fetch_add(1u);
+        state.fetch_add(1u, cuda::memory_order_acq_rel);
 
-        while (state.load() < target) {
+        while (state.load(cuda::memory_order_acquire) < target) {
             __nanosleep(64);
         }
     }
@@ -270,6 +305,9 @@ __device__ __forceinline__ void execute_window_task_stripe(
                 cta_barrier_counter);
 
         if (task.terminal) {
+            if (cta_idx == 0 && threadIdx.x == 0) {
+                reset_cta_barrier_counter(cta_barrier_counter);
+            }
             return;
         }
 

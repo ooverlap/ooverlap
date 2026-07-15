@@ -61,9 +61,43 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
 
     __shared__ sync::semaphore barriers[Variant::barrier_count];
 
-    if (collective_epoch > 0 &&
+    const bool use_entry_ready =
+        collective_epoch > 0 &&
         local_ready_signal != nullptr &&
-        ready_plan.protocol != MultiGpuReadySignalProtocol::Disabled) {
+        ready_plan.protocol != MultiGpuReadySignalProtocol::Disabled;
+
+    if (cta_barrier_counter != nullptr) {
+        if (threadIdx.x == 0) {
+            if (blockIdx.x == 0) {
+                if (use_entry_ready) {
+                    const int entry_ready_value =
+                        collective_epoch * comm::plan::kReadySignalPhaseStride;
+
+                    publish_ready_signal(
+                        local_ready_signal,
+                        entry_ready_value,
+                        ready_plan.protocol);
+
+                    for (int peer_idx = 0;
+                         peer_idx < ready_plan.peer_count;
+                         ++peer_idx) {
+                        wait_until_ready_signal_at_least(
+                            ready_plan.peer_ready_signals[peer_idx],
+                            entry_ready_value,
+                            ready_plan.poll_sleep_cycles);
+                    }
+                }
+
+                advance_cta_barrier_counter(cta_barrier_counter, 1u);
+            } else {
+                wait_until_cta_barrier_counter_at_least(
+                    cta_barrier_counter,
+                    1u);
+            }
+        }
+
+        __syncthreads();
+    } else if (use_entry_ready) {
         const int entry_ready_value =
             collective_epoch * comm::plan::kReadySignalPhaseStride;
 
@@ -132,10 +166,43 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
  */
 constexpr int kOoMappedWindowPlanScratchSlots = 257;
 
+inline cudaError_t allocate_zeroed_cta_barrier_counter(
+    int device,
+    unsigned int** out) {
+    if (out == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    *out = nullptr;
+
+    cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess) {
+        return err;
+    }
+
+    unsigned int* counter = nullptr;
+    err = cudaMalloc(
+        reinterpret_cast<void**>(&counter),
+        sizeof(unsigned int));
+    if (err != cudaSuccess) {
+        return err;
+    }
+
+    err = cudaMemset(counter, 0, sizeof(unsigned int));
+    if (err != cudaSuccess) {
+        cudaFree(counter);
+        return err;
+    }
+
+    *out = counter;
+    return cudaSuccess;
+}
+
 template <int MaxTasks>
 struct WindowPlanMappedScratch {
     comm::plan::WindowTaskExecutorPlan<MaxTasks>* host_plan = nullptr;
     const comm::plan::WindowTaskExecutorPlan<MaxTasks>* device_plan = nullptr;
+    unsigned int* cta_barrier_counter = nullptr;
     cudaEvent_t completion_event = nullptr;
 };
 
@@ -162,6 +229,8 @@ cudaError_t get_mapped_window_plan_scratch(
     static std::mutex mutex;
     static void* host_buffers[32][kOoMappedWindowPlanScratchSlots] = {};
     static void* device_buffers[32][kOoMappedWindowPlanScratchSlots] = {};
+    static unsigned int* cta_barrier_counters
+        [32][kOoMappedWindowPlanScratchSlots] = {};
     static cudaEvent_t completion_events
         [32][kOoMappedWindowPlanScratchSlots] = {};
 
@@ -179,8 +248,12 @@ cudaError_t get_mapped_window_plan_scratch(
                 std::memory_order_acquire)) {
             void* host_buffer = host_buffers[device][storage_index];
             void* device_buffer = device_buffers[device][storage_index];
+            unsigned int* cta_barrier_counter =
+                cta_barrier_counters[device][storage_index];
 
-            if (host_buffer != nullptr && device_buffer != nullptr) {
+            if (host_buffer != nullptr &&
+                device_buffer != nullptr &&
+                cta_barrier_counter != nullptr) {
                 out->host_plan =
                     reinterpret_cast<
                         comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
@@ -189,6 +262,7 @@ cudaError_t get_mapped_window_plan_scratch(
                     reinterpret_cast<
                         const comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
                             device_buffer);
+                out->cta_barrier_counter = cta_barrier_counter;
                 out->completion_event = nullptr;
                 return cudaSuccess;
             }
@@ -198,6 +272,8 @@ cudaError_t get_mapped_window_plan_scratch(
 
         void*& host_buffer = host_buffers[device][storage_index];
         void*& device_buffer = device_buffers[device][storage_index];
+        unsigned int*& cta_barrier_counter =
+            cta_barrier_counters[device][storage_index];
 
         /*
          * Check again after taking the lock. Another thread may have completed
@@ -238,6 +314,16 @@ cudaError_t get_mapped_window_plan_scratch(
             device_buffer = device_ptr;
         }
 
+        if (cta_barrier_counter == nullptr) {
+            const cudaError_t counter_err =
+                allocate_zeroed_cta_barrier_counter(
+                    device,
+                    &cta_barrier_counter);
+            if (counter_err != cudaSuccess) {
+                return counter_err;
+            }
+        }
+
         no_event_fast_path_ready[device].store(
             true,
             std::memory_order_release);
@@ -249,6 +335,7 @@ cudaError_t get_mapped_window_plan_scratch(
             reinterpret_cast<
                 const comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
                     device_buffer);
+        out->cta_barrier_counter = cta_barrier_counter;
         out->completion_event = nullptr;
 
         return cudaSuccess;
@@ -266,6 +353,8 @@ cudaError_t get_mapped_window_plan_scratch(
 
     void*& host_buffer = host_buffers[device][scratch_index];
     void*& device_buffer = device_buffers[device][scratch_index];
+    unsigned int*& cta_barrier_counter =
+        cta_barrier_counters[device][scratch_index];
     cudaEvent_t& completion_event =
         completion_events[device][scratch_index];
 
@@ -329,12 +418,23 @@ cudaError_t get_mapped_window_plan_scratch(
         }
     }
 
+    if (cta_barrier_counter == nullptr) {
+        const cudaError_t counter_err =
+            allocate_zeroed_cta_barrier_counter(
+                device,
+                &cta_barrier_counter);
+        if (counter_err != cudaSuccess) {
+            return counter_err;
+        }
+    }
+
     out->host_plan =
         reinterpret_cast<comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
             host_buffer);
     out->device_plan =
         reinterpret_cast<const comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
             device_buffer);
+    out->cta_barrier_counter = cta_barrier_counter;
     out->completion_event = completion_event;
 
     return cudaSuccess;
@@ -358,46 +458,6 @@ cudaError_t get_mapped_window_plan_scratch(
         out);
 }
 
-
-/*
- * One persistent device counter per GPU for the research CTA barrier path.
- * The current path assumes one active executor kernel per device.
- */
-inline cudaError_t get_device_cta_barrier_counter(
-    int device,
-    unsigned int** out) {
-    if (out == nullptr) {
-        return cudaErrorInvalidValue;
-    }
-
-    *out = nullptr;
-
-    if (device < 0 || device >= 32) {
-        return cudaErrorInvalidDevice;
-    }
-
-    static std::mutex mutex;
-    static unsigned int* counters[32] = {};
-
-    std::lock_guard<std::mutex> lock(mutex);
-
-    if (counters[device] == nullptr) {
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess) {
-            return err;
-        }
-
-        err = cudaMalloc(
-            reinterpret_cast<void**>(&counters[device]),
-            sizeof(unsigned int));
-        if (err != cudaSuccess) {
-            return err;
-        }
-    }
-
-    *out = counters[device];
-    return cudaSuccess;
-}
 
 /*
  * OOVERLAP_WINDOW_PLAN_DEVICE_LAUNCH_HELPER_PATCH:

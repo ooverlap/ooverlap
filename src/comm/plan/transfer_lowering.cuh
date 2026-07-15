@@ -764,6 +764,7 @@ inline bool recompute_rank_transfer_task_stats(
 
     buffer->ready_count = 0;
     buffer->ready_pair_count = 0;
+    buffer->barrier_count = 0;
     buffer->window_count = 0;
     buffer->max_end_window = 0;
 
@@ -836,10 +837,6 @@ inline bool collect_rank_transfer_tasks(
             continue;
         }
 
-        if (transfer_task_is_barrier(transfer)) {
-            continue;
-        }
-
         if (transfer_task_is_ready(transfer)) {
             if (!ctx.lower_ready_tasks) {
                 continue;
@@ -885,6 +882,10 @@ inline bool pass_validate_transfer_tasks(
         if (transfer.executor_rank != ctx.current_rank ||
             !transfer_task_has_work(transfer)) {
             return false;
+        }
+
+        if (transfer_task_is_barrier(transfer)) {
+            continue;
         }
 
         if (transfer_task_is_ready(transfer)) {

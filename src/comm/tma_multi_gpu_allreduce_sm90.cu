@@ -199,19 +199,6 @@ void debug_print_window_task_plan(
 }
 #endif
 
-
-template <int MaxTasks>
-bool window_plan_has_cta_barrier(
-    const comm::plan::WindowTaskExecutorPlan<MaxTasks>& plan) {
-    for (int i = 0; i < plan.total_tasks; ++i) {
-        if (plan.tasks[i].op == comm::task::WindowTaskOp::Barrier) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 template <
     typename ReduceOp,
     int ChunkBytes,
@@ -389,7 +376,8 @@ cudaError_t launch_allreduce_rank_variant_sm90(
 
     if (window_plan_scratch_err != cudaSuccess ||
         window_plan_scratch.host_plan == nullptr ||
-        window_plan_scratch.device_plan == nullptr) {
+        window_plan_scratch.device_plan == nullptr ||
+        window_plan_scratch.cta_barrier_counter == nullptr) {
         return window_plan_scratch_err != cudaSuccess
             ? window_plan_scratch_err
             : cudaErrorInvalidValue;
@@ -426,32 +414,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
 
     if (num_blocks <= 0 || window_plan.total_tasks <= 0) {
         return cudaSuccess;
-    }
-
-    unsigned int* cta_barrier_counter = nullptr;
-
-    if (window_plan_has_cta_barrier(window_plan)) {
-        const cudaError_t counter_err =
-            comm::kernels::get_device_cta_barrier_counter(
-                launch.local_device,
-                &cta_barrier_counter);
-
-        if (counter_err != cudaSuccess || cta_barrier_counter == nullptr) {
-            return counter_err != cudaSuccess
-                ? counter_err
-                : cudaErrorInvalidValue;
-        }
-
-        static const unsigned int initial_barrier_value = 1u;
-        const cudaError_t reset_err = cudaMemcpyAsync(
-            cta_barrier_counter,
-            &initial_barrier_value,
-            sizeof(initial_barrier_value),
-            cudaMemcpyHostToDevice,
-            stream);
-        if (reset_err != cudaSuccess) {
-            return reset_err;
-        }
     }
 
     #if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
@@ -498,7 +460,7 @@ cudaError_t launch_allreduce_rank_variant_sm90(
                 launch.local_ready_signal,
                 ready_plan,
                 launch.collective_epoch,
-                cta_barrier_counter);
+                window_plan_scratch.cta_barrier_counter);
 
     if (launch_error != cudaSuccess) {
         return launch_error;
