@@ -35,7 +35,8 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
     const comm::plan::WindowTaskExecutorPlan<MaxTasks>* plan,
     int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
-    int collective_epoch) {
+    int collective_epoch,
+    unsigned int* cta_barrier_counter) {
 
     using Variant = comm::TmaPipelineVariant<
         ChunkBytes,
@@ -105,7 +106,8 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
             plan->tasks_per_cta,
             static_cast<int>(blockIdx.x),
             shared_raw,
-            barriers);
+            barriers,
+            cta_barrier_counter);
 }
 
 
@@ -358,6 +360,46 @@ cudaError_t get_mapped_window_plan_scratch(
 
 
 /*
+ * One persistent device counter per GPU for the research CTA barrier path.
+ * The current path assumes one active executor kernel per device.
+ */
+inline cudaError_t get_device_cta_barrier_counter(
+    int device,
+    unsigned int** out) {
+    if (out == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    *out = nullptr;
+
+    if (device < 0 || device >= 32) {
+        return cudaErrorInvalidDevice;
+    }
+
+    static std::mutex mutex;
+    static unsigned int* counters[32] = {};
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (counters[device] == nullptr) {
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            return err;
+        }
+
+        err = cudaMalloc(
+            reinterpret_cast<void**>(&counters[device]),
+            sizeof(unsigned int));
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+
+    *out = counters[device];
+    return cudaSuccess;
+}
+
+/*
  * OOVERLAP_WINDOW_PLAN_DEVICE_LAUNCH_HELPER_PATCH:
  *
  * WindowTaskExecutorPlan can be too large to pass by value as a CUDA kernel
@@ -381,7 +423,8 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
     cudaStream_t stream,
     int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
-    int collective_epoch) {
+    int collective_epoch,
+    unsigned int* cta_barrier_counter = nullptr) {
     if (num_blocks <= 0 || threads <= 0 || window_plan == nullptr) {
         return cudaSuccess;
     }
@@ -402,7 +445,8 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
                 window_plan,
                 local_ready_signal,
                 ready_plan,
-                collective_epoch);
+                collective_epoch,
+                cta_barrier_counter);
 
     return cudaGetLastError();
 }

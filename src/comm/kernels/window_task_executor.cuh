@@ -7,9 +7,28 @@
 #include "comm/tma_variant_config.h"
 #include "comm/kernels/multi_gpu_ready_signal.cuh"
 
+#include <cuda/atomic>
+
 namespace ooverlap {
 namespace comm {
 namespace kernels {
+
+__device__ __forceinline__ void arrive_and_wait_cta_barrier(
+    unsigned int* counter,
+    unsigned int target) {
+    if (counter == nullptr || target == 0) {
+        return;
+    }
+
+    if (threadIdx.x == 0) {
+        cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
+        state.fetch_add(1u);
+
+        while (state.load() < target) {
+            __nanosleep(64);
+        }
+    }
+}
 
 /*
  * Execute one task.
@@ -33,7 +52,8 @@ template <
 __device__ __forceinline__ void execute_window_task(
     const task::WindowTask& task,
     unsigned char* shared_raw,
-    sync::semaphore* barriers) {
+    sync::semaphore* barriers,
+    unsigned int* cta_barrier_counter) {
     static_assert(StageDepth > 0, "StageDepth must be > 0");
     static_assert(FillDepth > 0, "FillDepth must be > 0");
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
@@ -148,6 +168,12 @@ __device__ __forceinline__ void execute_window_task(
             }
             return;
 
+        case task::WindowTaskOp::Barrier:
+            arrive_and_wait_cta_barrier(
+                cta_barrier_counter,
+                task.barrier_target);
+            return;
+
         case task::WindowTaskOp::None:
         default:
             return;
@@ -188,7 +214,8 @@ __device__ __forceinline__ void execute_window_task_stripe(
     int tasks_per_cta,
     int cta_idx,
     unsigned char* shared_raw,
-    sync::semaphore* barriers) {
+    sync::semaphore* barriers,
+    unsigned int* cta_barrier_counter) {
     static_assert(StageDepth > 0, "StageDepth must be > 0");
     static_assert(FillDepth > 0, "FillDepth must be > 0");
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
@@ -239,7 +266,8 @@ __device__ __forceinline__ void execute_window_task_stripe(
             SmallTaskBytes>(
                 task,
                 shared_raw,
-                barriers);
+                barriers,
+                cta_barrier_counter);
 
         if (task.terminal) {
             return;

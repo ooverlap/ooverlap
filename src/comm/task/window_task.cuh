@@ -20,6 +20,8 @@ constexpr WindowTaskCtaMask kWindowTaskAllCtas = ~WindowTaskCtaMask{0};
 enum class WindowTaskOp : uint8_t {
     None = 0,
 
+    uint32_t barrier_target = 0;
+
     /*
      * TMA load from task.src into shared memory, then reduce/apply into
      * task.dst. No inter-CTA window signal.
@@ -80,6 +82,7 @@ enum class WindowTaskOp : uint8_t {
 
     CopyTMAFanout = 11,
     ReduceTMAFanout = 12,
+    Barrier = 13,
 };
 
 struct WindowTask {
@@ -155,6 +158,14 @@ __host__ __device__ __forceinline__ bool window_task_runs_on_cta(
         WindowTaskCtaMask{1} << static_cast<unsigned int>(cta_idx);
 
     return (task.cta_mask & cta_bit) != 0;
+}
+
+__host__ __device__ __forceinline__ WindowTask make_barrier_task(
+    uint32_t barrier_target) {
+    WindowTask task{};
+    task.op = WindowTaskOp::Barrier;
+    task.barrier_target = barrier_target;
+    return task;
 }
 
 __host__ __device__ __forceinline__ WindowTask make_window_task(

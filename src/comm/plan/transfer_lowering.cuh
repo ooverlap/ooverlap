@@ -215,6 +215,11 @@ __host__ __device__ __forceinline__ bool transfer_task_is_ready(
            task.op == TransferOp::ReadyWait;
 }
 
+__host__ __device__ __forceinline__ bool transfer_task_is_barrier(
+    const TransferTask& task) {
+    return task.op == TransferOp::Barrier;
+}
+
 __host__ __device__ __forceinline__ bool transfer_task_is_windowed(
     const TransferTask& task) {
     return task.op == TransferOp::Copy ||
@@ -689,6 +694,7 @@ struct RankTransferTaskBuffer {
     int count;
     int ready_count;
     int ready_pair_count;
+    int barrier_count;
     int window_count;
     int max_end_window;
 
@@ -718,6 +724,7 @@ inline void rank_transfer_task_buffer_reset(
     buffer->count = 0;
     buffer->ready_count = 0;
     buffer->ready_pair_count = 0;
+    buffer->barrier_count = 0;
     buffer->window_count = 0;
     buffer->max_end_window = 0;
 }
@@ -762,6 +769,11 @@ inline bool recompute_rank_transfer_task_stats(
 
     for (int i = 0; i < buffer->count; ++i) {
         const TransferTask& transfer = buffer->tasks[i];
+
+        if (transfer_task_is_barrier(transfer)) {
+            ++buffer->barrier_count;
+            continue;
+        }
 
         if (transfer_task_is_ready(transfer)) {
             ++buffer->ready_count;
@@ -816,11 +828,15 @@ inline bool collect_rank_transfer_tasks(
             return false;
         }
 
-        /*
-         * Barrier is part of the logical IR now. Its real CTA synchronization
-         * lowering is intentionally added later; skip it for current execution.
-         */
-        if (transfer.op == TransferOp::Barrier) {
+        if (transfer_task_is_barrier(transfer)) {
+            if (!rank_transfer_task_buffer_push(out, transfer)) {
+                return false;
+            }
+
+            continue;
+        }
+
+        if (transfer_task_is_barrier(transfer)) {
             continue;
         }
 
@@ -1107,6 +1123,53 @@ inline ReduceCtaGroup reduce_cta_group_for_task(
     return group;
 }
 
+template <int MaxTransferTasks, int MaxRanks>
+inline bool barrier_follows_full_cta_reduce(
+    const RankTransferTaskBuffer<MaxTransferTasks>& tasks,
+    int barrier_task_index,
+    const LoweringContext<MaxRanks>& ctx,
+    int launched_ctas) {
+    int producer_index = barrier_task_index - 1;
+
+    while (producer_index >= 0 &&
+           transfer_task_is_ready(tasks.tasks[producer_index])) {
+        --producer_index;
+    }
+
+    if (producer_index < 0) {
+        return false;
+    }
+
+    const TransferTask& producer = tasks.tasks[producer_index];
+
+    if (producer.op == TransferOp::ReduceFanout) {
+        return true;
+    }
+
+    if (producer.op != TransferOp::Reduce) {
+        return false;
+    }
+
+    if (!ctx.options.enable_reduce_cta_groups) {
+        return true;
+    }
+
+    int reduce_task_index = 0;
+    for (int i = 0; i < producer_index; ++i) {
+        if (tasks.tasks[i].op == TransferOp::Reduce) {
+            ++reduce_task_index;
+        }
+    }
+
+    const ReduceCtaGroup group =
+        reduce_cta_group_for_task(
+            reduce_task_index,
+            launched_ctas,
+            ctx.options.max_ctas_per_reduce_task);
+
+    return group.first_cta == 0 && group.cta_count == launched_ctas;
+}
+
 template <int MaxTransferTasks, int MaxWindowTasks, int MaxRanks>
 inline bool compute_lowering_shape(
     const LoweringContext<MaxRanks>& ctx,
@@ -1119,7 +1182,9 @@ inline bool compute_lowering_shape(
     LoweringShape shape{};
     shape.max_end_window = tasks.max_end_window;
 
-    if (tasks.ready_count == 0 && tasks.window_count == 0) {
+    if (tasks.ready_count == 0 &&
+        tasks.barrier_count == 0 &&
+        tasks.window_count == 0) {
         *out = shape;
         return true;
     }
@@ -1131,6 +1196,7 @@ inline bool compute_lowering_shape(
 
     shape.tasks_per_cta =
         tasks.ready_count +
+        tasks.barrier_count +
         tasks.window_count -
         merged_ready_task_savings;
 
@@ -1233,9 +1299,31 @@ inline bool emit_window_plan_from_rank_tasks(
         int task_idx = cta_idx * shape.tasks_per_cta;
         int ready_pair_index = 0;
         int reduce_task_index = 0;
+        int active_barrier_index = 0;
 
         for (int i = 0; i < rank_tasks.count; ++i) {
             const TransferTask& transfer = rank_tasks.tasks[i];
+
+            if (transfer_task_is_barrier(transfer)) {
+                if (barrier_follows_full_cta_reduce(
+                        rank_tasks,
+                        i,
+                        ctx,
+                        shape.cta_count)) {
+                    out_window_plan->tasks[task_idx++] = task::WindowTask{};
+                    continue;
+                }
+
+                const unsigned int barrier_target =
+                    1u +
+                    static_cast<unsigned int>(
+                        (active_barrier_index + 1) * shape.cta_count);
+
+                out_window_plan->tasks[task_idx++] =
+                    task::make_barrier_task(barrier_target);
+                ++active_barrier_index;
+                continue;
+            }
 
             if (transfer_task_is_ready(transfer)) {
                 if (!ctx.lower_ready_tasks || ctx.ready_binding == nullptr) {
