@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -30,7 +31,29 @@ namespace {
 
 using testing::TestCollective;
 
-constexpr int kIpcExternalWorldSize = 2;
+void validate_devices(
+    const std::vector<int>& devices,
+    int local_rank) {
+    if (devices.size() < 2) {
+        throw std::invalid_argument(
+            "IPC external P2P collective requires at least two devices");
+    }
+
+    std::set<int> unique;
+    for (int device : devices) {
+        if (device < 0) {
+            throw std::invalid_argument("device ids must be non-negative");
+        }
+        if (!unique.insert(device).second) {
+            throw std::invalid_argument("device ids must be unique");
+        }
+    }
+
+    if (local_rank < 0 ||
+        local_rank >= static_cast<int>(devices.size())) {
+        throw std::invalid_argument("local_rank is outside the device list");
+    }
+}
 
 void broker_sync(oo_group_t* group) {
     if (group != nullptr && group->broker) {
@@ -52,11 +75,7 @@ void nccl_mem_alloc_half_on_device(
     system::runtime::set_device(device);
 
     void* raw = nullptr;
-
-    OOVERLAP_TEST_NCCL_CHECK(
-        ncclMemAlloc(
-            &raw,
-            bytes));
+    OOVERLAP_TEST_NCCL_CHECK(ncclMemAlloc(&raw, bytes));
 
     if (raw == nullptr) {
         throw std::runtime_error(
@@ -95,7 +114,6 @@ void register_nccl_symmetric_window_rank(
     size_t bytes,
     ncclWindow_t& win) {
     win = nullptr;
-
     OOVERLAP_TEST_NCCL_CHECK(
         ncclCommWindowRegister(
             comm,
@@ -128,7 +146,6 @@ void launch_ooverlap_public_once_for_rank(
 
     if (collective == TestCollective::ReduceScatter) {
         oo_tensor_slice_t slice{};
-
         testing::check_oo(
             oo_reduce_scatter_tuned(
                 node,
@@ -165,6 +182,7 @@ void launch_nccl_once_for_rank(
     half* work,
     size_t numel,
     int local_rank,
+    int world_size,
     cudaStream_t stream) {
     testing::launch_nccl_collective_fp16(
         collective,
@@ -172,7 +190,7 @@ void launch_nccl_once_for_rank(
         work,
         numel,
         local_rank,
-        kIpcExternalWorldSize,
+        world_size,
         stream);
 }
 
@@ -180,10 +198,7 @@ void sync_device_stream(
     int device,
     cudaStream_t stream,
     const char* label) {
-    system::runtime::sync_stream_on_device(
-        device,
-        stream,
-        label);
+    system::runtime::sync_stream_on_device(device, stream, label);
 }
 
 void reset_and_sync(
@@ -199,11 +214,7 @@ void reset_and_sync(
         bytes,
         device,
         stream);
-
-    sync_device_stream(
-        device,
-        stream,
-        label);
+    sync_device_stream(device, stream, label);
 }
 
 void verify_collective_result_rank(
@@ -212,6 +223,7 @@ void verify_collective_result_rank(
     half* work,
     int64_t numel,
     int local_rank,
+    int world_size,
     int local_device,
     bool verify_runtime) {
 #if OOVERLAP_BENCH_VERIFY_RESULTS
@@ -224,15 +236,13 @@ void verify_collective_result_rank(
         return;
     }
 
-    return;
-
     testing::verify_collective_fp16(
         collective,
         label,
         work,
         numel,
         local_rank,
-        kIpcExternalWorldSize,
+        world_size,
         local_device);
 }
 
@@ -258,7 +268,6 @@ void warmup_ooverlap_rank(
             "sync ipc ooverlap warmup reset");
 
         broker_sync(group);
-
         launch_ooverlap_public_once_for_rank(
             collective,
             node,
@@ -266,12 +275,10 @@ void warmup_ooverlap_rank(
             numel,
             stream,
             "ipc ooverlap warmup");
-
         sync_device_stream(
             local_device,
             stream,
             "sync ipc ooverlap warmup");
-
         broker_sync(group);
     }
 }
@@ -300,21 +307,18 @@ double benchmark_ooverlap_rank_total_ms(
             "sync ipc ooverlap timed reset");
 
         broker_sync(group);
-
-        total_ms +=
-            testing::elapsed_one_rank_ms(
-                local_device,
-                stream,
-                [&]() {
-                    launch_ooverlap_public_once_for_rank(
-                        collective,
-                        node,
-                        local_buf,
-                        numel,
-                        stream,
-                        "ipc ooverlap timed");
-                });
-
+        total_ms += testing::elapsed_one_rank_ms(
+            local_device,
+            stream,
+            [&]() {
+                launch_ooverlap_public_once_for_rank(
+                    collective,
+                    node,
+                    local_buf,
+                    numel,
+                    stream,
+                    "ipc ooverlap timed");
+            });
         broker_sync(group);
     }
 
@@ -330,6 +334,7 @@ void warmup_nccl_rank(
     size_t numel,
     size_t bytes,
     int local_rank,
+    int world_size,
     int local_device,
     cudaStream_t stream,
     int warmup,
@@ -344,20 +349,15 @@ void warmup_nccl_rank(
             "sync ipc nccl warmup reset");
 
         broker_sync(barrier_group);
-
         launch_nccl_once_for_rank(
             collective,
             comm,
             work,
             numel,
             local_rank,
+            world_size,
             stream);
-
-        sync_device_stream(
-            local_device,
-            stream,
-            sync_label);
-
+        sync_device_stream(local_device, stream, sync_label);
         broker_sync(barrier_group);
     }
 }
@@ -371,6 +371,7 @@ double benchmark_nccl_rank_total_ms(
     size_t numel,
     size_t bytes,
     int local_rank,
+    int world_size,
     int local_device,
     cudaStream_t stream,
     int iters) {
@@ -386,21 +387,19 @@ double benchmark_nccl_rank_total_ms(
             "sync ipc nccl timed reset");
 
         broker_sync(barrier_group);
-
-        total_ms +=
-            testing::elapsed_one_rank_ms(
-                local_device,
-                stream,
-                [&]() {
-                    launch_nccl_once_for_rank(
-                        collective,
-                        comm,
-                        work,
-                        numel,
-                        local_rank,
-                        stream);
-                });
-
+        total_ms += testing::elapsed_one_rank_ms(
+            local_device,
+            stream,
+            [&]() {
+                launch_nccl_once_for_rank(
+                    collective,
+                    comm,
+                    work,
+                    numel,
+                    local_rank,
+                    world_size,
+                    stream);
+            });
         broker_sync(barrier_group);
     }
 
@@ -433,21 +432,10 @@ void cleanup_rank(
         ooverlap_buf = nullptr;
     }
 
-    testing::cuda_free_on_device(
-        local_device,
-        local_src);
-
-    testing::cuda_free_on_device(
-        local_device,
-        ooverlap_work);
-
-    testing::cuda_free_on_device(
-        local_device,
-        nccl_work);
-
-    nccl_mem_free_on_device(
-        local_device,
-        nccl_symmetric_work);
+    testing::cuda_free_on_device(local_device, local_src);
+    testing::cuda_free_on_device(local_device, ooverlap_work);
+    testing::cuda_free_on_device(local_device, nccl_work);
+    nccl_mem_free_on_device(local_device, nccl_symmetric_work);
 
     if (node != nullptr) {
         oo_node_destroy(node);
@@ -460,31 +448,27 @@ void cleanup_rank(
     }
 
     if (stream != nullptr) {
-        system::runtime::destroy_stream_on_device(
-            local_device,
-            stream);
+        system::runtime::destroy_stream_on_device(local_device, stream);
         stream = nullptr;
     }
 }
 
 } // namespace
 
-bool ipc_external_p2p_two_gpu_collective_smoke_rank_sm90(
+bool ipc_external_p2p_collective_smoke_rank_sm90(
     const std::string& collective_name_arg,
     int64_t numel,
     int local_rank,
-    int dev0,
-    int dev1,
+    const std::vector<int>& devices,
     const std::string& broker_key,
     const std::vector<int64_t>& nccl_unique_id_bytes,
     bool verify) {
     std::map<std::string, double> result =
-        benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
+        benchmark_ipc_external_p2p_collective_rank_sm90(
             collective_name_arg,
             numel,
             local_rank,
-            dev0,
-            dev1,
+            devices,
             broker_key,
             nccl_unique_id_bytes,
             1,
@@ -495,12 +479,11 @@ bool ipc_external_p2p_two_gpu_collective_smoke_rank_sm90(
 }
 
 std::map<std::string, double>
-benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
+benchmark_ipc_external_p2p_collective_rank_sm90(
     const std::string& collective_name_arg,
     int64_t numel_arg,
     int local_rank,
-    int dev0,
-    int dev1,
+    const std::vector<int>& devices,
     const std::string& broker_key,
     const std::vector<int64_t>& nccl_unique_id_bytes,
     int iters,
@@ -509,31 +492,25 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
     if (numel_arg <= 0 ||
         iters <= 0 ||
         warmup < 0 ||
-        broker_key.empty() ||
-        (local_rank != 0 && local_rank != 1) ||
-        dev0 == dev1) {
+        broker_key.empty()) {
         throw std::invalid_argument(
-            "benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90: invalid args");
+            "benchmark_ipc_external_p2p_collective_rank_sm90: invalid args");
     }
 
+    validate_devices(devices, local_rank);
+
+    const int world_size = static_cast<int>(devices.size());
+    const int local_device = devices[static_cast<std::size_t>(local_rank)];
     const TestCollective collective =
-        testing::parse_collective(
-            collective_name_arg);
+        testing::parse_collective(collective_name_arg);
 
     testing::validate_numel_for_collective(
         collective,
         numel_arg,
-        kIpcExternalWorldSize);
+        world_size);
 
-    const size_t numel =
-        static_cast<size_t>(numel_arg);
-
-    const size_t bytes =
-        numel * sizeof(half);
-
-    const int devices[2] = {dev0, dev1};
-    const int local_device =
-        local_rank == 0 ? dev0 : dev1;
+    const size_t numel = static_cast<size_t>(numel_arg);
+    const size_t bytes = numel * sizeof(half);
 
     oo_group_t* group = nullptr;
     oo_node_t* node = nullptr;
@@ -545,35 +522,28 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
     half* nccl_symmetric_work = nullptr;
 
     cudaStream_t stream = nullptr;
-
     ncclComm_t nccl_comm = nullptr;
     ncclWindow_t nccl_symmetric_win = nullptr;
 
     try {
         system::runtime::set_device(local_device);
-
-        stream =
-            system::runtime::create_stream_on_device(
-                local_device);
+        stream = system::runtime::create_stream_on_device(local_device);
 
         testing::cuda_malloc_half_on_device(
             local_device,
             &local_src,
             bytes,
             "cudaMalloc(ipc external local_src)");
-
         testing::cuda_malloc_half_on_device(
             local_device,
             &ooverlap_work,
             bytes,
             "cudaMalloc(ipc external ooverlap_work)");
-
         testing::cuda_malloc_half_on_device(
             local_device,
             &nccl_work,
             bytes,
             "cudaMalloc(ipc external nccl_work)");
-
         nccl_mem_alloc_half_on_device(
             local_device,
             &nccl_symmetric_work,
@@ -589,8 +559,8 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
 
         testing::check_oo(
             oo_group_create_ipc(
-                devices,
-                kIpcExternalWorldSize,
+                devices.data(),
+                world_size,
                 local_rank,
                 broker_key.c_str(),
                 &group),
@@ -612,18 +582,15 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             "oo_buffer_wrap(ipc external ooverlap_work)");
 
         const ncclUniqueId nccl_id =
-            testing::make_nccl_unique_id(
-                nccl_unique_id_bytes);
+            testing::make_nccl_unique_id(nccl_unique_id_bytes);
 
         broker_sync(group);
-
         OOVERLAP_TEST_NCCL_CHECK(
             ncclCommInitRank(
                 &nccl_comm,
-                kIpcExternalWorldSize,
+                world_size,
                 nccl_id,
                 local_rank));
-
         broker_sync(group);
 
         register_nccl_symmetric_window_rank(
@@ -631,7 +598,6 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             nccl_symmetric_work,
             bytes,
             nccl_symmetric_win);
-
         broker_sync(group);
 
         std::map<std::string, double> results;
@@ -667,13 +633,13 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             local_device,
             stream,
             "sync ipc ooverlap measured");
-
         verify_collective_result_rank(
             collective,
             "ipc ooverlap external p2p",
             ooverlap_work,
             numel_arg,
             local_rank,
+            world_size,
             local_device,
             verify);
 
@@ -686,6 +652,7 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             numel,
             bytes,
             local_rank,
+            world_size,
             local_device,
             stream,
             warmup,
@@ -701,6 +668,7 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
                 numel,
                 bytes,
                 local_rank,
+                world_size,
                 local_device,
                 stream,
                 iters);
@@ -709,13 +677,13 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             local_device,
             stream,
             "sync ipc nccl measured");
-
         verify_collective_result_rank(
             collective,
             "ipc normal NCCL external p2p",
             nccl_work,
             numel_arg,
             local_rank,
+            world_size,
             local_device,
             verify);
 
@@ -728,6 +696,7 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             numel,
             bytes,
             local_rank,
+            world_size,
             local_device,
             stream,
             warmup,
@@ -743,6 +712,7 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
                 numel,
                 bytes,
                 local_rank,
+                world_size,
                 local_device,
                 stream,
                 iters);
@@ -751,13 +721,13 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             local_device,
             stream,
             "sync ipc nccl symmetric measured");
-
         verify_collective_result_rank(
             collective,
             "ipc symmetric NCCL external p2p",
             nccl_symmetric_work,
             numel_arg,
             local_rank,
+            world_size,
             local_device,
             verify);
 
@@ -765,26 +735,19 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             testing::rank_partition_count(
                 numel,
                 local_rank,
-                kIpcExternalWorldSize);
+                world_size);
 
-        results["collective"] =
-            testing::collective_code(collective);
-        results["rank"] =
-            static_cast<double>(local_rank);
-        results["world_size"] =
-            static_cast<double>(kIpcExternalWorldSize);
-        results["numel"] =
-            static_cast<double>(numel);
-        results["bytes"] =
-            static_cast<double>(bytes);
+        results["collective"] = testing::collective_code(collective);
+        results["rank"] = static_cast<double>(local_rank);
+        results["world_size"] = static_cast<double>(world_size);
+        results["numel"] = static_cast<double>(numel);
+        results["bytes"] = static_cast<double>(bytes);
         results["local_shard_numel"] =
             static_cast<double>(local_shard_count);
         results["local_shard_bytes"] =
             static_cast<double>(local_shard_count * sizeof(half));
-        results["iters"] =
-            static_cast<double>(iters);
-        results["warmup"] =
-            static_cast<double>(warmup);
+        results["iters"] = static_cast<double>(iters);
+        results["warmup"] = static_cast<double>(warmup);
         results["ooverlap_ms"] =
             ooverlap_total_ms / static_cast<double>(iters);
         results["nccl_ms"] =
@@ -793,7 +756,6 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             nccl_symmetric_total_ms / static_cast<double>(iters);
 
         broker_sync(group);
-
         cleanup_rank(
             local_device,
             local_src,
@@ -821,9 +783,73 @@ benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
             node,
             group,
             stream);
-
         throw;
     }
+}
+
+std::map<std::string, double>
+benchmark_ipc_external_p2p_allreduce_rank_sm90(
+    int64_t numel,
+    int local_rank,
+    const std::vector<int>& devices,
+    const std::string& broker_key,
+    const std::vector<int64_t>& nccl_unique_id_bytes,
+    int iters,
+    int warmup,
+    bool verify) {
+    return benchmark_ipc_external_p2p_collective_rank_sm90(
+        "allreduce",
+        numel,
+        local_rank,
+        devices,
+        broker_key,
+        nccl_unique_id_bytes,
+        iters,
+        warmup,
+        verify);
+}
+
+bool ipc_external_p2p_two_gpu_collective_smoke_rank_sm90(
+    const std::string& collective,
+    int64_t numel,
+    int local_rank,
+    int dev0,
+    int dev1,
+    const std::string& broker_key,
+    const std::vector<int64_t>& nccl_unique_id_bytes,
+    bool verify) {
+    return ipc_external_p2p_collective_smoke_rank_sm90(
+        collective,
+        numel,
+        local_rank,
+        std::vector<int>{dev0, dev1},
+        broker_key,
+        nccl_unique_id_bytes,
+        verify);
+}
+
+std::map<std::string, double>
+benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
+    const std::string& collective,
+    int64_t numel,
+    int local_rank,
+    int dev0,
+    int dev1,
+    const std::string& broker_key,
+    const std::vector<int64_t>& nccl_unique_id_bytes,
+    int iters,
+    int warmup,
+    bool verify) {
+    return benchmark_ipc_external_p2p_collective_rank_sm90(
+        collective,
+        numel,
+        local_rank,
+        std::vector<int>{dev0, dev1},
+        broker_key,
+        nccl_unique_id_bytes,
+        iters,
+        warmup,
+        verify);
 }
 
 std::map<std::string, double>
@@ -837,12 +863,10 @@ benchmark_ipc_external_p2p_two_gpu_allreduce_rank_sm90(
     int iters,
     int warmup,
     bool verify) {
-    return benchmark_ipc_external_p2p_two_gpu_collective_rank_sm90(
-        "allreduce",
+    return benchmark_ipc_external_p2p_allreduce_rank_sm90(
         numel,
         local_rank,
-        dev0,
-        dev1,
+        std::vector<int>{dev0, dev1},
         broker_key,
         nccl_unique_id_bytes,
         iters,

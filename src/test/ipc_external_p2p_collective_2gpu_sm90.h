@@ -7,6 +7,39 @@
 
 namespace ooverlap {
 
+bool ipc_external_p2p_collective_smoke_rank_sm90(
+    const std::string& collective,
+    int64_t numel,
+    int local_rank,
+    const std::vector<int>& devices,
+    const std::string& broker_key,
+    const std::vector<int64_t>& nccl_unique_id_bytes,
+    bool verify = true);
+
+std::map<std::string, double>
+benchmark_ipc_external_p2p_collective_rank_sm90(
+    const std::string& collective,
+    int64_t numel,
+    int local_rank,
+    const std::vector<int>& devices,
+    const std::string& broker_key,
+    const std::vector<int64_t>& nccl_unique_id_bytes,
+    int iters,
+    int warmup,
+    bool verify);
+
+std::map<std::string, double>
+benchmark_ipc_external_p2p_allreduce_rank_sm90(
+    int64_t numel,
+    int local_rank,
+    const std::vector<int>& devices,
+    const std::string& broker_key,
+    const std::vector<int64_t>& nccl_unique_id_bytes,
+    int iters,
+    int warmup,
+    bool verify);
+
+// Backward-compatible two-GPU wrappers.
 bool ipc_external_p2p_two_gpu_collective_smoke_rank_sm90(
     const std::string& collective,
     int64_t numel,

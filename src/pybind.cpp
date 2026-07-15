@@ -459,6 +459,39 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("dev0") = 0,
         py::arg("dev1") = 1);
 
+  m.def("ipc_external_p2p_collective_smoke_rank_sm90",
+      &ooverlap::ipc_external_p2p_collective_smoke_rank_sm90,
+      py::arg("collective"),
+      py::arg("numel"),
+      py::arg("local_rank"),
+      py::arg("devices"),
+      py::arg("broker_key"),
+      py::arg("nccl_unique_id_bytes"),
+      py::arg("verify") = true);
+
+  m.def("benchmark_ipc_external_p2p_collective_rank_sm90",
+      &ooverlap::benchmark_ipc_external_p2p_collective_rank_sm90,
+      py::arg("collective"),
+      py::arg("numel"),
+      py::arg("local_rank"),
+      py::arg("devices"),
+      py::arg("broker_key"),
+      py::arg("nccl_unique_id_bytes"),
+      py::arg("iters"),
+      py::arg("warmup"),
+      py::arg("verify"));
+
+  m.def("benchmark_ipc_external_p2p_allreduce_rank_sm90",
+      &ooverlap::benchmark_ipc_external_p2p_allreduce_rank_sm90,
+      py::arg("numel"),
+      py::arg("local_rank"),
+      py::arg("devices"),
+      py::arg("broker_key"),
+      py::arg("nccl_unique_id_bytes"),
+      py::arg("iters"),
+      py::arg("warmup"),
+      py::arg("verify"));
+
   m.def("ipc_external_p2p_two_gpu_collective_smoke_rank_sm90",
       &ooverlap::ipc_external_p2p_two_gpu_collective_smoke_rank_sm90,
       py::arg("collective"),
