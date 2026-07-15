@@ -17,8 +17,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef OOVERLAP_BENCH_VERIFY_RESULTS
@@ -29,25 +31,6 @@ namespace ooverlap {
 namespace {
 
 using testing::TestCollective;
-
-/*
- * OOVERLAP_PERSISTENT_EXTERNAL_P2P_RING_MODE_PATCH
- *
- * This benchmark intentionally uses a ring of independent work buffers for all
- * three implementations:
- *
- *   - ooverlap external cudaMalloc + oo_buffer_wrap
- *   - normal NCCL cudaMalloc
- *   - NCCL symmetric ncclMemAlloc + ncclCommWindowRegister
- *
- * Setup remains outside the measured CUDA-event region.  The measured loop
- * rotates through ring[i % ring_size] so each implementation sees many distinct
- * addresses instead of one hot address.
- *
- * Tune with:
- *
- *   OOVERLAP_BENCH_RING_SIZE=16
- */
 
 int ring_size_from_env() {
     constexpr int kDefaultRingSize = 16;
@@ -68,6 +51,121 @@ int ring_size_from_env() {
         std::min<long>(parsed, kMaxReasonableRingSize));
 }
 
+void validate_devices(const std::vector<int>& devices) {
+    if (devices.size() < 2) {
+        throw std::invalid_argument(
+            "external P2P collective requires at least two devices");
+    }
+
+    std::set<int> unique;
+    for (int device : devices) {
+        if (device < 0) {
+            throw std::invalid_argument("device ids must be non-negative");
+        }
+        if (!unique.insert(device).second) {
+            throw std::invalid_argument("device ids must be unique");
+        }
+    }
+}
+
+void sync_streams(
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
+    const char* label) {
+    if (devices.size() != streams.size()) {
+        throw std::invalid_argument("sync_streams: size mismatch");
+    }
+
+    for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+        system::runtime::sync_stream_on_device(
+            devices[rank],
+            streams[rank],
+            label);
+    }
+}
+
+void destroy_events_best_effort(
+    const std::vector<int>& devices,
+    std::vector<cudaEvent_t>& events) {
+    const std::size_t count = std::min(devices.size(), events.size());
+    for (std::size_t rank = 0; rank < count; ++rank) {
+        if (events[rank] != nullptr) {
+            (void)cudaSetDevice(devices[rank]);
+            (void)cudaEventDestroy(events[rank]);
+            events[rank] = nullptr;
+        }
+    }
+}
+
+template <typename LaunchOnce>
+double elapsed_ms_stream_max(
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
+    int iters,
+    LaunchOnce&& launch_once) {
+    if (devices.size() != streams.size() || devices.empty()) {
+        throw std::invalid_argument("elapsed_ms_stream_max: invalid streams");
+    }
+    if (iters <= 0) {
+        throw std::invalid_argument("elapsed_ms_stream_max: iters must be > 0");
+    }
+
+    const std::size_t world_size = devices.size();
+    std::vector<cudaEvent_t> starts(world_size, nullptr);
+    std::vector<cudaEvent_t> stops(world_size, nullptr);
+
+    try {
+        for (std::size_t rank = 0; rank < world_size; ++rank) {
+            system::runtime::set_device(devices[rank]);
+            testing::check_cuda(
+                cudaEventCreate(&starts[rank]),
+                "cudaEventCreate(start)");
+            testing::check_cuda(
+                cudaEventCreate(&stops[rank]),
+                "cudaEventCreate(stop)");
+            testing::check_cuda(
+                cudaEventRecord(starts[rank], streams[rank]),
+                "cudaEventRecord(start)");
+        }
+
+        for (int i = 0; i < iters; ++i) {
+            launch_once(i);
+        }
+
+        for (std::size_t rank = 0; rank < world_size; ++rank) {
+            system::runtime::set_device(devices[rank]);
+            testing::check_cuda(
+                cudaEventRecord(stops[rank], streams[rank]),
+                "cudaEventRecord(stop)");
+        }
+
+        double max_ms = 0.0;
+        for (std::size_t rank = 0; rank < world_size; ++rank) {
+            system::runtime::set_device(devices[rank]);
+            testing::check_cuda(
+                cudaEventSynchronize(stops[rank]),
+                "cudaEventSynchronize(stop)");
+
+            float rank_ms = 0.0f;
+            testing::check_cuda(
+                cudaEventElapsedTime(
+                    &rank_ms,
+                    starts[rank],
+                    stops[rank]),
+                "cudaEventElapsedTime");
+            max_ms = std::max(max_ms, static_cast<double>(rank_ms));
+        }
+
+        destroy_events_best_effort(devices, starts);
+        destroy_events_best_effort(devices, stops);
+        return max_ms;
+    } catch (...) {
+        destroy_events_best_effort(devices, starts);
+        destroy_events_best_effort(devices, stops);
+        throw;
+    }
+}
+
 void nccl_mem_alloc_half_on_device(
     int device,
     half** ptr,
@@ -79,93 +177,73 @@ void nccl_mem_alloc_half_on_device(
     }
 
     *ptr = nullptr;
-
     system::runtime::set_device(device);
 
     void* raw = nullptr;
-
-    OOVERLAP_TEST_NCCL_CHECK(
-        ncclMemAlloc(&raw, bytes));
+    OOVERLAP_TEST_NCCL_CHECK(ncclMemAlloc(&raw, bytes));
 
     if (raw == nullptr) {
         throw std::runtime_error(
             std::string(label) + ": ncclMemAlloc returned nullptr");
     }
 
-    *ptr =
-        reinterpret_cast<half*>(raw);
+    *ptr = reinterpret_cast<half*>(raw);
 }
 
-void nccl_mem_free_on_device(
-    int device,
-    half*& ptr) {
+void nccl_mem_free_on_device(int device, half*& ptr) {
     if (ptr == nullptr) {
         return;
     }
 
-    /*
-     * Cleanup path should not throw.
-     */
     (void)cudaSetDevice(device);
     (void)ncclMemFree(static_cast<void*>(ptr));
-
     ptr = nullptr;
 }
 
 void register_nccl_symmetric_windows(
-    ncclComm_t* comms,
-    half* rank0_buf,
-    half* rank1_buf,
+    const std::vector<ncclComm_t>& comms,
+    const std::vector<half*>& buffers,
     size_t bytes,
-    ncclWindow_t& rank0_win,
-    ncclWindow_t& rank1_win) {
-    rank0_win = nullptr;
-    rank1_win = nullptr;
+    std::vector<ncclWindow_t>& windows) {
+    if (comms.size() != buffers.size() || comms.empty()) {
+        throw std::invalid_argument(
+            "register_nccl_symmetric_windows: size mismatch");
+    }
+
+    windows.assign(comms.size(), nullptr);
 
     OOVERLAP_TEST_NCCL_CHECK(ncclGroupStart());
-
-    OOVERLAP_TEST_NCCL_CHECK(
-        ncclCommWindowRegister(
-            comms[0],
-            rank0_buf,
-            bytes,
-            &rank0_win,
-            NCCL_WIN_COLL_SYMMETRIC));
-
-    OOVERLAP_TEST_NCCL_CHECK(
-        ncclCommWindowRegister(
-            comms[1],
-            rank1_buf,
-            bytes,
-            &rank1_win,
-            NCCL_WIN_COLL_SYMMETRIC));
-
+    for (std::size_t rank = 0; rank < comms.size(); ++rank) {
+        OOVERLAP_TEST_NCCL_CHECK(
+            ncclCommWindowRegister(
+                comms[rank],
+                buffers[rank],
+                bytes,
+                &windows[rank],
+                NCCL_WIN_COLL_SYMMETRIC));
+    }
     OOVERLAP_TEST_NCCL_CHECK(ncclGroupEnd());
 }
 
 void deregister_nccl_window_best_effort(
     ncclComm_t comm,
-    ncclWindow_t& win) {
-    if (comm == nullptr || win == nullptr) {
+    ncclWindow_t& window) {
+    if (comm == nullptr || window == nullptr) {
         return;
     }
 
-    (void)ncclCommWindowDeregister(comm, win);
-    win = nullptr;
+    (void)ncclCommWindowDeregister(comm, window);
+    window = nullptr;
 }
 
 struct OoverlapRingSlot {
-    half* rank0_work = nullptr;
-    half* rank1_work = nullptr;
-    oo_buffer_t* rank0_buf = nullptr;
-    oo_buffer_t* rank1_buf = nullptr;
+    std::vector<half*> work;
+    std::vector<oo_buffer_t*> buffers;
 };
 
 struct NcclRingSlot {
-    half* rank0_work = nullptr;
-    half* rank1_work = nullptr;
-    ncclWindow_t rank0_win = nullptr;
-    ncclWindow_t rank1_win = nullptr;
+    std::vector<half*> work;
+    std::vector<ncclWindow_t> windows;
 };
 
 void launch_ooverlap_public_once_for_rank(
@@ -191,7 +269,6 @@ void launch_ooverlap_public_once_for_rank(
 
     if (collective == TestCollective::ReduceScatter) {
         oo_tensor_slice_t slice{};
-
         testing::check_oo(
             oo_reduce_scatter_tuned(
                 node,
@@ -224,227 +301,170 @@ void launch_ooverlap_public_once_for_rank(
 
 void launch_ooverlap_public_once(
     TestCollective collective,
-    oo_node_t* node0,
-    oo_node_t* node1,
-    oo_buffer_t* rank0_buf,
-    oo_buffer_t* rank1_buf,
+    const std::vector<oo_node_t*>& nodes,
+    const OoverlapRingSlot& slot,
     size_t numel,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
-    launch_ooverlap_public_once_for_rank(
-        collective,
-        node0,
-        rank0_buf,
-        numel,
-        stream0,
-        "ooverlap rank0");
+    const std::vector<cudaStream_t>& streams) {
+    if (nodes.size() != slot.buffers.size() ||
+        nodes.size() != streams.size()) {
+        throw std::invalid_argument(
+            "launch_ooverlap_public_once: size mismatch");
+    }
 
-    launch_ooverlap_public_once_for_rank(
-        collective,
-        node1,
-        rank1_buf,
-        numel,
-        stream1,
-        "ooverlap rank1");
+    for (std::size_t rank = 0; rank < nodes.size(); ++rank) {
+        const std::string label =
+            "ooverlap rank" + std::to_string(rank);
+        launch_ooverlap_public_once_for_rank(
+            collective,
+            nodes[rank],
+            slot.buffers[rank],
+            numel,
+            streams[rank],
+            label.c_str());
+    }
 }
 
 void launch_nccl_once(
     TestCollective collective,
-    half* rank0_buf,
-    half* rank1_buf,
+    const NcclRingSlot& slot,
     size_t numel,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    ncclComm_t* comms) {
+    const std::vector<cudaStream_t>& streams,
+    const std::vector<ncclComm_t>& comms) {
+    const std::size_t world_size = comms.size();
+    if (slot.work.size() != world_size || streams.size() != world_size) {
+        throw std::invalid_argument("launch_nccl_once: size mismatch");
+    }
+
     OOVERLAP_TEST_NCCL_CHECK(ncclGroupStart());
-
-    testing::launch_nccl_collective_fp16(
-        collective,
-        comms[0],
-        rank0_buf,
-        numel,
-        0,
-        2,
-        stream0);
-
-    testing::launch_nccl_collective_fp16(
-        collective,
-        comms[1],
-        rank1_buf,
-        numel,
-        1,
-        2,
-        stream1);
-
+    for (std::size_t rank = 0; rank < world_size; ++rank) {
+        testing::launch_nccl_collective_fp16(
+            collective,
+            comms[rank],
+            slot.work[rank],
+            numel,
+            static_cast<int>(rank),
+            static_cast<int>(world_size),
+            streams[rank]);
+    }
     OOVERLAP_TEST_NCCL_CHECK(ncclGroupEnd());
 }
 
-void verify_collective_result(
-    TestCollective collective,
-    const char* label,
-    half* rank0,
-    half* rank1,
-    int64_t numel,
-    int dev0,
-    int dev1) {
-#if OOVERLAP_BENCH_VERIFY_RESULTS
-    testing::verify_collective_fp16(
-        collective,
-        label,
-        rank0,
-        numel,
-        0,
-        2,
-        dev0);
+void prepare_work_buffers(
+    const std::vector<half*>& sources,
+    const std::vector<half*>& work,
+    size_t bytes,
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams) {
+    const std::size_t world_size = devices.size();
+    if (sources.size() != world_size ||
+        work.size() != world_size ||
+        streams.size() != world_size) {
+        throw std::invalid_argument("prepare_work_buffers: size mismatch");
+    }
 
-    testing::verify_collective_fp16(
-        collective,
-        label,
-        rank1,
-        numel,
-        1,
-        2,
-        dev1);
-#else
-    (void)collective;
-    (void)label;
-    (void)rank0;
-    (void)rank1;
-    (void)numel;
-    (void)dev0;
-    (void)dev1;
-#endif
+    for (std::size_t rank = 0; rank < world_size; ++rank) {
+        testing::reset_work_buffer_async(
+            work[rank],
+            sources[rank],
+            bytes,
+            devices[rank],
+            streams[rank]);
+    }
+
+    sync_streams(devices, streams, "sync prepare_work_buffers");
 }
 
 void prepare_ooverlap_ring(
     const std::vector<OoverlapRingSlot>& ring,
-    const half* rank0_src,
-    const half* rank1_src,
+    const std::vector<half*>& sources,
     size_t bytes,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams) {
     for (const OoverlapRingSlot& slot : ring) {
-        testing::prepare_two_work_buffers(
-            rank0_src,
-            rank1_src,
-            slot.rank0_work,
-            slot.rank1_work,
+        prepare_work_buffers(
+            sources,
+            slot.work,
             bytes,
-            dev0,
-            dev1,
-            stream0,
-            stream1);
+            devices,
+            streams);
     }
 }
 
 void prepare_nccl_ring(
     const std::vector<NcclRingSlot>& ring,
-    const half* rank0_src,
-    const half* rank1_src,
+    const std::vector<half*>& sources,
     size_t bytes,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams) {
     for (const NcclRingSlot& slot : ring) {
-        testing::prepare_two_work_buffers(
-            rank0_src,
-            rank1_src,
-            slot.rank0_work,
-            slot.rank1_work,
+        prepare_work_buffers(
+            sources,
+            slot.work,
             bytes,
-            dev0,
-            dev1,
-            stream0,
-            stream1);
+            devices,
+            streams);
     }
 }
 
 void run_ooverlap_ring_iters(
     TestCollective collective,
     oo_group_t* group,
-    oo_node_t* node0,
-    oo_node_t* node1,
+    const std::vector<oo_node_t*>& nodes,
     const std::vector<OoverlapRingSlot>& ring,
     size_t numel,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
     int iters,
     const char* sync_label) {
     if (iters <= 0) {
         return;
     }
-
     if (ring.empty()) {
         throw std::invalid_argument("run_ooverlap_ring_iters: ring is empty");
     }
 
     testing::reset_ready_signals(group);
-
     for (int i = 0; i < iters; ++i) {
         const OoverlapRingSlot& slot =
             ring[static_cast<std::size_t>(i) % ring.size()];
-
         launch_ooverlap_public_once(
             collective,
-            node0,
-            node1,
-            slot.rank0_buf,
-            slot.rank1_buf,
+            nodes,
+            slot,
             numel,
-            stream0,
-            stream1);
+            streams);
     }
 
-    testing::sync_two_streams(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        sync_label);
+    sync_streams(devices, streams, sync_label);
 }
 
 double elapsed_ms_ooverlap_ring(
     TestCollective collective,
     oo_group_t* group,
-    oo_node_t* node0,
-    oo_node_t* node1,
+    const std::vector<oo_node_t*>& nodes,
     const std::vector<OoverlapRingSlot>& ring,
     size_t numel,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
     int iters) {
     if (ring.empty()) {
         throw std::invalid_argument("elapsed_ms_ooverlap_ring: ring is empty");
     }
 
     testing::reset_ready_signals(group);
-
-    return testing::elapsed_ms_two_stream_max(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
+    return elapsed_ms_stream_max(
+        devices,
+        streams,
         iters,
         [&](int i) {
             const OoverlapRingSlot& slot =
                 ring[static_cast<std::size_t>(i) % ring.size()];
-
             launch_ooverlap_public_once(
                 collective,
-                node0,
-                node1,
-                slot.rank0_buf,
-                slot.rank1_buf,
+                nodes,
+                slot,
                 numel,
-                stream0,
-                stream1);
+                streams);
         });
 }
 
@@ -452,17 +472,14 @@ void run_nccl_ring_iters(
     TestCollective collective,
     const std::vector<NcclRingSlot>& ring,
     size_t numel,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    ncclComm_t* comms,
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
+    const std::vector<ncclComm_t>& comms,
     int iters,
     const char* sync_label) {
     if (iters <= 0) {
         return;
     }
-
     if (ring.empty()) {
         throw std::invalid_argument("run_nccl_ring_iters: ring is empty");
     }
@@ -470,56 +487,41 @@ void run_nccl_ring_iters(
     for (int i = 0; i < iters; ++i) {
         const NcclRingSlot& slot =
             ring[static_cast<std::size_t>(i) % ring.size()];
-
         launch_nccl_once(
             collective,
-            slot.rank0_work,
-            slot.rank1_work,
+            slot,
             numel,
-            stream0,
-            stream1,
+            streams,
             comms);
     }
 
-    testing::sync_two_streams(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        sync_label);
+    sync_streams(devices, streams, sync_label);
 }
 
 double elapsed_ms_nccl_ring(
     TestCollective collective,
     const std::vector<NcclRingSlot>& ring,
     size_t numel,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    ncclComm_t* comms,
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
+    const std::vector<ncclComm_t>& comms,
     int iters) {
     if (ring.empty()) {
         throw std::invalid_argument("elapsed_ms_nccl_ring: ring is empty");
     }
 
-    return testing::elapsed_ms_two_stream_max(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
+    return elapsed_ms_stream_max(
+        devices,
+        streams,
         iters,
         [&](int i) {
             const NcclRingSlot& slot =
                 ring[static_cast<std::size_t>(i) % ring.size()];
-
             launch_nccl_once(
                 collective,
-                slot.rank0_work,
-                slot.rank1_work,
+                slot,
                 numel,
-                stream0,
-                stream1,
+                streams,
                 comms);
         });
 }
@@ -527,45 +529,43 @@ double elapsed_ms_nccl_ring(
 void allocate_ooverlap_ring(
     std::vector<OoverlapRingSlot>& ring,
     int ring_size,
-    oo_node_t* node0,
-    oo_node_t* node1,
+    const std::vector<oo_node_t*>& nodes,
     size_t bytes,
-    int dev0,
-    int dev1) {
+    const std::vector<int>& devices) {
+    const std::size_t world_size = devices.size();
+    if (nodes.size() != world_size) {
+        throw std::invalid_argument("allocate_ooverlap_ring: size mismatch");
+    }
+
     ring.clear();
     ring.resize(static_cast<std::size_t>(ring_size));
 
     for (int i = 0; i < ring_size; ++i) {
-        OoverlapRingSlot& slot =
-            ring[static_cast<std::size_t>(i)];
+        OoverlapRingSlot& slot = ring[static_cast<std::size_t>(i)];
+        slot.work.assign(world_size, nullptr);
+        slot.buffers.assign(world_size, nullptr);
 
-        testing::cuda_malloc_half_on_device(
-            dev0,
-            &slot.rank0_work,
-            bytes,
-            "cudaMalloc(ooverlap ring rank0)");
-
-        testing::cuda_malloc_half_on_device(
-            dev1,
-            &slot.rank1_work,
-            bytes,
-            "cudaMalloc(ooverlap ring rank1)");
-
-        testing::check_oo(
-            oo_buffer_wrap(
-                node0,
-                slot.rank0_work,
+        for (std::size_t rank = 0; rank < world_size; ++rank) {
+            const std::string malloc_label =
+                "cudaMalloc(ooverlap ring rank" +
+                std::to_string(rank) + ")";
+            testing::cuda_malloc_half_on_device(
+                devices[rank],
+                &slot.work[rank],
                 bytes,
-                &slot.rank0_buf),
-            "oo_buffer_wrap(ooverlap ring rank0)");
+                malloc_label.c_str());
 
-        testing::check_oo(
-            oo_buffer_wrap(
-                node1,
-                slot.rank1_work,
-                bytes,
-                &slot.rank1_buf),
-            "oo_buffer_wrap(ooverlap ring rank1)");
+            const std::string wrap_label =
+                "oo_buffer_wrap(ooverlap ring rank" +
+                std::to_string(rank) + ")";
+            testing::check_oo(
+                oo_buffer_wrap(
+                    nodes[rank],
+                    slot.work[rank],
+                    bytes,
+                    &slot.buffers[rank]),
+                wrap_label.c_str());
+        }
     }
 }
 
@@ -573,70 +573,71 @@ void allocate_nccl_ring(
     std::vector<NcclRingSlot>& ring,
     int ring_size,
     size_t bytes,
-    int dev0,
-    int dev1,
+    const std::vector<int>& devices,
     bool symmetric,
-    ncclComm_t* comms) {
+    const std::vector<ncclComm_t>& comms) {
+    const std::size_t world_size = devices.size();
+    if (comms.size() != world_size) {
+        throw std::invalid_argument("allocate_nccl_ring: size mismatch");
+    }
+
     ring.clear();
     ring.resize(static_cast<std::size_t>(ring_size));
 
     for (int i = 0; i < ring_size; ++i) {
-        NcclRingSlot& slot =
-            ring[static_cast<std::size_t>(i)];
+        NcclRingSlot& slot = ring[static_cast<std::size_t>(i)];
+        slot.work.assign(world_size, nullptr);
+        slot.windows.assign(world_size, nullptr);
+
+        for (std::size_t rank = 0; rank < world_size; ++rank) {
+            const std::string label =
+                std::string(symmetric ? "ncclMemAlloc" : "cudaMalloc") +
+                "(nccl ring rank" + std::to_string(rank) + ")";
+
+            if (symmetric) {
+                nccl_mem_alloc_half_on_device(
+                    devices[rank],
+                    &slot.work[rank],
+                    bytes,
+                    label.c_str());
+            } else {
+                testing::cuda_malloc_half_on_device(
+                    devices[rank],
+                    &slot.work[rank],
+                    bytes,
+                    label.c_str());
+            }
+        }
 
         if (symmetric) {
-            nccl_mem_alloc_half_on_device(
-                dev0,
-                &slot.rank0_work,
-                bytes,
-                "ncclMemAlloc(nccl symmetric ring rank0)");
-
-            nccl_mem_alloc_half_on_device(
-                dev1,
-                &slot.rank1_work,
-                bytes,
-                "ncclMemAlloc(nccl symmetric ring rank1)");
-
             register_nccl_symmetric_windows(
                 comms,
-                slot.rank0_work,
-                slot.rank1_work,
+                slot.work,
                 bytes,
-                slot.rank0_win,
-                slot.rank1_win);
-        } else {
-            testing::cuda_malloc_half_on_device(
-                dev0,
-                &slot.rank0_work,
-                bytes,
-                "cudaMalloc(nccl ring rank0)");
-
-            testing::cuda_malloc_half_on_device(
-                dev1,
-                &slot.rank1_work,
-                bytes,
-                "cudaMalloc(nccl ring rank1)");
+                slot.windows);
         }
     }
 }
 
 void destroy_ooverlap_ring(
     std::vector<OoverlapRingSlot>& ring,
-    int dev0,
-    int dev1) {
+    const std::vector<int>& devices) {
     for (OoverlapRingSlot& slot : ring) {
-        if (slot.rank0_buf != nullptr) {
-            oo_buffer_destroy(slot.rank0_buf);
-            slot.rank0_buf = nullptr;
+        const std::size_t world_size =
+            std::min(devices.size(), slot.work.size());
+
+        for (std::size_t rank = 0; rank < slot.buffers.size(); ++rank) {
+            if (slot.buffers[rank] != nullptr) {
+                oo_buffer_destroy(slot.buffers[rank]);
+                slot.buffers[rank] = nullptr;
+            }
         }
 
-        if (slot.rank1_buf != nullptr) {
-            oo_buffer_destroy(slot.rank1_buf);
-            slot.rank1_buf = nullptr;
+        for (std::size_t rank = 0; rank < world_size; ++rank) {
+            testing::cuda_free_on_device(
+                devices[rank],
+                slot.work[rank]);
         }
-
-        testing::cuda_free_on_device(dev0, slot.rank0_work);
-        testing::cuda_free_on_device(dev1, slot.rank1_work);
     }
 
     ring.clear();
@@ -644,102 +645,106 @@ void destroy_ooverlap_ring(
 
 void destroy_nccl_ring(
     std::vector<NcclRingSlot>& ring,
-    int dev0,
-    int dev1,
+    const std::vector<int>& devices,
     bool symmetric,
-    ncclComm_t* comms) {
+    const std::vector<ncclComm_t>& comms) {
     for (NcclRingSlot& slot : ring) {
-        if (symmetric) {
-            deregister_nccl_window_best_effort(
-                comms != nullptr ? comms[0] : nullptr,
-                slot.rank0_win);
+        const std::size_t world_size =
+            std::min(devices.size(), slot.work.size());
 
-            deregister_nccl_window_best_effort(
-                comms != nullptr ? comms[1] : nullptr,
-                slot.rank1_win);
-
-            nccl_mem_free_on_device(dev0, slot.rank0_work);
-            nccl_mem_free_on_device(dev1, slot.rank1_work);
-        } else {
-            testing::cuda_free_on_device(dev0, slot.rank0_work);
-            testing::cuda_free_on_device(dev1, slot.rank1_work);
+        for (std::size_t rank = 0; rank < world_size; ++rank) {
+            if (symmetric) {
+                if (rank < slot.windows.size() && rank < comms.size()) {
+                    deregister_nccl_window_best_effort(
+                        comms[rank],
+                        slot.windows[rank]);
+                }
+                nccl_mem_free_on_device(
+                    devices[rank],
+                    slot.work[rank]);
+            } else {
+                testing::cuda_free_on_device(
+                    devices[rank],
+                    slot.work[rank]);
+            }
         }
     }
 
     ring.clear();
 }
 
+void verify_collective_result(
+    TestCollective collective,
+    const char* label,
+    const std::vector<half*>& work,
+    int64_t numel,
+    const std::vector<int>& devices) {
+#if OOVERLAP_BENCH_VERIFY_RESULTS
+    if (work.size() != devices.size()) {
+        throw std::invalid_argument("verify_collective_result: size mismatch");
+    }
+
+    const int world_size = static_cast<int>(devices.size());
+    for (int rank = 0; rank < world_size; ++rank) {
+        testing::verify_collective_fp16(
+            collective,
+            label,
+            work[static_cast<std::size_t>(rank)],
+            numel,
+            rank,
+            world_size,
+            devices[static_cast<std::size_t>(rank)]);
+    }
+#else
+    (void)collective;
+    (void)label;
+    (void)work;
+    (void)numel;
+    (void)devices;
+#endif
+}
+
 void verify_ooverlap_once(
     TestCollective collective,
-    oo_node_t* node0,
-    oo_node_t* node1,
+    oo_group_t* group,
+    const std::vector<oo_node_t*>& nodes,
     const std::vector<OoverlapRingSlot>& ring,
-    const half* rank0_src,
-    const half* rank1_src,
+    const std::vector<half*>& sources,
     size_t numel,
     size_t bytes,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams) {
 #if OOVERLAP_BENCH_VERIFY_RESULTS
     if (ring.empty()) {
         return;
     }
 
     const OoverlapRingSlot& slot = ring[0];
-
-    testing::prepare_two_work_buffers(
-        rank0_src,
-        rank1_src,
-        slot.rank0_work,
-        slot.rank1_work,
-        bytes,
-        dev0,
-        dev1,
-        stream0,
-        stream1);
-
-    testing::reset_ready_signals(oo_node_group(node0));
-
+    prepare_work_buffers(sources, slot.work, bytes, devices, streams);
+    testing::reset_ready_signals(group);
     launch_ooverlap_public_once(
         collective,
-        node0,
-        node1,
-        slot.rank0_buf,
-        slot.rank1_buf,
+        nodes,
+        slot,
         numel,
-        stream0,
-        stream1);
-
-    testing::sync_two_streams(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        "sync ooverlap ring verification");
-
+        streams);
+    sync_streams(devices, streams, "sync ooverlap ring verification");
     verify_collective_result(
         collective,
         "ooverlap",
-        slot.rank0_work,
-        slot.rank1_work,
+        slot.work,
         static_cast<int64_t>(numel),
-        dev0,
-        dev1);
+        devices);
 #else
     (void)collective;
-    (void)node0;
-    (void)node1;
+    (void)group;
+    (void)nodes;
     (void)ring;
-    (void)rank0_src;
-    (void)rank1_src;
+    (void)sources;
     (void)numel;
     (void)bytes;
-    (void)dev0;
-    (void)dev1;
-    (void)stream0;
-    (void)stream1;
+    (void)devices;
+    (void)streams;
 #endif
 }
 
@@ -747,69 +752,41 @@ void verify_nccl_once(
     TestCollective collective,
     const char* label,
     const std::vector<NcclRingSlot>& ring,
-    const half* rank0_src,
-    const half* rank1_src,
+    const std::vector<half*>& sources,
     size_t numel,
     size_t bytes,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    ncclComm_t* comms) {
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
+    const std::vector<ncclComm_t>& comms) {
 #if OOVERLAP_BENCH_VERIFY_RESULTS
     if (ring.empty()) {
         return;
     }
 
     const NcclRingSlot& slot = ring[0];
-
-    testing::prepare_two_work_buffers(
-        rank0_src,
-        rank1_src,
-        slot.rank0_work,
-        slot.rank1_work,
-        bytes,
-        dev0,
-        dev1,
-        stream0,
-        stream1);
-
+    prepare_work_buffers(sources, slot.work, bytes, devices, streams);
     launch_nccl_once(
         collective,
-        slot.rank0_work,
-        slot.rank1_work,
+        slot,
         numel,
-        stream0,
-        stream1,
+        streams,
         comms);
-
-    testing::sync_two_streams(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        "sync nccl ring verification");
-
+    sync_streams(devices, streams, "sync nccl ring verification");
     verify_collective_result(
         collective,
         label,
-        slot.rank0_work,
-        slot.rank1_work,
+        slot.work,
         static_cast<int64_t>(numel),
-        dev0,
-        dev1);
+        devices);
 #else
     (void)collective;
     (void)label;
     (void)ring;
-    (void)rank0_src;
-    (void)rank1_src;
+    (void)sources;
     (void)numel;
     (void)bytes;
-    (void)dev0;
-    (void)dev1;
-    (void)stream0;
-    (void)stream1;
+    (void)devices;
+    (void)streams;
     (void)comms;
 #endif
 }
@@ -818,87 +795,53 @@ void bench_ooverlap_external_ring(
     std::map<std::string, double>& results,
     TestCollective collective,
     oo_group_t* group,
-    oo_node_t* node0,
-    oo_node_t* node1,
+    const std::vector<oo_node_t*>& nodes,
     const std::vector<OoverlapRingSlot>& ring,
-    const half* rank0_src,
-    const half* rank1_src,
+    const std::vector<half*>& sources,
     size_t numel,
     size_t bytes,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
     int iters,
     int warmup) {
-    prepare_ooverlap_ring(
-        ring,
-        rank0_src,
-        rank1_src,
-        bytes,
-        dev0,
-        dev1,
-        stream0,
-        stream1);
+    prepare_ooverlap_ring(ring, sources, bytes, devices, streams);
 
     run_ooverlap_ring_iters(
         collective,
         group,
-        node0,
-        node1,
+        nodes,
         ring,
         numel,
-        dev0,
-        dev1,
-        stream0,
-        stream1,
+        devices,
+        streams,
         warmup,
         "sync ooverlap ring warmup");
 
-    prepare_ooverlap_ring(
-        ring,
-        rank0_src,
-        rank1_src,
-        bytes,
-        dev0,
-        dev1,
-        stream0,
-        stream1);
+    prepare_ooverlap_ring(ring, sources, bytes, devices, streams);
 
     const double total_ms =
         elapsed_ms_ooverlap_ring(
             collective,
             group,
-            node0,
-            node1,
+            nodes,
             ring,
             numel,
-            dev0,
-            dev1,
-            stream0,
-            stream1,
+            devices,
+            streams,
             iters);
 
-    testing::sync_two_streams(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        "sync ooverlap ring measured");
+    sync_streams(devices, streams, "sync ooverlap ring measured");
 
     verify_ooverlap_once(
         collective,
-        node0,
-        node1,
+        group,
+        nodes,
         ring,
-        rank0_src,
-        rank1_src,
+        sources,
         numel,
         bytes,
-        dev0,
-        dev1,
-        stream0,
-        stream1);
+        devices,
+        streams);
 
     results["ooverlap_ms"] =
         total_ms / static_cast<double>(iters);
@@ -909,80 +852,49 @@ void bench_nccl_external_ring(
     const char* result_key,
     TestCollective collective,
     const std::vector<NcclRingSlot>& ring,
-    const half* rank0_src,
-    const half* rank1_src,
+    const std::vector<half*>& sources,
     size_t numel,
     size_t bytes,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    ncclComm_t* comms,
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
+    const std::vector<ncclComm_t>& comms,
     int iters,
     int warmup) {
-    prepare_nccl_ring(
-        ring,
-        rank0_src,
-        rank1_src,
-        bytes,
-        dev0,
-        dev1,
-        stream0,
-        stream1);
+    prepare_nccl_ring(ring, sources, bytes, devices, streams);
 
     run_nccl_ring_iters(
         collective,
         ring,
         numel,
-        dev0,
-        dev1,
-        stream0,
-        stream1,
+        devices,
+        streams,
         comms,
         warmup,
         "sync nccl ring warmup");
 
-    prepare_nccl_ring(
-        ring,
-        rank0_src,
-        rank1_src,
-        bytes,
-        dev0,
-        dev1,
-        stream0,
-        stream1);
+    prepare_nccl_ring(ring, sources, bytes, devices, streams);
 
     const double total_ms =
         elapsed_ms_nccl_ring(
             collective,
             ring,
             numel,
-            dev0,
-            dev1,
-            stream0,
-            stream1,
+            devices,
+            streams,
             comms,
             iters);
 
-    testing::sync_two_streams(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        "sync nccl ring measured");
+    sync_streams(devices, streams, "sync nccl ring measured");
 
     verify_nccl_once(
         collective,
         result_key,
         ring,
-        rank0_src,
-        rank1_src,
+        sources,
         numel,
         bytes,
-        dev0,
-        dev1,
-        stream0,
-        stream1,
+        devices,
+        streams,
         comms);
 
     results[result_key] =
@@ -990,212 +902,170 @@ void bench_nccl_external_ring(
 }
 
 void cleanup(
-    int dev0,
-    int dev1,
-    half*& rank0_src,
-    half*& rank1_src,
+    const std::vector<int>& devices,
+    std::vector<half*>& sources,
     std::vector<OoverlapRingSlot>& ooverlap_ring,
     std::vector<NcclRingSlot>& nccl_ring,
     std::vector<NcclRingSlot>& nccl_symmetric_ring,
-    oo_node_t*& node0,
-    oo_node_t*& node1,
+    std::vector<oo_node_t*>& nodes,
     oo_group_t*& group,
-    cudaStream_t& stream0,
-    cudaStream_t& stream1,
-    ncclComm_t* comms) {
-    destroy_ooverlap_ring(
-        ooverlap_ring,
-        dev0,
-        dev1);
+    std::vector<cudaStream_t>& streams,
+    std::vector<ncclComm_t>& comms) {
+    destroy_ooverlap_ring(ooverlap_ring, devices);
+    destroy_nccl_ring(nccl_ring, devices, false, comms);
+    destroy_nccl_ring(nccl_symmetric_ring, devices, true, comms);
 
-    destroy_nccl_ring(
-        nccl_ring,
-        dev0,
-        dev1,
-        false,
-        comms);
+    if (!comms.empty()) {
+        testing::destroy_nccl_comms(
+            comms.data(),
+            static_cast<int>(comms.size()));
+    }
 
-    destroy_nccl_ring(
-        nccl_symmetric_ring,
-        dev0,
-        dev1,
-        true,
-        comms);
+    const std::size_t world_size = devices.size();
+    for (std::size_t rank = 0;
+         rank < world_size && rank < sources.size();
+         ++rank) {
+        testing::cuda_free_on_device(devices[rank], sources[rank]);
+    }
 
-    testing::destroy_nccl_comms(comms, 2);
-
-    testing::cuda_free_on_device(dev0, rank0_src);
-    testing::cuda_free_on_device(dev1, rank1_src);
-
-    testing::destroy_oo_node(node0);
-    testing::destroy_oo_node(node1);
+    for (oo_node_t*& node : nodes) {
+        testing::destroy_oo_node(node);
+    }
     testing::destroy_oo_group(group);
 
-    testing::destroy_stream_on_device(dev0, stream0);
-    testing::destroy_stream_on_device(dev1, stream1);
+    for (std::size_t rank = 0;
+         rank < world_size && rank < streams.size();
+         ++rank) {
+        testing::destroy_stream_on_device(
+            devices[rank],
+            streams[rank]);
+    }
 }
 
 } // namespace
 
-bool external_p2p_two_gpu_collective_smoke_test(
+bool external_p2p_collective_smoke_test(
     const std::string& collective_name_arg,
     int64_t numel,
-    int dev0,
-    int dev1) {
-    std::map<std::string, double> result =
-        benchmark_external_p2p_two_gpu_collective_sm90(
+    const std::vector<int>& devices) {
+    const std::map<std::string, double> result =
+        benchmark_external_p2p_collective_sm90(
             collective_name_arg,
             numel,
             1,
             0,
-            dev0,
-            dev1);
+            devices);
 
     return !result.empty();
 }
 
-bool external_p2p_two_gpu_allreduce_smoke_test(
+bool external_p2p_allreduce_smoke_test(
     int64_t numel,
-    int dev0,
-    int dev1) {
-    return external_p2p_two_gpu_collective_smoke_test(
+    const std::vector<int>& devices) {
+    return external_p2p_collective_smoke_test(
         "allreduce",
         numel,
-        dev0,
-        dev1);
+        devices);
 }
 
-std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
+std::map<std::string, double> benchmark_external_p2p_collective_sm90(
     const std::string& collective_name_arg,
     int64_t numel_arg,
     int iters,
     int warmup,
-    int dev0,
-    int dev1) {
+    const std::vector<int>& devices) {
     if (numel_arg <= 0 || iters <= 0 || warmup < 0) {
         throw std::invalid_argument(
-            "benchmark_external_p2p_two_gpu_collective_sm90: invalid args");
+            "benchmark_external_p2p_collective_sm90: invalid args");
     }
 
-    if (dev0 == dev1) {
-        throw std::invalid_argument(
-            "benchmark_external_p2p_two_gpu_collective_sm90: dev0 and dev1 must differ");
-    }
+    validate_devices(devices);
 
     const TestCollective collective =
         testing::parse_collective(collective_name_arg);
+    const int world_size = static_cast<int>(devices.size());
 
     testing::validate_numel_for_collective(
         collective,
         numel_arg,
-        2);
+        world_size);
 
-    const size_t numel =
-        static_cast<size_t>(numel_arg);
-
-    const size_t bytes =
-        numel * sizeof(half);
-
-    const int ring_size =
-        ring_size_from_env();
+    const size_t numel = static_cast<size_t>(numel_arg);
+    const size_t bytes = numel * sizeof(half);
+    const int ring_size = ring_size_from_env();
 
     oo_group_t* group = nullptr;
-    oo_node_t* node0 = nullptr;
-    oo_node_t* node1 = nullptr;
-
-    half* rank0_src = nullptr;
-    half* rank1_src = nullptr;
+    std::vector<oo_node_t*> nodes(
+        static_cast<std::size_t>(world_size), nullptr);
+    std::vector<half*> sources(
+        static_cast<std::size_t>(world_size), nullptr);
+    std::vector<cudaStream_t> streams(
+        static_cast<std::size_t>(world_size), nullptr);
+    std::vector<ncclComm_t> comms(
+        static_cast<std::size_t>(world_size), nullptr);
 
     std::vector<OoverlapRingSlot> ooverlap_ring;
     std::vector<NcclRingSlot> nccl_ring;
     std::vector<NcclRingSlot> nccl_symmetric_ring;
 
-    cudaStream_t stream0 = nullptr;
-    cudaStream_t stream1 = nullptr;
-
-    ncclComm_t comms[2] = {
-        nullptr,
-        nullptr,
-    };
-
     try {
-        int devices[2] = {dev0, dev1};
-
         testing::check_oo(
             oo_group_create_p2p(
-                devices,
-                2,
+                devices.data(),
+                world_size,
                 &group),
             "oo_group_create_p2p");
 
-        testing::check_oo(
-            oo_node_create(
-                group,
-                0,
-                &node0),
-            "oo_node_create(rank0)");
+        for (int rank = 0; rank < world_size; ++rank) {
+            const std::string node_label =
+                "oo_node_create(rank" + std::to_string(rank) + ")";
+            testing::check_oo(
+                oo_node_create(
+                    group,
+                    rank,
+                    &nodes[static_cast<std::size_t>(rank)]),
+                node_label.c_str());
 
-        testing::check_oo(
-            oo_node_create(
-                group,
-                1,
-                &node1),
-            "oo_node_create(rank1)");
+            const int node_device =
+                oo_node_device(nodes[static_cast<std::size_t>(rank)]);
 
-        const int node0_dev =
-            oo_node_device(node0);
+            streams[static_cast<std::size_t>(rank)] =
+                system::runtime::create_stream_on_device(node_device);
 
-        const int node1_dev =
-            oo_node_device(node1);
+            const std::string source_label =
+                "cudaMalloc(rank" + std::to_string(rank) + "_src)";
+            testing::cuda_malloc_half_on_device(
+                node_device,
+                &sources[static_cast<std::size_t>(rank)],
+                bytes,
+                source_label.c_str());
 
-        stream0 =
-            system::runtime::create_stream_on_device(node0_dev);
-
-        stream1 =
-            system::runtime::create_stream_on_device(node1_dev);
-
-        testing::cuda_malloc_half_on_device(
-            node0_dev,
-            &rank0_src,
-            bytes,
-            "cudaMalloc(rank0_src)");
-
-        testing::cuda_malloc_half_on_device(
-            node1_dev,
-            &rank1_src,
-            bytes,
-            "cudaMalloc(rank1_src)");
-
-        testing::fill_two_rank_sources_fp16(
-            rank0_src,
-            rank1_src,
-            numel_arg,
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1);
+            testing::fill_rank_source_fp16(
+                sources[static_cast<std::size_t>(rank)],
+                numel_arg,
+                rank,
+                node_device,
+                streams[static_cast<std::size_t>(rank)]);
+        }
 
         OOVERLAP_TEST_NCCL_CHECK(
             ncclCommInitAll(
-                comms,
-                2,
-                devices));
+                comms.data(),
+                world_size,
+                devices.data()));
 
         allocate_ooverlap_ring(
             ooverlap_ring,
             ring_size,
-            node0,
-            node1,
+            nodes,
             bytes,
-            node0_dev,
-            node1_dev);
+            devices);
 
         allocate_nccl_ring(
             nccl_ring,
             ring_size,
             bytes,
-            node0_dev,
-            node1_dev,
+            devices,
             false,
             comms);
 
@@ -1203,8 +1073,7 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             nccl_symmetric_ring,
             ring_size,
             bytes,
-            node0_dev,
-            node1_dev,
+            devices,
             true,
             comms);
 
@@ -1214,17 +1083,13 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             results,
             collective,
             group,
-            node0,
-            node1,
+            nodes,
             ooverlap_ring,
-            rank0_src,
-            rank1_src,
+            sources,
             numel,
             bytes,
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1,
+            devices,
+            streams,
             iters,
             warmup);
 
@@ -1233,14 +1098,11 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             "nccl_ms",
             collective,
             nccl_ring,
-            rank0_src,
-            rank1_src,
+            sources,
             numel,
             bytes,
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1,
+            devices,
+            streams,
             comms,
             iters,
             warmup);
@@ -1250,76 +1112,96 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
             "nccl_symmetric_ms",
             collective,
             nccl_symmetric_ring,
-            rank0_src,
-            rank1_src,
+            sources,
             numel,
             bytes,
-            node0_dev,
-            node1_dev,
-            stream0,
-            stream1,
+            devices,
+            streams,
             comms,
             iters,
             warmup);
 
-        results["collective"] =
-            testing::collective_code(collective);
-
-        results["numel"] =
-            static_cast<double>(numel);
-
-        results["bytes"] =
-            static_cast<double>(bytes);
-
-        results["iters"] =
-            static_cast<double>(iters);
-
-        results["warmup"] =
-            static_cast<double>(warmup);
-
-        results["ring_size"] =
-            static_cast<double>(ring_size);
+        results["collective"] = testing::collective_code(collective);
+        results["world_size"] = static_cast<double>(world_size);
+        results["numel"] = static_cast<double>(numel);
+        results["bytes"] = static_cast<double>(bytes);
+        results["iters"] = static_cast<double>(iters);
+        results["warmup"] = static_cast<double>(warmup);
+        results["ring_size"] = static_cast<double>(ring_size);
 
         cleanup(
-            node0_dev,
-            node1_dev,
-            rank0_src,
-            rank1_src,
+            devices,
+            sources,
             ooverlap_ring,
             nccl_ring,
             nccl_symmetric_ring,
-            node0,
-            node1,
+            nodes,
             group,
-            stream0,
-            stream1,
+            streams,
             comms);
 
         return results;
     } catch (...) {
-        const int node0_dev =
-            node0 != nullptr ? oo_node_device(node0) : dev0;
-
-        const int node1_dev =
-            node1 != nullptr ? oo_node_device(node1) : dev1;
-
         cleanup(
-            node0_dev,
-            node1_dev,
-            rank0_src,
-            rank1_src,
+            devices,
+            sources,
             ooverlap_ring,
             nccl_ring,
             nccl_symmetric_ring,
-            node0,
-            node1,
+            nodes,
             group,
-            stream0,
-            stream1,
+            streams,
             comms);
-
         throw;
     }
+}
+
+std::map<std::string, double> benchmark_external_p2p_allreduce_sm90(
+    int64_t numel,
+    int iters,
+    int warmup,
+    const std::vector<int>& devices) {
+    return benchmark_external_p2p_collective_sm90(
+        "allreduce",
+        numel,
+        iters,
+        warmup,
+        devices);
+}
+
+bool external_p2p_two_gpu_collective_smoke_test(
+    const std::string& collective,
+    int64_t numel,
+    int dev0,
+    int dev1) {
+    return external_p2p_collective_smoke_test(
+        collective,
+        numel,
+        std::vector<int>{dev0, dev1});
+}
+
+bool external_p2p_two_gpu_allreduce_smoke_test(
+    int64_t numel,
+    int dev0,
+    int dev1) {
+    return external_p2p_allreduce_smoke_test(
+        numel,
+        std::vector<int>{dev0, dev1});
+}
+
+std::map<std::string, double> benchmark_external_p2p_two_gpu_collective_sm90(
+    const std::string& collective,
+    int64_t numel,
+    int iters,
+    int warmup,
+    int dev0,
+    int dev1) {
+    return benchmark_external_p2p_collective_sm90(
+        collective,
+        numel,
+        iters,
+        warmup,
+        std::vector<int>{dev0, dev1});
 }
 
 std::map<std::string, double> benchmark_external_p2p_two_gpu_allreduce_sm90(
@@ -1328,13 +1210,11 @@ std::map<std::string, double> benchmark_external_p2p_two_gpu_allreduce_sm90(
     int warmup,
     int dev0,
     int dev1) {
-    return benchmark_external_p2p_two_gpu_collective_sm90(
-        "allreduce",
+    return benchmark_external_p2p_allreduce_sm90(
         numel,
         iters,
         warmup,
-        dev0,
-        dev1);
+        std::vector<int>{dev0, dev1});
 }
 
 } // namespace ooverlap

@@ -403,6 +403,32 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("warmup"),
         py::arg("verify"));
 
+  m.def("external_p2p_collective_smoke_test",
+        &ooverlap::external_p2p_collective_smoke_test,
+        py::arg("collective"),
+        py::arg("numel"),
+        py::arg("devices"));
+
+  m.def("external_p2p_allreduce_smoke_test",
+        &ooverlap::external_p2p_allreduce_smoke_test,
+        py::arg("numel"),
+        py::arg("devices"));
+
+  m.def("benchmark_external_p2p_collective_sm90",
+        &ooverlap::benchmark_external_p2p_collective_sm90,
+        py::arg("collective"),
+        py::arg("numel"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("devices"));
+
+  m.def("benchmark_external_p2p_allreduce_sm90",
+        &ooverlap::benchmark_external_p2p_allreduce_sm90,
+        py::arg("numel"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("devices"));
+
   m.def("external_p2p_two_gpu_collective_smoke_test",
         &ooverlap::external_p2p_two_gpu_collective_smoke_test,
         py::arg("collective"),
