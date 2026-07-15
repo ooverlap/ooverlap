@@ -617,6 +617,13 @@ struct LoweringPassOptions {
     bool enable_ready_publish_wait_merge = true;
 
     /*
+     * Assign independent TransferOp::Reduce tasks to contiguous CTA groups.
+     * The all-reduce launcher enables this and supplies the group-size limit.
+     */
+    bool enable_reduce_cta_groups = false;
+    int max_ctas_per_reduce_task = 8;
+
+    /*
      * The current executor has historically had a temporary local-task limit in
      * execute_window_task_stripe(). Keep this disabled by default so the skeleton
      * preserves old lowering behavior. Enable while debugging if needed.
@@ -653,7 +660,10 @@ inline bool make_lowering_context(
         binding.world_size <= 0 ||
         binding.world_size > MaxRanks ||
         launch_config.max_ctas < 0 ||
-        reserved_prefix_tasks_per_cta < 0) {
+        reserved_prefix_tasks_per_cta < 0 ||
+        (options.enable_reduce_cta_groups &&
+         (options.max_ctas_per_reduce_task <= 0 ||
+          options.max_ctas_per_reduce_task > task::kWindowTaskMaxCtas))) {
         return false;
     }
 
@@ -1014,6 +1024,81 @@ struct LoweringShape {
     int max_end_window = 0;
 };
 
+
+struct ReduceCtaGroup {
+    task::WindowTaskCtaMask mask = 0;
+    int first_cta = 0;
+    int cta_count = 0;
+};
+
+inline task::WindowTaskCtaMask make_contiguous_cta_mask(
+    int first_cta,
+    int cta_count) {
+    if (first_cta < 0 ||
+        cta_count <= 0 ||
+        first_cta >= task::kWindowTaskMaxCtas) {
+        return 0;
+    }
+
+    const int end_cta =
+        comm::utils::min_int(
+            first_cta + cta_count,
+            task::kWindowTaskMaxCtas);
+
+    task::WindowTaskCtaMask mask = 0;
+
+    for (int cta = first_cta; cta < end_cta; ++cta) {
+        mask |=
+            task::WindowTaskCtaMask{1}
+            << static_cast<unsigned int>(cta);
+    }
+
+    return mask;
+}
+
+inline ReduceCtaGroup reduce_cta_group_for_task(
+    int reduce_task_index,
+    int launched_ctas,
+    int max_ctas_per_reduce_task) {
+    ReduceCtaGroup group{};
+
+    if (reduce_task_index < 0 ||
+        launched_ctas <= 0 ||
+        max_ctas_per_reduce_task <= 0) {
+        return group;
+    }
+
+    const int usable_ctas =
+        comm::utils::min_int(
+            launched_ctas,
+            task::kWindowTaskMaxCtas);
+
+    const int group_size =
+        comm::utils::min_int(
+            max_ctas_per_reduce_task,
+            usable_ctas);
+
+    const int group_count =
+        comm::utils::ceil_div_int(
+            usable_ctas,
+            group_size);
+
+    const int group_index =
+        reduce_task_index % group_count;
+
+    group.first_cta = group_index * group_size;
+    group.cta_count =
+        comm::utils::min_int(
+            group_size,
+            usable_ctas - group.first_cta);
+    group.mask =
+        make_contiguous_cta_mask(
+            group.first_cta,
+            group.cta_count);
+
+    return group;
+}
+
 template <int MaxTransferTasks, int MaxWindowTasks, int MaxRanks>
 inline bool compute_lowering_shape(
     const LoweringContext<MaxRanks>& ctx,
@@ -1080,6 +1165,13 @@ inline bool compute_lowering_shape(
             shape.cta_count,
             shape.max_ctas_by_plan);
 
+    if (ctx.options.enable_reduce_cta_groups) {
+        shape.cta_count =
+            comm::utils::min_int(
+                shape.cta_count,
+                task::kWindowTaskMaxCtas);
+    }
+
     if (shape.cta_count <= 0) {
         *out = shape;
         return true;
@@ -1132,6 +1224,7 @@ inline bool emit_window_plan_from_rank_tasks(
 
         int task_idx = cta_idx * shape.tasks_per_cta;
         int ready_pair_index = 0;
+        int reduce_task_index = 0;
 
         for (int i = 0; i < rank_tasks.count; ++i) {
             const TransferTask& transfer = rank_tasks.tasks[i];
@@ -1203,22 +1296,54 @@ inline bool emit_window_plan_from_rank_tasks(
                 continue;
             }
 
+            comm::utils::WindowRange task_cta_range = cta_range;
+            task::WindowTaskCtaMask cta_mask = task::kWindowTaskAllCtas;
+
+            if (ctx.options.enable_reduce_cta_groups &&
+                transfer.op == TransferOp::Reduce) {
+                const ReduceCtaGroup group =
+                    reduce_cta_group_for_task(
+                        reduce_task_index++,
+                        shape.cta_count,
+                        ctx.options.max_ctas_per_reduce_task);
+
+                cta_mask = group.mask;
+
+                if (cta_idx < group.first_cta ||
+                    cta_idx >= group.first_cta + group.cta_count) {
+                    task::WindowTask skipped_task{};
+                    skipped_task.cta_mask = cta_mask;
+                    out_window_plan->tasks[task_idx++] = skipped_task;
+                    continue;
+                }
+
+                task_cta_range =
+                    comm::utils::cta_window_range(
+                        cta_idx - group.first_cta,
+                        group.cta_count,
+                        comm::utils::WindowRange{
+                            transfer.begin_window,
+                            transfer.end_window});
+            }
+
             const int begin_window =
                 comm::utils::max_int(
                     transfer.begin_window,
-                    cta_range.begin);
+                    task_cta_range.begin);
 
             const int end_window =
                 comm::utils::min_int(
                     transfer.end_window,
-                    cta_range.end);
+                    task_cta_range.end);
 
             if (begin_window >= end_window) {
                 /*
                  * Keep task striping rectangular. A no-op task preserves
                  * tasks_per_cta indexing.
                  */
-                out_window_plan->tasks[task_idx++] = task::WindowTask{};
+                task::WindowTask no_work_task{};
+                no_work_task.cta_mask = cta_mask;
+                out_window_plan->tasks[task_idx++] = no_work_task;
                 continue;
             }
 
@@ -1277,6 +1402,7 @@ inline bool emit_window_plan_from_rank_tasks(
                     return false;
                 }
 
+                window_task.cta_mask = cta_mask;
                 out_window_plan->tasks[task_idx++] = window_task;
                 continue;
             }
@@ -1301,6 +1427,7 @@ inline bool emit_window_plan_from_rank_tasks(
                 return false;
             }
 
+            window_task.cta_mask = cta_mask;
             out_window_plan->tasks[task_idx++] = window_task;
         }
     }
