@@ -319,6 +319,11 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         return launch_error;
     }
 
+    /* OOVERLAP_PLAN_SCRATCH_NULL_EVENT_RECORD_SKIP_V1 */
+    if (window_plan_scratch.completion_event == nullptr) {
+        return cudaSuccess;
+    }
+
     /*
      * The event is queued after the kernel on the same stream. The next use of
      * this exact plan slot may rewrite its mapped host memory only after this

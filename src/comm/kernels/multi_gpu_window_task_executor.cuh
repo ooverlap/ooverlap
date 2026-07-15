@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstddef>
 #include <driver_types.h>
 #include <mutex>
@@ -59,7 +60,6 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
 
     __shared__ sync::semaphore barriers[Variant::barrier_count];
 
-    
     if (collective_epoch > 0 &&
         local_ready_signal != nullptr &&
         ready_plan.protocol != MultiGpuReadySignalProtocol::Disabled) {
@@ -109,18 +109,24 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
 }
 
 
-
 /*
  * OOVERLAP_MAPPED_WINDOW_PLAN_SCRATCH_PATCH
  * OOVERLAP_ROUND_ROBIN_PLAN_SCRATCH_RING_V1
+ * OOVERLAP_PLAN_SCRATCH_MINUS_ONE_FAST_PATH_V1
  *
- * The GPU reads WindowTaskExecutorPlan directly from mapped pinned host memory.
- * Therefore the CPU must not rewrite a plan entry until the prior kernel using
- * that exact entry has completed.
+ * scratch_index == -1:
+ *   - uses storage entry 0
+ *   - never creates, queries, synchronizes, or returns a completion event
+ *   - after first initialization, returns through an atomic lock-free fast path
  *
- * Each round-robin data slot gets a matching plan-scratch entry and completion
- * event. On reuse, only that slot is queried/synchronized. Other slots remain
- * available and there is no device-wide synchronization.
+ * scratch_index >= 0:
+ *   - preserves the existing event-protected behavior
+ *   - the CPU may rewrite mapped host memory only after the prior kernel using
+ *     that exact entry has completed
+ *
+ * The -1 path intentionally removes the lifetime protection for entry 0. It is
+ * an experimental path and must only be used when the caller guarantees that
+ * the CPU will not rewrite the plan while a prior kernel is still reading it.
  */
 constexpr int kOoMappedWindowPlanScratchSlots = 257;
 
@@ -146,7 +152,7 @@ cudaError_t get_mapped_window_plan_scratch(
         return cudaErrorInvalidDevice;
     }
 
-    if (scratch_index < 0 ||
+    if (scratch_index < -1 ||
         scratch_index >= kOoMappedWindowPlanScratchSlots) {
         return cudaErrorInvalidValue;
     }
@@ -157,6 +163,98 @@ cudaError_t get_mapped_window_plan_scratch(
     static cudaEvent_t completion_events
         [32][kOoMappedWindowPlanScratchSlots] = {};
 
+    /*
+     * Publish completion of the one-time -1-path initialization. The pointer
+     * arrays remain the requested storage; this atomic only makes their
+     * lock-free reads well-defined after the initializing thread releases them.
+     */
+    static std::atomic<bool> no_event_fast_path_ready[32] = {};
+
+    if (scratch_index == -1) {
+        constexpr int storage_index = 0;
+
+        if (no_event_fast_path_ready[device].load(
+                std::memory_order_acquire)) {
+            void* host_buffer = host_buffers[device][storage_index];
+            void* device_buffer = device_buffers[device][storage_index];
+
+            if (host_buffer != nullptr && device_buffer != nullptr) {
+                out->host_plan =
+                    reinterpret_cast<
+                        comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
+                            host_buffer);
+                out->device_plan =
+                    reinterpret_cast<
+                        const comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
+                            device_buffer);
+                out->completion_event = nullptr;
+                return cudaSuccess;
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+
+        void*& host_buffer = host_buffers[device][storage_index];
+        void*& device_buffer = device_buffers[device][storage_index];
+
+        /*
+         * Check again after taking the lock. Another thread may have completed
+         * the allocation while this thread was waiting.
+         */
+        if (host_buffer == nullptr || device_buffer == nullptr) {
+            cudaError_t err = cudaSetDevice(device);
+            if (err != cudaSuccess) {
+                return err;
+            }
+
+            void* host_ptr = nullptr;
+
+            err =
+                cudaHostAlloc(
+                    &host_ptr,
+                    sizeof(comm::plan::WindowTaskExecutorPlan<MaxTasks>),
+                    cudaHostAllocMapped | cudaHostAllocPortable);
+
+            if (err != cudaSuccess) {
+                return err;
+            }
+
+            void* device_ptr = nullptr;
+
+            err =
+                cudaHostGetDevicePointer(
+                    &device_ptr,
+                    host_ptr,
+                    0);
+
+            if (err != cudaSuccess) {
+                cudaFreeHost(host_ptr);
+                return err;
+            }
+
+            host_buffer = host_ptr;
+            device_buffer = device_ptr;
+        }
+
+        no_event_fast_path_ready[device].store(
+            true,
+            std::memory_order_release);
+
+        out->host_plan =
+            reinterpret_cast<comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
+                host_buffer);
+        out->device_plan =
+            reinterpret_cast<
+                const comm::plan::WindowTaskExecutorPlan<MaxTasks>*>(
+                    device_buffer);
+        out->completion_event = nullptr;
+
+        return cudaSuccess;
+    }
+
+    /*
+     * Existing event-protected path for every nonnegative scratch index.
+     */
     cudaError_t err = cudaSetDevice(device);
     if (err != cudaSuccess) {
         return err;
@@ -263,9 +361,8 @@ cudaError_t get_mapped_window_plan_scratch(
  * OOVERLAP_WINDOW_PLAN_DEVICE_LAUNCH_HELPER_PATCH:
  *
  * WindowTaskExecutorPlan can be too large to pass by value as a CUDA kernel
- * parameter after WindowTask grows fanout metadata.  Keep the host-side lowering
- * path unchanged, but copy the final plan to device memory and pass only a
- * pointer to the kernel.
+ * parameter after WindowTask grows fanout metadata. Keep the host-side lowering
+ * path unchanged, but pass the mapped device alias to the kernel.
  */
 template <
     typename ReduceApply,

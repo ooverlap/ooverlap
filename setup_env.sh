@@ -95,6 +95,22 @@ install_python_packages() {
     setuptools wheel cmake numpy setuptools_scm setuptools_rust matplotlib \
     "vllm==$VLLM_VER"
 
+  local vllm_communicators_dir
+  vllm_communicators_dir="$($PYTHON_BIN - <<'PY'
+from pathlib import Path
+import vllm
+print(Path(vllm.__file__).resolve().parent / "distributed" / "device_communicators")
+PY
+)"
+
+  curl -fsSL \
+    https://raw.githubusercontent.com/ooverlap/vllm/refs/heads/oo-force-allreduce-backends/vllm/distributed/device_communicators/cuda_communicator.py \
+    -o "$vllm_communicators_dir/cuda_communicator.py"
+
+  curl -fsSL \
+    https://raw.githubusercontent.com/ooverlap/vllm/refs/heads/oo-force-allreduce-backends/vllm/distributed/device_communicators/ooverlap_all_reduce.py \
+    -o "$vllm_communicators_dir/ooverlap_all_reduce.py"
+
   "$PYTHON_BIN" - <<'PY'
 import torch, vllm
 print("vllm:", vllm.__version__)
