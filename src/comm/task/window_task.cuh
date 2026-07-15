@@ -11,6 +11,12 @@ namespace ooverlap {
 namespace comm {
 namespace task {
 
+constexpr int kWindowTaskMaxCtas = 64;
+
+using WindowTaskCtaMask = uint64_t;
+
+constexpr WindowTaskCtaMask kWindowTaskAllCtas = ~WindowTaskCtaMask{0};
+
 enum class WindowTaskOp : uint8_t {
     None = 0,
 
@@ -79,6 +85,8 @@ enum class WindowTaskOp : uint8_t {
 struct WindowTask {
     WindowTaskOp op = WindowTaskOp::None;
 
+    WindowTaskCtaMask cta_mask = kWindowTaskAllCtas;
+
     const void* src = nullptr;
     void* dst = nullptr;
     
@@ -128,6 +136,26 @@ struct WindowTask {
      */
     bool terminal = false;
 };
+
+/*
+ * Static CTA assignment for one lowered WindowTask.
+ *
+ * The lowering layer will set cta_mask later. Until then, the all-ones default
+ * preserves the existing behavior: every launched CTA executes every task in
+ * its stripe.
+ */
+__host__ __device__ __forceinline__ bool window_task_runs_on_cta(
+    const WindowTask& task,
+    int cta_idx) {
+    if (cta_idx < 0 || cta_idx >= kWindowTaskMaxCtas) {
+        return false;
+    }
+
+    const WindowTaskCtaMask cta_bit =
+        WindowTaskCtaMask{1} << static_cast<unsigned int>(cta_idx);
+
+    return (task.cta_mask & cta_bit) != 0;
+}
 
 __host__ __device__ __forceinline__ WindowTask make_window_task(
     WindowTaskOp op,

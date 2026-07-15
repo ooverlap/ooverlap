@@ -224,6 +224,10 @@ __device__ __forceinline__ void execute_window_task_stripe(
 
         const task::WindowTask task = tasks[task_idx];
 
+        if (!task::window_task_runs_on_cta(task, cta_idx)) {
+            continue;
+        }
+
         execute_window_task<
             StageDepth,
             FillDepth,
