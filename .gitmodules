@@ -1,6 +1,7 @@
 [submodule "src/third-party/cutlass"]
 	path = src/third-party/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
+	url = https://github.com/ooverlap/cutlass.git
+	branch = v3.9.0-oo
 [submodule "src/third-party/nlohmann_json"]
 	path = src/third-party/nlohmann_json
 	url = https://github.com/nlohmann/json.git
