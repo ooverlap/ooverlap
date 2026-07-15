@@ -121,6 +121,255 @@ bool push_copy_task(
     return push_task_or_abort(plan, copy);
 }
 
+
+/*
+ * OOVERLAP_ALLGATHER_COPY_FANOUT_PLANNER_V1
+ *
+ * The current low-level TMA fanout path handles only fully 16-byte-aligned
+ * bulk ranges. Keep ordinary Copy tasks as the correctness fallback for every
+ * other slice.
+ */
+inline bool all_gather_copy_fanout_compatible(
+    std::size_t byte_offset,
+    std::size_t bytes) {
+    constexpr std::size_t kTmaBulkAlignment = 16;
+
+    return (byte_offset % kTmaBulkAlignment) == 0 &&
+           (bytes % kTmaBulkAlignment) == 0;
+}
+
+template <int MaxTransferTasks>
+bool push_copy_fanout_task(
+    TransferPlan<MaxTransferTasks>* plan,
+    const TransferPlanBuildInput& input,
+    int executor_rank,
+    int src_rank,
+    const int* dst_ranks,
+    LogicalBufferRef src,
+    const LogicalBufferRef* fanout_dsts,
+    int fanout_dst_count,
+    std::size_t bytes,
+    int num_windows,
+    topology::TransportKind transport,
+    int* task_phase) {
+    if (task_phase == nullptr ||
+        dst_ranks == nullptr ||
+        fanout_dsts == nullptr ||
+        fanout_dst_count <= 0 ||
+        fanout_dst_count > TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS ||
+        bytes == 0 ||
+        num_windows <= 0 ||
+        !all_gather_transport_is_direct(transport)) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
+
+    const TransferTask copy =
+        make_copy_fanout_transfer_task(
+            executor_rank,
+            src_rank,
+            dst_ranks,
+            src,
+            fanout_dsts,
+            fanout_dst_count,
+            bytes,
+            num_windows,
+            input.launch_config.window_chunks,
+            transport,
+            false,
+            (*task_phase)++);
+
+    return push_task_or_abort(plan, copy);
+}
+
+template <int MaxTransferTasks>
+bool push_copy_batch_task(
+    TransferPlan<MaxTransferTasks>* plan,
+    const TransferPlanBuildInput& input,
+    int executor_rank,
+    int src_rank,
+    const int* dst_ranks,
+    LogicalBufferRef src,
+    const LogicalBufferRef* fanout_dsts,
+    int fanout_dst_count,
+    std::size_t bytes,
+    int num_windows,
+    topology::TransportKind transport,
+    int* task_phase) {
+    if (fanout_dst_count == 1) {
+        return push_copy_task(
+            plan,
+            input,
+            executor_rank,
+            src_rank,
+            dst_ranks[0],
+            src,
+            fanout_dsts[0],
+            bytes,
+            num_windows,
+            transport,
+            task_phase);
+    }
+
+    return push_copy_fanout_task(
+        plan,
+        input,
+        executor_rank,
+        src_rank,
+        dst_ranks,
+        src,
+        fanout_dsts,
+        fanout_dst_count,
+        bytes,
+        num_windows,
+        transport,
+        task_phase);
+}
+
+template <int MaxTransferTasks>
+bool emit_all_gather_source_copies(
+    TransferPlan<MaxTransferTasks>* plan,
+    const TransferPlanBuildInput& input,
+    const TransportMatrix& transports,
+    int src_rank,
+    const int* candidate_ranks,
+    int candidate_count,
+    std::size_t slice_begin_bytes,
+    std::size_t slice_bytes,
+    int slice_windows,
+    int* task_phase) {
+    if (plan == nullptr ||
+        candidate_ranks == nullptr ||
+        candidate_count < 0 ||
+        candidate_count > input.world_size ||
+        !valid_rank(src_rank, input.world_size) ||
+        task_phase == nullptr ||
+        slice_bytes == 0 ||
+        slice_windows <= 0) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
+
+    const LogicalBufferRef src =
+        rank_buffer_ref(src_rank, slice_begin_bytes);
+
+    if (!all_gather_copy_fanout_compatible(
+            slice_begin_bytes,
+            slice_bytes)) {
+        for (int i = 0; i < candidate_count; ++i) {
+            const int dst_rank = candidate_ranks[i];
+
+            if (dst_rank == src_rank) {
+                continue;
+            }
+
+            if (!valid_rank(dst_rank, input.world_size) ||
+                !all_gather_transport_is_direct(
+                    transports.kind[src_rank][dst_rank])) {
+                transfer_plan_abort_build(plan);
+                return false;
+            }
+
+            if (!push_copy_task(
+                    plan,
+                    input,
+                    src_rank,
+                    src_rank,
+                    dst_rank,
+                    src,
+                    rank_buffer_ref(dst_rank, slice_begin_bytes),
+                    slice_bytes,
+                    slice_windows,
+                    transports.kind[src_rank][dst_rank],
+                    task_phase)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    int batch_dst_ranks[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+    LogicalBufferRef batch_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+    int batch_count = 0;
+    topology::TransportKind batch_transport =
+        topology::TransportKind::DirectNvlink;
+
+    for (int i = 0; i < candidate_count; ++i) {
+        const int dst_rank = candidate_ranks[i];
+
+        if (dst_rank == src_rank) {
+            continue;
+        }
+
+        if (!valid_rank(dst_rank, input.world_size)) {
+            transfer_plan_abort_build(plan);
+            return false;
+        }
+
+        const topology::TransportKind transport =
+            transports.kind[src_rank][dst_rank];
+
+        if (!all_gather_transport_is_direct(transport)) {
+            transfer_plan_abort_build(plan);
+            return false;
+        }
+
+        const bool flush_batch =
+            batch_count > 0 &&
+            (batch_count == TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS ||
+             transport != batch_transport);
+
+        if (flush_batch) {
+            if (!push_copy_batch_task(
+                    plan,
+                    input,
+                    src_rank,
+                    src_rank,
+                    batch_dst_ranks,
+                    src,
+                    batch_dsts,
+                    batch_count,
+                    slice_bytes,
+                    slice_windows,
+                    batch_transport,
+                    task_phase)) {
+                return false;
+            }
+
+            batch_count = 0;
+        }
+
+        if (batch_count == 0) {
+            batch_transport = transport;
+        }
+
+        batch_dst_ranks[batch_count] = dst_rank;
+        batch_dsts[batch_count] =
+            rank_buffer_ref(dst_rank, slice_begin_bytes);
+        ++batch_count;
+    }
+
+    if (batch_count > 0 &&
+        !push_copy_batch_task(
+            plan,
+            input,
+            src_rank,
+            src_rank,
+            batch_dst_ranks,
+            src,
+            batch_dsts,
+            batch_count,
+            slice_bytes,
+            slice_windows,
+            batch_transport,
+            task_phase)) {
+        return false;
+    }
+
+    return true;
+}
+
 template <int MaxTransferTasks>
 bool push_ready_publish_task(
     TransferPlan<MaxTransferTasks>* plan,
@@ -556,32 +805,24 @@ bool build_direct_all_gather_plan(
         return false;
     }
 
+    int all_ranks[kPlannerMaxRanks] = {};
+    for (int rank = 0; rank < input.world_size; ++rank) {
+        all_ranks[rank] = rank;
+    }
+
     for (int src_rank = 0; src_rank < input.world_size; ++src_rank) {
-        for (int dst_rank = 0; dst_rank < input.world_size; ++dst_rank) {
-            if (dst_rank == src_rank) {
-                continue;
-            }
-
-            if (!all_gather_transport_is_direct(
-                    transports.kind[src_rank][dst_rank])) {
-                transfer_plan_abort_build(plan);
-                return false;
-            }
-
-            if (!push_copy_task(
-                    plan,
-                    input,
-                    src_rank,
-                    src_rank,
-                    dst_rank,
-                    rank_buffer_ref(src_rank, slice_begin_bytes[src_rank]),
-                    rank_buffer_ref(dst_rank, slice_begin_bytes[src_rank]),
-                    slice_bytes[src_rank],
-                    slice_windows[src_rank],
-                    transports.kind[src_rank][dst_rank],
-                    &task_phase[src_rank])) {
-                return false;
-            }
+        if (!emit_all_gather_source_copies(
+                plan,
+                input,
+                transports,
+                src_rank,
+                all_ranks,
+                input.world_size,
+                slice_begin_bytes[src_rank],
+                slice_bytes[src_rank],
+                slice_windows[src_rank],
+                &task_phase[src_rank])) {
+            return false;
         }
     }
 
@@ -606,36 +847,18 @@ bool emit_intra_island_all_gather(
             const int src_rank =
                 islands.island_ranks[island][src_idx];
 
-            for (int dst_idx = 0;
-                 dst_idx < islands.island_size[island];
-                 ++dst_idx) {
-                const int dst_rank =
-                    islands.island_ranks[island][dst_idx];
-
-                if (dst_rank == src_rank) {
-                    continue;
-                }
-
-                if (!all_gather_transport_is_direct(
-                        transports.kind[src_rank][dst_rank])) {
-                    transfer_plan_abort_build(plan);
-                    return false;
-                }
-
-                if (!push_copy_task(
-                        plan,
-                        input,
-                        src_rank,
-                        src_rank,
-                        dst_rank,
-                        rank_buffer_ref(src_rank, slice_begin_bytes[src_rank]),
-                        rank_buffer_ref(dst_rank, slice_begin_bytes[src_rank]),
-                        slice_bytes[src_rank],
-                        slice_windows[src_rank],
-                        transports.kind[src_rank][dst_rank],
-                        &task_phase[src_rank])) {
-                    return false;
-                }
+            if (!emit_all_gather_source_copies(
+                    plan,
+                    input,
+                    transports,
+                    src_rank,
+                    islands.island_ranks[island],
+                    islands.island_size[island],
+                    slice_begin_bytes[src_rank],
+                    slice_bytes[src_rank],
+                    slice_windows[src_rank],
+                    &task_phase[src_rank])) {
+                return false;
             }
         }
     }
