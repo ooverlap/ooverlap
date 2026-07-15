@@ -99,7 +99,7 @@ bool validate_allreduce_launch(
 }
 
 #ifndef OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
-#define OOVERLAP_DEBUG_PRINT_WINDOW_TASKS 1
+#define OOVERLAP_DEBUG_PRINT_WINDOW_TASKS 0
 #endif
 
 #if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
@@ -189,7 +189,7 @@ void debug_print_window_task_plan(
                 task.ready_epoch,
                 task.ready_protocol,
                 task.ready_poll_sleep_cycles,
-                static_cast<int>(task.terminal), task.cta_mask);
+                static_cast<int>(task.terminal), static_cast<unsigned long>(task.cta_mask));
         }
     }
 
