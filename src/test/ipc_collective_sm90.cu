@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -23,6 +24,31 @@ namespace ooverlap {
 namespace {
 
 using testing::TestCollective;
+
+/* OOVERLAP_IPC_COLLECTIVE_MULTI_GPU_V1 */
+void validate_devices(
+    const std::vector<int>& devices,
+    int local_rank) {
+    if (devices.size() < 2) {
+        throw std::invalid_argument(
+            "IPC collective requires at least two devices");
+    }
+
+    std::set<int> unique;
+    for (int device : devices) {
+        if (device < 0) {
+            throw std::invalid_argument("device ids must be non-negative");
+        }
+        if (!unique.insert(device).second) {
+            throw std::invalid_argument("device ids must be unique");
+        }
+    }
+
+    if (local_rank < 0 ||
+        local_rank >= static_cast<int>(devices.size())) {
+        throw std::invalid_argument("local_rank is outside the device list");
+    }
+}
 
 void nccl_mem_alloc_half_on_device(
     int device,
@@ -166,8 +192,7 @@ void destroy_ipc_oo_context(IpcOoContext& ctx) {
 IpcOoContext create_ipc_oo_context(
     int64_t numel,
     int local_rank,
-    int dev0,
-    int dev1,
+    const std::vector<int>& devices,
     const std::string& broker_key) {
     /*
      * OOVERLAP_IPC_COLLECTIVE_LEGACY_TEST_CREATE_PATCH:
@@ -181,24 +206,22 @@ IpcOoContext create_ipc_oo_context(
      *
      * The comm layer exports/imports peer pointers internally every collective.
      */
-    if (local_rank != 0 && local_rank != 1) {
-        throw std::invalid_argument("local_rank must be 0 or 1");
-    }
+    validate_devices(devices, local_rank);
 
     if (broker_key.empty()) {
         throw std::invalid_argument("broker_key must be non-empty");
     }
 
-    int devices[2] = {dev0, dev1};
+    const int world_size = static_cast<int>(devices.size());
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
 
     IpcOoContext ctx;
-    ctx.local_device = local_rank == 0 ? dev0 : dev1;
+    ctx.local_device = devices[static_cast<std::size_t>(local_rank)];
 
     testing::check_oo(
         oo_group_create_ipc(
-            devices,
-            2,
+            devices.data(),
+            world_size,
             local_rank,
             broker_key.c_str(),
             &ctx.group),
@@ -395,6 +418,7 @@ void warmup_nccl(
     const half* local_src,
     size_t numel,
     int local_rank,
+    int world_size,
     int local_device,
     cudaStream_t stream,
     IpcOoContext& barrier_ctx,
@@ -418,7 +442,7 @@ void warmup_nccl(
             work,
             numel,
             local_rank,
-            2,
+            world_size,
             stream);
 
         sync_device_stream(local_device, stream, "sync nccl warmup");
@@ -433,6 +457,7 @@ double benchmark_nccl_total_ms(
     const half* local_src,
     size_t numel,
     int local_rank,
+    int world_size,
     int local_device,
     cudaStream_t stream,
     IpcOoContext& barrier_ctx,
@@ -462,7 +487,7 @@ double benchmark_nccl_total_ms(
                         work,
                         numel,
                         local_rank,
-                        2,
+                        world_size,
                         stream);
                 });
 
@@ -478,6 +503,7 @@ void verify_ooverlap_once(
     const half* local_src,
     int64_t numel,
     int local_rank,
+    int world_size,
     int local_device,
     cudaStream_t stream) {
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
@@ -506,7 +532,7 @@ void verify_ooverlap_once(
         ctx.local_work,
         numel,
         local_rank,
-        2,
+        world_size,
         local_device);
 
     broker_sync(ctx);
@@ -519,6 +545,7 @@ void verify_nccl_once(
     const half* local_src,
     int64_t numel,
     int local_rank,
+    int world_size,
     int local_device,
     cudaStream_t stream,
     IpcOoContext& barrier_ctx) {
@@ -540,7 +567,7 @@ void verify_nccl_once(
         work,
         static_cast<size_t>(numel),
         local_rank,
-        2,
+        world_size,
         stream);
 
     sync_device_stream(local_device, stream, "sync nccl verify");
@@ -551,7 +578,7 @@ void verify_nccl_once(
         work,
         numel,
         local_rank,
-        2,
+        world_size,
         local_device);
 
     broker_sync(barrier_ctx);
@@ -561,19 +588,21 @@ std::map<std::string, double> run_one_size(
     TestCollective collective,
     int64_t numel,
     int local_rank,
-    int dev0,
-    int dev1,
+    const std::vector<int>& devices,
     const std::string& broker_key,
     ncclComm_t nccl_comm,
     int iters,
     int warmup,
     bool verify) {
+    validate_devices(devices, local_rank);
+    const int world_size = static_cast<int>(devices.size());
+
     testing::validate_numel_for_collective(
         collective,
         numel,
-        2);
+        world_size);
 
-    const int local_device = local_rank == 0 ? dev0 : dev1;
+    const int local_device = devices[static_cast<std::size_t>(local_rank)];
     const size_t bytes = static_cast<size_t>(numel) * sizeof(half);
 
     IpcOoContext ctx;
@@ -619,8 +648,7 @@ std::map<std::string, double> run_one_size(
             create_ipc_oo_context(
                 numel,
                 local_rank,
-                dev0,
-                dev1,
+                devices,
                 broker_key);
 
         broker_sync(ctx);
@@ -669,6 +697,7 @@ std::map<std::string, double> run_one_size(
             local_src,
             static_cast<size_t>(numel),
             local_rank,
+            world_size,
             local_device,
             stream,
             ctx,
@@ -682,6 +711,7 @@ std::map<std::string, double> run_one_size(
                 local_src,
                 static_cast<size_t>(numel),
                 local_rank,
+                world_size,
                 local_device,
                 stream,
                 ctx,
@@ -694,6 +724,7 @@ std::map<std::string, double> run_one_size(
             local_src,
             static_cast<size_t>(numel),
             local_rank,
+            world_size,
             local_device,
             stream,
             ctx,
@@ -707,6 +738,7 @@ std::map<std::string, double> run_one_size(
                 local_src,
                 static_cast<size_t>(numel),
                 local_rank,
+                world_size,
                 local_device,
                 stream,
                 ctx,
@@ -719,6 +751,7 @@ std::map<std::string, double> run_one_size(
                 local_src,
                 numel,
                 local_rank,
+                world_size,
                 local_device,
                 stream);
 
@@ -729,6 +762,7 @@ std::map<std::string, double> run_one_size(
                 local_src,
                 numel,
                 local_rank,
+                world_size,
                 local_device,
                 stream,
                 ctx);
@@ -740,6 +774,7 @@ std::map<std::string, double> run_one_size(
                 local_src,
                 numel,
                 local_rank,
+                world_size,
                 local_device,
                 stream,
                 ctx);
@@ -783,12 +818,12 @@ std::map<std::string, double> run_one_size(
             testing::rank_partition_count(
                 static_cast<size_t>(numel),
                 local_rank,
-                2);
+                world_size);
 
         return {
             {"collective", testing::collective_code(collective)},
             {"rank", static_cast<double>(local_rank)},
-            {"world_size", 2.0},
+            {"world_size", static_cast<double>(world_size)},
             {"numel", static_cast<double>(numel)},
             {"bytes", static_cast<double>(bytes)},
             {"local_shard_numel", static_cast<double>(local_shard_count)},
@@ -833,8 +868,7 @@ bool smoke_ipc_collective_rank_sm90(
     const std::string& collective,
     int64_t numel,
     int local_rank,
-    int dev0,
-    int dev1,
+    const std::vector<int>& devices,
     const std::string& broker_key,
     const std::vector<int64_t>& nccl_unique_id_bytes,
     bool verify) {
@@ -843,8 +877,7 @@ bool smoke_ipc_collective_rank_sm90(
             collective,
             std::vector<int64_t>{numel},
             local_rank,
-            dev0,
-            dev1,
+            devices,
             broker_key,
             nccl_unique_id_bytes,
             1,
@@ -858,8 +891,7 @@ std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
     const std::string& collective_name_arg,
     const std::vector<int64_t>& sizes,
     int local_rank,
-    int dev0,
-    int dev1,
+    const std::vector<int>& devices,
     const std::string& broker_key,
     const std::vector<int64_t>& nccl_unique_id_bytes,
     int iters,
@@ -877,13 +909,7 @@ std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
         throw std::invalid_argument("warmup must be >= 0");
     }
 
-    if (dev0 == dev1) {
-        throw std::invalid_argument("dev0 and dev1 must differ");
-    }
-
-    if (local_rank != 0 && local_rank != 1) {
-        throw std::invalid_argument("local_rank must be 0 or 1");
-    }
+    validate_devices(devices, local_rank);
 
     if (broker_key.empty()) {
         throw std::invalid_argument("broker_key must be non-empty");
@@ -895,7 +921,8 @@ std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
     const ncclUniqueId nccl_id =
         testing::make_nccl_unique_id(nccl_unique_id_bytes);
 
-    const int local_device = local_rank == 0 ? dev0 : dev1;
+    const int world_size = static_cast<int>(devices.size());
+    const int local_device = devices[static_cast<std::size_t>(local_rank)];
 
     ncclComm_t nccl_comm = nullptr;
 
@@ -905,7 +932,7 @@ std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
         OOVERLAP_TEST_NCCL_CHECK(
             ncclCommInitRank(
                 &nccl_comm,
-                2,
+                world_size,
                 nccl_id,
                 local_rank));
 
@@ -918,8 +945,7 @@ std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
                     collective,
                     numel,
                     local_rank,
-                    dev0,
-                    dev1,
+                    devices,
                     broker_key,
                     nccl_comm,
                     iters,
@@ -941,6 +967,49 @@ std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
 
         throw;
     }
+}
+
+// Backward-compatible two-GPU overloads.
+bool smoke_ipc_collective_rank_sm90(
+    const std::string& collective,
+    int64_t numel,
+    int local_rank,
+    int dev0,
+    int dev1,
+    const std::string& broker_key,
+    const std::vector<int64_t>& nccl_unique_id_bytes,
+    bool verify) {
+    return smoke_ipc_collective_rank_sm90(
+        collective,
+        numel,
+        local_rank,
+        std::vector<int>{dev0, dev1},
+        broker_key,
+        nccl_unique_id_bytes,
+        verify);
+}
+
+std::vector<std::map<std::string, double>> benchmark_ipc_collective_rank_sm90(
+    const std::string& collective,
+    const std::vector<int64_t>& sizes,
+    int local_rank,
+    int dev0,
+    int dev1,
+    const std::string& broker_key,
+    const std::vector<int64_t>& nccl_unique_id_bytes,
+    int iters,
+    int warmup,
+    bool verify) {
+    return benchmark_ipc_collective_rank_sm90(
+        collective,
+        sizes,
+        local_rank,
+        std::vector<int>{dev0, dev1},
+        broker_key,
+        nccl_unique_id_bytes,
+        iters,
+        warmup,
+        verify);
 }
 
 } // namespace ooverlap

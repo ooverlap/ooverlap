@@ -26,6 +26,18 @@ def load_ooverlap_ext():
     return mod
 
 
+# OOVERLAP_IPC_COLLECTIVE_MULTI_GPU_V1
+def parse_devices(value: str) -> list[int]:
+    devices = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if len(devices) < 2:
+        raise ValueError("--devices must contain at least two device ids")
+    if len(set(devices)) != len(devices):
+        raise ValueError("--devices must not contain duplicates")
+    if any(device < 0 for device in devices):
+        raise ValueError("--devices must contain non-negative device ids")
+    return devices
+
+
 def parse_size_one(s: str) -> int:
     text = s.strip().lower()
     mult = 1
@@ -121,7 +133,7 @@ def label_with_cta(base: str, ctas: int | None) -> str:
     suffix = cta_label(ctas)
     return base if not suffix else f"{base} {suffix}"
 
-def rank_worker(q, collective, sizes_bytes, local_rank, dev0, dev1, broker_key,
+def rank_worker(q, collective, sizes_bytes, local_rank, devices, broker_key,
                 nccl_id, iters, warmup, verify, ctas):
     try:
         set_cta_env(ctas)
@@ -130,8 +142,7 @@ def rank_worker(q, collective, sizes_bytes, local_rank, dev0, dev1, broker_key,
             collective,
             [bytes_to_numel(x) for x in sizes_bytes],
             int(local_rank),
-            int(dev0),
-            int(dev1),
+            devices,
             broker_key,
             nccl_id,
             int(iters),
@@ -143,8 +154,8 @@ def rank_worker(q, collective, sizes_bytes, local_rank, dev0, dev1, broker_key,
         q.put((local_rank, None, repr(exc)))
 
 
-def run_two_rank_collective(collective, sizes_bytes, dev0, dev1, iters, warmup,
-                            verify, ctas):
+def run_rank_collective(collective, sizes_bytes, devices, iters, warmup,
+                        verify, ctas):
     set_cta_env(ctas)
     ext = load_ooverlap_ext()
     nccl_id = ext.generate_nccl_id()
@@ -156,14 +167,14 @@ def run_two_rank_collective(collective, sizes_bytes, dev0, dev1, iters, warmup,
     procs = [
         ctx.Process(
             target=rank_worker,
-            args=(q, collective, sizes_bytes, rank, dev0, dev1, broker_key,
+            args=(q, collective, sizes_bytes, rank, devices, broker_key,
                   nccl_id, iters, warmup, verify, ctas),
         )
-        for rank in (0, 1)
+        for rank in range(len(devices))
     ]
 
-    for p in procs:
-        p.start()
+    for proc in procs:
+        proc.start()
 
     results, errors = {}, []
     for _ in procs:
@@ -173,62 +184,81 @@ def run_two_rank_collective(collective, sizes_bytes, dev0, dev1, iters, warmup,
         else:
             errors.append(f"rank{rank}: {err}")
 
-    for p in procs:
-        p.join()
-        if p.exitcode != 0:
-            errors.append(f"process pid={p.pid} exitcode={p.exitcode}")
+    for proc in procs:
+        proc.join()
+        if proc.exitcode != 0:
+            errors.append(f"process pid={proc.pid} exitcode={proc.exitcode}")
 
     if errors:
         raise RuntimeError("\n".join(errors))
     return results
 
 
-def per_rank_bandwidth_bytes(collective: str, a, b) -> int:
-    """
-    Return the byte count used for per-rank bandwidth normalization.
-
-    Keep allreduce as full buffer bytes per rank.
-    For reduce_scatter/all_gather, normalize to the local shard size so the
-    bandwidth plot is not accidentally aggregate/full-buffer bandwidth.
-    """
-    full_bytes = int(a["bytes"])
+def per_rank_bandwidth_bytes(collective: str, rows) -> int:
+    """Return the byte count used for per-rank bandwidth normalization."""
+    full_bytes = int(rows[0]["bytes"])
 
     if collective == "allreduce":
         return full_bytes
 
     if collective in ("reduce_scatter", "all_gather"):
-        if "local_shard_bytes" in a and "local_shard_bytes" in b:
-            return int(max(float(a["local_shard_bytes"]), float(b["local_shard_bytes"])))
+        shard_values = [
+            int(float(row["local_shard_bytes"]))
+            for row in rows
+            if "local_shard_bytes" in row
+        ]
+        if len(shard_values) == len(rows):
+            return max(shard_values)
 
-        world_size = int(round(float(a.get("world_size", 2.0))))
-        if world_size <= 0:
-            world_size = 2
-
-        return full_bytes // world_size
+        world_size = int(round(float(rows[0].get("world_size", len(rows)))))
+        return full_bytes // max(world_size, 1)
 
     return full_bytes
 
 
 def combine_rank_rows(collective, rank_rows):
-    rows = []
-    for a, b in zip(rank_rows[0], rank_rows[1]):
-        iters = int(a["iters"])
+    expected_ranks = set(range(len(rank_rows)))
+    if set(rank_rows) != expected_ranks:
+        raise RuntimeError(
+            f"expected rank results for {sorted(expected_ranks)}, "
+            f"got {sorted(rank_rows)}"
+        )
+
+    ordered = [rank_rows[rank] for rank in range(len(rank_rows))]
+    row_counts = {len(rows) for rows in ordered}
+    if len(row_counts) != 1:
+        raise RuntimeError(f"rank result lengths differ: {sorted(row_counts)}")
+
+    combined = []
+    for index in range(len(ordered[0])):
+        rank_values = [rows[index] for rows in ordered]
+        first = rank_values[0]
+        iters = int(first["iters"])
+
         row = {
-            "bytes": int(a["bytes"]),
-            "bandwidth_bytes_per_rank": per_rank_bandwidth_bytes(collective, a, b),
+            "bytes": int(first["bytes"]),
+            "world_size": len(rank_values),
+            "bandwidth_bytes_per_rank": per_rank_bandwidth_bytes(
+                collective, rank_values
+            ),
             "iters": iters,
-            "oo_latency_ms": max(float(a["oo_total_ms"]), float(b["oo_total_ms"])) / iters,
-            "nccl_latency_ms": max(float(a["nccl_total_ms"]), float(b["nccl_total_ms"])) / iters,
+            "oo_latency_ms": max(
+                float(value["oo_total_ms"]) for value in rank_values
+            ) / iters,
+            "nccl_latency_ms": max(
+                float(value["nccl_total_ms"]) for value in rank_values
+            ) / iters,
         }
 
-        if "nccl_symmetric_total_ms" in a and "nccl_symmetric_total_ms" in b:
-            row["nccl_symmetric_latency_ms"] = (
-                max(float(a["nccl_symmetric_total_ms"]),
-                    float(b["nccl_symmetric_total_ms"])) / iters
-            )
+        if all("nccl_symmetric_total_ms" in value for value in rank_values):
+            row["nccl_symmetric_latency_ms"] = max(
+                float(value["nccl_symmetric_total_ms"])
+                for value in rank_values
+            ) / iters
 
-        rows.append(row)
-    return rows
+        combined.append(row)
+
+    return combined
 
 
 def bandwidth_gbps(size_bytes: int, latency_ms: float) -> float:
@@ -272,32 +302,55 @@ def metric_values(metric: str, rows):
     raise ValueError(f"unknown metric: {metric}")
 
 
-def run_smoke(smoke_bytes, dev0, dev1):
-    print(f"[smoke] size_bytes={smoke_bytes}")
+def validate_sizes_for_collective(collective, sizes_bytes, world_size):
+    if collective not in ("reduce_scatter", "all_gather"):
+        return
+
+    invalid = [
+        size_bytes
+        for size_bytes in sizes_bytes
+        if bytes_to_numel(size_bytes) % world_size != 0
+    ]
+    if invalid:
+        rendered = ", ".join(format_size_bytes(value) for value in invalid)
+        raise ValueError(
+            f"{collective} sizes must be divisible by world size {world_size}: "
+            f"{rendered}"
+        )
+
+
+def run_smoke(smoke_bytes, devices):
+    print(f"[smoke] size_bytes={smoke_bytes} devices={devices}")
     for collective in COLLECTIVES:
+        validate_sizes_for_collective(collective, [smoke_bytes], len(devices))
         print(f"[smoke] {collective}")
-        run_two_rank_collective(
-            collective, [smoke_bytes], dev0, dev1,
+        run_rank_collective(
+            collective, [smoke_bytes], devices,
             iters=1, warmup=0, verify=True, ctas=None
         )
     print("[smoke] PASS")
 
 
-
-def run_metric_suite(metric, sizes_bytes, cta_values, dev0, dev1, iters, warmup,
+def run_metric_suite(metric, sizes_bytes, cta_values, devices, iters, warmup,
                      verify, out_path):
-    all_rows = {c: {} for c in COLLECTIVES}
+    all_rows = {collective: {} for collective in COLLECTIVES}
 
     for ctas in cta_values:
         for collective in COLLECTIVES:
+            validate_sizes_for_collective(
+                collective, sizes_bytes, len(devices)
+            )
             print(
                 f"[bench] metric={metric} collective={collective} "
-                f"ctas={cta_log_label(ctas)} sizes={sizes_bytes}"
+                f"ctas={cta_log_label(ctas)} devices={devices} "
+                f"sizes={sizes_bytes}"
             )
-            rank_rows = run_two_rank_collective(
-                collective, sizes_bytes, dev0, dev1, iters, warmup, verify, ctas
+            rank_rows = run_rank_collective(
+                collective, sizes_bytes, devices, iters, warmup, verify, ctas
             )
-            all_rows[collective][ctas] = combine_rank_rows(collective, rank_rows)
+            all_rows[collective][ctas] = combine_rank_rows(
+                collective, rank_rows
+            )
 
     if metric == "speedup":
         for ctas in cta_values:
@@ -305,12 +358,17 @@ def run_metric_suite(metric, sizes_bytes, cta_values, dev0, dev1, iters, warmup,
                 collective: {ctas: all_rows[collective][ctas]}
                 for collective in COLLECTIVES
             }
-            plot_metric(metric, one_cta_rows, name_with_cta_suffix(out_path, ctas))
+            plot_metric(
+                metric,
+                one_cta_rows,
+                name_with_cta_suffix(out_path, ctas),
+                len(devices),
+            )
     else:
-        plot_metric(metric, all_rows, out_path)
+        plot_metric(metric, all_rows, out_path, len(devices))
 
 
-def plot_metric(metric, all_rows, out_path: Path):
+def plot_metric(metric, all_rows, out_path: Path, world_size: int):
     COLLECTIVE_TITLES = {
         "allreduce": "All-Reduce",
         "reduce_scatter": "Reduce-Scatter",
@@ -367,9 +425,9 @@ def plot_metric(metric, all_rows, out_path: Path):
 
     def figure_title(metric: str, only_cta, single_cta_setting: bool, has_cta_limit: bool):
         metric_titles = {
-            "bandwidth": "Two-GPU Collective Bandwidth",
-            "latency": "Two-GPU Collective Latency",
-            "speedup": "Two-GPU Collective Speedup Relative to NCCL",
+            "bandwidth": f"{world_size}-GPU Collective Bandwidth",
+            "latency": f"{world_size}-GPU Collective Latency",
+            "speedup": f"{world_size}-GPU Collective Speedup Relative to NCCL",
         }
     
         base = metric_titles[metric]
@@ -418,33 +476,59 @@ def plot_metric(metric, all_rows, out_path: Path):
 def main():
     parser = argparse.ArgumentParser("IPC collective smoke + benchmark plotter")
     parser.add_argument("--mode", choices=["smoke", "bench", "both"], default="both")
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="comma-separated device ids, for example 0,1,2,3",
+    )
     parser.add_argument("--dev0", type=int, default=0)
     parser.add_argument("--dev1", type=int, default=1)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--smoke-bytes", default="1M")
-    parser.add_argument("--metric", choices=["latency", "bandwidth", "speedup", "both", "all"], default="bandwidth")
+    parser.add_argument(
+        "--metric",
+        choices=["latency", "bandwidth", "speedup", "both", "all"],
+        default="bandwidth",
+    )
     parser.add_argument("--bytes", default="1M,2M,4M,8M,16M,32M,64M,128M,256M")
     parser.add_argument("--latency-bytes", default=None)
     parser.add_argument("--bandwidth-bytes", default=None)
     parser.add_argument("--speedup-bytes", default=None)
-    parser.add_argument("--ctas", default=None, help="comma-separated communication CTA counts, e.g. 1,2,4,8")
+    parser.add_argument(
+        "--ctas",
+        default=None,
+        help="comma-separated communication CTA counts, e.g. 1,2,4,8",
+    )
     parser.add_argument("--out-prefix", default="ipc_collective")
 
     args = parser.parse_args()
+    devices = (
+        parse_devices(args.devices)
+        if args.devices is not None
+        else parse_devices(f"{args.dev0},{args.dev1}")
+    )
 
-    assert torch.cuda.is_available(), "torch.cuda.is_available() is False"
-    assert torch.cuda.device_count() >= 2, "Need at least 2 GPUs"
-    if args.dev0 == args.dev1:
-        raise ValueError("--dev0 and --dev1 must be different")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available")
+    if max(devices) >= torch.cuda.device_count():
+        raise ValueError(
+            f"requested devices {devices}, but CUDA device count is "
+            f"{torch.cuda.device_count()}"
+        )
+    if args.iters <= 0:
+        raise ValueError("--iters must be > 0")
+    if args.warmup < 0:
+        raise ValueError("--warmup must be >= 0")
 
     print(f"[info] torch={torch.__version__}")
-    print(f"[info] devices={torch.cuda.device_count()} dev0={args.dev0} dev1={args.dev1}")
+    print(f"[info] cuda_device_count={torch.cuda.device_count()}")
+    print(f"[info] devices={devices} world_size={len(devices)}")
     print(f"[info] iters={args.iters} warmup={args.warmup} ctas={args.ctas or 'default'}")
 
     if args.mode in ("smoke", "both"):
-        run_smoke(parse_size_one(args.smoke_bytes), args.dev0, args.dev1)
+        run_smoke(parse_size_one(args.smoke_bytes), devices)
 
     if args.mode in ("bench", "both"):
         default_sizes = parse_sizes(args.bytes)
@@ -465,16 +549,15 @@ def main():
                 metric=metric,
                 sizes_bytes=sizes,
                 cta_values=cta_values,
-                dev0=args.dev0,
-                dev1=args.dev1,
+                devices=devices,
                 iters=args.iters,
                 warmup=args.warmup,
                 verify=args.verify,
                 out_path=Path(f"{args.out_prefix}_{metric}.png"),
             )
 
-    torch.cuda.synchronize(args.dev0)
-    torch.cuda.synchronize(args.dev1)
+    for device in devices:
+        torch.cuda.synchronize(device)
     print("PASS")
 
 

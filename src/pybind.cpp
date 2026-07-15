@@ -379,8 +379,60 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         /*&ooverlap::benchmark_tma_two_gpu_collective_sweep_json,*/
         /*py::arg("request_json"));*/
 
+  // OOVERLAP_IPC_COLLECTIVE_MULTI_GPU_V1
+  using SmokeIpcDevicesFn = bool (*)(
+      const std::string&,
+      int64_t,
+      int,
+      const std::vector<int>&,
+      const std::string&,
+      const std::vector<int64_t>&,
+      bool);
+  using SmokeIpcTwoGpuFn = bool (*)(
+      const std::string&,
+      int64_t,
+      int,
+      int,
+      int,
+      const std::string&,
+      const std::vector<int64_t>&,
+      bool);
+  using BenchIpcDevicesFn = std::vector<std::map<std::string, double>> (*)(
+      const std::string&,
+      const std::vector<int64_t>&,
+      int,
+      const std::vector<int>&,
+      const std::string&,
+      const std::vector<int64_t>&,
+      int,
+      int,
+      bool);
+  using BenchIpcTwoGpuFn = std::vector<std::map<std::string, double>> (*)(
+      const std::string&,
+      const std::vector<int64_t>&,
+      int,
+      int,
+      int,
+      const std::string&,
+      const std::vector<int64_t>&,
+      int,
+      int,
+      bool);
+
   m.def("smoke_ipc_collective_rank_sm90",
-        &ooverlap::smoke_ipc_collective_rank_sm90,
+        static_cast<SmokeIpcDevicesFn>(
+            &ooverlap::smoke_ipc_collective_rank_sm90),
+        py::arg("collective"),
+        py::arg("numel"),
+        py::arg("local_rank"),
+        py::arg("devices"),
+        py::arg("broker_key"),
+        py::arg("nccl_unique_id_bytes"),
+        py::arg("verify") = true);
+
+  m.def("smoke_ipc_collective_rank_sm90",
+        static_cast<SmokeIpcTwoGpuFn>(
+            &ooverlap::smoke_ipc_collective_rank_sm90),
         py::arg("collective"),
         py::arg("numel"),
         py::arg("local_rank"),
@@ -391,7 +443,21 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("verify") = true);
 
   m.def("benchmark_ipc_collective_rank_sm90",
-        &ooverlap::benchmark_ipc_collective_rank_sm90,
+        static_cast<BenchIpcDevicesFn>(
+            &ooverlap::benchmark_ipc_collective_rank_sm90),
+        py::arg("collective"),
+        py::arg("sizes"),
+        py::arg("local_rank"),
+        py::arg("devices"),
+        py::arg("broker_key"),
+        py::arg("nccl_unique_id_bytes"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("verify"));
+
+  m.def("benchmark_ipc_collective_rank_sm90",
+        static_cast<BenchIpcTwoGpuFn>(
+            &ooverlap::benchmark_ipc_collective_rank_sm90),
         py::arg("collective"),
         py::arg("sizes"),
         py::arg("local_rank"),
