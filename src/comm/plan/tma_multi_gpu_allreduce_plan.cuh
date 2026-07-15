@@ -335,6 +335,155 @@ void mark_last_task_per_rank_terminal(
     }
 }
 
+__host__ __device__ __forceinline__ bool logical_buffer_ref_equal(
+    const LogicalBufferRef& lhs,
+    const LogicalBufferRef& rhs) {
+    return lhs.role == rhs.role &&
+           lhs.owner_rank == rhs.owner_rank &&
+           lhs.staging_slot == rhs.staging_slot &&
+           lhs.byte_offset == rhs.byte_offset;
+}
+
+__host__ __device__ __forceinline__ bool logical_buffer_is_local_device_buffer(
+    const LogicalBufferRef& ref,
+    int executor_rank) {
+    return executor_rank >= 0 &&
+           ref.owner_rank == executor_rank &&
+           (ref.role == LogicalBufferRole::RankBuffer ||
+            ref.role == LogicalBufferRole::RankOutput);
+}
+
+inline bool reduce_task_writes_range(
+    const TransferTask& task,
+    int executor_rank,
+    const LogicalBufferRef& range,
+    std::size_t bytes) {
+    if (task.executor_rank != executor_rank ||
+        task.bytes != bytes) {
+        return false;
+    }
+
+    if (task.op == TransferOp::Reduce) {
+        return logical_buffer_ref_equal(task.dst, range);
+    }
+
+    if (task.op == TransferOp::ReduceFanout) {
+        for (int i = 0; i < task.fanout_dst_count; ++i) {
+            if (logical_buffer_ref_equal(task.fanout_dsts[i], range)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+inline bool barrier_matches_range(
+    const TransferTask& task,
+    int executor_rank,
+    const LogicalBufferRef& range,
+    std::size_t bytes) {
+    return task.op == TransferOp::Barrier &&
+           task.executor_rank == executor_rank &&
+           task.bytes == bytes &&
+           logical_buffer_ref_equal(task.src, range);
+}
+
+template <int MaxTransferTasks>
+bool insert_local_reduce_copy_barriers(
+    TransferPlan<MaxTransferTasks>* plan) {
+    if (plan == nullptr ||
+        plan->total_tasks < 0 ||
+        plan->total_tasks > MaxTransferTasks) {
+        return false;
+    }
+
+    for (int consumer_idx = 0;
+         consumer_idx < plan->total_tasks;
+         ++consumer_idx) {
+        const TransferTask consumer = plan->tasks[consumer_idx];
+
+        if (consumer.op != TransferOp::Copy &&
+            consumer.op != TransferOp::CopyFanout) {
+            continue;
+        }
+
+        const LogicalBufferRef range = consumer.src;
+
+        if (consumer.bytes == 0 ||
+            !logical_buffer_is_local_device_buffer(
+                range,
+                consumer.executor_rank)) {
+            continue;
+        }
+
+        bool has_producer = false;
+        bool has_barrier = false;
+
+        for (int i = 0; i < consumer_idx; ++i) {
+            const TransferTask& previous = plan->tasks[i];
+
+            if (barrier_matches_range(
+                    previous,
+                    consumer.executor_rank,
+                    range,
+                    consumer.bytes)) {
+                has_barrier = true;
+                break;
+            }
+
+            if (reduce_task_writes_range(
+                    previous,
+                    consumer.executor_rank,
+                    range,
+                    consumer.bytes)) {
+                has_producer = true;
+            }
+        }
+
+        if (!has_producer || has_barrier) {
+            continue;
+        }
+
+        if (plan->total_tasks >= MaxTransferTasks) {
+            return false;
+        }
+
+        for (int i = plan->total_tasks; i > consumer_idx; --i) {
+            plan->tasks[i] = plan->tasks[i - 1];
+        }
+
+        TransferTask barrier{};
+        barrier.op = TransferOp::Barrier;
+        barrier.executor_rank = consumer.executor_rank;
+        barrier.src_rank = consumer.executor_rank;
+        barrier.dst_rank = consumer.executor_rank;
+        barrier.src = range;
+        barrier.dst = range;
+        barrier.bytes = consumer.bytes;
+        barrier.phase = consumer.phase;
+
+        plan->tasks[consumer_idx] = barrier;
+        ++plan->total_tasks;
+
+        /* Skip the consumer that was shifted one slot to the right. */
+        ++consumer_idx;
+    }
+
+    int phase_by_rank[kPlannerMaxRanks] = {};
+
+    for (int i = 0; i < plan->total_tasks; ++i) {
+        TransferTask& task = plan->tasks[i];
+
+        if (task.executor_rank >= 0 &&
+            task.executor_rank < kPlannerMaxRanks) {
+            task.phase = phase_by_rank[task.executor_rank]++;
+        }
+    }
+
+    return true;
+}
+
 inline bool build_allreduce_islands(
     const TransferPlanBuildInput& input,
     const TransportMatrix& transports,
@@ -1118,11 +1267,17 @@ bool build_allreduce_transfer_plan(
                     input,
                     transports);
 
-        if (ok) {
-            debug_print_transfer_plan_if_enabled("allreduce", *plan);
+        if (!ok) {
+            return false;
         }
 
-        return ok;
+        if (!allreduce_detail::insert_local_reduce_copy_barriers(plan)) {
+            transfer_plan_abort_build(plan);
+            return false;
+        }
+
+        debug_print_transfer_plan_if_enabled("allreduce", *plan);
+        return true;
     }
 
     if (input.out_of_place) {
@@ -1137,11 +1292,17 @@ bool build_allreduce_transfer_plan(
             transports,
             islands);
 
-    if (ok) {
-        debug_print_transfer_plan_if_enabled("allreduce", *plan);
+    if (!ok) {
+        return false;
     }
 
-    return ok;
+    if (!allreduce_detail::insert_local_reduce_copy_barriers(plan)) {
+        transfer_plan_abort_build(plan);
+        return false;
+    }
+
+    debug_print_transfer_plan_if_enabled("allreduce", *plan);
+    return true;
 }
 
 } // namespace plan

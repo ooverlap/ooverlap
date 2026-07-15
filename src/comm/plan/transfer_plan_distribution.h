@@ -12,7 +12,9 @@ namespace plan {
 
 constexpr int kTmaMultiGpuAllReduceMaxTransferTasks =
     (kTmaMultiGpuAllReduceMaxPeers + 1) *
-    (2 * kTmaMultiGpuAllReduceMaxPeers + 1);
+    (2 * kTmaMultiGpuAllReduceMaxPeers + 2);
+
+/* The extra per-rank slot above is for one local reduce-to-copy barrier. */
 
 constexpr int kTmaMultiGpuReduceScatterMaxTransferTasks =
     (kTmaMultiGpuReduceScatterMaxPeers + 1) *

@@ -816,6 +816,14 @@ inline bool collect_rank_transfer_tasks(
             return false;
         }
 
+        /*
+         * Barrier is part of the logical IR now. Its real CTA synchronization
+         * lowering is intentionally added later; skip it for current execution.
+         */
+        if (transfer.op == TransferOp::Barrier) {
+            continue;
+        }
+
         if (transfer_task_is_ready(transfer)) {
             if (!ctx.lower_ready_tasks) {
                 continue;

@@ -737,6 +737,8 @@ inline const char* debug_transfer_op_name(
             return "CopyFanout";
         case TransferOp::ReduceFanout:
             return "ReduceFanout";
+        case TransferOp::Barrier:
+            return "Barrier";
         default:
             return "UnknownTransferOp";
     }
