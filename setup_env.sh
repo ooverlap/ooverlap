@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 # Run with:
-#   bash ./setup_env.sh
+#   bash ./setup_env.sh                    # Vera: use /local/tmp.*
+#   bash ./setup_env.sh /path/to/venv      # Other machines: use this venv
 # Then activate later with the env file printed at the end.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,6 +16,7 @@ CLEAN_BUILD="${CLEAN_BUILD:-1}"
 SKIP_MODULES="${SKIP_MODULES:-0}"
 PYTHON_BOOTSTRAP="${PYTHON_BOOTSTRAP:-python3}"
 MODULES_LOADED=0
+VENV_PATH_ARG=""
 
 VERA_MODULES=(
   foss/2025b
@@ -31,9 +33,17 @@ VERA_MODULES=(
 log() { printf '[info] %s\n' "$*"; }
 die() { printf '[error] %s\n' "$*" >&2; exit 1; }
 
+parse_args() {
+  if (( $# > 1 )); then
+    die "Usage: bash ./setup_env.sh [venv-path]"
+  fi
+
+  VENV_PATH_ARG="${1:-}"
+}
+
 load_vera_modules() {
   if [[ "$SKIP_MODULES" == "1" ]] || ! command -v module >/dev/null 2>&1; then
-    log "Environment modules unavailable or disabled; using system toolchain"
+    log "Environment modules unavailable or disabled; checking system toolchain"
     return
   fi
 
@@ -41,6 +51,59 @@ load_vera_modules() {
   module load "${VERA_MODULES[@]}"
   module list
   MODULES_LOADED=1
+}
+
+check_system_toolchain() {
+  [[ "$MODULES_LOADED" == "0" ]] || return
+
+  local missing=()
+  local tool
+
+  for tool in "$PYTHON_BOOTSTRAP" cmake curl c++; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+
+  if ! command -v ninja >/dev/null 2>&1 &&
+     ! command -v make >/dev/null 2>&1; then
+    missing+=("ninja or make")
+  fi
+
+  local nvcc_path
+  nvcc_path="${CUDACXX:-$(command -v nvcc || true)}"
+  [[ -n "$nvcc_path" && -x "$nvcc_path" ]] || missing+=("nvcc")
+
+  if command -v "$PYTHON_BOOTSTRAP" >/dev/null 2>&1 &&
+     ! "$PYTHON_BOOTSTRAP" -m venv --help >/dev/null 2>&1; then
+    missing+=("$PYTHON_BOOTSTRAP venv module")
+  fi
+
+  if (( ${#missing[@]} > 0 )); then
+    printf '[error] Missing required system tools:\n' >&2
+    printf '  - %s\n' "${missing[@]}" >&2
+    printf '[error] Install the missing tools and rerun setup_env.sh.\n' >&2
+    exit 1
+  fi
+
+  local detected_cuda_home
+  detected_cuda_home="${CUDA_HOME:-$(cd "$(dirname "$(readlink -f "$nvcc_path")")/.." && pwd)}"
+
+  local missing_cuda_libs=()
+  local lib
+  for lib in libnvrtc.so libcublas.so; do
+    if ! find -L "$detected_cuda_home" -type f -name "$lib" -print -quit 2>/dev/null | grep -q .; then
+      missing_cuda_libs+=("$lib")
+    fi
+  done
+
+  if (( ${#missing_cuda_libs[@]} > 0 )); then
+    printf '[error] CUDA developer libraries are missing from %s:\n' "$detected_cuda_home" >&2
+    printf '  - %s\n' "${missing_cuda_libs[@]}" >&2
+    printf '[error] Install the matching CUDA developer libraries ' >&2
+    printf '(NVRTC and cuBLAS), then rerun setup_env.sh.\n' >&2
+    exit 1
+  fi
+
+  log "System toolchain checks passed"
 }
 
 setup_cuda_toolchain() {
@@ -71,26 +134,26 @@ pick_vera_tmp() {
     [[ -d "$path" && -w "$path" ]] && { printf '%s\n' "$path"; return; }
   done < <(find /local -maxdepth 1 -type d -name 'tmp.*' 2>/dev/null | sort)
 
-  die 'No writable /local/tmp.* directory found'
+  die 'No writable /local/tmp.* directory found; pass a venv path as the first argument'
 }
 
 setup_local_environment() {
-  if [[ -z "${VENV_DIR:-}" ]]; then
-    if [[ -n "${LOCAL_TMP_ROOT:-}" ]]; then
-      VENV_DIR="$LOCAL_TMP_ROOT/$USER/$VENV_NAME"
-    elif [[ "$MODULES_LOADED" == "1" ]]; then
-      LOCAL_TMP_ROOT="$(pick_vera_tmp)"
-      VENV_DIR="$LOCAL_TMP_ROOT/$USER/$VENV_NAME"
+  if [[ -n "$VENV_PATH_ARG" ]]; then
+    if [[ "$VENV_PATH_ARG" == /* ]]; then
+      VENV_DIR="$VENV_PATH_ARG"
     else
-      VENV_DIR="$HOME/venv"
+      VENV_DIR="$PWD/$VENV_PATH_ARG"
     fi
+  else
+    LOCAL_TMP_ROOT="${LOCAL_TMP_ROOT:-$(pick_vera_tmp)}"
+    VENV_DIR="$LOCAL_TMP_ROOT/$USER/$VENV_NAME"
   fi
 
   if [[ -z "${OOTMP:-}" ]]; then
-    if [[ "$MODULES_LOADED" == "1" ]]; then
-      OOTMP="$(dirname "$VENV_DIR")"
+    if [[ -n "$VENV_PATH_ARG" ]]; then
+      OOTMP="$(dirname "$VENV_DIR")/ooverlap-env"
     else
-      OOTMP="$HOME/ooverlap-env"
+      OOTMP="$(dirname "$VENV_DIR")"
     fi
   fi
 
@@ -237,7 +300,9 @@ write_runtime_env() {
 }
 
 main() {
+  parse_args "$@"
   load_vera_modules
+  check_system_toolchain
   setup_cuda_toolchain
   setup_local_environment
   install_python_packages
