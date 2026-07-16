@@ -199,6 +199,25 @@ void debug_print_window_task_plan(
 }
 #endif
 
+template <int MaxTasks>
+unsigned int final_cta_barrier_counter_value(
+    const comm::plan::WindowTaskExecutorPlan<MaxTasks>& plan,
+    unsigned int entry_value) {
+    unsigned int value = entry_value;
+    const int first_stripe_tasks =
+        plan.tasks_per_cta < plan.total_tasks
+            ? plan.tasks_per_cta
+            : plan.total_tasks;
+
+    for (int i = 0; i < first_stripe_tasks; ++i) {
+        if (plan.tasks[i].op == comm::task::WindowTaskOp::Barrier) {
+            value = plan.tasks[i].barrier_target;
+        }
+    }
+
+    return value;
+}
+
 template <
     typename ReduceOp,
     int ChunkBytes,
@@ -377,7 +396,8 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     if (window_plan_scratch_err != cudaSuccess ||
         window_plan_scratch.host_plan == nullptr ||
         window_plan_scratch.device_plan == nullptr ||
-        window_plan_scratch.cta_barrier_counter == nullptr) {
+        window_plan_scratch.cta_barrier_counter == nullptr ||
+        window_plan_scratch.cta_barrier_last_value == nullptr) {
         return window_plan_scratch_err != cudaSuccess
             ? window_plan_scratch_err
             : cudaErrorInvalidValue;
@@ -388,10 +408,14 @@ cudaError_t launch_allreduce_rank_variant_sm90(
 
     int num_blocks = 0;
 
+    const unsigned int cta_barrier_start =
+        *window_plan_scratch.cta_barrier_last_value + 1u;
+
     comm::plan::lowering_detail::LoweringPassOptions lowering_options{};
     lowering_options.enable_reduce_cta_groups = true;
     lowering_options.max_ctas_per_reduce_task =
         max_ctas_per_reduce_task_from_env();
+    lowering_options.cta_barrier_start = cta_barrier_start;
 
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<
@@ -415,6 +439,11 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     if (num_blocks <= 0 || window_plan.total_tasks <= 0) {
         return cudaSuccess;
     }
+
+    const unsigned int cta_barrier_final_value =
+        final_cta_barrier_counter_value(
+            window_plan,
+            cta_barrier_start);
 
     #if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
         debug_print_window_task_plan<MaxTasks>(
@@ -460,11 +489,15 @@ cudaError_t launch_allreduce_rank_variant_sm90(
                 launch.local_ready_signal,
                 ready_plan,
                 launch.collective_epoch,
-                window_plan_scratch.cta_barrier_counter);
+                window_plan_scratch.cta_barrier_counter,
+                cta_barrier_start);
 
     if (launch_error != cudaSuccess) {
         return launch_error;
     }
+
+    *window_plan_scratch.cta_barrier_last_value =
+        cta_barrier_final_value;
 
     /* OOVERLAP_PLAN_SCRATCH_NULL_EVENT_RECORD_SKIP_V1 */
     if (window_plan_scratch.completion_event == nullptr) {

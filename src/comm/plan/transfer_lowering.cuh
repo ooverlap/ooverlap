@@ -628,6 +628,9 @@ struct LoweringPassOptions {
     bool enable_reduce_cta_groups = false;
     int max_ctas_per_reduce_task = 8;
 
+    /* Counter value released by CTA 0 after entry synchronization. */
+    unsigned int cta_barrier_start = 1u;
+
     /*
      * The current executor has historically had a temporary local-task limit in
      * execute_window_task_stripe(). Keep this disabled by default so the skeleton
@@ -1316,7 +1319,7 @@ inline bool emit_window_plan_from_rank_tasks(
                 }
 
                 const unsigned int barrier_target =
-                    1u +
+                    ctx.options.cta_barrier_start +
                     static_cast<unsigned int>(
                         (active_barrier_index + 1) * shape.cta_count);
 

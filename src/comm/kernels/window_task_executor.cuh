@@ -38,16 +38,6 @@ __device__ __forceinline__ void advance_cta_barrier_counter(
     state.fetch_add(increment, cuda::memory_order_release);
 }
 
-__device__ __forceinline__ void reset_cta_barrier_counter(
-    unsigned int* counter) {
-    if (counter == nullptr) {
-        return;
-    }
-
-    cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
-    state.store(0u, cuda::memory_order_release);
-}
-
 __device__ __forceinline__ void arrive_and_wait_cta_barrier(
     unsigned int* counter,
     unsigned int target) {
@@ -273,6 +263,7 @@ __device__ __forceinline__ void execute_window_task_stripe(
         return;
     }
 
+
     for (int local_task = 0; local_task < tasks_per_cta; ++local_task) {
         const int task_idx = base + local_task;
 
@@ -280,9 +271,9 @@ __device__ __forceinline__ void execute_window_task_stripe(
             return;
         }
 
-        /*if (local_task >= 1) {*/
-            /*return;*/
-        /*}*/
+        if (local_task >= 1) {
+            return;
+        }
 
         const task::WindowTask task = tasks[task_idx];
 
@@ -305,9 +296,6 @@ __device__ __forceinline__ void execute_window_task_stripe(
                 cta_barrier_counter);
 
         if (task.terminal) {
-            if (cta_idx == 0 && threadIdx.x == 0) {
-                reset_cta_barrier_counter(cta_barrier_counter);
-            }
             return;
         }
 
