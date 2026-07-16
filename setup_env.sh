@@ -12,6 +12,9 @@ VENV_NAME="${VENV_NAME:-torch_venv}"
 JOBS="${JOBS:-12}"
 CUDA_ARCH="${CUDA_ARCH:-90a}"
 CLEAN_BUILD="${CLEAN_BUILD:-1}"
+SKIP_MODULES="${SKIP_MODULES:-0}"
+PYTHON_BOOTSTRAP="${PYTHON_BOOTSTRAP:-python3}"
+MODULES_LOADED=0
 
 VERA_MODULES=(
   foss/2025b
@@ -29,9 +32,32 @@ log() { printf '[info] %s\n' "$*"; }
 die() { printf '[error] %s\n' "$*" >&2; exit 1; }
 
 load_vera_modules() {
+  if [[ "$SKIP_MODULES" == "1" ]] || ! command -v module >/dev/null 2>&1; then
+    log "Environment modules unavailable or disabled; using system toolchain"
+    return
+  fi
+
   module purge
   module load "${VERA_MODULES[@]}"
   module list
+  MODULES_LOADED=1
+}
+
+setup_cuda_toolchain() {
+  local nvcc_path
+  nvcc_path="${CUDACXX:-$(command -v nvcc || true)}"
+
+  [[ -n "$nvcc_path" && -x "$nvcc_path" ]] || \
+    die 'nvcc was not found; set CUDACXX or CUDA_HOME'
+
+  CUDACXX="$(readlink -f "$nvcc_path")"
+  CUDA_HOME="${CUDA_HOME:-$(cd "$(dirname "$CUDACXX")/.." && pwd)}"
+
+  export CUDACXX CUDA_HOME
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+
+  log "CUDA: $CUDA_HOME"
 }
 
 pick_vera_tmp() {
@@ -49,9 +75,24 @@ pick_vera_tmp() {
 }
 
 setup_local_environment() {
-  LOCAL_TMP_ROOT="${LOCAL_TMP_ROOT:-$(pick_vera_tmp)}"
-  VENV_DIR="${VENV_DIR:-$LOCAL_TMP_ROOT/$USER/$VENV_NAME}"
-  OOTMP="${OOTMP:-$(dirname "$VENV_DIR")}"
+  if [[ -z "${VENV_DIR:-}" ]]; then
+    if [[ -n "${LOCAL_TMP_ROOT:-}" ]]; then
+      VENV_DIR="$LOCAL_TMP_ROOT/$USER/$VENV_NAME"
+    elif [[ "$MODULES_LOADED" == "1" ]]; then
+      LOCAL_TMP_ROOT="$(pick_vera_tmp)"
+      VENV_DIR="$LOCAL_TMP_ROOT/$USER/$VENV_NAME"
+    else
+      VENV_DIR="$HOME/venv"
+    fi
+  fi
+
+  if [[ -z "${OOTMP:-}" ]]; then
+    if [[ "$MODULES_LOADED" == "1" ]]; then
+      OOTMP="$(dirname "$VENV_DIR")"
+    else
+      OOTMP="$HOME/ooverlap-env"
+    fi
+  fi
 
   local dirs=(
     tmp uv-cache pip-cache torch-extensions hf-cache
@@ -83,7 +124,9 @@ setup_local_environment() {
 
 install_python_packages() {
   if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-    python3.13 -m venv "$VENV_DIR"
+    command -v "$PYTHON_BOOTSTRAP" >/dev/null 2>&1 || \
+      die "Python bootstrap executable not found: $PYTHON_BOOTSTRAP"
+    "$PYTHON_BOOTSTRAP" -m venv "$VENV_DIR"
   fi
 
   # shellcheck disable=SC1091
@@ -165,12 +208,16 @@ write_runtime_env() {
   ENV_OUT="${ENV_OUT:-$OOTMP/ooverlap_vllm_env.sh}"
 
   {
-    printf '%s\n' '#!/usr/bin/env bash' 'module purge'
+    printf '%s\n' '#!/usr/bin/env bash'
     local name
-    for name in "${VERA_MODULES[@]}"; do
-      printf 'module load %q\n' "$name"
-    done
+    if [[ "$MODULES_LOADED" == "1" ]]; then
+      printf '%s\n' 'module purge'
+      for name in "${VERA_MODULES[@]}"; do
+        printf 'module load %q\n' "$name"
+      done
+    fi
     printf 'source %q\n' "$VENV_DIR/bin/activate"
+    printf 'export PATH=%q:$PATH\n' "$CUDA_HOME/bin"
 
     local vars=(
       OOTMP TMPDIR UV_CACHE_DIR PIP_CACHE_DIR TORCH_EXTENSIONS_DIR
@@ -178,7 +225,7 @@ write_runtime_env() {
       VLLM_CACHE_ROOT VLLM_CONFIG_ROOT FETCHCONTENT_BASE_DIR
       VLLM_NO_USAGE_STATS VLLM_DO_NOT_TRACK NCCL_PKG_DIR
       VLLM_NCCL_INCLUDE_PATH VLLM_NCCL_SO_PATH LIBRARY_PATH LD_LIBRARY_PATH
-      VLLM_OOVERLAP_TORCH_EXT
+      CUDA_HOME CUDACXX VLLM_OOVERLAP_TORCH_EXT
     )
     for name in "${vars[@]}"; do
       printf 'export %s=%q\n' "$name" "${!name}"
@@ -191,6 +238,7 @@ write_runtime_env() {
 
 main() {
   load_vera_modules
+  setup_cuda_toolchain
   setup_local_environment
   install_python_packages
   setup_nccl_paths
