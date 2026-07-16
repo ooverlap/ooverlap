@@ -54,7 +54,7 @@ load_vera_modules() {
 }
 
 check_system_toolchain() {
-  [[ "$MODULES_LOADED" == "0" ]] || return
+  [[ "$MODULES_LOADED" == "0" ]] || return 0
 
   local missing=()
   local tool
