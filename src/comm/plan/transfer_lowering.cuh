@@ -936,21 +936,16 @@ inline bool pass_drop_disabled_ready_tasks(
 }
 
 template <int MaxTransferTasks, int MaxRanks>
-inline bool pass_drop_hardcoded_entry_ready_pair(
+inline bool pass_drop_hardcoded_entry_ready_tasks(
     const LoweringContext<MaxRanks>& ctx,
     RankTransferTaskBuffer<MaxTransferTasks>* tasks) {
     if (tasks == nullptr) {
         return false;
     }
 
-    if (!ctx.lower_ready_tasks || tasks->count < 2) {
+    if (!ctx.lower_ready_tasks || tasks->count <= 0) {
         return true;
     }
-
-    const TransferTask& publish =
-        tasks->tasks[0];
-    const TransferTask& wait =
-        tasks->tasks[1];
 
     const int device_channel =
         static_cast<int>(ReadySignalChannel::DeviceMemory);
@@ -958,37 +953,40 @@ inline bool pass_drop_hardcoded_entry_ready_pair(
     /*
      * OOVERLAP_HARDCODED_ENTRY_READY_RENDEZVOUS_PATCH:
      *
-     * The executor kernel now performs the common entry ReadyPublish+ReadyWait
-     * directly before execute_window_task_stripe().  Drop only the exact phase-0
-     * device-memory pair at the front of this rank's task list.  Leave all other
-     * ready tasks in the plan so later multi-phase algorithms keep working.
+     * The executor kernel now performs the complete phase-0 DeviceMemory entry
+     * rendezvous before execute_window_task_stripe(): one local publish followed
+     * by waits for every peer in ready_plan. Remove every matching task from the
+     * initial contiguous ready-task prefix, not just the first publish/wait pair.
      *
-     * This is intentionally narrow: if a future planner emits host-mapped entry
-     * ready, a non-zero entry phase, or a different ordering, this pass will not
-     * drop it.  In that case update the kernel launch args with an explicit
-     * entry-ready descriptor before removing those tasks.
+     * Preserve HostMapped tasks, nonzero phases, and all ready tasks that occur
+     * after the entry prefix. Those may express staged/island dependencies that
+     * are not handled by the kernel's direct-device entry rendezvous.
      */
-    const bool is_entry_pair =
-        publish.op == TransferOp::ReadyPublish &&
-        wait.op == TransferOp::ReadyWait &&
-        publish.executor_rank == ctx.current_rank &&
-        wait.executor_rank == ctx.current_rank &&
-        publish.ready_rank == ctx.current_rank &&
-        publish.ready_phase == 0 &&
-        wait.ready_phase == 0 &&
-        publish.ready_channel == device_channel &&
-        wait.ready_channel == device_channel &&
-        !publish.terminal;
+    int write = 0;
+    bool in_entry_ready_prefix = true;
 
-    if (!is_entry_pair) {
-        return true;
+    for (int read = 0; read < tasks->count; ++read) {
+        const TransferTask& transfer = tasks->tasks[read];
+
+        if (in_entry_ready_prefix && transfer_task_is_ready(transfer)) {
+            const bool handled_by_kernel_entry_rendezvous =
+                transfer.executor_rank == ctx.current_rank &&
+                transfer.ready_phase == 0 &&
+                transfer.ready_channel == device_channel &&
+                (transfer.op == TransferOp::ReadyPublish ||
+                 transfer.op == TransferOp::ReadyWait);
+
+            if (handled_by_kernel_entry_rendezvous) {
+                continue;
+            }
+        } else {
+            in_entry_ready_prefix = false;
+        }
+
+        tasks->tasks[write++] = transfer;
     }
 
-    for (int i = 2; i < tasks->count; ++i) {
-        tasks->tasks[i - 2] = tasks->tasks[i];
-    }
-
-    tasks->count -= 2;
+    tasks->count = write;
 
     return recompute_rank_transfer_task_stats(tasks);
 }
@@ -1028,7 +1026,7 @@ inline bool run_transfer_task_lowering_passes(
         return false;
     }
 
-    if (!pass_drop_hardcoded_entry_ready_pair(ctx, tasks)) {
+    if (!pass_drop_hardcoded_entry_ready_tasks(ctx, tasks)) {
         return false;
     }
 
