@@ -165,6 +165,9 @@ OOVERLAP_TUNING_POLICY = ""
 # Otherwise the parent environment is preserved.
 CUDA_VISIBLE_DEVICES = ""
 
+# Runtime device selection populated from --devices.
+ACTIVE_DEVICES: List[int] = []
+
 OUT_DIR = Path("results/eval_sm90")
 
 # Store full stdout in scenario JSON. Usually false because logs are saved separately.
@@ -194,8 +197,24 @@ def shape_id(shape: Shape) -> str:
     return f"m{shape.m}n{shape.n}k{shape.k}"
 
 
+def parse_devices(value: str) -> List[int]:
+    devices = [int(x.strip()) for x in str(value).split(",") if x.strip()]
+    if len(devices) < 2:
+        raise ValueError("--devices must contain at least two CUDA device ids")
+    if len(set(devices)) != len(devices):
+        raise ValueError("--devices must not contain duplicate CUDA device ids")
+    if any(device < 0 for device in devices):
+        raise ValueError("--devices must contain non-negative CUDA device ids")
+    return devices
+
+
+def device_config_id(devices: List[int]) -> str:
+    return f"tp{len(devices)}__dev{'-'.join(str(x) for x in devices)}"
+
+
 def scenario_id(shape: Shape, slack: int) -> str:
-    return f"{shape_id(shape)}__slack{int(slack)}"
+    device_part = device_config_id(ACTIVE_DEVICES) if ACTIVE_DEVICES else "tp_unknown"
+    return f"{shape_id(shape)}__{device_part}__slack{int(slack)}"
 
 
 def scenario_json_path(run_dir: Path, sid: str) -> Path:
@@ -268,7 +287,9 @@ def make_env(for_test: bool = False) -> Dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    if CUDA_VISIBLE_DEVICES:
+    if ACTIVE_DEVICES:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in ACTIVE_DEVICES)
+    elif CUDA_VISIBLE_DEVICES:
         env["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
 
     if for_test and OOVERLAP_TUNING_POLICY:
@@ -799,6 +820,9 @@ def run_scenario(shape: Shape, slack: int, run_dir: Path) -> Dict[str, Any]:
         },
         "comm_op": COMM_OP,
         "comm_backend": COMM_BACKEND,
+        "world_size": len(ACTIVE_DEVICES),
+        "devices": list(ACTIVE_DEVICES),
+        "cuda_visible_devices": ",".join(str(x) for x in ACTIVE_DEVICES),
         "comm_sm_slack": int(slack),
         "status": "running",
         "started_at": now_stamp(),
@@ -898,6 +922,13 @@ def parse_args():
     )
 
     ap.add_argument(
+        "--devices",
+        type=str,
+        default=CUDA_VISIBLE_DEVICES or os.environ.get("CUDA_VISIBLE_DEVICES", "0,1"),
+        help="Comma-separated physical CUDA device ids, for example 0,1 or 0,1,2,3.",
+    )
+
+    ap.add_argument(
         "--only-shape",
         type=str,
         default="",
@@ -908,7 +939,10 @@ def parse_args():
 
 
 def main() -> int:
+    global ACTIVE_DEVICES
+
     args = parse_args()
+    ACTIVE_DEVICES = parse_devices(args.devices)
 
     if not SHAPES:
         raise SystemExit("SHAPES is empty. Edit SHAPES near the top of this script first.")
@@ -943,7 +977,9 @@ def main() -> int:
         "skip_existing_profile": bool(args.skip_existing_profile),
         "skip_existing_ok_scenarios": bool(SKIP_EXISTING_OK_SCENARIOS and not args.rerun_existing_scenarios),
         "ooverlap_tuning_policy": OOVERLAP_TUNING_POLICY,
-        "cuda_visible_devices": CUDA_VISIBLE_DEVICES or os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "world_size": len(ACTIVE_DEVICES),
+        "devices": list(ACTIVE_DEVICES),
+        "cuda_visible_devices": ",".join(str(x) for x in ACTIVE_DEVICES),
         "out_dir": str(run_dir),
     }
 
@@ -989,6 +1025,9 @@ def main() -> int:
                     "shape": {"m": shape.m, "n": shape.n, "k": shape.k},
                     "comm_op": COMM_OP,
                     "comm_backend": COMM_BACKEND,
+                    "world_size": len(ACTIVE_DEVICES),
+                    "devices": list(ACTIVE_DEVICES),
+                    "cuda_visible_devices": ",".join(str(x) for x in ACTIVE_DEVICES),
                     "comm_sm_slack": int(slack),
                     "status": "failed",
                     "failed_stage": "profile",

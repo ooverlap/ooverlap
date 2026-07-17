@@ -223,21 +223,39 @@ void OverlapImpl::OoverlapIpcInit(
     const std::vector<int64_t> devices,
     const std::string broker_key) {
 
-    TORCH_CHECK(tp_size == 2, "ooverlap IPC currently supports exactly 2 ranks");
-    TORCH_CHECK(devices.size() == 2, "devices must contain exactly 2 CUDA device ids");
+    TORCH_CHECK(tp_size >= 2, "ooverlap IPC requires at least 2 ranks");
+    TORCH_CHECK(tp_rank >= 0 && tp_rank < tp_size, "invalid IPC rank");
+    TORCH_CHECK(
+        static_cast<int64_t>(devices.size()) == tp_size,
+        "devices.size() must equal tp_size");
+
+    std::vector<int> devs;
+    devs.reserve(devices.size());
+    for (int64_t device : devices) {
+        TORCH_CHECK(device >= 0, "CUDA device ids must be non-negative");
+        devs.push_back(static_cast<int>(device));
+    }
 
     OoverlapRelease();
 
     oo_rank_ = tp_rank;
     oo_size_ = tp_size;
-    oo_devices_[0] = static_cast<int>(devices[0]);
-    oo_devices_[1] = static_cast<int>(devices[1]);
 
-    int devs[2] = {oo_devices_[0], oo_devices_[1]};
-    CUDA_CHECK(cudaSetDevice(oo_devices_[oo_rank_]), "cudaSetDevice");
+    // overlap_impl.h still has a two-slot compatibility member. For IPC, keep
+    // only this rank's local device there; the full group is passed directly to
+    // oo_group_create_ipc below.
+    oo_devices_[0] = devs[static_cast<size_t>(oo_rank_)];
+    oo_devices_[1] = -1;
+
+    CUDA_CHECK(cudaSetDevice(oo_devices_[0]), "cudaSetDevice");
 
     OO_CHECK(
-        oo_group_create_ipc(devs, 2, static_cast<int>(oo_rank_), broker_key.c_str(), &oo_group_),
+        oo_group_create_ipc(
+            devs.data(),
+            static_cast<int>(devs.size()),
+            static_cast<int>(oo_rank_),
+            broker_key.c_str(),
+            &oo_group_),
         "oo_group_create_ipc");
 
     oo_owns_group_ = true;
@@ -260,14 +278,17 @@ void OverlapImpl::OoverlapP2pInit(
 
     OoverlapRelease();
 
+    int devs[2] = {
+        static_cast<int>(devices[0]),
+        static_cast<int>(devices[1]),
+    };
+
     oo_rank_ = tp_rank;
     oo_size_ = tp_size;
-    oo_devices_[0] = static_cast<int>(devices[0]);
-    oo_devices_[1] = static_cast<int>(devices[1]);
+    oo_devices_[0] = devs[static_cast<int>(oo_rank_)];
+    oo_devices_[1] = -1;
 
-    int devs[2] = {oo_devices_[0], oo_devices_[1]};
-
-    CUDA_CHECK(cudaSetDevice(oo_devices_[oo_rank_]), "cudaSetDevice");
+    CUDA_CHECK(cudaSetDevice(oo_devices_[0]), "cudaSetDevice");
 
     /*
      * OOVERLAP_FLASHOVERLAP_DIRECT_P2P_API_PATCH:
@@ -347,7 +368,7 @@ void OverlapImpl::OoverlapEnsureBuffer(at::Tensor C) {
 
     OoverlapUnregisterBuffer();
 
-    CUDA_CHECK(cudaSetDevice(oo_devices_[oo_rank_]), "cudaSetDevice");
+    CUDA_CHECK(cudaSetDevice(oo_devices_[0]), "cudaSetDevice");
     OO_CHECK(oo_buffer_wrap(oo_node_, c_ptr, bytes, &oo_local_buf_), "oo_buffer_wrap");
 
     /*
