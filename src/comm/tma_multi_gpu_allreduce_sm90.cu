@@ -24,7 +24,7 @@
 namespace ooverlap {
 namespace {
 
-constexpr int kDefaultMaxCtasPerReduceTask = 4;
+constexpr int kDefaultMaxCtasPerReduceTask = 8;
 
 int max_ctas_per_reduce_task_from_env() {
     static const int value = [] {

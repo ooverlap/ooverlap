@@ -7,7 +7,8 @@
 #include <cstdio>
 #include <set>
 
-#define OOVERLAP_DEBUG_TRANSFER_PLAN 1
+// Comment it to disable the debugs
+//#define OOVERLAP_DEBUG_TRANSFER_PLAN 1
 
 namespace ooverlap {
 namespace comm {

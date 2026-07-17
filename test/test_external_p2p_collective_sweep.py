@@ -17,6 +17,7 @@ from typing import Any
 COLLECTIVES = ("allreduce", "reduce_scatter", "all_gather")
 FP16_BYTES = 2
 CTA_ENV_VARS = ("OOVERLAP_MAX_CTAS", "NCCL_MAX_CTAS")
+REDUCE_TASK_CTA_ENV_VAR = "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
 
 OUTPUT_COLUMNS = [
     "timestamp_utc",
@@ -28,6 +29,7 @@ OUTPUT_COLUMNS = [
     "cta_limit",
     "ooverlap_max_ctas",
     "nccl_max_ctas",
+    "ooverlap_max_ctas_per_reduce_task",
     "devices",
     "world_size",
     "numel",
@@ -51,9 +53,6 @@ OUTPUT_COLUMNS = [
     "ooverlap_bandwidth_gbps",
     "nccl_bandwidth_gbps",
     "nccl_symmetric_bandwidth_gbps",
-    "ooverlap_speedup_over_nccl",
-    "ooverlap_speedup_over_nccl_symmetric",
-    "nccl_symmetric_speedup_over_nccl",
 ]
 
 TEXT_COLUMNS = [
@@ -61,6 +60,7 @@ TEXT_COLUMNS = [
     "metric_set",
     "collective",
     "cta_limit",
+    "ooverlap_max_ctas_per_reduce_task",
     "bytes",
     "ooverlap_latency_us",
     "nccl_latency_us",
@@ -68,7 +68,6 @@ TEXT_COLUMNS = [
     "ooverlap_bandwidth_gbps",
     "nccl_bandwidth_gbps",
     "nccl_symmetric_bandwidth_gbps",
-    "ooverlap_speedup_over_nccl",
 ]
 
 
@@ -167,6 +166,29 @@ def parse_ctas(value: str | None) -> list[int | None]:
     return parsed or [None]
 
 
+def parse_optional_positive_int(
+    value: str | None,
+    option_name: str,
+) -> int | None:
+    if value is None:
+        return None
+
+    token = value.strip().lower()
+    if token in ("default", "none", "unset"):
+        return None
+
+    try:
+        parsed = int(token)
+    except ValueError as exc:
+        raise ValueError(
+            f"{option_name} must be a positive integer or 'default'"
+        ) from exc
+
+    if parsed <= 0:
+        raise ValueError(f"{option_name} must be positive or 'default'")
+    return parsed
+
+
 def bytes_to_numel(size_bytes: int) -> int:
     if size_bytes <= 0:
         raise ValueError("buffer size must be positive")
@@ -191,8 +213,6 @@ def selected_metrics(metric: str) -> list[str]:
         metrics.append("latency")
     if metric in ("bandwidth", "both", "all"):
         metrics.append("bandwidth")
-    if metric in ("speedup", "all"):
-        metrics.append("speedup")
     return metrics
 
 
@@ -269,10 +289,6 @@ def build_jobs(args: argparse.Namespace, devices: list[int]) -> list[dict[str, A
     return jobs
 
 
-def safe_ratio(numerator: float, denominator: float) -> float:
-    return 0.0 if denominator <= 0.0 else numerator / denominator
-
-
 def bandwidth_gbps(size_bytes: float, latency_ms: float) -> float:
     if size_bytes <= 0.0 or latency_ms <= 0.0:
         return 0.0
@@ -305,6 +321,9 @@ def normalize_row(
         "cta_limit": cta_limit,
         "ooverlap_max_ctas": os.environ.get("OOVERLAP_MAX_CTAS", ""),
         "nccl_max_ctas": os.environ.get("NCCL_MAX_CTAS", ""),
+        "ooverlap_max_ctas_per_reduce_task": os.environ.get(
+            REDUCE_TASK_CTA_ENV_VAR, ""
+        ),
         "devices": ",".join(str(device) for device in request["devices"]),
         **row,
         "ooverlap_latency_us": oo_ms * 1000.0,
@@ -314,13 +333,6 @@ def normalize_row(
         "nccl_bandwidth_gbps": bandwidth_gbps(normalized_bytes, nccl_ms),
         "nccl_symmetric_bandwidth_gbps": bandwidth_gbps(
             normalized_bytes, nccl_symmetric_ms
-        ),
-        "ooverlap_speedup_over_nccl": safe_ratio(nccl_ms, oo_ms),
-        "ooverlap_speedup_over_nccl_symmetric": safe_ratio(
-            nccl_symmetric_ms, oo_ms
-        ),
-        "nccl_symmetric_speedup_over_nccl": safe_ratio(
-            nccl_ms, nccl_symmetric_ms
         ),
     }
     return result
@@ -348,8 +360,10 @@ def run_worker(request_path: Path, output_path: Path) -> None:
         )
 
     cta_label = request.get("cta_limit")
+    reduce_task_ctas = request.get("max_ctas_per_reduce_task")
     print(
         f"[worker] ctas={cta_label if cta_label is not None else 'default'} "
+        f"reduce_task_ctas={reduce_task_ctas if reduce_task_ctas is not None else 'default'} "
         f"devices={devices} torch={torch.__version__}",
         flush=True,
     )
@@ -396,19 +410,26 @@ def run_worker(request_path: Path, output_path: Path) -> None:
     output_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
 
 
-def worker_environment(cta_limit: int | None) -> dict[str, str]:
+def worker_environment(
+    cta_limit: int | None,
+    max_ctas_per_reduce_task: int | None,
+) -> dict[str, str]:
     env = os.environ.copy()
     for name in CTA_ENV_VARS:
         env.pop(name, None)
+    env.pop(REDUCE_TASK_CTA_ENV_VAR, None)
     if cta_limit is not None:
         value = str(cta_limit)
         for name in CTA_ENV_VARS:
             env[name] = value
+    if max_ctas_per_reduce_task is not None:
+        env[REDUCE_TASK_CTA_ENV_VAR] = str(max_ctas_per_reduce_task)
     return env
 
 
 def run_cta_worker(
     cta_limit: int | None,
+    max_ctas_per_reduce_task: int | None,
     jobs: list[dict[str, Any]],
     devices: list[int],
     run_id: str,
@@ -418,6 +439,7 @@ def run_cta_worker(
         "run_id": run_id,
         "timestamp_utc": timestamp_utc,
         "cta_limit": cta_limit,
+        "max_ctas_per_reduce_task": max_ctas_per_reduce_task,
         "devices": devices,
         "jobs": jobs,
     }
@@ -438,7 +460,11 @@ def run_cta_worker(
         ]
         label = "default" if cta_limit is None else str(cta_limit)
         print(f"[parent] starting fresh CTA worker: {label}", flush=True)
-        subprocess.run(command, env=worker_environment(cta_limit), check=True)
+        subprocess.run(
+            command,
+            env=worker_environment(cta_limit, max_ctas_per_reduce_task),
+            check=True,
+        )
 
         if not output_path.exists():
             raise RuntimeError(f"CTA worker {label} did not create {output_path}")
@@ -515,7 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--metric",
-        choices=("latency", "bandwidth", "speedup", "both", "all"),
+        choices=("latency", "bandwidth", "both", "all"),
         default="all",
     )
     parser.add_argument(
@@ -528,13 +554,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--max-ctas-per-reduce-task",
+        default="8",
+        help=(
+            "positive OOVERLAP_MAX_CTAS_PER_REDUCE_TASK value. Defaults to 8; "
+            "use default or unset to leave the environment variable unset"
+        ),
+    )
+    parser.add_argument(
         "--bytes",
         default="1M,2M,4M,8M,16M,32M,64M,128M,256M,512M",
         help="default byte-size list used when a metric-specific list is omitted",
     )
     parser.add_argument("--latency-bytes", default=None)
     parser.add_argument("--bandwidth-bytes", default=None)
-    parser.add_argument("--speedup-bytes", default=None)
     parser.add_argument("--smoke-bytes", default="1M")
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=20)
@@ -583,6 +616,13 @@ def main() -> None:
         else parse_devices(f"{args.dev0},{args.dev1}")
     )
     cta_values = parse_ctas(args.ctas)
+    try:
+        max_ctas_per_reduce_task = parse_optional_positive_int(
+            args.max_ctas_per_reduce_task,
+            "--max-ctas-per-reduce-task",
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     jobs = build_jobs(args, devices)
 
     timestamp_utc = datetime.now(timezone.utc).isoformat()
@@ -590,6 +630,10 @@ def main() -> None:
 
     print(f"[info] devices={devices} world_size={len(devices)}")
     print(f"[info] ctas={cta_values}")
+    print(
+        "[info] max_ctas_per_reduce_task="
+        f"{max_ctas_per_reduce_task if max_ctas_per_reduce_task is not None else 'default'}"
+    )
     print(f"[info] jobs={len(jobs)} iters={args.iters} warmup={args.warmup}")
     print("[info] no plotting; saving CSV, JSONL, and tab-separated text")
 
@@ -598,6 +642,7 @@ def main() -> None:
         all_rows.extend(
             run_cta_worker(
                 cta_limit,
+                max_ctas_per_reduce_task,
                 jobs,
                 devices,
                 run_id,
