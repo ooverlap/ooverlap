@@ -353,6 +353,183 @@ __host__ __device__ __forceinline__ bool logical_buffer_is_local_device_buffer(
             ref.role == LogicalBufferRole::RankOutput);
 }
 
+__host__ __device__ __forceinline__ bool
+logical_buffer_ref_same_fanout_layout(
+    const LogicalBufferRef& lhs,
+    const LogicalBufferRef& rhs) {
+    return lhs.role == rhs.role &&
+           lhs.staging_slot == rhs.staging_slot &&
+           lhs.byte_offset == rhs.byte_offset;
+}
+
+inline bool copy_task_is_fanout_eligible(
+    const TransferTask& task) {
+    constexpr std::size_t kTmaBulkAlignment = 16;
+
+    const bool destination_is_rank_buffer =
+        task.dst.role == LogicalBufferRole::RankBuffer ||
+        task.dst.role == LogicalBufferRole::RankOutput;
+
+    return task.op == TransferOp::Copy &&
+           task.executor_rank >= 0 &&
+           task.src_rank == task.executor_rank &&
+           task.dst_rank >= 0 &&
+           task.dst_rank != task.executor_rank &&
+           task.dst.owner_rank == task.dst_rank &&
+           destination_is_rank_buffer &&
+           logical_buffer_is_local_device_buffer(
+               task.src,
+               task.executor_rank) &&
+           task.bytes != 0 &&
+           task.begin_window == 0 &&
+           task.begin_window < task.end_window &&
+           task.window_chunks > 0 &&
+           allreduce_transport_is_direct(task.transport) &&
+           task.requires_tma_load &&
+           task.requires_tma_store &&
+           !task.requires_tma_reduce &&
+           !task.requires_native_atomic &&
+           (task.src.byte_offset % kTmaBulkAlignment) == 0 &&
+           (task.dst.byte_offset % kTmaBulkAlignment) == 0 &&
+           (task.bytes % kTmaBulkAlignment) == 0;
+}
+
+inline bool copy_tasks_share_fanout_shape(
+    const TransferTask& first,
+    const TransferTask& previous,
+    const TransferTask& candidate) {
+    return copy_task_is_fanout_eligible(first) &&
+           copy_task_is_fanout_eligible(candidate) &&
+           !previous.terminal &&
+           candidate.phase == previous.phase + 1 &&
+           candidate.executor_rank == first.executor_rank &&
+           candidate.src_rank == first.src_rank &&
+           logical_buffer_ref_equal(candidate.src, first.src) &&
+           candidate.bytes == first.bytes &&
+           candidate.begin_window == first.begin_window &&
+           candidate.end_window == first.end_window &&
+           candidate.window_chunks == first.window_chunks &&
+           candidate.transport == first.transport &&
+           candidate.requires_tma_load == first.requires_tma_load &&
+           candidate.requires_tma_store == first.requires_tma_store &&
+           candidate.requires_tma_reduce == first.requires_tma_reduce &&
+           candidate.requires_native_atomic == first.requires_native_atomic &&
+           logical_buffer_ref_same_fanout_layout(
+               candidate.dst,
+               first.dst);
+}
+
+inline bool copy_destination_is_distinct(
+    const TransferTask* tasks,
+    int first_idx,
+    int task_count,
+    const TransferTask& candidate) {
+    if (tasks == nullptr || first_idx < 0 || task_count <= 0) {
+        return false;
+    }
+
+    for (int i = 0; i < task_count; ++i) {
+        const TransferTask& existing = tasks[first_idx + i];
+
+        if (existing.dst_rank == candidate.dst_rank ||
+            logical_buffer_ref_equal(existing.dst, candidate.dst)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/*
+ * OOVERLAP_ALLREDUCE_COPY_FANOUT_COALESCE_V1
+ *
+ * Collapse only consecutive, fully compatible direct Copy tasks. A fanout task
+ * has one transport/capability description and the current device pipeline only
+ * supports 16-byte-aligned bulk TMA ranges, so preserve those constraints here.
+ *
+ * This runs before local reduce/copy barriers are inserted. The barrier pass
+ * already understands CopyFanout and renumbers per-rank phases afterwards.
+ */
+template <int MaxTransferTasks>
+bool coalesce_adjacent_copy_tasks_into_fanout(
+    TransferPlan<MaxTransferTasks>* plan) {
+    if (plan == nullptr ||
+        plan->total_tasks < 0 ||
+        plan->total_tasks > MaxTransferTasks) {
+        return false;
+    }
+
+    int write = 0;
+    int read = 0;
+
+    while (read < plan->total_tasks) {
+        const TransferTask first = plan->tasks[read];
+
+        if (!copy_task_is_fanout_eligible(first)) {
+            plan->tasks[write++] = first;
+            ++read;
+            continue;
+        }
+
+        int group_count = 1;
+
+        while (read + group_count < plan->total_tasks &&
+               group_count < TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS) {
+            const TransferTask& previous =
+                plan->tasks[read + group_count - 1];
+            const TransferTask& candidate =
+                plan->tasks[read + group_count];
+
+            if (!copy_tasks_share_fanout_shape(
+                    first,
+                    previous,
+                    candidate) ||
+                !copy_destination_is_distinct(
+                    plan->tasks,
+                    read,
+                    group_count,
+                    candidate)) {
+                break;
+            }
+
+            ++group_count;
+        }
+
+        if (group_count < 2) {
+            plan->tasks[write++] = first;
+            ++read;
+            continue;
+        }
+
+        TransferTask fanout = first;
+        fanout.op = TransferOp::CopyFanout;
+        fanout.dst = LogicalBufferRef{};
+        fanout.fanout_dst_count = group_count;
+
+        for (int i = 0; i < TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS; ++i) {
+            fanout.fanout_dsts[i] = LogicalBufferRef{};
+            fanout.fanout_dst_rank[i] = -1;
+            fanout.fanout_reduce_scope[i] = 0;
+        }
+
+        for (int i = 0; i < group_count; ++i) {
+            const TransferTask& copy = plan->tasks[read + i];
+            fanout.fanout_dsts[i] = copy.dst;
+            fanout.fanout_dst_rank[i] = copy.dst_rank;
+        }
+
+        fanout.dst_rank = fanout.fanout_dst_rank[0];
+        fanout.terminal =
+            plan->tasks[read + group_count - 1].terminal;
+
+        plan->tasks[write++] = fanout;
+        read += group_count;
+    }
+
+    plan->total_tasks = write;
+    return true;
+}
+
 inline bool reduce_task_writes_range(
     const TransferTask& task,
     int executor_rank,
@@ -1271,6 +1448,12 @@ bool build_allreduce_transfer_plan(
             return false;
         }
 
+        if (!allreduce_detail::coalesce_adjacent_copy_tasks_into_fanout(
+                plan)) {
+            transfer_plan_abort_build(plan);
+            return false;
+        }
+
         if (!allreduce_detail::insert_local_reduce_copy_barriers(plan)) {
             transfer_plan_abort_build(plan);
             return false;
@@ -1293,6 +1476,12 @@ bool build_allreduce_transfer_plan(
             islands);
 
     if (!ok) {
+        return false;
+    }
+
+    if (!allreduce_detail::coalesce_adjacent_copy_tasks_into_fanout(
+            plan)) {
+        transfer_plan_abort_build(plan);
         return false;
     }
 
