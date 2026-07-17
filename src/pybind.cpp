@@ -21,6 +21,7 @@
 #include "test/ipc_collective_sm90.h"
 //#include "test/tma_collective_sweep_2gpu.h"
 #include "test/persistent_external_p2p_collective_2gpu_sm90.h"
+#include "test/external_p2p_collective_sweep_sm90.h"
 #include "test/host_mapped_ready_microtest.h"
 #include "test/ipc_external_p2p_collective_2gpu_sm90.h"
 
@@ -487,6 +488,15 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("iters"),
         py::arg("warmup"),
         py::arg("devices"));
+
+  m.def("benchmark_external_p2p_collective_sweep_sm90",
+        &ooverlap::benchmark_external_p2p_collective_sweep_sm90,
+        py::arg("collective"),
+        py::arg("sizes"),
+        py::arg("iters"),
+        py::arg("warmup"),
+        py::arg("devices"),
+        py::arg("verify") = false);
 
   m.def("benchmark_external_p2p_allreduce_sm90",
         &ooverlap::benchmark_external_p2p_allreduce_sm90,
