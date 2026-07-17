@@ -135,11 +135,11 @@ def validate_backend(comm_backend: str, comm_op: str, world_size: int):
     if comm_op not in ("all_reduce", "reduce_scatter"):
         raise ValueError(f"Unsupported comm_op={comm_op}")
 
-    if comm_backend == "ooverlap":
-        if comm_op != "all_reduce":
-            raise ValueError("ooverlap backend currently supports only all_reduce")
-        if world_size != 2:
-            raise ValueError("ooverlap backend currently supports exactly 2 visible GPUs")
+    if world_size < 2:
+        raise ValueError("At least two visible GPUs are required")
+
+    if comm_backend == "ooverlap" and comm_op != "all_reduce":
+        raise ValueError("ooverlap backend currently supports only all_reduce")
 
 
 def method(obj, names):
@@ -180,6 +180,14 @@ def init_baseline_nccl(obj, rank, world_size, nccl_id):
 
 def solution_json_path(M: int, N: int, K: int, comm_backend: str):
     gpu = gpu_config_name()
+    world_size = torch.cuda.device_count()
+    return repo_root() / "configs" / (
+        f"solution_{comm_backend}_m{M}n{N}k{K}_{gpu}_tp{world_size}_packed_sm90.json"
+    )
+
+
+def legacy_backend_solution_json_path(M: int, N: int, K: int, comm_backend: str):
+    gpu = gpu_config_name()
     return repo_root() / "configs" / f"solution_{comm_backend}_m{M}n{N}k{K}_{gpu}_packed_sm90.json"
 
 
@@ -193,13 +201,20 @@ def find_solution_json(M: int, N: int, K: int, comm_backend: str):
     if path.exists():
         return path
 
-    if comm_backend == "nccl":
-        legacy = legacy_solution_json_path(M, N, K)
-        if legacy.exists():
-            return legacy
+    world_size = torch.cuda.device_count()
+    if world_size == 2:
+        legacy_backend = legacy_backend_solution_json_path(M, N, K, comm_backend)
+        if legacy_backend.exists():
+            return legacy_backend
+
+        if comm_backend == "nccl":
+            legacy = legacy_solution_json_path(M, N, K)
+            if legacy.exists():
+                return legacy
 
     raise FileNotFoundError(
-        f"Could not find solution JSON for backend={comm_backend}:\n"
+        f"Could not find solution JSON for backend={comm_backend}, "
+        f"world_size={world_size}:\n"
         f"  {path}\n"
         "Run tool/search.py first."
     )
@@ -212,6 +227,13 @@ def load_solution(M: int, N: int, K: int, comm_backend: str):
     json_backend = data.get("comm_backend")
     if json_backend is not None and json_backend != comm_backend:
         print(f"WARNING: loaded solution has comm_backend={json_backend}, requested={comm_backend}")
+
+    world_size = torch.cuda.device_count()
+    json_world_size = data.get("world_size")
+    if json_world_size is not None and int(json_world_size) != world_size:
+        raise RuntimeError(
+            f"Solution world_size={json_world_size} does not match visible world_size={world_size}: {path}"
+        )
 
     return path, data
 

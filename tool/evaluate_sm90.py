@@ -376,21 +376,37 @@ def solution_path(shape: Shape, backend: str) -> Path:
     root = repo_root()
     gpu = get_gpu_name_slug()
     config_dir = root / "configs"
+    world_size = len(ACTIVE_DEVICES)
+
+    if world_size < 2:
+        raise RuntimeError("ACTIVE_DEVICES must contain at least two GPUs")
 
     if gpu:
-        exact = config_dir / f"solution_{backend}_{shape_id(shape)}_{gpu}_packed_sm90.json"
+        exact = config_dir / (
+            f"solution_{backend}_{shape_id(shape)}_{gpu}_tp{world_size}_packed_sm90.json"
+        )
         if exact.exists():
             return exact
+
+        if world_size == 2:
+            legacy = config_dir / f"solution_{backend}_{shape_id(shape)}_{gpu}_packed_sm90.json"
+            if legacy.exists():
+                return legacy
+
         return exact
 
     matches = sorted(
-        config_dir.glob(f"solution_{backend}_{shape_id(shape)}_*_packed_sm90.json"),
+        config_dir.glob(
+            f"solution_{backend}_{shape_id(shape)}_*_tp{world_size}_packed_sm90.json"
+        ),
         key=lambda p: p.stat().st_mtime,
     )
     if matches:
         return matches[-1]
 
-    return config_dir / f"solution_{backend}_{shape_id(shape)}_unknown_packed_sm90.json"
+    return config_dir / (
+        f"solution_{backend}_{shape_id(shape)}_unknown_tp{world_size}_packed_sm90.json"
+    )
 
 
 def csv_path_for_shape(shape: Shape) -> Path:
@@ -421,12 +437,25 @@ def load_solution_summary(shape: Shape, backend: str) -> Dict[str, Any]:
             "error": "solution json missing or invalid",
         }
 
+    expected_world_size = len(ACTIVE_DEVICES)
+    json_world_size = data.get("world_size")
+    if json_world_size is not None and int(json_world_size) != expected_world_size:
+        return {
+            "ok": False,
+            "path": str(path),
+            "error": (
+                f"solution world_size={json_world_size} does not match "
+                f"requested world_size={expected_world_size}"
+            ),
+        }
+
     return {
         "ok": True,
         "path": str(path),
         "M": data.get("M"),
         "N": data.get("N"),
         "K": data.get("K"),
+        "world_size": data.get("world_size", expected_world_size),
         "comm_backend": data.get("comm_backend", backend),
         "comm_op": data.get("comm_op"),
         "Algo": data.get("Algo"),

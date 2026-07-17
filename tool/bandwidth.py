@@ -50,6 +50,10 @@ def parse_devices(s):
     devices = [int(x) for x in str(s).split(",") if x.strip() != ""]
     if len(devices) < 2:
         raise ValueError("--devices must contain at least two CUDA device ids, e.g. --devices 0,1")
+    if len(set(devices)) != len(devices):
+        raise ValueError("--devices must not contain duplicate CUDA device ids")
+    if any(device < 0 for device in devices):
+        raise ValueError("--devices must contain non-negative CUDA device ids")
     return devices
 
 
@@ -68,8 +72,6 @@ def init_comm(ext, rank, world_size, devices, backend, nccl_id, broker_key):
         return comm
 
     if backend == "ooverlap":
-        if world_size != 2:
-            raise RuntimeError("ooverlap backend currently supports exactly 2 GPUs/ranks")
         comm = ext.OverlapImpl()
         comm.cutlass_init()
         comm.ooverlap_ipc_init(rank, world_size, devices, broker_key)
@@ -214,9 +216,6 @@ def perf_comm(comm_backend, comm_op, devices, sizes, warmup, iters, sleep_second
 
     if world_size < 2:
         raise RuntimeError("At least 2 GPUs are required.")
-
-    if comm_backend == "ooverlap" and world_size != 2:
-        raise RuntimeError("ooverlap backend currently supports exactly 2 GPUs/ranks")
 
     if comm_backend == "ooverlap" and comm_op != "all_reduce":
         raise RuntimeError("ooverlap backend currently supports only all_reduce")

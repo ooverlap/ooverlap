@@ -191,32 +191,45 @@ def shape_json_path(M: int, N: int, K: int, layout: str = "packed") -> Path:
 
 
 def solution_json_path(M: int, N: int, K: int, comm_backend: str) -> Path:
-    return repo_root() / "configs" / f"solution_{comm_backend}_m{M}n{N}k{K}_{gpu_config_name()}_packed_sm90.json"
+    world_size = torch.cuda.device_count()
+    return repo_root() / "configs" / (
+        f"solution_{comm_backend}_m{M}n{N}k{K}_{gpu_config_name()}_tp{world_size}_packed_sm90.json"
+    )
 
 
 def legacy_solution_json_path(M: int, N: int, K: int) -> Path:
     return repo_root() / "configs" / f"solution_m{M}n{N}k{K}_{gpu_config_name()}_packed_sm90.json"
 
 
-def bandwidth_curve_path(comm_backend: str, comm_op: str, world_size: int) -> Path:
+def bandwidth_curve_paths(comm_backend: str, comm_op: str, world_size: int):
+    config_dir = repo_root() / "configs"
+    primary = config_dir / f"bandwidth_{comm_backend}_{comm_op}_tp{world_size}.pt"
+
     if comm_backend == "nccl":
-        return repo_root() / "configs" / f"bandwidth_{comm_op}_tp{world_size}.pt"
-    return repo_root() / "configs" / f"bandwidth_ooverlap_{comm_op}_tp{world_size}.pt"
+        legacy = config_dir / f"bandwidth_{comm_op}_tp{world_size}.pt"
+        return [primary, legacy]
+
+    return [primary]
 
 
 def load_comm_array(comm_backend: str, comm_op: str, world_size: int, bandwidth_path: str = ""):
-    path = Path(bandwidth_path) if bandwidth_path else bandwidth_curve_path(comm_backend, comm_op, world_size)
+    candidates = (
+        [Path(bandwidth_path)]
+        if bandwidth_path
+        else bandwidth_curve_paths(comm_backend, comm_op, world_size)
+    )
+    path = next((candidate for candidate in candidates if candidate.exists()), None)
 
-    if not path.exists():
+    if path is None:
+        tried = "\n".join(f"  {candidate}" for candidate in candidates)
         raise FileNotFoundError(
-            f"Could not find bandwidth curve:\n"
-            f"  {path}\n"
+            f"Could not find bandwidth curve. Tried:\n"
+            f"{tried}\n"
             f"Generate it first with tool/bandwidth.py."
         )
 
     print(f"Bandwidth curve captured from: {path}")
     return torch.load(path), path
-
 
 def load_shape_config(M: int, N: int, K: int):
     path = shape_json_path(M, N, K, "packed")
@@ -334,6 +347,7 @@ def save_solution(
     write_legacy_solution=False,
 ):
     out_path = solution_json_path(M, N, K, comm_backend)
+    world_size = torch.cuda.device_count()
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     sm_count = int(props.multi_processor_count)
@@ -346,6 +360,7 @@ def save_solution(
         "M": int(M),
         "N": int(N),
         "K": int(K),
+        "world_size": int(world_size),
         "comm_backend": str(comm_backend),
         "comm_op": str(comm_op),
         "bandwidth_path": str(bandwidth_path) if bandwidth_path else "",
