@@ -281,22 +281,39 @@ cudaError_t launch_all_gather_rank_variant_sm90(
      * Pass the large WindowTaskExecutorPlan through device memory instead of
      * CUDA kernel formal parameter space.
      */
-    return comm::kernels::launch_multi_gpu_window_task_executor_sm90<
-        ReduceApply,
-        ChunkBytes,
-        StageDepth,
-        MaxTasks,
-        MaxPeers,
-        Variant::fill_depth,
-        Variant::load_fill_depth>(
-            window_plan_scratch.device_plan,
-            num_blocks,
-            launch_config.threads,
-            Variant::dynamic_shared_bytes,
-            stream,
-            launch.local_ready_signal,
-            ready_plan,
-            launch.collective_epoch);
+    const cudaError_t launch_error =
+        comm::kernels::launch_multi_gpu_window_task_executor_sm90<
+            ReduceApply,
+            ChunkBytes,
+            StageDepth,
+            MaxTasks,
+            MaxPeers,
+            Variant::fill_depth,
+            Variant::load_fill_depth>(
+                window_plan_scratch.device_plan,
+                num_blocks,
+                launch_config.threads,
+                Variant::dynamic_shared_bytes,
+                stream,
+                launch.local_ready_signal,
+                ready_plan,
+                launch.collective_epoch);
+
+    if (launch_error != cudaSuccess) {
+        return launch_error;
+    }
+
+    if (window_plan_scratch.completion_event == nullptr) {
+        return cudaSuccess;
+    }
+
+    /*
+     * The event is queued after the kernel on the same stream. The next
+     * all-gather may rewrite this mapped plan only after the kernel finishes.
+     */
+    return cudaEventRecord(
+        window_plan_scratch.completion_event,
+        stream);
 }
 
 template <
