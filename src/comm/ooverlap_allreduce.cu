@@ -17,7 +17,7 @@ oo_status_t allreduce_impl(
     cudaStream_t stream,
     oo_buffer_t* const* prebound_rank_buffers = nullptr,
     int prebound_rank_buffer_count = 0,
-    int plan_scratch_index = -1) {
+    int plan_scratch_index = 0) {
     /* OOVERLAP_ROUND_ROBIN_SLOT_POOL_PATCH_V1 */
     /* OOVERLAP_ROUND_ROBIN_PLAN_SCRATCH_RING_V1 */
     if (!oo_allreduce_supported(dtype, op)) {
