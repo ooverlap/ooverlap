@@ -1,315 +1,464 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Run with:
-#   bash ./setup_env.sh                    # Vera: use /local/tmp.*
-#   bash ./setup_env.sh /path/to/venv      # Other machines: use this venv
-# Then activate later with the env file printed at the end.
+# Minimal Arrhenius GH200 build environment for ooverlap.
+#
+# This script:
+#   1. Loads the Arrhenius GCC/CUDA build environment.
+#   2. Creates a small Python venv for CMake, Ninja, NumPy and Matplotlib.
+#   3. Builds only the native ooverlap core library.
+#
+# It intentionally does NOT install or build:
+#   - vLLM
+#   - PyTorch integrations
+#   - Python extension
+#   - GEMM/CUTLASS helpers
+#   - tests/benchmarks
+#   - legacy overlap code
+#   - RMSNorm helpers
+#
+# Usage:
+#   CLEAN_VENV=1 ./setup_env.sh ../venv
+#
+# Later:
+#   source ../ooverlap-env/ooverlap_core_env.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
-VLLM_VER="${VLLM_VER:-0.25.0}"
-VENV_NAME="${VENV_NAME:-torch_venv}"
-JOBS="${JOBS:-12}"
-CUDA_ARCH="${CUDA_ARCH:-90a}"
-CLEAN_BUILD="${CLEAN_BUILD:-1}"
-SKIP_MODULES="${SKIP_MODULES:-0}"
-PYTHON_BOOTSTRAP="${PYTHON_BOOTSTRAP:-python3}"
-MODULES_LOADED=0
-VENV_PATH_ARG=""
+VENV_PATH_ARG="${1:-}"
 
-VERA_MODULES=(
-  foss/2025b
-  CUDA/13.3.0
-  Ninja/1.13.0-GCCcore-14.3.0
-  Python/3.13.5-GCCcore-14.3.0
-  protobuf/31.1-GCCcore-14.3.0
-  numactl/2.0.19-GCCcore-14.3.0
-  FFmpeg/7.1.2-GCCcore-14.3.0
-  Rust/1.88.0-GCCcore-14.3.0
-  nodejs/22.17.1-GCCcore-14.3.0
+JOBS="${JOBS:-12}"
+CLEAN_BUILD="${CLEAN_BUILD:-1}"
+CLEAN_VENV="${CLEAN_VENV:-0}"
+SKIP_MODULES="${SKIP_MODULES:-0}"
+
+PYTHON_BOOTSTRAP="${PYTHON_BOOTSTRAP:-/usr/bin/python3}"
+
+MODULES_LOADED=0
+VENV_DIR=""
+PYTHON_BIN=""
+CUDA_HOME=""
+CUDACXX=""
+GCC_RUNTIME_DIR=""
+OOTMP="${OOTMP:-}"
+ENV_OUT="${ENV_OUT:-}"
+
+ARRHENIUS_MODULES=(
+  GPU/buildtool-easybuild/5.2.1-hpca3ef7d197
+  GPU/buildenv-gcccuda/2026.03-cu13.0
 )
 
-log() { printf '[info] %s\n' "$*"; }
-die() { printf '[error] %s\n' "$*" >&2; exit 1; }
+log() {
+  printf '[info] %s\n' "$*"
+}
+
+warn() {
+  printf '[warning] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[error] %s\n' "$*" >&2
+  exit 1
+}
+
+on_error() {
+  local status=$?
+
+  printf '[error] Command failed at line %s:\n' \
+    "${BASH_LINENO[0]:-unknown}" >&2
+  printf '        %s\n' "${BASH_COMMAND:-unknown}" >&2
+
+  exit "$status"
+}
+
+trap on_error ERR
+
+prepend_path() {
+  local variable_name="$1"
+  local directory="$2"
+  local current_value="${!variable_name:-}"
+
+  [[ -n "$directory" && -d "$directory" ]] || return 0
+
+  case ":$current_value:" in
+    *":$directory:"*)
+      return 0
+      ;;
+  esac
+
+  if [[ -n "$current_value" ]]; then
+    printf -v "$variable_name" '%s:%s' "$directory" "$current_value"
+  else
+    printf -v "$variable_name" '%s' "$directory"
+  fi
+
+  export "$variable_name"
+}
 
 parse_args() {
   if (( $# > 1 )); then
-    die "Usage: bash ./setup_env.sh [venv-path]"
+    die "Usage: ./setup_env.sh [venv-path]"
   fi
-
-  VENV_PATH_ARG="${1:-}"
 }
 
-load_vera_modules() {
-  if [[ "$SKIP_MODULES" == "1" ]] || ! command -v module >/dev/null 2>&1; then
-    log "Environment modules unavailable or disabled; checking system toolchain"
+load_modules() {
+  if [[ "$SKIP_MODULES" == "1" ]]; then
+    log "Skipping environment modules"
     return
   fi
 
-  module purge
-  module load "${VERA_MODULES[@]}"
-  module list
-  MODULES_LOADED=1
-}
+  if ! command -v module >/dev/null 2>&1; then
+    die "The module command is unavailable"
+  fi
 
-check_system_toolchain() {
-  [[ "$MODULES_LOADED" == "0" ]] || return 0
+  module --force purge
 
-  local missing=()
-  local tool
-
-  for tool in "$PYTHON_BOOTSTRAP" cmake curl c++; do
-    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  local module_name
+  for module_name in "${ARRHENIUS_MODULES[@]}"; do
+    log "Loading module: $module_name"
+    module load "$module_name"
   done
 
-  if ! command -v ninja >/dev/null 2>&1 &&
-     ! command -v make >/dev/null 2>&1; then
-    missing+=("ninja or make")
+  MODULES_LOADED=1
+  module list
+}
+
+validate_host() {
+  local architecture
+  architecture="$(uname -m)"
+
+  log "Host architecture: $architecture"
+
+  case "$architecture" in
+    aarch64|arm64)
+      ;;
+    *)
+      warn "Expected a GH200 ARM64 node, but detected: $architecture"
+      ;;
+  esac
+
+  [[ -x "$PYTHON_BOOTSTRAP" ]] ||
+    die "Python is not executable: $PYTHON_BOOTSTRAP"
+
+  log "Bootstrap Python: $PYTHON_BOOTSTRAP"
+  "$PYTHON_BOOTSTRAP" --version
+
+  local python_file
+  python_file="$(file -L "$PYTHON_BOOTSTRAP")"
+  log "Python binary: $python_file"
+
+  if [[ "$architecture" == "aarch64" || "$architecture" == "arm64" ]]; then
+    if grep -qiE 'x86-64|x86_64' <<<"$python_file"; then
+      die "Selected Python is an x86-64 binary"
+    fi
   fi
 
-  local nvcc_path
-  nvcc_path="${CUDACXX:-$(command -v nvcc || true)}"
-  [[ -n "$nvcc_path" && -x "$nvcc_path" ]] || missing+=("nvcc")
+  "$PYTHON_BOOTSTRAP" -m venv --help >/dev/null 2>&1 ||
+    die "Python venv support is unavailable"
+}
 
-  if command -v "$PYTHON_BOOTSTRAP" >/dev/null 2>&1 &&
-     ! "$PYTHON_BOOTSTRAP" -m venv --help >/dev/null 2>&1; then
-    missing+=("$PYTHON_BOOTSTRAP venv module")
-  fi
+check_build_tools() {
+  local missing=()
+  local command_name
+
+  for command_name in \
+    gcc \
+    g++ \
+    nvcc \
+    git \
+    file \
+    readlink
+  do
+    command -v "$command_name" >/dev/null 2>&1 ||
+      missing+=("$command_name")
+  done
 
   if (( ${#missing[@]} > 0 )); then
-    printf '[error] Missing required system tools:\n' >&2
+    printf '[error] Missing required commands:\n' >&2
     printf '  - %s\n' "${missing[@]}" >&2
-    printf '[error] Install the missing tools and rerun setup_env.sh.\n' >&2
     exit 1
   fi
 
-  local detected_cuda_home
-  detected_cuda_home="${CUDA_HOME:-$(cd "$(dirname "$(readlink -f "$nvcc_path")")/.." && pwd)}"
+  log "GCC: $(command -v gcc)"
+  gcc --version | head -n 1
 
-  local missing_cuda_libs=()
-  local lib
-  for lib in libnvrtc.so libcublas.so; do
-    if ! find -L "$detected_cuda_home" -type f -name "$lib" -print -quit 2>/dev/null | grep -q .; then
-      missing_cuda_libs+=("$lib")
-    fi
-  done
+  log "G++: $(command -v g++)"
+  g++ --version | head -n 1
 
-  if (( ${#missing_cuda_libs[@]} > 0 )); then
-    printf '[error] CUDA developer libraries are missing from %s:\n' "$detected_cuda_home" >&2
-    printf '  - %s\n' "${missing_cuda_libs[@]}" >&2
-    printf '[error] Install the matching CUDA developer libraries ' >&2
-    printf '(NVRTC and cuBLAS), then rerun setup_env.sh.\n' >&2
-    exit 1
-  fi
-
-  log "System toolchain checks passed"
+  log "NVCC: $(command -v nvcc)"
+  nvcc --version | tail -n 1
 }
 
-setup_cuda_toolchain() {
-  local nvcc_path
-  nvcc_path="${CUDACXX:-$(command -v nvcc || true)}"
+setup_gcc_runtime() {
+  local libstdcpp
 
-  [[ -n "$nvcc_path" && -x "$nvcc_path" ]] || \
-    die 'nvcc was not found; set CUDACXX or CUDA_HOME'
+  libstdcpp="$(g++ -print-file-name=libstdc++.so.6)"
+
+  if [[ -z "$libstdcpp" || "$libstdcpp" == "libstdc++.so.6" ]]; then
+    die "g++ could not locate libstdc++.so.6"
+  fi
+
+  libstdcpp="$(readlink -f "$libstdcpp")"
+
+  [[ -f "$libstdcpp" ]] ||
+    die "libstdc++ does not exist: $libstdcpp"
+
+  GCC_RUNTIME_DIR="$(dirname "$libstdcpp")"
+  export GCC_RUNTIME_DIR
+
+  prepend_path LD_LIBRARY_PATH "$GCC_RUNTIME_DIR"
+  prepend_path LIBRARY_PATH "$GCC_RUNTIME_DIR"
+
+  log "GCC runtime: $libstdcpp"
+}
+
+setup_cuda() {
+  local nvcc_path
+  nvcc_path="$(command -v nvcc)"
+
+  [[ -x "$nvcc_path" ]] ||
+    die "nvcc was not found"
 
   CUDACXX="$(readlink -f "$nvcc_path")"
-  CUDA_HOME="${CUDA_HOME:-$(cd "$(dirname "$CUDACXX")/.." && pwd)}"
+  CUDA_HOME="$(cd "$(dirname "$CUDACXX")/.." && pwd)"
 
   export CUDACXX CUDA_HOME
-  export PATH="$CUDA_HOME/bin:$PATH"
-  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+  export CMAKE_CUDA_COMPILER="$CUDACXX"
 
-  log "CUDA: $CUDA_HOME"
+  prepend_path PATH "$CUDA_HOME/bin"
+
+  if [[ -d "$CUDA_HOME/lib64" ]]; then
+    prepend_path LD_LIBRARY_PATH "$CUDA_HOME/lib64"
+    prepend_path LIBRARY_PATH "$CUDA_HOME/lib64"
+  fi
+
+  if [[ -d "$CUDA_HOME/lib" ]]; then
+    prepend_path LD_LIBRARY_PATH "$CUDA_HOME/lib"
+    prepend_path LIBRARY_PATH "$CUDA_HOME/lib"
+  fi
+
+  # Make sure the GCC runtime remains preferred over /lib64.
+  prepend_path LD_LIBRARY_PATH "$GCC_RUNTIME_DIR"
+  prepend_path LIBRARY_PATH "$GCC_RUNTIME_DIR"
+
+  log "CUDA home: $CUDA_HOME"
+  log "CUDA compiler: $CUDACXX"
 }
 
-pick_vera_tmp() {
-  local path
-
-  while read -r path; do
-    [[ -d "$path" && -w "$path" ]] && { printf '%s\n' "$path"; return; }
-  done < <(df -P | awk '$6 ~ /^\/local\/tmp\./ {print $6}')
-
-  while read -r path; do
-    [[ -d "$path" && -w "$path" ]] && { printf '%s\n' "$path"; return; }
-  done < <(find /local -maxdepth 1 -type d -name 'tmp.*' 2>/dev/null | sort)
-
-  die 'No writable /local/tmp.* directory found; pass a venv path as the first argument'
-}
-
-setup_local_environment() {
+setup_directories() {
   if [[ -n "$VENV_PATH_ARG" ]]; then
     if [[ "$VENV_PATH_ARG" == /* ]]; then
       VENV_DIR="$VENV_PATH_ARG"
     else
-      VENV_DIR="$PWD/$VENV_PATH_ARG"
+      VENV_DIR="$(realpath -m "$PWD/$VENV_PATH_ARG")"
     fi
   else
-    LOCAL_TMP_ROOT="${LOCAL_TMP_ROOT:-$(pick_vera_tmp)}"
-    VENV_DIR="$LOCAL_TMP_ROOT/$USER/$VENV_NAME"
+    VENV_DIR="$HOME/venv-ooverlap-core"
   fi
 
-  if [[ -z "${OOTMP:-}" ]]; then
-    if [[ -n "$VENV_PATH_ARG" ]]; then
-      OOTMP="$(dirname "$VENV_DIR")/ooverlap-env"
-    else
-      OOTMP="$(dirname "$VENV_DIR")"
-    fi
+  if [[ -z "$OOTMP" ]]; then
+    OOTMP="$(dirname "$VENV_DIR")/ooverlap-env"
   fi
 
-  local dirs=(
-    tmp uv-cache pip-cache torch-extensions hf-cache
-    xdg-cache xdg-config vllm-cache vllm-config vllm-deps nccl-link
-  )
-  local dir
-  for dir in "${dirs[@]}"; do
-    mkdir -p "$OOTMP/$dir"
-  done
+  mkdir -p \
+    "$OOTMP/tmp" \
+    "$OOTMP/pip-cache" \
+    "$OOTMP/xdg-cache" \
+    "$OOTMP/xdg-config"
 
-  export OOTMP
+  export VENV_DIR OOTMP
   export TMPDIR="$OOTMP/tmp"
-  export UV_CACHE_DIR="$OOTMP/uv-cache"
   export PIP_CACHE_DIR="$OOTMP/pip-cache"
-  export TORCH_EXTENSIONS_DIR="$OOTMP/torch-extensions"
   export XDG_CACHE_HOME="$OOTMP/xdg-cache"
   export XDG_CONFIG_HOME="$OOTMP/xdg-config"
-  export HF_HOME="$OOTMP/hf-cache"
-  export HF_HUB_CACHE="$HF_HOME/hub"
-  export TRANSFORMERS_CACHE="$HF_HOME/transformers"
-  export VLLM_CACHE_ROOT="$OOTMP/vllm-cache"
-  export VLLM_CONFIG_ROOT="$OOTMP/vllm-config"
-  export FETCHCONTENT_BASE_DIR="$OOTMP/vllm-deps"
-  export VLLM_NO_USAGE_STATS=1
-  export VLLM_DO_NOT_TRACK=1
 
   log "Venv: $VENV_DIR"
+  log "Build directory: $BUILD_DIR"
 }
 
-install_python_packages() {
+create_venv() {
+  if [[ "$CLEAN_VENV" == "1" && -e "$VENV_DIR" ]]; then
+    log "Removing existing venv"
+    rm -rf "$VENV_DIR"
+  fi
+
+  if [[ -e "$VENV_DIR" && ! -x "$VENV_DIR/bin/python" ]]; then
+    die "$VENV_DIR exists but is not a valid virtual environment"
+  fi
+
   if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-    command -v "$PYTHON_BOOTSTRAP" >/dev/null 2>&1 || \
-      die "Python bootstrap executable not found: $PYTHON_BOOTSTRAP"
+    log "Creating Python virtual environment"
     "$PYTHON_BOOTSTRAP" -m venv "$VENV_DIR"
   fi
 
   # shellcheck disable=SC1091
   source "$VENV_DIR/bin/activate"
+
   PYTHON_BIN="$VENV_DIR/bin/python"
+  export PYTHON_BIN
 
-  "$PYTHON_BIN" -m pip install --upgrade pip uv
-  "$VENV_DIR/bin/uv" pip install --python "$PYTHON_BIN" --upgrade \
-    setuptools wheel cmake numpy setuptools_scm setuptools_rust matplotlib \
-    "vllm==$VLLM_VER"
+  "$PYTHON_BIN" --version
+}
 
-  local vllm_communicators_dir
-  vllm_communicators_dir="$($PYTHON_BIN - <<'PY'
-from pathlib import Path
-import vllm
-print(Path(vllm.__file__).resolve().parent / "distributed" / "device_communicators")
-PY
-)"
+install_basic_python_tools() {
+  log "Installing basic Python build and analysis tools"
 
-  curl -fsSL \
-    https://raw.githubusercontent.com/ooverlap/vllm/refs/heads/oo-force-allreduce-backends/vllm/distributed/device_communicators/cuda_communicator.py \
-    -o "$vllm_communicators_dir/cuda_communicator.py"
+  "$PYTHON_BIN" -m pip install --upgrade \
+    pip \
+    setuptools \
+    wheel
 
-  curl -fsSL \
-    https://raw.githubusercontent.com/ooverlap/vllm/refs/heads/oo-force-allreduce-backends/vllm/distributed/device_communicators/ooverlap_all_reduce.py \
-    -o "$vllm_communicators_dir/ooverlap_all_reduce.py"
+  "$PYTHON_BIN" -m pip install --upgrade \
+    cmake \
+    ninja \
+    numpy \
+    matplotlib torch
+
+  log "CMake: $VENV_DIR/bin/cmake"
+  "$VENV_DIR/bin/cmake" --version | head -n 1
+
+  log "Ninja: $VENV_DIR/bin/ninja"
+  "$VENV_DIR/bin/ninja" --version
 
   "$PYTHON_BIN" - <<'PY'
-import torch, vllm
-print("vllm:", vllm.__version__)
-print("torch:", torch.__version__)
-print("CUDA:", torch.version.cuda)
-print("NCCL:", torch.cuda.nccl.version())
+import matplotlib
+import numpy
+
+print("NumPy:", numpy.__version__)
+print("Matplotlib:", matplotlib.__version__)
 PY
 }
 
-setup_nccl_paths() {
-  NCCL_PKG_DIR="$($PYTHON_BIN - <<'PY'
-from pathlib import Path
-import nvidia.nccl
-print(Path(next(iter(nvidia.nccl.__path__))).resolve())
-PY
-)"
+prepare_repository() {
+  if [[ ! -f "$ROOT_DIR/CMakeLists.txt" ]]; then
+    die "CMakeLists.txt was not found in $ROOT_DIR"
+  fi
 
-  export NCCL_PKG_DIR
-  export VLLM_NCCL_INCLUDE_PATH="$NCCL_PKG_DIR/include"
-  export VLLM_NCCL_SO_PATH="$NCCL_PKG_DIR/lib/libnccl.so.2"
-
-  ln -sf "$VLLM_NCCL_SO_PATH" "$OOTMP/nccl-link/libnccl.so"
-  export LIBRARY_PATH="$OOTMP/nccl-link:$NCCL_PKG_DIR/lib:${LIBRARY_PATH:-}"
-  export LD_LIBRARY_PATH="$OOTMP/nccl-link:$NCCL_PKG_DIR/lib:${LD_LIBRARY_PATH:-}"
+  # Core-only building does not require CUTLASS, nlohmann_json, or NCCL
+  # submodules, but initializing existing submodules is harmless and avoids
+  # surprises if the build configuration changes.
+  if [[ -d "$ROOT_DIR/.git" ]]; then
+    log "Updating repository submodules"
+    git -C "$ROOT_DIR" submodule update --init --recursive
+  fi
 }
 
-build_ooverlap() {
-  [[ -f "$ROOT_DIR/patch_gcc_typename.py" ]] && \
-    "$PYTHON_BIN" "$ROOT_DIR/patch_gcc_typename.py"
+configure_core_build() {
+  if [[ "$CLEAN_BUILD" == "1" ]]; then
+    log "Removing previous build directory"
+    rm -rf "$BUILD_DIR"
+  fi
 
-  [[ "$CLEAN_BUILD" == "1" ]] && rm -rf "$BUILD_DIR"
   mkdir -p "$BUILD_DIR"
 
-  local torch_prefix
-  torch_prefix="$($PYTHON_BIN -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+  local cmake_bin
+  cmake_bin="$VENV_DIR/bin/cmake"
 
-  cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
+  log "Configuring core-only ooverlap build"
+
+  local torch_prefix
+  torch_prefix="$("$PYTHON_BIN" -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+
+  "$cmake_bin" \
+    -S "$ROOT_DIR" \
+    -B "$BUILD_DIR" \
+    -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER="$(command -v gcc)" \
+    -DCMAKE_CXX_COMPILER="$(command -v g++)" \
+    -DCMAKE_CUDA_COMPILER="$CUDACXX" \
+    -DCUDAToolkit_ROOT="$CUDA_HOME" \
     -DCMAKE_PREFIX_PATH="$torch_prefix" \
-    -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-    -DPython3_EXECUTABLE="$PYTHON_BIN" \
-    -DPython3_FIND_STRATEGY=LOCATION \
-    -DPython3_FIND_IMPLEMENTATIONS=CPython \
     -DOOVERLAP_BUILD_TORCH_COLLECTIVES=ON \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-  cmake --build "$BUILD_DIR" -j "$JOBS"
-  export VLLM_OOVERLAP_TORCH_EXT="$BUILD_DIR/lib/ooverlap_torch_ext.so"
+  log "CMake configuration completed"
 }
 
-write_runtime_env() {
-  ENV_OUT="${ENV_OUT:-$OOTMP/ooverlap_vllm_env.sh}"
+build_core() {
+  local cmake_bin
+  cmake_bin="$VENV_DIR/bin/cmake"
+
+  log "Building ooverlap core with $JOBS parallel jobs"
+
+  "$cmake_bin" \
+    --build "$BUILD_DIR" \
+    --parallel "$JOBS"
+
+  log "Core build completed"
+}
+
+show_build_outputs() {
+  log "Built libraries:"
+
+  find "$BUILD_DIR" \
+    -type f \
+    \( \
+      -name 'libooverlap*.a' -o \
+      -name 'libooverlap*.so' \
+    \) \
+    -print |
+    sort
+}
+
+write_runtime_environment() {
+  if [[ -z "$ENV_OUT" ]]; then
+    ENV_OUT="$OOTMP/ooverlap_core_env.sh"
+  fi
 
   {
     printf '%s\n' '#!/usr/bin/env bash'
-    local name
+
     if [[ "$MODULES_LOADED" == "1" ]]; then
-      printf '%s\n' 'module purge'
-      for name in "${VERA_MODULES[@]}"; do
-        printf 'module load %q\n' "$name"
+      printf '%s\n' 'module --force purge'
+
+      local module_name
+      for module_name in "${ARRHENIUS_MODULES[@]}"; do
+        printf 'module load %q\n' "$module_name"
       done
     fi
+
     printf 'source %q\n' "$VENV_DIR/bin/activate"
+
+    printf 'export CUDA_HOME=%q\n' "$CUDA_HOME"
+    printf 'export CUDACXX=%q\n' "$CUDACXX"
+    printf 'export GCC_RUNTIME_DIR=%q\n' "$GCC_RUNTIME_DIR"
+    printf 'export OOVERLAP_ROOT=%q\n' "$ROOT_DIR"
+    printf 'export OOVERLAP_BUILD_DIR=%q\n' "$BUILD_DIR"
+    printf 'export OOTMP=%q\n' "$OOTMP"
+    printf 'export TMPDIR=%q\n' "$TMPDIR"
+    printf 'export PIP_CACHE_DIR=%q\n' "$PIP_CACHE_DIR"
+    printf 'export XDG_CACHE_HOME=%q\n' "$XDG_CACHE_HOME"
+    printf 'export XDG_CONFIG_HOME=%q\n' "$XDG_CONFIG_HOME"
+
     printf 'export PATH=%q:$PATH\n' "$CUDA_HOME/bin"
+    printf 'export LD_LIBRARY_PATH=%q\n' "$LD_LIBRARY_PATH"
+    printf 'export LIBRARY_PATH=%q\n' "$LIBRARY_PATH"
+  } >"$ENV_OUT"
 
-    local vars=(
-      OOTMP TMPDIR UV_CACHE_DIR PIP_CACHE_DIR TORCH_EXTENSIONS_DIR
-      XDG_CACHE_HOME XDG_CONFIG_HOME HF_HOME HF_HUB_CACHE TRANSFORMERS_CACHE
-      VLLM_CACHE_ROOT VLLM_CONFIG_ROOT FETCHCONTENT_BASE_DIR
-      VLLM_NO_USAGE_STATS VLLM_DO_NOT_TRACK NCCL_PKG_DIR
-      VLLM_NCCL_INCLUDE_PATH VLLM_NCCL_SO_PATH LIBRARY_PATH LD_LIBRARY_PATH
-      CUDA_HOME CUDACXX VLLM_OOVERLAP_TORCH_EXT
-    )
-    for name in "${vars[@]}"; do
-      printf 'export %s=%q\n' "$name" "${!name}"
-    done
-  } > "$ENV_OUT"
+  chmod 700 "$ENV_OUT"
 
-  chmod +x "$ENV_OUT"
-  log "Runtime env: $ENV_OUT"
+  log "Runtime environment: $ENV_OUT"
 }
 
 main() {
   parse_args "$@"
-  load_vera_modules
-  check_system_toolchain
-  setup_cuda_toolchain
-  setup_local_environment
-  install_python_packages
-  setup_nccl_paths
-  build_ooverlap
-  write_runtime_env
-  log "Done. Later run: source $ENV_OUT"
+  load_modules
+  validate_host
+  check_build_tools
+  setup_gcc_runtime
+  setup_cuda
+  setup_directories
+  create_venv
+  install_basic_python_tools
+  prepare_repository
+  configure_core_build
+  build_core
+  show_build_outputs
+  write_runtime_environment
+
+  log "Done"
+  log "Activate later with: source $ENV_OUT"
 }
 
 main "$@"
