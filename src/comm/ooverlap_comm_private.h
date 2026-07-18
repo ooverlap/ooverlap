@@ -73,7 +73,7 @@ struct CollectiveLaunchState {
      * Round-robin collectives use their data slot index here, so the CPU never
      * overwrites a plan that an earlier asynchronous kernel is still reading.
      */
-    int plan_scratch_index = 0;
+    int plan_scratch_index = -1;
 
     size_t dtype_size = 0;
     size_t bytes = 0;

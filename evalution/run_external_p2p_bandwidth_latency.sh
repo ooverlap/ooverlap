@@ -46,13 +46,20 @@ WARMUP="20"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DRIVER="$REPO_ROOT/test/test_external_p2p_collective_sweep.py"
+PLOTTER="$REPO_ROOT/test/plot_external_p2p_collective.py"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 OUT_DIR="$REPO_ROOT/results/evalution/external_p2p/tp${WORLD_SIZE}"
 OUT_PREFIX="$OUT_DIR/external_p2p_bandwidth_latency"
+PLOT_PREFIX="$OUT_DIR/external_p2p_collective"
 
 [[ -f "$DRIVER" ]] || {
   echo "error: benchmark driver not found: $DRIVER" >&2
+  exit 1
+}
+
+[[ -f "$PLOTTER" ]] || {
+  echo "error: plotter not found: $PLOTTER" >&2
   exit 1
 }
 
@@ -62,7 +69,12 @@ command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
 }
 
 mkdir -p "$OUT_DIR"
-rm -f "${OUT_PREFIX}.txt" "${OUT_PREFIX}.csv" "${OUT_PREFIX}.jsonl"
+rm -f \
+  "${OUT_PREFIX}.txt" \
+  "${OUT_PREFIX}.csv" \
+  "${OUT_PREFIX}.jsonl" \
+  "${PLOT_PREFIX}_latency.png" \
+  "${PLOT_PREFIX}_bandwidth.png"
 
 cd "$REPO_ROOT"
 
@@ -91,6 +103,13 @@ echo "[evalution] output=${OUT_PREFIX}.txt"
   --devices "$DEVICES" \
   --out-prefix "$OUT_PREFIX"
 
+"$PYTHON_BIN" "$PLOTTER" \
+  --text "${OUT_PREFIX}.txt" \
+  --tp "$WORLD_SIZE" \
+  --out-prefix "$PLOT_PREFIX"
+
 echo "[evalution] wrote text: ${OUT_PREFIX}.txt"
 echo "[evalution] wrote csv:  ${OUT_PREFIX}.csv"
 echo "[evalution] wrote jsonl:${OUT_PREFIX}.jsonl"
+echo "[evalution] wrote plot: ${PLOT_PREFIX}_latency.png"
+echo "[evalution] wrote plot: ${PLOT_PREFIX}_bandwidth.png"
