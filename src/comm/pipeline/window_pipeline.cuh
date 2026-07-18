@@ -931,7 +931,6 @@ __device__ __forceinline__ void run_byte_range_single_tma_copy_fanout_16b_aligne
 
     void* range_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
 
-    #pragma unroll 4
     for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
         range_dsts[dst_idx] =
             fanout_dsts[dst_idx] != nullptr
@@ -994,7 +993,6 @@ __device__ __forceinline__ void run_byte_range_single_tma_reduce_fanout_16b_alig
 
     void* range_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
 
-    #pragma unroll 4
     for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
         range_dsts[dst_idx] =
             fanout_dsts[dst_idx] != nullptr
@@ -1058,7 +1056,6 @@ __device__ __forceinline__ void run_chunk_range_tma_copy_fanout_16b_aligned_thre
     const int total_range_chunks =
         end_chunk - begin_chunk;
 
-    #pragma unroll 16
     for (int warm = 0; warm < LoadFillDepth; ++warm) {
         if (warm >= total_range_chunks) {
             break;
@@ -1079,7 +1076,6 @@ __device__ __forceinline__ void run_chunk_range_tma_copy_fanout_16b_aligned_thre
         load.issue(&stage);
     }
 
-    #pragma unroll 8
     for (int iter = 0; iter < total_range_chunks; ++iter) {
         const int abs_chunk =
             begin_chunk + iter;
@@ -1133,7 +1129,6 @@ __device__ __forceinline__ void run_chunk_range_tma_copy_fanout_16b_aligned_thre
                 chunk_offset_bytes<ChunkBytes>(abs_chunk);
 
 
-            #pragma unroll 4
             for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
                 if (fanout_dsts[dst_idx] == nullptr) {
                     chunk_dsts[dst_idx] = nullptr;
@@ -1226,7 +1221,6 @@ __device__ __forceinline__ void run_chunk_range_tma_reduce_fanout_16b_aligned_th
         load.issue(&stage);
     }
 
-    #pragma unroll 8
     for (int iter = 0; iter < total_range_chunks; ++iter) {
         const int abs_chunk =
             begin_chunk + iter;
@@ -1279,7 +1273,6 @@ __device__ __forceinline__ void run_chunk_range_tma_reduce_fanout_16b_aligned_th
             const size_t offset =
                 chunk_offset_bytes<ChunkBytes>(abs_chunk);
 
-            #pragma unroll 4
             for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
                 if (fanout_dsts[dst_idx] == nullptr) {
                     chunk_dsts[dst_idx] = nullptr;
