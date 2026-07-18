@@ -45,7 +45,7 @@ ExternalProject_Add(ooverlap_nccl_external
   SOURCE_DIR ${OOVERLAP_NCCL_SOURCE_DIR}
   CONFIGURE_COMMAND ""
   BUILD_COMMAND
-    ${CMAKE_MAKE_PROGRAM}
+    /usr/bin/make
       -C ${OOVERLAP_NCCL_SOURCE_DIR}
       -j
       src.build
