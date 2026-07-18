@@ -10,3 +10,4 @@ tmp/
 configs/
 compile_commands.json
 scripts/gpu_p2p_access_check
+tool/__pycache__
