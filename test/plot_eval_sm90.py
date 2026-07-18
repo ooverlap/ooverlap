@@ -126,6 +126,44 @@ def parse_int_list(text: str) -> List[int]:
     return [int(x) for x in str(text).replace(",", " ").split() if x.strip()]
 
 
+def scenario_world_size(scenario: Dict[str, Any]) -> Optional[int]:
+    for key in ("world_size", "tp_size", "tensor_parallel_size"):
+        try:
+            value = int(scenario.get(key))
+        except Exception:
+            continue
+        if value > 0:
+            return value
+
+    devices = scenario.get("devices")
+    if isinstance(devices, (list, tuple)) and devices:
+        return len(devices)
+
+    for part in str(scenario.get("scenario_id", "")).split("__"):
+        if part.startswith("tp") and part[2:].isdigit():
+            value = int(part[2:])
+            if value > 0:
+                return value
+
+    return None
+
+
+def scenarios_by_tp(
+    scenarios: List[Dict[str, Any]],
+) -> Tuple[Dict[int, List[Dict[str, Any]]], int]:
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    unknown_count = 0
+
+    for scenario in scenarios:
+        tp = scenario_world_size(scenario)
+        if tp is None:
+            unknown_count += 1
+            continue
+        grouped.setdefault(tp, []).append(scenario)
+
+    return dict(sorted(grouped.items())), unknown_count
+
+
 def cseg_for_backend(scenario: Dict[str, Any], backend: str) -> Optional[List[int]]:
     cseg = get_in(scenario, ["solutions", backend, "cSeg"])
     if isinstance(cseg, list):
@@ -430,6 +468,35 @@ def global_ymax(rows: List[ShapeKResult]) -> float:
     return max(1.2, ymax * 1.18)
 
 
+def average_speedups(rows: List[ShapeKResult]) -> Dict[str, Any]:
+    valid = [r for r in rows if valid_for_plot(r)]
+
+    def mean(values: List[float]) -> Optional[float]:
+        return sum(values) / len(values) if values else None
+
+    nccl_values = [float(r.nccl_speedup) for r in valid]
+    ooverlap_values = [float(r.ooverlap_speedup) for r in valid]
+    ooverlap_vs_nccl_values = [
+        float(r.ooverlap_speedup) / float(r.nccl_speedup)
+        for r in valid
+        if float(r.nccl_speedup) > 0.0
+    ]
+
+    return {
+        "aggregation": "arithmetic_mean_of_per_shape_speedups",
+        "total_row_count": len(rows),
+        "valid_row_count": len(valid),
+        "mean_baseline_speedup": 1.0 if valid else None,
+        "mean_nccl_speedup": mean(nccl_values),
+        "mean_ooverlap_speedup": mean(ooverlap_values),
+        "mean_ooverlap_vs_nccl": mean(ooverlap_vs_nccl_values),
+    }
+
+
+def format_speedup(x: Optional[float]) -> str:
+    return "NA" if x is None else f"{x:.3f}x"
+
+
 def plot_results_grid(
     by_shape: Dict[Tuple[int, int], List[ShapeKResult]],
     out_png: Path,
@@ -559,6 +626,91 @@ def plot_results_grid(
     if out_pdf is not None:
         fig.savefig(out_pdf, bbox_inches="tight")
 
+    plt.close(fig)
+
+
+def plot_tp_average_speedups(
+    averages: List[Dict[str, Any]],
+    out_png: Path,
+    out_pdf: Optional[Path],
+    title: str,
+) -> None:
+    rows = [row for row in averages if int(row.get("valid_row_count", 0)) > 0]
+    if not rows:
+        raise RuntimeError("No valid per-TP averages to plot.")
+
+    xs = list(range(len(rows)))
+    bar_width = 0.25
+    baseline_values = [1.0 for _ in rows]
+    nccl_values = [float(row["mean_nccl_speedup"]) for row in rows]
+    ooverlap_values = [float(row["mean_ooverlap_speedup"]) for row in rows]
+
+    fig_width = max(7.0, 2.4 * len(rows) + 2.5)
+    fig, ax = plt.subplots(figsize=(fig_width, 4.8))
+
+    bars0 = ax.bar(
+        [x - bar_width for x in xs],
+        baseline_values,
+        width=bar_width,
+        label="Baseline (No Overlap)",
+    )
+    bars1 = ax.bar(
+        xs,
+        nccl_values,
+        width=bar_width,
+        label="NCCL-Based Overlap",
+        hatch="//",
+    )
+    bars2 = ax.bar(
+        [x + bar_width for x in xs],
+        ooverlap_values,
+        width=bar_width,
+        label="OOverlap-Based Overlap",
+        hatch="xx",
+    )
+
+    ymax = max(baseline_values + nccl_values + ooverlap_values)
+    ymax = max(1.2, ymax * 1.22)
+    ax.set_ylim(0.0, ymax)
+    ax.axhline(1.0, linewidth=1.0, linestyle="--", alpha=0.75)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([
+        f"TP={int(row['world_size'])}\n(n={int(row['valid_row_count'])})"
+        for row in rows
+    ])
+    ax.set_xlabel("Tensor parallel size")
+    ax.set_ylabel("Arithmetic mean normalized speedup")
+    ax.set_title(title)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.45)
+    ax.legend(loc="upper center", ncols=3, frameon=False)
+
+    for bars in (bars0, bars1, bars2):
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                height + 0.02 * ymax,
+                f"{height:.2f}x",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+    for x, row in zip(xs, rows):
+        ax.text(
+            x,
+            0.03 * ymax,
+            f"OO/NCCL {format_speedup(row.get('mean_ooverlap_vs_nccl'))}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=240, bbox_inches="tight")
+    if out_pdf is not None:
+        fig.savefig(out_pdf, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -692,6 +844,57 @@ def write_summary_txt(path: Path, rows: List[ShapeKResult]) -> None:
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
+def write_tp_average_csv(path: Path, averages: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "world_size",
+        "total_row_count",
+        "valid_row_count",
+        "mean_baseline_speedup",
+        "mean_nccl_speedup",
+        "mean_ooverlap_speedup",
+        "mean_ooverlap_vs_nccl",
+        "aggregation",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(averages)
+
+
+def write_tp_average_txt(path: Path, averages: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    headers = ["TP", "Valid/Total", "NCCL vs base", "OOverlap vs base", "OOverlap vs NCCL"]
+    table_rows = [
+        [
+            str(row["world_size"]),
+            f"{row['valid_row_count']}/{row['total_row_count']}",
+            format_speedup(row.get("mean_nccl_speedup")),
+            format_speedup(row.get("mean_ooverlap_speedup")),
+            format_speedup(row.get("mean_ooverlap_vs_nccl")),
+        ]
+        for row in averages
+    ]
+    widths = [len(header) for header in headers]
+    for row in table_rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    def line(cells: List[str]) -> str:
+        return "  ".join(cell.ljust(widths[index]) for index, cell in enumerate(cells))
+
+    out = [
+        "Average Operator Speedup by Tensor Parallel Size",
+        "",
+        "Arithmetic mean of per-(M,N,K) normalized speedups over valid selected rows.",
+        "",
+        line(headers),
+        line(["-" * width for width in widths]),
+    ]
+    out.extend(line(row) for row in table_rows)
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
 
@@ -735,6 +938,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional N filter, for example: --ns 4096,8192",
     )
 
+    p.add_argument(
+        "--tps",
+        type=parse_int_list,
+        default=[],
+        help="Optional TP/world-size filter, for example: --tps 2,4,8",
+    )
     p.add_argument("--annotate", action="store_true")
     p.add_argument("--no-pdf", action="store_true")
     p.add_argument(
@@ -777,78 +986,141 @@ def main() -> int:
     out_dir = Path(args.out_dir).expanduser().resolve()
 
     data = load_eval_json(in_path)
-    scenarios = data["scenarios"]
+    grouped, unknown_tp_count = scenarios_by_tp(data["scenarios"])
+    source_has_multiple_tps = len(grouped) > 1
 
-    shape_plots = choose_shape_plots(
-        scenarios=scenarios,
-        use_all_shapes=bool(args.all_shapes),
-        ms_filter=args.ms,
-        ns_filter=args.ns,
-    )
+    if args.tps:
+        selected_tps = set(int(tp) for tp in args.tps)
+        grouped = {tp: scenarios for tp, scenarios in grouped.items() if tp in selected_tps}
 
-    by_shape, all_rows = build_results(
-        scenarios=scenarios,
-        shape_plots=shape_plots,
-        baseline_source=args.baseline_source,
-        test_mode=args.test_mode,
-    )
+    if not grouped:
+        raise SystemExit(
+            "No scenarios with usable TP metadata were selected. "
+            "Expected scenario.world_size, scenario.devices, or __tpN__ in scenario_id."
+        )
 
-    out_png = out_dir / f"{args.name}.png"
-    out_pdf = None if args.no_pdf else out_dir / f"{args.name}.pdf"
-    out_json = out_dir / f"{args.name}_data.json"
-    out_csv = out_dir / f"{args.name}_data.csv"
-    out_txt = out_dir / f"{args.name}_summary.txt"
+    tp_averages: List[Dict[str, Any]] = []
 
-    summary = {
+    for world_size, scenarios in grouped.items():
+        shape_plots = choose_shape_plots(
+            scenarios=scenarios,
+            use_all_shapes=bool(args.all_shapes),
+            ms_filter=args.ms,
+            ns_filter=args.ns,
+        )
+
+        by_shape, all_rows = build_results(
+            scenarios=scenarios,
+            shape_plots=shape_plots,
+            baseline_source=args.baseline_source,
+            test_mode=args.test_mode,
+        )
+
+        average = average_speedups(all_rows)
+        average["world_size"] = int(world_size)
+        tp_averages.append(average)
+
+        suffix = f"_tp{world_size}" if source_has_multiple_tps else ""
+        output_stem = f"{args.name}{suffix}"
+        out_png = out_dir / f"{output_stem}.png"
+        out_pdf = None if args.no_pdf else out_dir / f"{output_stem}.pdf"
+        out_json = out_dir / f"{output_stem}_data.json"
+        out_csv = out_dir / f"{output_stem}_data.csv"
+        out_txt = out_dir / f"{output_stem}_summary.txt"
+
+        summary = {
+            "input_json": str(in_path),
+            "world_size": int(world_size),
+            "baseline_source": args.baseline_source,
+            "test_mode": args.test_mode,
+            "plot_layout": "rows=M, columns=N, x-axis=K",
+            "average_speedup": average,
+            "plot_shapes": [
+                {
+                    "m": sp.m,
+                    "n": sp.n,
+                    "k": sp.k,
+                    "label": sp.label,
+                }
+                for sp in shape_plots
+            ],
+            "rows": [result_to_dict(r) for r in all_rows],
+        }
+
+        write_summary_json(out_json, summary)
+        write_summary_csv(out_csv, all_rows)
+        write_summary_txt(out_txt, all_rows)
+
+        plot_title = (
+            f"{args.title}\n"
+            f"TP={world_size} | mean NCCL={format_speedup(average['mean_nccl_speedup'])} | "
+            f"mean OOverlap={format_speedup(average['mean_ooverlap_speedup'])} | "
+            f"OOverlap/NCCL={format_speedup(average['mean_ooverlap_vs_nccl'])} | "
+            f"n={average['valid_row_count']}"
+        )
+        plot_results_grid(
+            by_shape=by_shape,
+            out_png=out_png,
+            out_pdf=out_pdf,
+            title=plot_title,
+            annotate=bool(args.annotate),
+        )
+
+        print(f"wrote: {out_png}")
+        if out_pdf is not None:
+            print(f"wrote: {out_pdf}")
+        print(f"wrote: {out_json}")
+        print(f"wrote: {out_csv}")
+        print(f"wrote: {out_txt}")
+
+        missing = [r for r in all_rows if not valid_for_plot(r)]
+        if missing:
+            print("")
+            print(f"WARNING: TP={world_size} has rows missing one or more timings:")
+            for r in missing:
+                print(
+                    f"  m={r.m} n={r.n} k={r.k} "
+                    f"baseline={r.baseline_ms} "
+                    f"nccl={r.nccl_overlap_ms} "
+                    f"ooverlap={r.ooverlap_overlap_ms}"
+                )
+
+    tp_averages.sort(key=lambda row: int(row["world_size"]))
+    average_stem = f"{args.name}_average_by_tp"
+    average_png = out_dir / f"{average_stem}.png"
+    average_pdf = None if args.no_pdf else out_dir / f"{average_stem}.pdf"
+    average_json = out_dir / f"{average_stem}.json"
+    average_csv = out_dir / f"{average_stem}.csv"
+    average_txt = out_dir / f"{average_stem}.txt"
+
+    average_summary = {
         "input_json": str(in_path),
         "baseline_source": args.baseline_source,
         "test_mode": args.test_mode,
-        "plot_layout": "rows=M, columns=N, x-axis=K",
-        "plot_shapes": [
-            {
-                "m": sp.m,
-                "n": sp.n,
-                "k": sp.k,
-                "label": sp.label,
-            }
-            for sp in shape_plots
-        ],
-        "rows": [result_to_dict(r) for r in all_rows],
+        "aggregation": "arithmetic_mean_of_per_shape_speedups",
+        "unknown_tp_scenario_count": unknown_tp_count,
+        "rows": tp_averages,
     }
-
-    write_summary_json(out_json, summary)
-    write_summary_csv(out_csv, all_rows)
-    write_summary_txt(out_txt, all_rows)
-
-    plot_results_grid(
-        by_shape=by_shape,
-        out_png=out_png,
-        out_pdf=out_pdf,
-        title=args.title,
-        annotate=bool(args.annotate),
+    write_summary_json(average_json, average_summary)
+    write_tp_average_csv(average_csv, tp_averages)
+    write_tp_average_txt(average_txt, tp_averages)
+    plot_tp_average_speedups(
+        averages=tp_averages,
+        out_png=average_png,
+        out_pdf=average_pdf,
+        title="Average Operator Speedup by Tensor Parallel Size",
     )
 
-    print(f"wrote: {out_png}")
-    if out_pdf is not None:
-        print(f"wrote: {out_pdf}")
-    print(f"wrote: {out_json}")
-    print(f"wrote: {out_csv}")
-    print(f"wrote: {out_txt}")
-
-    missing = [r for r in all_rows if not valid_for_plot(r)]
-    if missing:
-        print("")
-        print("WARNING: some rows were missing one or more timings:")
-        for r in missing:
-            print(
-                f"  m={r.m} n={r.n} k={r.k} "
-                f"baseline={r.baseline_ms} "
-                f"nccl={r.nccl_overlap_ms} "
-                f"ooverlap={r.ooverlap_overlap_ms}"
-            )
+    print(f"wrote: {average_png}")
+    if average_pdf is not None:
+        print(f"wrote: {average_pdf}")
+    print(f"wrote: {average_json}")
+    print(f"wrote: {average_csv}")
+    print(f"wrote: {average_txt}")
+    if unknown_tp_count:
+        print(f"WARNING: skipped {unknown_tp_count} scenarios without TP metadata")
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
