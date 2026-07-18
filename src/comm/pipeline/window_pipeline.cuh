@@ -927,7 +927,6 @@ __device__ __forceinline__ void run_byte_range_single_tma_copy_fanout_16b_aligne
 
     PipelineTMALoad load{};
     load.issue(&stage);
-    load.wait_ready(&stage);
 
     void* range_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
 
@@ -938,6 +937,8 @@ __device__ __forceinline__ void run_byte_range_single_tma_copy_fanout_16b_aligne
                     begin_byte
                 : nullptr;
     }
+
+    load.wait_ready(&stage);
 
     tma::store_async_fanout_array_op_nofence(
         stage.smem,
@@ -989,7 +990,6 @@ __device__ __forceinline__ void run_byte_range_single_tma_reduce_fanout_16b_alig
     ReduceApply apply{};
 
     load.issue(&stage);
-    load.wait_ready(&stage);
 
     void* range_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
 
@@ -1000,6 +1000,8 @@ __device__ __forceinline__ void run_byte_range_single_tma_reduce_fanout_16b_alig
                     begin_byte
                 : nullptr;
     }
+
+    load.wait_ready(&stage);
 
     issue_reduce_fanout_nofence(
         apply,
