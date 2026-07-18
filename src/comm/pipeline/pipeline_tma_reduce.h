@@ -13,8 +13,19 @@ namespace ooverlap {
 namespace comm {
 namespace pipeline {
 
+#define OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE(TMA_BASE_NAME)               \
+    template <tma::TmaReduceScope Scope>                                      \
+    __device__ __forceinline__ static void issue_bulk_op_nofence(             \
+        void* dst,                                                            \
+        void* smem,                                                           \
+        uint32_t bytes) {                                                     \
+        tma::TMA_BASE_NAME##_op_nofence<Scope>(dst, smem, bytes);             \
+    }
+
 struct PipelineReduceAddF16 {
     using scalar_t = half;
+
+    OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE(reduce_add_f16_async)
 
     __device__ __forceinline__ static void issue_bulk(
         void* dst,
@@ -33,6 +44,8 @@ struct PipelineReduceAddF16 {
 struct PipelineReduceAddNoFtzF16 {
     using scalar_t = half;
 
+    OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE(reduce_add_noftz_f16_async)
+
     __device__ __forceinline__ static void issue_bulk(
         void* dst,
         void* smem,
@@ -49,6 +62,8 @@ struct PipelineReduceAddNoFtzF16 {
 
 struct PipelineReduceMinF16 {
     using scalar_t = half;
+
+    OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE(reduce_min_f16_async)
 
     __device__ __forceinline__ static void issue_bulk(
         void* dst,
@@ -69,6 +84,8 @@ struct PipelineReduceMinF16 {
 struct PipelineReduceMaxF16 {
     using scalar_t = half;
 
+    OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE(reduce_max_f16_async)
+
     __device__ __forceinline__ static void issue_bulk(
         void* dst,
         void* smem,
@@ -88,6 +105,8 @@ struct PipelineReduceMaxF16 {
 struct PipelineReduceAddBF16 {
     using scalar_t = __nv_bfloat16;
 
+    OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE(reduce_add_noftz_bf16_async)
+
     __device__ __forceinline__ static void issue_bulk(
         void* dst,
         void* smem,
@@ -105,6 +124,8 @@ struct PipelineReduceAddBF16 {
 
 struct PipelineReduceMinBF16 {
     using scalar_t = __nv_bfloat16;
+
+    OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE(reduce_min_bf16_async)
 
     __device__ __forceinline__ static void issue_bulk(
         void* dst,
@@ -125,6 +146,8 @@ struct PipelineReduceMinBF16 {
 struct PipelineReduceMaxBF16 {
     using scalar_t = __nv_bfloat16;
 
+    OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE(reduce_max_bf16_async)
+
     __device__ __forceinline__ static void issue_bulk(
         void* dst,
         void* smem,
@@ -144,6 +167,8 @@ struct PipelineReduceMaxBF16 {
 struct PipelineReduceAddF32 {
     using scalar_t = float;
 
+    OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE(reduce_add_f32_async)
+
     __device__ __forceinline__ static void issue_bulk(
         void* dst,
         void* smem,
@@ -158,6 +183,8 @@ struct PipelineReduceAddF32 {
     }
 };
 
+#undef OOVERLAP_PIPELINE_REDUCE_DEFINE_NOFENCE
+
 template <int StageDepth, int FillDepth, typename ReduceOp>
 struct PipelineTMAReduce {
     static_assert(StageDepth > 0, "StageDepth must be > 0");
@@ -168,6 +195,79 @@ struct PipelineTMAReduce {
 
     __device__ __forceinline__ void wait_before_stage_reuse() const {
         tma::reduce_async_read_wait<FillDepth - 1>();
+    }
+
+    __device__ __forceinline__ void issue_fence() const {
+        tma::reduce_fence_proxy_async_shared_cta();
+    }
+
+    __device__ __forceinline__ void commit() const {
+        tma::reduce_commit_group();
+    }
+
+    template <tma::TmaReduceScope Scope>
+    __device__ __forceinline__ void issue_bulk_op_nofence(
+        const PipelineStage* stage,
+        void* dst_override) const {
+        if (stage == nullptr || dst_override == nullptr) {
+            return;
+        }
+
+        const size_t bulk_bytes = pipeline_stage_bulk_bytes(stage);
+
+        if (bulk_bytes == 0) {
+            return;
+        }
+
+        ReduceOp::template issue_bulk_op_nofence<Scope>(
+            dst_override,
+            stage->smem,
+            static_cast<uint32_t>(bulk_bytes));
+    }
+
+    template <tma::TmaReduceScope Scope>
+    __device__ __forceinline__ void issue_bulk_op_nofence_with_scope_fallback(
+        const PipelineStage* stage,
+        void* dst_override) const {
+        if constexpr (
+            Scope == tma::TmaReduceScope::Default ||
+            OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE != 0) {
+            issue_bulk_op_nofence<Scope>(stage, dst_override);
+        } else {
+            issue_bulk_op_nofence<tma::TmaReduceScope::Default>(
+                stage,
+                dst_override);
+        }
+    }
+
+    __device__ __forceinline__ void issue_bulk_op_nofence(
+        const PipelineStage* stage,
+        void* dst_override,
+        tma::TmaReduceScope scope) const {
+        switch (scope) {
+            case tma::TmaReduceScope::Cta:
+                issue_bulk_op_nofence_with_scope_fallback<
+                    tma::TmaReduceScope::Cta>(stage, dst_override);
+                return;
+            case tma::TmaReduceScope::Cluster:
+                issue_bulk_op_nofence_with_scope_fallback<
+                    tma::TmaReduceScope::Cluster>(stage, dst_override);
+                return;
+            case tma::TmaReduceScope::Gpu:
+                issue_bulk_op_nofence_with_scope_fallback<
+                    tma::TmaReduceScope::Gpu>(stage, dst_override);
+                return;
+            case tma::TmaReduceScope::Sys:
+                issue_bulk_op_nofence_with_scope_fallback<
+                    tma::TmaReduceScope::Sys>(stage, dst_override);
+                return;
+            case tma::TmaReduceScope::Default:
+            default:
+                issue_bulk_op_nofence<tma::TmaReduceScope::Default>(
+                    stage,
+                    dst_override);
+                return;
+        }
     }
 
     __device__ __forceinline__ void issue_bulk(
@@ -186,6 +286,18 @@ struct PipelineTMAReduce {
 
     __device__ __forceinline__ void finish_tail(
         const PipelineStage* stage) const {
+        finish_tail(
+            stage,
+            stage != nullptr ? stage->chunk.dst : nullptr);
+    }
+
+    __device__ __forceinline__ void finish_tail(
+        const PipelineStage* stage,
+        void* dst_override) const {
+        if (stage == nullptr || dst_override == nullptr) {
+            return;
+        }
+
         const size_t bulk_bytes = pipeline_stage_bulk_bytes(stage);
         const size_t tail_bytes = pipeline_stage_tail_bytes(stage);
 
@@ -197,7 +309,7 @@ struct PipelineTMAReduce {
         const size_t tail_elems = tail_bytes / sizeof(scalar_t);
 
         scalar_t* dst =
-            reinterpret_cast<scalar_t*>(stage->chunk.dst);
+            reinterpret_cast<scalar_t*>(dst_override);
         const scalar_t* src =
             reinterpret_cast<const scalar_t*>(stage->smem);
 

@@ -129,7 +129,8 @@ __device__ __forceinline__ void execute_window_task(
                 StageDepth,
                 FillDepth,
                 ChunkBytes,
-                LoadFillDepth>(
+                LoadFillDepth,
+                SmallTaskBytes>(
                     task.src,
                     task.fanout_dsts,
                     static_cast<int>(task.fanout_dst_count),
@@ -146,7 +147,9 @@ __device__ __forceinline__ void execute_window_task(
                 StageDepth,
                 FillDepth,
                 ChunkBytes,
-                LoadFillDepth>(
+                ReduceApply,
+                LoadFillDepth,
+                SmallTaskBytes>(
                     task.src,
                     task.fanout_dsts,
                     task.fanout_reduce_scope,

@@ -817,118 +817,6 @@ fanout_reduce_scope_from_u8(uint8_t scope_value) {
     }
 }
 
-__device__ __forceinline__ void issue_reduce_add_noftz_f16_fanout_one_nofence(
-    void* dst_gmem,
-    void* src_smem,
-    uint32_t size_bytes,
-    tma::TmaReduceScope scope) {
-    if (dst_gmem == nullptr || src_smem == nullptr || size_bytes == 0) {
-        return;
-    }
-
-    switch (scope) {
-        case tma::TmaReduceScope::Cta:
-            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {
-                tma::reduce_add_noftz_f16_async_op_nofence<
-                    tma::TmaReduceScope::Cta>(
-                        dst_gmem,
-                        src_smem,
-                        size_bytes);
-            } else {
-                tma::reduce_add_noftz_f16_async_op_nofence<
-                    tma::TmaReduceScope::Default>(
-                        dst_gmem,
-                        src_smem,
-                        size_bytes);
-            }
-            break;
-
-        case tma::TmaReduceScope::Cluster:
-            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {
-                tma::reduce_add_noftz_f16_async_op_nofence<
-                    tma::TmaReduceScope::Cluster>(
-                        dst_gmem,
-                        src_smem,
-                        size_bytes);
-            } else {
-                tma::reduce_add_noftz_f16_async_op_nofence<
-                    tma::TmaReduceScope::Default>(
-                        dst_gmem,
-                        src_smem,
-                        size_bytes);
-            }
-            break;
-
-        case tma::TmaReduceScope::Gpu:
-            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {
-                tma::reduce_add_noftz_f16_async_op_nofence<
-                    tma::TmaReduceScope::Gpu>(
-                        dst_gmem,
-                        src_smem,
-                        size_bytes);
-            } else {
-                tma::reduce_add_noftz_f16_async_op_nofence<
-                    tma::TmaReduceScope::Default>(
-                        dst_gmem,
-                        src_smem,
-                        size_bytes);
-            }
-            break;
-
-        case tma::TmaReduceScope::Sys:
-            if constexpr (OOVERLAP_TMA_REDUCE_HAS_PTX93_SCOPE) {
-                tma::reduce_add_noftz_f16_async_op_nofence<
-                    tma::TmaReduceScope::Sys>(
-                        dst_gmem,
-                        src_smem,
-                        size_bytes);
-            } else {
-                tma::reduce_add_noftz_f16_async_op_nofence<
-                    tma::TmaReduceScope::Default>(
-                        dst_gmem,
-                        src_smem,
-                        size_bytes);
-            }
-            break;
-
-        case tma::TmaReduceScope::Default:
-        default:
-            tma::reduce_add_noftz_f16_async_op_nofence<
-                tma::TmaReduceScope::Default>(
-                    dst_gmem,
-                    src_smem,
-                    size_bytes);
-            break;
-    }
-}
-
-__device__ __forceinline__ void issue_reduce_add_noftz_f16_fanout_nofence(
-    void* src_smem,
-    uint32_t size_bytes,
-    void* const* dst_gmems,
-    const uint8_t* reduce_scopes,
-    int dst_count) {
-    if (src_smem == nullptr ||
-        size_bytes == 0 ||
-        dst_gmems == nullptr ||
-        dst_count <= 0) {
-        return;
-    }
-
-    for (int i = 0; i < dst_count; ++i) {
-        const tma::TmaReduceScope scope =
-            reduce_scopes != nullptr
-                ? fanout_reduce_scope_from_u8(reduce_scopes[i])
-                : tma::TmaReduceScope::Default;
-
-        issue_reduce_add_noftz_f16_fanout_one_nofence(
-            dst_gmems[i],
-            src_smem,
-            size_bytes,
-            scope);
-    }
-}
-
 template <size_t ChunkBytes>
 __device__ __forceinline__ PipelineStage make_fanout_stage_for_abs_chunk(
     const unsigned char* src_base,
@@ -961,6 +849,168 @@ __device__ __forceinline__ int clamp_fanout_dst_count(int dst_count) {
     }
 
     return dst_count > MaxFanoutDsts ? MaxFanoutDsts : dst_count;
+}
+
+__device__ __forceinline__ PipelineStage make_fanout_stage_for_byte_range(
+    const unsigned char* src_base,
+    size_t begin_byte,
+    size_t byte_count,
+    unsigned char* shared_raw,
+    sync::semaphore* barrier) {
+    return make_pipeline_stage(
+        make_pipeline_chunk(
+            src_base + begin_byte,
+            nullptr,
+            byte_count),
+        shared_raw,
+        barrier);
+}
+
+template <typename ReduceApply>
+__device__ __forceinline__ void issue_reduce_fanout_nofence(
+    const ReduceApply& apply,
+    const PipelineStage* stage,
+    void* const* dst_gmems,
+    const uint8_t* reduce_scopes,
+    int dst_count) {
+    if (stage == nullptr || dst_gmems == nullptr || dst_count <= 0) {
+        return;
+    }
+
+    for (int i = 0; i < dst_count; ++i) {
+        const tma::TmaReduceScope scope =
+            reduce_scopes != nullptr
+                ? fanout_reduce_scope_from_u8(reduce_scopes[i])
+                : tma::TmaReduceScope::Default;
+
+        apply.issue_bulk_op_nofence(
+            stage,
+            dst_gmems[i],
+            scope);
+    }
+}
+
+__device__ __forceinline__ void run_byte_range_single_tma_copy_fanout_16b_aligned_thread0(
+    const void* src_base,
+    void* const* fanout_dsts,
+    int fanout_dst_count,
+    size_t begin_byte,
+    size_t byte_count,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int dst_count =
+        clamp_fanout_dst_count<TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS>(
+            fanout_dst_count);
+
+    if (src_base == nullptr ||
+        fanout_dsts == nullptr ||
+        byte_count == 0 ||
+        dst_count <= 0 ||
+        !byte_range_is_16b_bulk_aligned(begin_byte, byte_count)) {
+        return;
+    }
+
+    const unsigned char* src_bytes =
+        reinterpret_cast<const unsigned char*>(src_base);
+
+    PipelineStage stage =
+        make_fanout_stage_for_byte_range(
+            src_bytes,
+            begin_byte,
+            byte_count,
+            shared_raw,
+            &barriers[0]);
+
+    PipelineTMALoad load{};
+    load.issue(&stage);
+    load.wait_ready(&stage);
+
+    void* range_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+
+    #pragma unroll 4
+    for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
+        range_dsts[dst_idx] =
+            fanout_dsts[dst_idx] != nullptr
+                ? reinterpret_cast<unsigned char*>(fanout_dsts[dst_idx]) +
+                    begin_byte
+                : nullptr;
+    }
+
+    tma::store_async_fanout_array_op_nofence(
+        stage.smem,
+        static_cast<uint32_t>(byte_count),
+        range_dsts,
+        dst_count);
+    tma::store_commit_group();
+    tma::store_async_wait<0>();
+}
+
+template <typename ReduceApply>
+__device__ __forceinline__ void run_byte_range_single_tma_reduce_fanout_16b_aligned_thread0(
+    const void* src_base,
+    void* const* fanout_dsts,
+    const uint8_t* fanout_reduce_scope,
+    int fanout_dst_count,
+    size_t begin_byte,
+    size_t byte_count,
+    unsigned char* shared_raw,
+    sync::semaphore* barriers) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int dst_count =
+        clamp_fanout_dst_count<TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS>(
+            fanout_dst_count);
+
+    if (src_base == nullptr ||
+        fanout_dsts == nullptr ||
+        byte_count == 0 ||
+        dst_count <= 0 ||
+        !byte_range_is_16b_bulk_aligned(begin_byte, byte_count)) {
+        return;
+    }
+
+    const unsigned char* src_bytes =
+        reinterpret_cast<const unsigned char*>(src_base);
+
+    PipelineStage stage =
+        make_fanout_stage_for_byte_range(
+            src_bytes,
+            begin_byte,
+            byte_count,
+            shared_raw,
+            &barriers[0]);
+
+    PipelineTMALoad load{};
+    ReduceApply apply{};
+
+    load.issue(&stage);
+    load.wait_ready(&stage);
+
+    void* range_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
+
+    #pragma unroll 4
+    for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
+        range_dsts[dst_idx] =
+            fanout_dsts[dst_idx] != nullptr
+                ? reinterpret_cast<unsigned char*>(fanout_dsts[dst_idx]) +
+                    begin_byte
+                : nullptr;
+    }
+
+    issue_reduce_fanout_nofence(
+        apply,
+        &stage,
+        range_dsts,
+        fanout_reduce_scope,
+        dst_count);
+    apply.commit();
+    apply.wait_complete();
 }
 
 template <
@@ -1111,6 +1161,7 @@ template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
+    typename ReduceApply,
     int LoadFillDepth = FillDepth>
 __device__ __forceinline__ void run_chunk_range_tma_reduce_fanout_16b_aligned_thread0(
     const void* src_base,
@@ -1149,6 +1200,7 @@ __device__ __forceinline__ void run_chunk_range_tma_reduce_fanout_16b_aligned_th
         reinterpret_cast<const unsigned char*>(src_base);
 
     PipelineTMALoad load{};
+    ReduceApply apply{};
 
     const int total_range_chunks =
         end_chunk - begin_chunk;
@@ -1213,7 +1265,7 @@ __device__ __forceinline__ void run_chunk_range_tma_reduce_fanout_16b_aligned_th
                     barriers);
 
             if (future_iter >= StageDepth) {
-                tma::reduce_async_read_wait<FillDepth - 1>();
+                apply.wait_before_stage_reuse();
             }
 
             load.issue(&future_stage);
@@ -1238,25 +1290,26 @@ __device__ __forceinline__ void run_chunk_range_tma_reduce_fanout_16b_aligned_th
                 }
             }
 
-            issue_reduce_add_noftz_f16_fanout_nofence(
-                cur_stage.smem,
-                static_cast<uint32_t>(bulk_bytes),
+            issue_reduce_fanout_nofence(
+                apply,
+                &cur_stage,
                 chunk_dsts,
                 fanout_reduce_scope,
                 dst_count);
 
-            tma::reduce_commit_group();
+            apply.commit();
         }
     }
 
-    tma::reduce_async_wait<0>();
+    apply.wait_complete();
 }
 
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    int LoadFillDepth = FillDepth>
+    int LoadFillDepth = FillDepth,
+    int SmallTaskBytes = 0>
 __device__ void copy_window_range_tma_fanout(
     const void* src_base,
     void* const* fanout_dsts,
@@ -1273,12 +1326,38 @@ __device__ void copy_window_range_tma_fanout(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     if (begin_window >= end_window ||
         window_chunks <= 0 ||
         total_bytes == 0 ||
         fanout_dst_count <= 0) {
         return;
+    }
+
+    if (SmallTaskBytes > 0) {
+        const ByteRange byte_range =
+            byte_range_for_window_range<ChunkBytes>(
+                begin_window,
+                end_window,
+                total_bytes,
+                window_chunks);
+
+        if (byte_range.bytes > 0 &&
+            byte_range.bytes <= static_cast<size_t>(SmallTaskBytes) &&
+            byte_range_is_16b_bulk_aligned(
+                byte_range.begin,
+                byte_range.bytes)) {
+            run_byte_range_single_tma_copy_fanout_16b_aligned_thread0(
+                src_base,
+                fanout_dsts,
+                fanout_dst_count,
+                byte_range.begin,
+                byte_range.bytes,
+                shared_raw,
+                barriers);
+            return;
+        }
     }
 
     const int total_chunks =
@@ -1325,7 +1404,9 @@ template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    int LoadFillDepth = FillDepth>
+    typename ReduceApply,
+    int LoadFillDepth = FillDepth,
+    int SmallTaskBytes = 0>
 __device__ void reduce_window_range_tma_fanout(
     const void* src_base,
     void* const* fanout_dsts,
@@ -1343,12 +1424,40 @@ __device__ void reduce_window_range_tma_fanout(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     if (begin_window >= end_window ||
         window_chunks <= 0 ||
         total_bytes == 0 ||
         fanout_dst_count <= 0) {
         return;
+    }
+
+    if (SmallTaskBytes > 0) {
+        const ByteRange byte_range =
+            byte_range_for_window_range<ChunkBytes>(
+                begin_window,
+                end_window,
+                total_bytes,
+                window_chunks);
+
+        if (byte_range.bytes > 0 &&
+            byte_range.bytes <= static_cast<size_t>(SmallTaskBytes) &&
+            byte_range_is_16b_bulk_aligned(
+                byte_range.begin,
+                byte_range.bytes)) {
+            run_byte_range_single_tma_reduce_fanout_16b_aligned_thread0<
+                ReduceApply>(
+                    src_base,
+                    fanout_dsts,
+                    fanout_reduce_scope,
+                    fanout_dst_count,
+                    byte_range.begin,
+                    byte_range.bytes,
+                    shared_raw,
+                    barriers);
+            return;
+        }
     }
 
     const int total_chunks =
@@ -1380,6 +1489,7 @@ __device__ void reduce_window_range_tma_fanout(
         StageDepth,
         FillDepth,
         ChunkBytes,
+        ReduceApply,
         LoadFillDepth>(
             src_base,
             fanout_dsts,
