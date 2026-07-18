@@ -16,12 +16,41 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdlib>
 #include <driver_types.h>
 #include <new>
 #include <stdexcept>
 
 namespace ooverlap {
 namespace {
+
+constexpr int kDefaultMaxCtasPerReduceTask = 8;
+
+int max_ctas_per_reduce_task_from_env() {
+    static const int value = [] {
+        const char* text =
+            std::getenv("OOVERLAP_MAX_CTAS_PER_REDUCE_TASK");
+
+        if (text == nullptr || text[0] == '\0') {
+            return kDefaultMaxCtasPerReduceTask;
+        }
+
+        char* end = nullptr;
+        const long parsed = std::strtol(text, &end, 10);
+
+        if (end == text || *end != '\0' || parsed <= 0) {
+            return kDefaultMaxCtasPerReduceTask;
+        }
+
+        if (parsed > comm::task::kWindowTaskMaxCtas) {
+            return comm::task::kWindowTaskMaxCtas;
+        }
+
+        return static_cast<int>(parsed);
+    }();
+
+    return value;
+}
 
 template <int MaxPeers>
 bool validate_reduce_scatter_launch(
@@ -236,6 +265,11 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
 
     int num_blocks = 0;
 
+    comm::plan::lowering_detail::LoweringPassOptions lowering_options{};
+    lowering_options.enable_reduce_cta_groups = true;
+    lowering_options.max_ctas_per_reduce_task =
+        max_ctas_per_reduce_task_from_env();
+
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<
             comm::plan::kTmaMultiGpuReduceScatterMaxTransferTasks,
@@ -248,7 +282,8 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
                 &window_plan,
                 &num_blocks,
                 0,
-                ready_binding_ptr);
+                ready_binding_ptr,
+                lowering_options);
 
     if (!plan_ok) {
         return cudaErrorInvalidValue;
