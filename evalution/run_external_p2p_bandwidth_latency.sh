@@ -22,11 +22,13 @@ case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
     OOVERLAP_MAX_CTAS="8"
+    NCCL_MAX_CTAS="-1"
     MAX_CTAS_PER_REDUCE_TASK="8"
     ;;
   4)
     DEVICES="0,1,2,3"
     OOVERLAP_MAX_CTAS="12"
+    NCCL_MAX_CTAS="24"
     MAX_CTAS_PER_REDUCE_TASK="4"
     ;;
   *)
@@ -34,6 +36,15 @@ case "$WORLD_SIZE" in
     usage
     ;;
 esac
+
+if [[ "$NCCL_MAX_CTAS" == "-1" ]]; then
+  NCCL_MAX_CTAS_LABEL="default"
+elif [[ "$NCCL_MAX_CTAS" =~ ^[1-9][0-9]*$ ]]; then
+  NCCL_MAX_CTAS_LABEL="$NCCL_MAX_CTAS"
+else
+  echo "error: NCCL_MAX_CTAS must be -1 or a positive integer; got: $NCCL_MAX_CTAS" >&2
+  exit 2
+fi
 
 # Keep the fixed latency range at 1 KiB and above. The external-P2P sweep can
 # stall in the very-small-message 8 B..512 B range on the current runtime,
@@ -81,7 +92,7 @@ cd "$REPO_ROOT"
 echo "[evalution] external-P2P latency and bandwidth"
 echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
 echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
-echo "[evalution] nccl_max_ctas=unrestricted"
+echo "[evalution] nccl_max_ctas=$NCCL_MAX_CTAS_LABEL"
 echo "[evalution] max_ctas_per_reduce_task=$MAX_CTAS_PER_REDUCE_TASK"
 echo "[evalution] latency_bytes=$LATENCY_BYTES"
 echo "[evalution] bandwidth_bytes=$BANDWIDTH_BYTES"
@@ -95,6 +106,7 @@ echo "[evalution] output=${OUT_PREFIX}.txt"
   --collective all \
   --metric all \
   --ctas "$OOVERLAP_MAX_CTAS" \
+  --nccl-ctas "$NCCL_MAX_CTAS" \
   --max-ctas-per-reduce-task "$MAX_CTAS_PER_REDUCE_TASK" \
   --latency-bytes "$LATENCY_BYTES" \
   --bandwidth-bytes "$BANDWIDTH_BYTES" \

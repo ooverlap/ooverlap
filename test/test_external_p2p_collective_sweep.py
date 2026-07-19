@@ -191,6 +191,29 @@ def parse_optional_positive_int(
     return parsed
 
 
+
+def parse_optional_nccl_ctas(value: str | None) -> int | None:
+    """Return None for -1/default, otherwise a positive NCCL CTA limit."""
+    if value is None:
+        return None
+
+    token = value.strip().lower()
+    if token in ("-1", "default", "none", "unset", "unlimited"):
+        return None
+
+    try:
+        parsed = int(token)
+    except ValueError as exc:
+        raise ValueError(
+            "--nccl-ctas must be a positive integer or -1 for NCCL default"
+        ) from exc
+
+    if parsed <= 0:
+        raise ValueError(
+            "--nccl-ctas must be a positive integer or -1 for NCCL default"
+        )
+    return parsed
+
 def bytes_to_numel(size_bytes: int) -> int:
     if size_bytes <= 0:
         raise ValueError("buffer size must be positive")
@@ -361,11 +384,12 @@ def run_worker(request_path: Path, output_path: Path) -> None:
         )
 
     cta_label = request.get("cta_limit")
+    nccl_cta_limit = request.get("nccl_cta_limit")
     reduce_task_ctas = request.get("max_ctas_per_reduce_task")
     ring_size = os.environ.get("OOVERLAP_BENCH_RING_SIZE", "16")
     print(
         f"[worker] ooverlap_ctas={cta_label if cta_label is not None else 'default'} "
-        f"nccl_ctas=unrestricted "
+        f"nccl_ctas={nccl_cta_limit if nccl_cta_limit is not None else 'default'} "
         f"reduce_task_ctas={reduce_task_ctas if reduce_task_ctas is not None else 'default'} "
         f"bandwidth_ring_size={ring_size} "
         f"devices={devices} torch={torch.__version__}",
@@ -419,18 +443,20 @@ def run_worker(request_path: Path, output_path: Path) -> None:
 
 def worker_environment(
     cta_limit: int | None,
+    nccl_cta_limit: int | None,
     max_ctas_per_reduce_task: int | None,
 ) -> dict[str, str]:
     env = os.environ.copy()
 
-    # The sweep CTA limit applies only to OOverlap. Always remove NCCL_MAX_CTAS
-    # so normal and symmetric NCCL use their unrestricted/default CTA policy.
+    # Clear inherited values first, then apply the independently requested limits.
     env.pop(OOVERLAP_CTA_ENV_VAR, None)
     env.pop(NCCL_CTA_ENV_VAR, None)
     env.pop(REDUCE_TASK_CTA_ENV_VAR, None)
 
     if cta_limit is not None:
         env[OOVERLAP_CTA_ENV_VAR] = str(cta_limit)
+    if nccl_cta_limit is not None:
+        env[NCCL_CTA_ENV_VAR] = str(nccl_cta_limit)
     if max_ctas_per_reduce_task is not None:
         env[REDUCE_TASK_CTA_ENV_VAR] = str(max_ctas_per_reduce_task)
     return env
@@ -438,6 +464,7 @@ def worker_environment(
 
 def run_cta_worker(
     cta_limit: int | None,
+    nccl_cta_limit: int | None,
     max_ctas_per_reduce_task: int | None,
     jobs: list[dict[str, Any]],
     devices: list[int],
@@ -445,7 +472,9 @@ def run_cta_worker(
     timestamp_utc: str,
 ) -> list[dict[str, Any]]:
     label = "default" if cta_limit is None else str(cta_limit)
-    environment = worker_environment(cta_limit, max_ctas_per_reduce_task)
+    environment = worker_environment(
+        cta_limit, nccl_cta_limit, max_ctas_per_reduce_task
+    )
     rows: list[dict[str, Any]] = []
 
     with tempfile.TemporaryDirectory(prefix="ooverlap-external-sweep-") as temp_dir:
@@ -456,6 +485,7 @@ def run_cta_worker(
                 "run_id": run_id,
                 "timestamp_utc": timestamp_utc,
                 "cta_limit": cta_limit,
+                "nccl_cta_limit": nccl_cta_limit,
                 "max_ctas_per_reduce_task": max_ctas_per_reduce_task,
                 "devices": devices,
                 "jobs": [job],
@@ -564,8 +594,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Collect in-process external-P2P collective measurements without "
-            "plotting. Each OOverlap CTA setting runs in a fresh process; NCCL "
-            "runs with NCCL_MAX_CTAS unset."
+            "plotting. OOverlap and NCCL CTA limits are configured independently "
+            "before each fresh worker process starts."
         )
     )
     parser.add_argument("--mode", choices=("smoke", "bench", "both"), default="bench")
@@ -584,8 +614,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "comma-separated OOverlap CTA limits, for example default,4,8. "
-            "Values set OOVERLAP_MAX_CTAS only; NCCL_MAX_CTAS is always unset "
-            "so NCCL uses its unrestricted/default CTA policy"
+            "Values set OOVERLAP_MAX_CTAS only"
+        ),
+    )
+    parser.add_argument(
+        "--nccl-ctas",
+        default="-1",
+        help=(
+            "NCCL_MAX_CTAS limit. Use a positive integer, or -1/default to "
+            "leave NCCL_MAX_CTAS unset and use NCCL's default policy"
         ),
     )
     parser.add_argument(
@@ -652,6 +689,7 @@ def main() -> None:
     )
     cta_values = parse_ctas(args.ctas)
     try:
+        nccl_cta_limit = parse_optional_nccl_ctas(args.nccl_ctas)
         max_ctas_per_reduce_task = parse_optional_positive_int(
             args.max_ctas_per_reduce_task,
             "--max-ctas-per-reduce-task",
@@ -665,7 +703,10 @@ def main() -> None:
 
     print(f"[info] devices={devices} world_size={len(devices)}")
     print(f"[info] ooverlap_ctas={cta_values}")
-    print("[info] nccl_ctas=unrestricted")
+    print(
+        "[info] nccl_ctas="
+        f"{nccl_cta_limit if nccl_cta_limit is not None else 'default'}"
+    )
     print(
         "[info] max_ctas_per_reduce_task="
         f"{max_ctas_per_reduce_task if max_ctas_per_reduce_task is not None else 'default'}"
@@ -678,6 +719,7 @@ def main() -> None:
         all_rows.extend(
             run_cta_worker(
                 cta_limit,
+                nccl_cta_limit,
                 max_ctas_per_reduce_task,
                 jobs,
                 devices,
