@@ -55,6 +55,13 @@ class MinGroupTrial:
     # This avoids very expensive search cases from small min_group_size.
     max_mn: Optional[int] = None
 
+
+@dataclass(frozen=True)
+class CommRunConfig:
+    comm_sm_slack: int
+    max_ctas_per_reduce_task: int
+
+
 SHAPES = [
 #     Shape(16384, 2048, 1024, "~/csv_out_h100/m16384n2048k1024.gemm.csv"),
     # Shape(16384, 2048, 2048, "~/csv_out_h100/m16384n2048k2048.gemm.csv"),
@@ -115,10 +122,19 @@ CSV_NAME_TEMPLATE = "m{m}n{n}k{k}.gemm.csv"
 COMM_OP = "all_reduce"
 COMM_BACKEND = "both"
 
-COMM_SM_SLACKS = [
-    9,
-    12,
-]
+# Communication settings are grouped because the reduction-task CTA split
+# must be tuned together with the number of SMs reserved for communication.
+# Add more CommRunConfig entries to a TP list to sweep more pairs.
+COMM_RUN_CONFIGS_BY_TP: Dict[int, List[CommRunConfig]] = {
+    2: [
+        CommRunConfig(comm_sm_slack=4, max_ctas_per_reduce_task=4),
+        CommRunConfig(comm_sm_slack=8, max_ctas_per_reduce_task=8),
+    ],
+    4: [
+        CommRunConfig(comm_sm_slack=9, max_ctas_per_reduce_task=3),
+        CommRunConfig(comm_sm_slack=12, max_ctas_per_reduce_task=4),
+    ],
+}
 
 # search.py retries these in order.
 # max_mn=None means always allowed.
@@ -211,9 +227,72 @@ def device_config_id(devices: List[int]) -> str:
     return f"tp{len(devices)}__dev{'-'.join(str(x) for x in devices)}"
 
 
-def scenario_id(shape: Shape, slack: int) -> str:
+def comm_run_config_to_dict(config: CommRunConfig) -> Dict[str, int]:
+    return {
+        "comm_sm_slack": int(config.comm_sm_slack),
+        "max_ctas_per_reduce_task": int(config.max_ctas_per_reduce_task),
+    }
+
+
+def active_comm_run_configs() -> List[CommRunConfig]:
+    world_size = len(ACTIVE_DEVICES)
+    configs = list(COMM_RUN_CONFIGS_BY_TP.get(world_size, []))
+
+    if not configs:
+        raise ValueError(
+            f"No communication configuration is defined for TP={world_size}. "
+            "Edit COMM_RUN_CONFIGS_BY_TP near the top of tool/evaluate_sm90.py."
+        )
+
+    seen = set()
+    for config in configs:
+        pair = (
+            int(config.comm_sm_slack),
+            int(config.max_ctas_per_reduce_task),
+        )
+        if pair[0] <= 0 or pair[1] <= 0:
+            raise ValueError(
+                "Communication configuration values must be positive: "
+                f"TP={world_size}, pair={pair}"
+            )
+        if pair in seen:
+            raise ValueError(
+                f"Duplicate communication configuration for TP={world_size}: {pair}"
+            )
+        seen.add(pair)
+
+    return configs
+
+
+def scenario_uses_configured_comm_run_config(
+    scenario: Dict[str, Any],
+) -> bool:
+    try:
+        world_size = int(scenario.get("world_size"))
+        pair = (
+            int(scenario.get("comm_sm_slack")),
+            int(scenario.get("max_ctas_per_reduce_task")),
+        )
+    except (TypeError, ValueError):
+        return False
+
+    configured_pairs = {
+        (
+            int(config.comm_sm_slack),
+            int(config.max_ctas_per_reduce_task),
+        )
+        for config in COMM_RUN_CONFIGS_BY_TP.get(world_size, [])
+    }
+    return pair in configured_pairs
+
+
+def scenario_id(shape: Shape, config: CommRunConfig) -> str:
     device_part = device_config_id(ACTIVE_DEVICES) if ACTIVE_DEVICES else "tp_unknown"
-    return f"{shape_id(shape)}__{device_part}__slack{int(slack)}"
+    return (
+        f"{shape_id(shape)}__{device_part}"
+        f"__slack{int(config.comm_sm_slack)}"
+        f"__rcta{int(config.max_ctas_per_reduce_task)}"
+    )
 
 
 def scenario_json_path(run_dir: Path, sid: str) -> Path:
@@ -263,13 +342,14 @@ def load_existing_scenarios(run_dir: Path) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def scenario_sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, int, str]:
+def scenario_sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, int, int, str]:
     shape = row.get("shape", {})
     return (
         int(shape.get("m", 0) or 0),
         int(shape.get("n", 0) or 0),
         int(shape.get("k", 0) or 0),
         int(row.get("comm_sm_slack", 0) or 0),
+        int(row.get("max_ctas_per_reduce_task", 0) or 0),
         str(row.get("scenario_id", "")),
     )
 
@@ -282,7 +362,11 @@ def command_to_string(cmd: List[str]) -> str:
     return " ".join(cmd)
 
 
-def make_env(for_test: bool = False) -> Dict[str, str]:
+def make_env(
+    for_test: bool = False,
+    comm_config: Optional[CommRunConfig] = None,
+    set_ooverlap_max_ctas: bool = False,
+) -> Dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
@@ -290,6 +374,15 @@ def make_env(for_test: bool = False) -> Dict[str, str]:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in ACTIVE_DEVICES)
     elif CUDA_VISIBLE_DEVICES:
         env["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
+
+    if comm_config is not None:
+        env["OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"] = str(
+            int(comm_config.max_ctas_per_reduce_task)
+        )
+        if set_ooverlap_max_ctas:
+            # search.py should model the same communication-SM reservation as
+            # the capped evaluation: total OOverlap CTAs equal comm_sm_slack.
+            env["OOVERLAP_MAX_CTAS"] = str(int(comm_config.comm_sm_slack))
 
     if for_test and OOVERLAP_TUNING_POLICY:
         env["OOVERLAP_TUNING_POLICY"] = OOVERLAP_TUNING_POLICY
@@ -689,12 +782,14 @@ def run_profile(
 
 def run_search_trial(
     shape: Shape,
-    slack: int,
+    comm_config: CommRunConfig,
     trial_cfg: MinGroupTrial,
     run_dir: Path,
 ) -> Dict[str, Any]:
+    slack = int(comm_config.comm_sm_slack)
+    reduce_ctas = int(comm_config.max_ctas_per_reduce_task)
     trial_name = (
-        f"{shape_id(shape)}__slack{slack}"
+        f"{shape_id(shape)}__slack{slack}__rcta{reduce_ctas}"
         f"__mg{trial_cfg.min_group_size}"
         f"__meg{trial_cfg.min_effective_group_size}"
     )
@@ -716,7 +811,11 @@ def run_search_trial(
     res = run_cmd(
         cmd,
         run_dir / "logs" / f"{trial_name}__search.log",
-        env=make_env(for_test=False),
+        env=make_env(
+            for_test=False,
+            comm_config=comm_config,
+            set_ooverlap_max_ctas=True,
+        ),
     )
 
     solutions = {
@@ -736,6 +835,7 @@ def run_search_trial(
     return {
         "ok": bool(ok),
         "skipped": False,
+        "comm_config": comm_run_config_to_dict(comm_config),
         **min_group_trial_to_dict(trial_cfg),
         "run": res,
         "solutions": solutions,
@@ -743,7 +843,11 @@ def run_search_trial(
     }
 
 
-def run_search_with_retries(shape: Shape, slack: int, run_dir: Path) -> Dict[str, Any]:
+def run_search_with_retries(
+    shape: Shape,
+    comm_config: CommRunConfig,
+    run_dir: Path,
+) -> Dict[str, Any]:
     trials = []
 
     for trial_cfg in MIN_GROUP_TRIALS:
@@ -764,7 +868,7 @@ def run_search_with_retries(shape: Shape, slack: int, run_dir: Path) -> Dict[str
             )
             continue
 
-        trial = run_search_trial(shape, slack, trial_cfg, run_dir)
+        trial = run_search_trial(shape, comm_config, trial_cfg, run_dir)
         trials.append(trial)
 
         if trial["ok"]:
@@ -792,10 +896,12 @@ def run_search_with_retries(shape: Shape, slack: int, run_dir: Path) -> Dict[str
 
 def run_test(
     shape: Shape,
-    slack: int,
+    comm_config: CommRunConfig,
     capped: bool,
     run_dir: Path,
 ) -> Dict[str, Any]:
+    slack = int(comm_config.comm_sm_slack)
+    reduce_ctas = int(comm_config.max_ctas_per_reduce_task)
     label = "capped" if capped else "uncapped"
 
     cmd = [
@@ -817,8 +923,11 @@ def run_test(
 
     res = run_cmd(
         cmd,
-        run_dir / "logs" / f"{shape_id(shape)}__slack{slack}__test_{label}.log",
-        env=make_env(for_test=True),
+        run_dir / "logs" / (
+            f"{shape_id(shape)}__slack{slack}__rcta{reduce_ctas}"
+            f"__test_{label}.log"
+        ),
+        env=make_env(for_test=True, comm_config=comm_config),
     )
 
     stdout = res["stdout"]
@@ -830,14 +939,20 @@ def run_test(
     return {
         "ok": res["returncode"] == 0,
         "capped": bool(capped),
+        "comm_config": comm_run_config_to_dict(comm_config),
         "run": res,
         "parsed": parsed,
         "error": "" if res["returncode"] == 0 else "test.py failed",
     }
 
 
-def run_scenario(shape: Shape, slack: int, run_dir: Path) -> Dict[str, Any]:
-    sid = scenario_id(shape, slack)
+def run_scenario(
+    shape: Shape,
+    comm_config: CommRunConfig,
+    run_dir: Path,
+) -> Dict[str, Any]:
+    slack = int(comm_config.comm_sm_slack)
+    sid = scenario_id(shape, comm_config)
 
     scenario: Dict[str, Any] = {
         "scenario_id": sid,
@@ -852,13 +967,17 @@ def run_scenario(shape: Shape, slack: int, run_dir: Path) -> Dict[str, Any]:
         "devices": list(ACTIVE_DEVICES),
         "cuda_visible_devices": ",".join(str(x) for x in ACTIVE_DEVICES),
         "comm_sm_slack": int(slack),
+        "max_ctas_per_reduce_task": int(
+            comm_config.max_ctas_per_reduce_task
+        ),
+        "comm_config": comm_run_config_to_dict(comm_config),
         "status": "running",
         "started_at": now_stamp(),
     }
 
     save_scenario(run_dir, scenario)
 
-    search = run_search_with_retries(shape, slack, run_dir)
+    search = run_search_with_retries(shape, comm_config, run_dir)
     scenario["search"] = search
 
     if not search["ok"]:
@@ -876,11 +995,21 @@ def run_scenario(shape: Shape, slack: int, run_dir: Path) -> Dict[str, Any]:
 
     tests: Dict[str, Any] = {}
 
-    tests["uncapped"] = run_test(shape, slack, capped=False, run_dir=run_dir)
+    tests["uncapped"] = run_test(
+        shape,
+        comm_config,
+        capped=False,
+        run_dir=run_dir,
+    )
     scenario["tests"] = tests
     save_scenario(run_dir, scenario)
 
-    tests["capped"] = run_test(shape, slack, capped=True, run_dir=run_dir)
+    tests["capped"] = run_test(
+        shape,
+        comm_config,
+        capped=True,
+        run_dir=run_dir,
+    )
     scenario["tests"] = tests
 
     if not tests["uncapped"]["ok"]:
@@ -915,6 +1044,9 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "failed_stage": r.get("failed_stage"),
                 "shape": r.get("shape"),
                 "comm_sm_slack": r.get("comm_sm_slack"),
+                "max_ctas_per_reduce_task": r.get(
+                    "max_ctas_per_reduce_task"
+                ),
             }
             for r in failed
         ],
@@ -971,6 +1103,7 @@ def main() -> int:
 
     args = parse_args()
     ACTIVE_DEVICES = parse_devices(args.devices)
+    comm_configs = active_comm_run_configs()
 
     if not SHAPES:
         raise SystemExit("SHAPES is empty. Edit SHAPES near the top of this script first.")
@@ -980,8 +1113,19 @@ def main() -> int:
     ensure_dir(run_dir / "logs")
     ensure_dir(run_dir / "scenarios")
 
-    scenarios_by_id = load_existing_scenarios(run_dir)
-    print(f"[resume] loaded existing scenarios: {len(scenarios_by_id)}")
+    loaded_scenarios = load_existing_scenarios(run_dir)
+    scenarios_by_id = {
+        sid: scenario
+        for sid, scenario in loaded_scenarios.items()
+        if scenario_uses_configured_comm_run_config(scenario)
+    }
+    ignored_scenarios = len(loaded_scenarios) - len(scenarios_by_id)
+    print(f"[resume] loaded configured scenarios: {len(scenarios_by_id)}")
+    if ignored_scenarios:
+        print(
+            f"[resume] ignored scenarios outside COMM_RUN_CONFIGS_BY_TP: "
+            f"{ignored_scenarios}"
+        )
 
     selected_shapes = SHAPES
     if args.only_shape:
@@ -997,7 +1141,13 @@ def main() -> int:
         "test_script": TEST_SCRIPT,
         "comm_op": COMM_OP,
         "comm_backend": COMM_BACKEND,
-        "comm_sm_slacks": COMM_SM_SLACKS,
+        "comm_run_configs_by_tp": {
+            str(tp): [comm_run_config_to_dict(config) for config in configs]
+            for tp, configs in sorted(COMM_RUN_CONFIGS_BY_TP.items())
+        },
+        "active_comm_run_configs": [
+            comm_run_config_to_dict(config) for config in comm_configs
+        ],
         "min_group_trials": [
             min_group_trial_to_dict(x)
             for x in MIN_GROUP_TRIALS
@@ -1027,22 +1177,26 @@ def main() -> int:
         print(f"# Shape {shape_id(shape)}")
         print("################################################################################")
 
-        shape_sids = [scenario_id(shape, slack) for slack in COMM_SM_SLACKS]
+        shape_sids = [scenario_id(shape, config) for config in comm_configs]
         skip_existing_scenarios = SKIP_EXISTING_OK_SCENARIOS and not args.rerun_existing_scenarios
 
         if skip_existing_scenarios and all(
             existing_scenario_is_ok(scenarios_by_id, sid)
             for sid in shape_sids
         ):
-            print(f"[resume] skip shape {shape_id(shape)}: all slack scenarios already ok")
+            print(
+                f"[resume] skip shape {shape_id(shape)}: "
+                "all communication configurations already ok"
+            )
             write_partial()
             continue
 
         profile = run_profile(shape, run_dir, args.skip_existing_profile)
 
         if not profile["ok"]:
-            for slack in COMM_SM_SLACKS:
-                sid = scenario_id(shape, slack)
+            for comm_config in comm_configs:
+                slack = int(comm_config.comm_sm_slack)
+                sid = scenario_id(shape, comm_config)
 
                 if skip_existing_scenarios and existing_scenario_is_ok(scenarios_by_id, sid):
                     print(f"[resume] keep existing ok scenario: {sid}")
@@ -1057,6 +1211,10 @@ def main() -> int:
                     "devices": list(ACTIVE_DEVICES),
                     "cuda_visible_devices": ",".join(str(x) for x in ACTIVE_DEVICES),
                     "comm_sm_slack": int(slack),
+                    "max_ctas_per_reduce_task": int(
+                        comm_config.max_ctas_per_reduce_task
+                    ),
+                    "comm_config": comm_run_config_to_dict(comm_config),
                     "status": "failed",
                     "failed_stage": "profile",
                     "profile": profile,
@@ -1070,8 +1228,8 @@ def main() -> int:
             write_partial()
             continue
 
-        for slack in COMM_SM_SLACKS:
-            sid = scenario_id(shape, slack)
+        for comm_config in comm_configs:
+            sid = scenario_id(shape, comm_config)
 
             if skip_existing_scenarios and existing_scenario_is_ok(scenarios_by_id, sid):
                 print(f"[resume] skip existing ok scenario: {sid}")
@@ -1083,7 +1241,7 @@ def main() -> int:
             print(f"# Scenario {sid}")
             print("--------------------------------------------------------------------------------")
 
-            scenario = run_scenario(shape, slack, run_dir)
+            scenario = run_scenario(shape, comm_config, run_dir)
             scenario["profile"] = profile
 
             save_scenario(run_dir, scenario)

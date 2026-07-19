@@ -28,7 +28,7 @@ case "$WORLD_SIZE" in
   4)
     DEVICES="0,1,2,3"
     OOVERLAP_MAX_CTAS="12"
-    NCCL_MAX_CTAS="-1"
+    NCCL_MAX_CTAS="12"
     MAX_CTAS_PER_REDUCE_TASK="4"
     ;;
   *)
