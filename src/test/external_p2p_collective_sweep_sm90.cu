@@ -729,23 +729,14 @@ SweepContext create_context(const std::vector<int>& devices) {
 }
 
 std::size_t bandwidth_bytes_per_rank(
-    TestCollective collective,
+    TestCollective /*collective*/,
     std::size_t numel,
-    int world_size) {
-    if (collective == TestCollective::AllReduce) {
-        return numel * sizeof(half);
-    }
-
-    std::size_t max_shard = 0;
-    for (int rank = 0; rank < world_size; ++rank) {
-        max_shard = std::max(
-            max_shard,
-            testing::rank_partition_count(
-                numel,
-                rank,
-                world_size));
-    }
-    return max_shard * sizeof(half);
+    int /*world_size*/) {
+    // Match nccl-tests AlgoBW: logical full-message bytes divided by time.
+    // AllReduce uses count * typesize. ReduceScatter and AllGather use
+    // local_count * typesize * nranks, which is the same full message size.
+    // Keep this helper name for output compatibility with existing results.
+    return numel * sizeof(half);
 }
 
 std::map<std::string, double> run_one_size_ring(

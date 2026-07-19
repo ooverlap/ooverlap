@@ -200,8 +200,8 @@ def plot_metric(
         t_ccl_key = "t_ccl_bandwidth_gbps"
         nccl_key = "nccl_bandwidth_gbps"
         symmetric_key = "nccl_symmetric_bandwidth_gbps"
-        ylabel = "Per-rank bandwidth (GB/s)"
-        metric_title = "External P2P Collective Bandwidth"
+        ylabel = "AlgoBW (GB/s)"
+        metric_title = "External P2P Collective Algorithm Bandwidth"
     else:
         raise ValueError(f"unsupported metric: {metric}")
 
