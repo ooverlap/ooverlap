@@ -26,8 +26,8 @@ case "$WORLD_SIZE" in
     ;;
   4)
     DEVICES="0,1,2,3"
-    MAX_CTAS="24"
-    MAX_CTAS_PER_REDUCE_TASK="8"
+    MAX_CTAS="12"
+    MAX_CTAS_PER_REDUCE_TASK="4"
     ;;
   *)
     echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2

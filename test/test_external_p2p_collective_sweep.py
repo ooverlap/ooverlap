@@ -24,6 +24,7 @@ OUTPUT_COLUMNS = [
     "run_id",
     "mode",
     "metric_set",
+    "timing_mode",
     "collective",
     "collective_code",
     "cta_limit",
@@ -58,9 +59,11 @@ OUTPUT_COLUMNS = [
 TEXT_COLUMNS = [
     "mode",
     "metric_set",
+    "timing_mode",
     "collective",
     "cta_limit",
     "ooverlap_max_ctas_per_reduce_task",
+    "ring_size",
     "bytes",
     "ooverlap_latency_us",
     "nccl_latency_us",
@@ -310,12 +313,14 @@ def normalize_row(
         row.get("bandwidth_bytes_per_rank", row.get("bytes", 0.0))
     )
     cta_limit = request.get("cta_limit")
+    timing_mode = "ring" if job["metric_set"] == "bandwidth" else "isolated"
 
     result: dict[str, Any] = {
         "timestamp_utc": request["timestamp_utc"],
         "run_id": request["run_id"],
         "mode": job["mode"],
         "metric_set": job["metric_set"],
+        "timing_mode": timing_mode,
         "collective": job["collective"],
         "collective_code": collective_code,
         "cta_limit": cta_limit,
@@ -336,6 +341,69 @@ def normalize_row(
         ),
     }
     return result
+
+
+def benchmark_ring_bandwidth_size(
+    ext: Any,
+    job: dict[str, Any],
+    numel: int,
+    devices: list[int],
+) -> dict[str, Any]:
+    """Run one size through the existing batched ring benchmark."""
+    if bool(job["verify"]):
+        raise ValueError(
+            "runtime --verify is not supported by the ring bandwidth backend; "
+            "run smoke verification separately"
+        )
+    if not hasattr(ext, "benchmark_external_p2p_collective_sm90"):
+        raise AttributeError(
+            "ooverlap_ext does not expose benchmark_external_p2p_collective_sm90; "
+            "rebuild the extension"
+        )
+
+    iters = int(job["iters"])
+    raw = dict(
+        ext.benchmark_external_p2p_collective_sm90(
+            job["collective"],
+            int(numel),
+            iters,
+            int(job["warmup"]),
+            devices,
+        )
+    )
+
+    world_size = int(raw.get("world_size", len(devices)))
+    if world_size <= 0:
+        raise RuntimeError("ring benchmark returned an invalid world_size")
+
+    measured_numel = int(raw.get("numel", numel))
+    measured_bytes = int(raw.get("bytes", measured_numel * FP16_BYTES))
+    max_local_shard_numel = (
+        measured_numel + world_size - 1
+    ) // world_size
+    max_local_shard_bytes = max_local_shard_numel * FP16_BYTES
+    normalized_bytes = (
+        measured_bytes
+        if job["collective"] == "allreduce"
+        else max_local_shard_bytes
+    )
+
+    oo_ms = float(raw.get("ooverlap_ms", 0.0))
+    nccl_ms = float(raw.get("nccl_ms", 0.0))
+    nccl_symmetric_ms = float(raw.get("nccl_symmetric_ms", 0.0))
+
+    raw.update(
+        {
+            "local_shard_numel": float(max_local_shard_numel),
+            "local_shard_bytes": float(max_local_shard_bytes),
+            "bandwidth_bytes_per_rank": float(normalized_bytes),
+            "verify": 0.0,
+            "oo_total_ms": oo_ms * iters,
+            "nccl_total_ms": nccl_ms * iters,
+            "nccl_symmetric_total_ms": nccl_symmetric_ms * iters,
+        }
+    )
+    return raw
 
 
 def run_worker(request_path: Path, output_path: Path) -> None:
@@ -361,9 +429,11 @@ def run_worker(request_path: Path, output_path: Path) -> None:
 
     cta_label = request.get("cta_limit")
     reduce_task_ctas = request.get("max_ctas_per_reduce_task")
+    ring_size = os.environ.get("OOVERLAP_BENCH_RING_SIZE", "16")
     print(
         f"[worker] ctas={cta_label if cta_label is not None else 'default'} "
         f"reduce_task_ctas={reduce_task_ctas if reduce_task_ctas is not None else 'default'} "
+        f"bandwidth_ring_size={ring_size} "
         f"devices={devices} torch={torch.__version__}",
         flush=True,
     )
@@ -374,7 +444,9 @@ def run_worker(request_path: Path, output_path: Path) -> None:
     for job in request["jobs"]:
         sizes_bytes = [int(value) for value in job["sizes_bytes"]]
         numels = [bytes_to_numel(value) for value in sizes_bytes]
+        timing_mode = "ring" if job["metric_set"] == "bandwidth" else "isolated"
         key = (
+            timing_mode,
             job["collective"],
             tuple(numels),
             int(job["iters"]),
@@ -384,22 +456,37 @@ def run_worker(request_path: Path, output_path: Path) -> None:
 
         print(
             f"[worker] mode={job['mode']} metric={job['metric_set']} "
-            f"collective={job['collective']} "
+            f"timing={timing_mode} collective={job['collective']} "
             f"sizes={[format_size(value) for value in sizes_bytes]}",
             flush=True,
         )
 
         raw_rows = cache.get(key)
         if raw_rows is None:
-            raw_rows = ext.benchmark_external_p2p_collective_sweep_sm90(
-                job["collective"],
-                numels,
-                int(job["iters"]),
-                int(job["warmup"]),
-                devices,
-                bool(job["verify"]),
-            )
-            raw_rows = [dict(row) for row in raw_rows]
+            if timing_mode == "ring":
+                if len(numels) != 1:
+                    raise RuntimeError(
+                        "ring bandwidth workers must receive exactly one size; "
+                        "the parent driver should split bandwidth jobs by size"
+                    )
+                raw_rows = [
+                    benchmark_ring_bandwidth_size(
+                        ext,
+                        job,
+                        numels[0],
+                        devices,
+                    )
+                ]
+            else:
+                raw_rows = ext.benchmark_external_p2p_collective_sweep_sm90(
+                    job["collective"],
+                    numels,
+                    int(job["iters"]),
+                    int(job["warmup"]),
+                    devices,
+                    bool(job["verify"]),
+                )
+                raw_rows = [dict(row) for row in raw_rows]
             cache[key] = raw_rows
 
         rows.extend(normalize_row(row, job, request) for row in raw_rows)
@@ -435,41 +522,88 @@ def run_cta_worker(
     run_id: str,
     timestamp_utc: str,
 ) -> list[dict[str, Any]]:
-    request = {
-        "run_id": run_id,
-        "timestamp_utc": timestamp_utc,
-        "cta_limit": cta_limit,
-        "max_ctas_per_reduce_task": max_ctas_per_reduce_task,
-        "devices": devices,
-        "jobs": jobs,
-    }
+    # Keep a hard process boundary between NCCL contexts. Bandwidth ring jobs
+    # are additionally split by size because the existing ring extension owns
+    # one communicator/context per call.
+    label = "default" if cta_limit is None else str(cta_limit)
+    environment = worker_environment(cta_limit, max_ctas_per_reduce_task)
+    worker_jobs: list[dict[str, Any]] = []
 
+    for job in jobs:
+        if job["metric_set"] == "bandwidth":
+            for size_bytes in job["sizes_bytes"]:
+                split_job = dict(job)
+                split_job["sizes_bytes"] = [int(size_bytes)]
+                worker_jobs.append(split_job)
+        else:
+            worker_jobs.append(dict(job))
+
+    rows: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="ooverlap-external-sweep-") as temp_dir:
         temp = Path(temp_dir)
-        request_path = temp / "request.json"
-        output_path = temp / "rows.json"
-        request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
 
-        command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "--_worker-request",
-            str(request_path),
-            "--_worker-output",
-            str(output_path),
-        ]
-        label = "default" if cta_limit is None else str(cta_limit)
-        print(f"[parent] starting fresh CTA worker: {label}", flush=True)
-        subprocess.run(
-            command,
-            env=worker_environment(cta_limit, max_ctas_per_reduce_task),
-            check=True,
-        )
+        for job_index, job in enumerate(worker_jobs, start=1):
+            request = {
+                "run_id": run_id,
+                "timestamp_utc": timestamp_utc,
+                "cta_limit": cta_limit,
+                "max_ctas_per_reduce_task": max_ctas_per_reduce_task,
+                "devices": devices,
+                "jobs": [job],
+            }
 
-        if not output_path.exists():
-            raise RuntimeError(f"CTA worker {label} did not create {output_path}")
-        return json.loads(output_path.read_text(encoding="utf-8"))
+            request_path = temp / f"request-{job_index}.json"
+            output_path = temp / f"rows-{job_index}.json"
+            request_path.write_text(
+                json.dumps(request, indent=2),
+                encoding="utf-8",
+            )
 
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--_worker-request",
+                str(request_path),
+                "--_worker-output",
+                str(output_path),
+            ]
+            timing_mode = (
+                "ring" if job["metric_set"] == "bandwidth" else "isolated"
+            )
+            sizes_label = ",".join(
+                format_size(int(value)) for value in job["sizes_bytes"]
+            )
+            job_label = (
+                f"{job['mode']}/{job['metric_set']}/{job['collective']}"
+                f"/{sizes_label}"
+            )
+            print(
+                f"[parent] starting fresh CTA/job worker: {label} "
+                f"job={job_index}/{len(worker_jobs)} timing={timing_mode} "
+                f"{job_label}",
+                flush=True,
+            )
+            subprocess.run(
+                command,
+                env=environment,
+                check=True,
+            )
+
+            if not output_path.exists():
+                raise RuntimeError(
+                    f"CTA/job worker {label} {job_label} did not create "
+                    f"{output_path}"
+                )
+
+            job_rows = json.loads(output_path.read_text(encoding="utf-8"))
+            if not isinstance(job_rows, list):
+                raise RuntimeError(
+                    f"CTA/job worker {label} {job_label} returned a "
+                    "non-list result"
+                )
+            rows.extend(job_rows)
+
+    return rows
 
 def csv_value(value: Any) -> Any:
     if value is None:
