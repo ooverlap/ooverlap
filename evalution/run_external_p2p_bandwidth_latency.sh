@@ -21,12 +21,12 @@ WORLD_SIZE="$1"
 case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
-    MAX_CTAS="8"
+    OOVERLAP_MAX_CTAS="8"
     MAX_CTAS_PER_REDUCE_TASK="8"
     ;;
   4)
     DEVICES="0,1,2,3"
-    MAX_CTAS="12"
+    OOVERLAP_MAX_CTAS="12"
     MAX_CTAS_PER_REDUCE_TASK="4"
     ;;
   *)
@@ -80,7 +80,8 @@ cd "$REPO_ROOT"
 
 echo "[evalution] external-P2P latency and bandwidth"
 echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
-echo "[evalution] max_ctas=$MAX_CTAS"
+echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
+echo "[evalution] nccl_max_ctas=unrestricted"
 echo "[evalution] max_ctas_per_reduce_task=$MAX_CTAS_PER_REDUCE_TASK"
 echo "[evalution] latency_bytes=$LATENCY_BYTES"
 echo "[evalution] bandwidth_bytes=$BANDWIDTH_BYTES"
@@ -93,7 +94,7 @@ echo "[evalution] output=${OUT_PREFIX}.txt"
   --mode bench \
   --collective all \
   --metric all \
-  --ctas "$MAX_CTAS" \
+  --ctas "$OOVERLAP_MAX_CTAS" \
   --max-ctas-per-reduce-task "$MAX_CTAS_PER_REDUCE_TASK" \
   --latency-bytes "$LATENCY_BYTES" \
   --bandwidth-bytes "$BANDWIDTH_BYTES" \
