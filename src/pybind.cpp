@@ -496,7 +496,8 @@ PYBIND11_MODULE(ooverlap_ext, m) {
         py::arg("iters"),
         py::arg("warmup"),
         py::arg("devices"),
-        py::arg("verify") = false);
+        py::arg("verify") = false,
+        py::arg("use_ring") = false);
 
   m.def("benchmark_external_p2p_allreduce_sm90",
         &ooverlap::benchmark_external_p2p_allreduce_sm90,

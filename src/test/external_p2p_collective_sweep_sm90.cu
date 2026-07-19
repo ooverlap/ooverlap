@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -31,6 +32,25 @@ namespace ooverlap {
 namespace {
 
 using testing::TestCollective;
+
+int ring_size_from_env() {
+    constexpr int kDefaultRingSize = 16;
+    constexpr int kMaxReasonableRingSize = 4096;
+
+    const char* env = std::getenv("OOVERLAP_BENCH_RING_SIZE");
+    if (env == nullptr || env[0] == '\0') {
+        return kDefaultRingSize;
+    }
+
+    char* end = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    if (end == env || parsed <= 0) {
+        return kDefaultRingSize;
+    }
+
+    return static_cast<int>(
+        std::min<long>(parsed, kMaxReasonableRingSize));
+}
 
 struct SweepContext {
     std::vector<int> devices;
@@ -598,6 +618,38 @@ SizeBuffers allocate_size_buffers(
     }
 }
 
+void destroy_size_buffer_ring_best_effort(
+    const SweepContext& ctx,
+    std::vector<SizeBuffers>& ring) {
+    for (SizeBuffers& slot : ring) {
+        destroy_size_buffers_best_effort(ctx, slot);
+    }
+    ring.clear();
+}
+
+std::vector<SizeBuffers> allocate_size_buffer_ring(
+    const SweepContext& ctx,
+    int64_t numel,
+    std::size_t bytes,
+    int ring_size) {
+    if (ring_size <= 0) {
+        throw std::invalid_argument("ring_size must be > 0");
+    }
+
+    std::vector<SizeBuffers> ring;
+    ring.reserve(static_cast<std::size_t>(ring_size));
+
+    try {
+        for (int slot = 0; slot < ring_size; ++slot) {
+            ring.push_back(allocate_size_buffers(ctx, numel, bytes));
+        }
+        return ring;
+    } catch (...) {
+        destroy_size_buffer_ring_best_effort(ctx, ring);
+        throw;
+    }
+}
+
 void destroy_context_best_effort(SweepContext& ctx) {
     if (!ctx.nccl_comms.empty()) {
         for (ncclComm_t& comm : ctx.nccl_comms) {
@@ -694,6 +746,250 @@ std::size_t bandwidth_bytes_per_rank(
                 world_size));
     }
     return max_shard * sizeof(half);
+}
+
+std::map<std::string, double> run_one_size_ring(
+    TestCollective collective,
+    int64_t numel_arg,
+    int iters,
+    int warmup,
+    bool verify,
+    const SweepContext& ctx,
+    TimingEvents& events) {
+    const std::size_t numel = static_cast<std::size_t>(numel_arg);
+    const std::size_t bytes = numel * sizeof(half);
+    const int world_size = static_cast<int>(ctx.devices.size());
+    const int ring_size = ring_size_from_env();
+
+    std::vector<SizeBuffers> ring =
+        allocate_size_buffer_ring(ctx, numel_arg, bytes, ring_size);
+
+    try {
+        const auto prepare_ooverlap_ring = [&]() {
+            for (const SizeBuffers& slot : ring) {
+                prepare_work_buffers(
+                    ctx,
+                    slot.sources,
+                    slot.ooverlap_work,
+                    bytes,
+                    "sync external ring ooverlap reset");
+            }
+        };
+        const auto launch_ooverlap_iters = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                const SizeBuffers& slot =
+                    ring[static_cast<std::size_t>(i) % ring.size()];
+                launch_ooverlap_once(
+                    collective,
+                    ctx,
+                    slot,
+                    numel);
+            }
+        };
+
+        prepare_ooverlap_ring();
+        testing::reset_ready_signals(ctx.group);
+        launch_ooverlap_iters(warmup);
+        sync_streams(
+            ctx.devices,
+            ctx.streams,
+            "sync external ring ooverlap warmup");
+
+        prepare_ooverlap_ring();
+        testing::reset_ready_signals(ctx.group);
+        const double oo_total_ms = elapsed_collective_once_ms(
+            ctx.devices,
+            ctx.streams,
+            events,
+            [&]() { launch_ooverlap_iters(iters); });
+
+        if (verification_enabled(verify)) {
+            SizeBuffers& slot = ring.front();
+            prepare_work_buffers(
+                ctx,
+                slot.sources,
+                slot.ooverlap_work,
+                bytes,
+                "sync external ring ooverlap verification reset");
+            testing::reset_ready_signals(ctx.group);
+            launch_ooverlap_once(collective, ctx, slot, numel);
+            sync_streams(
+                ctx.devices,
+                ctx.streams,
+                "sync external ring ooverlap verification");
+            verify_result(
+                collective,
+                "ooverlap external ring",
+                ctx,
+                slot.ooverlap_work,
+                numel_arg,
+                verify);
+        }
+
+        const auto prepare_nccl_ring = [&]() {
+            for (const SizeBuffers& slot : ring) {
+                prepare_work_buffers(
+                    ctx,
+                    slot.sources,
+                    slot.nccl_work,
+                    bytes,
+                    "sync external ring nccl reset");
+            }
+        };
+        const auto launch_nccl_iters = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                const SizeBuffers& slot =
+                    ring[static_cast<std::size_t>(i) % ring.size()];
+                launch_nccl_once(
+                    collective,
+                    ctx,
+                    slot.nccl_work,
+                    numel);
+            }
+        };
+
+        prepare_nccl_ring();
+        launch_nccl_iters(warmup);
+        sync_streams(
+            ctx.devices,
+            ctx.streams,
+            "sync external ring nccl warmup");
+
+        prepare_nccl_ring();
+        const double nccl_total_ms = elapsed_collective_once_ms(
+            ctx.devices,
+            ctx.streams,
+            events,
+            [&]() { launch_nccl_iters(iters); });
+
+        if (verification_enabled(verify)) {
+            SizeBuffers& slot = ring.front();
+            prepare_work_buffers(
+                ctx,
+                slot.sources,
+                slot.nccl_work,
+                bytes,
+                "sync external ring nccl verification reset");
+            launch_nccl_once(collective, ctx, slot.nccl_work, numel);
+            sync_streams(
+                ctx.devices,
+                ctx.streams,
+                "sync external ring nccl verification");
+            verify_result(
+                collective,
+                "NCCL external ring",
+                ctx,
+                slot.nccl_work,
+                numel_arg,
+                verify);
+        }
+
+        const auto prepare_nccl_symmetric_ring = [&]() {
+            for (const SizeBuffers& slot : ring) {
+                prepare_work_buffers(
+                    ctx,
+                    slot.sources,
+                    slot.nccl_symmetric_work,
+                    bytes,
+                    "sync external ring symmetric NCCL reset");
+            }
+        };
+        const auto launch_nccl_symmetric_iters = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                const SizeBuffers& slot =
+                    ring[static_cast<std::size_t>(i) % ring.size()];
+                launch_nccl_once(
+                    collective,
+                    ctx,
+                    slot.nccl_symmetric_work,
+                    numel);
+            }
+        };
+
+        prepare_nccl_symmetric_ring();
+        launch_nccl_symmetric_iters(warmup);
+        sync_streams(
+            ctx.devices,
+            ctx.streams,
+            "sync external ring symmetric NCCL warmup");
+
+        prepare_nccl_symmetric_ring();
+        const double nccl_symmetric_total_ms = elapsed_collective_once_ms(
+            ctx.devices,
+            ctx.streams,
+            events,
+            [&]() { launch_nccl_symmetric_iters(iters); });
+
+        if (verification_enabled(verify)) {
+            SizeBuffers& slot = ring.front();
+            prepare_work_buffers(
+                ctx,
+                slot.sources,
+                slot.nccl_symmetric_work,
+                bytes,
+                "sync external ring symmetric NCCL verification reset");
+            launch_nccl_once(
+                collective,
+                ctx,
+                slot.nccl_symmetric_work,
+                numel);
+            sync_streams(
+                ctx.devices,
+                ctx.streams,
+                "sync external ring symmetric NCCL verification");
+            verify_result(
+                collective,
+                "symmetric NCCL external ring",
+                ctx,
+                slot.nccl_symmetric_work,
+                numel_arg,
+                verify);
+        }
+
+        std::size_t max_local_shard_numel = 0;
+        for (int rank = 0; rank < world_size; ++rank) {
+            max_local_shard_numel = std::max(
+                max_local_shard_numel,
+                testing::rank_partition_count(
+                    numel,
+                    rank,
+                    world_size));
+        }
+
+        const std::size_t normalized_bytes =
+            bandwidth_bytes_per_rank(
+                collective,
+                numel,
+                world_size);
+
+        std::map<std::string, double> row = {
+            {"collective", testing::collective_code(collective)},
+            {"world_size", static_cast<double>(world_size)},
+            {"numel", static_cast<double>(numel)},
+            {"bytes", static_cast<double>(bytes)},
+            {"local_shard_numel", static_cast<double>(max_local_shard_numel)},
+            {"local_shard_bytes",
+             static_cast<double>(max_local_shard_numel * sizeof(half))},
+            {"bandwidth_bytes_per_rank", static_cast<double>(normalized_bytes)},
+            {"iters", static_cast<double>(iters)},
+            {"warmup", static_cast<double>(warmup)},
+            {"verify", verify ? 1.0 : 0.0},
+            {"ring_size", static_cast<double>(ring_size)},
+            {"oo_total_ms", oo_total_ms},
+            {"nccl_total_ms", nccl_total_ms},
+            {"nccl_symmetric_total_ms", nccl_symmetric_total_ms},
+            {"ooverlap_ms", oo_total_ms / static_cast<double>(iters)},
+            {"nccl_ms", nccl_total_ms / static_cast<double>(iters)},
+            {"nccl_symmetric_ms",
+             nccl_symmetric_total_ms / static_cast<double>(iters)},
+        };
+
+        destroy_size_buffer_ring_best_effort(ctx, ring);
+        return row;
+    } catch (...) {
+        destroy_size_buffer_ring_best_effort(ctx, ring);
+        throw;
+    }
 }
 
 std::map<std::string, double> run_one_size(
@@ -908,7 +1204,8 @@ benchmark_external_p2p_collective_sweep_sm90(
     int iters,
     int warmup,
     const std::vector<int>& devices,
-    bool verify) {
+    bool verify,
+    bool use_ring) {
     if (iters <= 0) {
         throw std::invalid_argument("iters must be > 0");
     }
@@ -936,14 +1233,23 @@ benchmark_external_p2p_collective_sweep_sm90(
 
         for (int64_t numel : sizes) {
             rows.push_back(
-                run_one_size(
-                    collective,
-                    numel,
-                    iters,
-                    warmup,
-                    verify,
-                    ctx,
-                    events));
+                use_ring
+                    ? run_one_size_ring(
+                          collective,
+                          numel,
+                          iters,
+                          warmup,
+                          verify,
+                          ctx,
+                          events)
+                    : run_one_size(
+                          collective,
+                          numel,
+                          iters,
+                          warmup,
+                          verify,
+                          ctx,
+                          events));
         }
 
         destroy_timing_events_best_effort(devices, events);

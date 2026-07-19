@@ -10,10 +10,8 @@ namespace ooverlap {
 /*
  * In-process external-buffer P2P collective sweep.
  *
- * All GPU ranks live in one process and are created through
- * oo_group_create_p2p(). Unlike the persistent benchmark, this interface uses
- * one work buffer per rank/backend and resets it outside the timed region for
- * every iteration. It intentionally does not use a buffer ring.
+ * use_ring=false measures one synchronized collective at a time.
+ * use_ring=true measures steady-state throughput with a buffer ring.
  */
 std::vector<std::map<std::string, double>>
 benchmark_external_p2p_collective_sweep_sm90(
@@ -22,6 +20,7 @@ benchmark_external_p2p_collective_sweep_sm90(
     int iters,
     int warmup,
     const std::vector<int>& devices,
-    bool verify);
+    bool verify,
+    bool use_ring);
 
 } // namespace ooverlap
