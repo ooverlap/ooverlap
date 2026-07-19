@@ -7,6 +7,11 @@ set -euo pipefail
 #   ./evalution/run_flashoverlap_sm90.sh 2
 #   ./evalution/run_flashoverlap_sm90.sh 4
 #
+# Optional OOverlap-only overrides:
+#   OOVERLAP_MAX_CTAS=8 \
+#   OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=4 \
+#     ./evalution/run_flashoverlap_sm90.sh 4
+#
 # The only accepted argument is the tensor-parallel/world size. Devices,
 # bandwidth settings, evaluation settings, and plotting settings are fixed here.
 
@@ -20,21 +25,44 @@ fail() {
   exit 1
 }
 
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+    fail "$name must be a positive integer; got: $value"
+  fi
+}
+
 [[ $# -eq 1 ]] || usage
 WORLD_SIZE="$1"
 
 case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
+    DEFAULT_OOVERLAP_MAX_CTAS="8"
+    DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="8"
     ;;
   4)
     DEVICES="0,1,2,3"
+    DEFAULT_OOVERLAP_MAX_CTAS="12"
+    DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="4"
     ;;
   *)
     echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
     usage
     ;;
 esac
+
+# These variables are passed only to OOverlap commands. They are deliberately
+# removed from the NCCL bandwidth command's environment.
+OOVERLAP_MAX_CTAS="${OOVERLAP_MAX_CTAS:-$DEFAULT_OOVERLAP_MAX_CTAS}"
+OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="${OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:-$DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK}"
+
+require_positive_integer "OOVERLAP_MAX_CTAS" "$OOVERLAP_MAX_CTAS"
+require_positive_integer \
+  "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
+  "$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
 
 # Fixed bandwidth-curve settings. The curve uses the mean latency because
 # neither --use-median nor --use-p90 is passed to tool/bandwidth.py.
@@ -157,20 +185,40 @@ run_bandwidth_if_missing() {
   fi
 
   echo "[evalution] generating $backend all-reduce bandwidth curve for TP=$WORLD_SIZE"
-  "$PYTHON_BIN" "$BANDWIDTH_SCRIPT" \
-    --comm_backend "$backend" \
-    --comm_op all_reduce \
-    --devices "$DEVICES" \
-    --warmup "$BANDWIDTH_WARMUP" \
-    --iters "$BANDWIDTH_ITERS" \
-    --sleep-seconds "$BANDWIDTH_SLEEP_SECONDS" \
-    2>&1 | tee "$log_path"
+
+  if [[ "$backend" == "ooverlap" ]]; then
+    OOVERLAP_MAX_CTAS="$OOVERLAP_MAX_CTAS" \
+    OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
+      "$PYTHON_BIN" "$BANDWIDTH_SCRIPT" \
+        --comm_backend "$backend" \
+        --comm_op all_reduce \
+        --devices "$DEVICES" \
+        --warmup "$BANDWIDTH_WARMUP" \
+        --iters "$BANDWIDTH_ITERS" \
+        --sleep-seconds "$BANDWIDTH_SLEEP_SECONDS"
+  else
+    # Prevent caller-exported OOverlap controls from leaking into the NCCL run.
+    (
+      unset OOVERLAP_MAX_CTAS
+      unset OOVERLAP_MAX_CTAS_PER_REDUCE_TASK
+
+      "$PYTHON_BIN" "$BANDWIDTH_SCRIPT" \
+        --comm_backend "$backend" \
+        --comm_op all_reduce \
+        --devices "$DEVICES" \
+        --warmup "$BANDWIDTH_WARMUP" \
+        --iters "$BANDWIDTH_ITERS" \
+        --sleep-seconds "$BANDWIDTH_SLEEP_SECONDS"
+    )
+  fi 2>&1 | tee "$log_path"
 
   [[ -s "$output_pt" ]] || fail "bandwidth command completed but did not create: $output_pt"
 }
 
 echo "[evalution] SM90 FlashOverlap paper pipeline"
 echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
+echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
+echo "[evalution] ooverlap_max_ctas_per_reduce_task=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
 echo "[evalution] bandwidth_warmup=$BANDWIDTH_WARMUP"
 echo "[evalution] bandwidth_iters=$BANDWIDTH_ITERS"
 echo "[evalution] bandwidth_sleep_seconds=$BANDWIDTH_SLEEP_SECONDS"
@@ -188,11 +236,13 @@ run_bandwidth_if_missing \
   "$PIPELINE_LOG_DIR/tp${WORLD_SIZE}_bandwidth_ooverlap.log"
 
 echo "[evalution] running SM90 search and overlap evaluation"
-"$PYTHON_BIN" "$EVALUATE_SCRIPT" \
-  --devices "$DEVICES" \
-  --out-dir "$EVAL_OUT_DIR" \
-  --skip-existing-profile \
-  2>&1 | tee "$PIPELINE_LOG_DIR/tp${WORLD_SIZE}_evaluate_sm90.log"
+OOVERLAP_MAX_CTAS="$OOVERLAP_MAX_CTAS" \
+OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
+  "$PYTHON_BIN" "$EVALUATE_SCRIPT" \
+    --devices "$DEVICES" \
+    --out-dir "$EVAL_OUT_DIR" \
+    --skip-existing-profile \
+    2>&1 | tee "$PIPELINE_LOG_DIR/tp${WORLD_SIZE}_evaluate_sm90.log"
 
 [[ -s "$EVAL_JSON" ]] || fail "evaluation completed but did not create: $EVAL_JSON"
 
