@@ -12,6 +12,9 @@ constexpr int kTmaMultiGpuAllReduceMaxWindowTasks = 256;
 constexpr int kTmaMultiGpuReduceScatterMaxWindowTasks = 256;
 constexpr int kTmaMultiGpuAllGatherMaxWindowTasks = 256;
 
+/* OOVERLAP_ALL_COLLECTIVES_PLAN_BY_VALUE_V1 */
+constexpr int kTmaMultiGpuByValueMaxWindowTasks = 96;
+
 } // namespace plan
 } // namespace comm
 } // namespace ooverlap

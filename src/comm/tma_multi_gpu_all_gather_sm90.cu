@@ -90,10 +90,20 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         Variant::fill_depth,
         DummyReduceOp>;
 
-    constexpr int MaxTasks =
+    constexpr int MaxLoweringTasks =
         comm::plan::kTmaMultiGpuAllGatherMaxWindowTasks;
+    constexpr int MaxByValueTasks =
+        comm::plan::kTmaMultiGpuByValueMaxWindowTasks;
     constexpr int MaxPeers =
         comm::plan::kTmaMultiGpuAllGatherMaxPeers;
+
+    using ByValuePlan =
+        comm::plan::WindowTaskExecutorPlan<MaxByValueTasks>;
+
+    static_assert(
+        sizeof(ByValuePlan) <= 16 * 1024,
+        "all-gather by-value plan unexpectedly exceeds 16 KiB");
+
     constexpr int MaxRanks =
         kOoMaxLocalDevices;
     constexpr int MaxStagingSlots = kOoMaxStagingSlots;
@@ -222,31 +232,17 @@ cudaError_t launch_all_gather_rank_variant_sm90(
     const comm::plan::ReadySignalBinding<MaxRanks>* ready_binding_ptr =
         use_ready_binding ? &ready_binding : nullptr;
 
-    comm::kernels::WindowPlanMappedScratch<MaxTasks> window_plan_scratch{};
-
-    const cudaError_t window_plan_scratch_err =
-        comm::kernels::get_mapped_window_plan_scratch<MaxTasks>(
-            launch.local_device,
-            &window_plan_scratch);
-
-
-    if (window_plan_scratch_err != cudaSuccess ||
-        window_plan_scratch.host_plan == nullptr ||
-        window_plan_scratch.device_plan == nullptr) {
-        return window_plan_scratch_err != cudaSuccess
-            ? window_plan_scratch_err
-            : cudaErrorInvalidValue;
-    }
-
-    comm::plan::WindowTaskExecutorPlan<MaxTasks>& window_plan =
-        *window_plan_scratch.host_plan;
+    /* OOVERLAP_ALL_COLLECTIVES_PLAN_BY_VALUE_V1 */
+    static thread_local
+        comm::plan::WindowTaskExecutorPlan<MaxLoweringTasks> window_plan;
+    static thread_local ByValuePlan by_value_plan;
 
     int num_blocks = 0;
 
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<
             comm::plan::kTmaMultiGpuAllGatherMaxTransferTasks,
-            MaxTasks,
+            MaxLoweringTasks,
             MaxRanks,
             MaxStagingSlots>(
                 transfer_plan,
@@ -265,57 +261,41 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         return cudaSuccess;
     }
 
+    if (!comm::plan::window_task_executor_plan_pack(
+            window_plan,
+            &by_value_plan)) {
+        return cudaErrorInvalidConfiguration;
+    }
+
     system::runtime::set_device(launch.local_device);
 
     comm::kernels::configure_multi_gpu_window_task_executor_once<
         ReduceApply,
         ChunkBytes,
         StageDepth,
-        MaxTasks,
+        MaxByValueTasks,
         MaxPeers,
         Variant::fill_depth,
         Variant::load_fill_depth>(
             launch.local_device,
-            "tma_multi_gpu_all_gather: requested shared memory exceeds opt-in limit");
+            "tma_multi_gpu_all_gather(by-value): requested shared memory exceeds opt-in limit");
 
-    /*
-     * OOVERLAP_WINDOW_PLAN_DEVICE_LAUNCH_HELPER_PATCH:
-     * Pass the large WindowTaskExecutorPlan through device memory instead of
-     * CUDA kernel formal parameter space.
-     */
-    const cudaError_t launch_error =
-        comm::kernels::launch_multi_gpu_window_task_executor_sm90<
-            ReduceApply,
-            ChunkBytes,
-            StageDepth,
-            MaxTasks,
-            MaxPeers,
-            Variant::fill_depth,
-            Variant::load_fill_depth>(
-                window_plan_scratch.device_plan,
-                num_blocks,
-                launch_config.threads,
-                Variant::dynamic_shared_bytes,
-                stream,
-                launch.local_ready_signal,
-                ready_plan,
-                launch.collective_epoch);
-
-    if (launch_error != cudaSuccess) {
-        return launch_error;
-    }
-
-    if (window_plan_scratch.completion_event == nullptr) {
-        return cudaSuccess;
-    }
-
-    /*
-     * The event is queued after the kernel on the same stream. The next
-     * all-gather may rewrite this mapped plan only after the kernel finishes.
-     */
-    return cudaEventRecord(
-        window_plan_scratch.completion_event,
-        stream);
+    return comm::kernels::launch_multi_gpu_window_task_executor_sm90<
+        ReduceApply,
+        ChunkBytes,
+        StageDepth,
+        MaxByValueTasks,
+        MaxPeers,
+        Variant::fill_depth,
+        Variant::load_fill_depth>(
+            by_value_plan,
+            num_blocks,
+            launch_config.threads,
+            Variant::dynamic_shared_bytes,
+            stream,
+            launch.local_ready_signal,
+            ready_plan,
+            launch.collective_epoch);
 }
 
 template <
