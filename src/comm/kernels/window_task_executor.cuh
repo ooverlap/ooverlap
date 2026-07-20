@@ -266,7 +266,6 @@ __device__ __forceinline__ void execute_window_task_stripe(
         return;
     }
 
-
     for (int local_task = 0; local_task < tasks_per_cta; ++local_task) {
         const int task_idx = base + local_task;
 

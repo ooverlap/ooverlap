@@ -61,16 +61,10 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         reinterpret_cast<unsigned char*>(shared_storage_u4);
 
     __shared__ sync::semaphore barriers[Variant::barrier_count];
-
-    const bool use_entry_ready =
-        collective_epoch > 0 &&
-        local_ready_signal != nullptr &&
-        ready_plan.protocol != MultiGpuReadySignalProtocol::Disabled;
-
+ 
     if (cta_barrier_counter != nullptr) {
         if (threadIdx.x == 0) {
             if (blockIdx.x == 0) {
-                if (use_entry_ready) {
                     const int entry_ready_value =
                         collective_epoch * comm::plan::kReadySignalPhaseStride;
 
@@ -87,7 +81,6 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
                             entry_ready_value,
                             ready_plan.poll_sleep_cycles);
                     }
-                }
 
                 advance_cta_barrier_counter(cta_barrier_counter, 1u);
             } else {
@@ -98,30 +91,7 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         }
 
         __syncthreads();
-    } else if (use_entry_ready) {
-        const int entry_ready_value =
-            collective_epoch * comm::plan::kReadySignalPhaseStride;
-
-        if (threadIdx.x == 0) {
-            if (blockIdx.x == 0) {
-                publish_ready_signal(
-                    local_ready_signal,
-                    entry_ready_value,
-                    ready_plan.protocol);
-            }
-
-            for (int peer_idx = 0;
-                 peer_idx < ready_plan.peer_count;
-                 ++peer_idx) {
-                wait_until_ready_signal_at_least(
-                    ready_plan.peer_ready_signals[peer_idx],
-                    entry_ready_value,
-                    ready_plan.poll_sleep_cycles);
-            }
-        }
-
-        __syncthreads();
-    }
+    } 
 
     /*
      * All-gather uses only copy tasks, but the task executor template still
@@ -244,6 +214,9 @@ cudaError_t get_mapped_window_plan_scratch(
      * lock-free reads well-defined after the initializing thread releases them.
      */
     static std::atomic<bool> no_event_fast_path_ready[32] = {};
+
+    // TODO: this is not good
+    scratch_index = -1;
 
     if (scratch_index == -1) {
         constexpr int storage_index = 0;
@@ -519,6 +492,7 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
                 collective_epoch,
                 cta_barrier_counter,
                 cta_barrier_start);
+
 
     return cudaGetLastError();
 }

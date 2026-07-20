@@ -30,8 +30,11 @@ struct PlainSm90AlgoMeta {
 
 static PlainSm90FuncPtr plain_sm90_func_table[] = {
   &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
@@ -42,8 +45,11 @@ static PlainSm90FuncPtr plain_sm90_func_table[] = {
   &::cutlass_gemm_plain_sm90<256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler>,
+  &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler>,
   &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler>,
+  &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler>,
   &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler>,
+  &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler>,
   &::cutlass_gemm_plain_sm90<128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler>,
   &::cutlass_gemm_plain_sm90<128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler>,
   &::cutlass_gemm_plain_sm90<128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::collective::EpilogueScheduleAuto, cutlass::gemm::StreamKScheduler>,
@@ -62,6 +68,12 @@ static PlainSm90FuncPtr plain_sm90_func_table[] = {
   &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<6>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<128, 128, 64, cutlass::gemm::collective::StageCount<7>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<128, 256, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<256, 128, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<256, 128, 64, cutlass::gemm::collective::StageCount<4>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<64, 128, 32, cutlass::gemm::collective::StageCountAuto, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<64, 128, 32, cutlass::gemm::collective::StageCountAuto, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<64, 128, 32, cutlass::gemm::collective::StageCountAuto, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
@@ -137,14 +149,19 @@ static PlainSm90FuncPtr plain_sm90_func_table[] = {
   &::cutlass_gemm_plain_sm90<256, 128, 128, cutlass::gemm::collective::StageCountAuto, cute::Shape<cute::_1, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<256, 128, 128, cutlass::gemm::collective::StageCountAuto, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
   &::cutlass_gemm_plain_sm90<256, 128, 128, cutlass::gemm::collective::StageCountAuto, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_1, cute::_2, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
+  &::cutlass_gemm_plain_sm90<256, 256, 64, cutlass::gemm::collective::StageCount<3>, cute::Shape<cute::_2, cute::_1, cute::_1>, cutlass::gemm::KernelTmaWarpSpecialized, cutlass::epilogue::collective::EpilogueScheduleAuto, void>,
 };
 
-static constexpr int plain_sm90_func_count = 108;
+static constexpr int plain_sm90_func_count = 122;
 
 static PlainSm90AlgoMeta plain_sm90_algo_meta[] = {
   {128, 128, 64, 1, 1, 1, 6, "cooperative", "auto", "normal", 1},
+  {128, 128, 64, 1, 1, 1, 7, "cooperative", "auto", "normal", 1},
   {128, 128, 64, 1, 2, 1, 6, "cooperative", "auto", "normal", 1},
+  {128, 128, 64, 1, 2, 1, 7, "cooperative", "auto", "normal", 1},
   {128, 128, 64, 2, 1, 1, 6, "cooperative", "auto", "normal", 1},
+  {128, 128, 64, 2, 1, 1, 7, "cooperative", "auto", "normal", 1},
   {128, 256, 64, 1, 1, 1, 4, "cooperative", "auto", "normal", 1},
   {128, 256, 64, 1, 2, 1, 4, "cooperative", "auto", "normal", 1},
   {128, 256, 64, 2, 1, 1, 4, "cooperative", "auto", "normal", 1},
@@ -155,8 +172,11 @@ static PlainSm90AlgoMeta plain_sm90_algo_meta[] = {
   {256, 256, 64, 1, 2, 1, 3, "cooperative", "auto", "normal", 1},
   {256, 256, 64, 2, 1, 1, 3, "cooperative", "auto", "normal", 1},
   {128, 128, 64, 1, 1, 1, 6, "cooperative", "auto", "stream_k", 1},
+  {128, 128, 64, 1, 1, 1, 7, "cooperative", "auto", "stream_k", 1},
   {128, 128, 64, 1, 2, 1, 6, "cooperative", "auto", "stream_k", 1},
+  {128, 128, 64, 1, 2, 1, 7, "cooperative", "auto", "stream_k", 1},
   {128, 128, 64, 2, 1, 1, 6, "cooperative", "auto", "stream_k", 1},
+  {128, 128, 64, 2, 1, 1, 7, "cooperative", "auto", "stream_k", 1},
   {128, 256, 64, 1, 1, 1, 4, "cooperative", "auto", "stream_k", 1},
   {128, 256, 64, 1, 2, 1, 4, "cooperative", "auto", "stream_k", 1},
   {128, 256, 64, 2, 1, 1, 4, "cooperative", "auto", "stream_k", 1},
@@ -175,6 +195,12 @@ static PlainSm90AlgoMeta plain_sm90_algo_meta[] = {
   {128, 128, 64, 1, 2, 1, 7, "pingpong", "auto", "normal", 1},
   {128, 128, 64, 2, 1, 1, 6, "pingpong", "auto", "normal", 1},
   {128, 128, 64, 2, 1, 1, 7, "pingpong", "auto", "normal", 1},
+  {128, 256, 64, 1, 2, 1, 4, "pingpong", "auto", "normal", 1},
+  {128, 256, 64, 2, 1, 1, 4, "pingpong", "auto", "normal", 1},
+  {256, 128, 64, 1, 2, 1, 4, "pingpong", "auto", "normal", 1},
+  {256, 128, 64, 2, 1, 1, 4, "pingpong", "auto", "normal", 1},
+  {256, 256, 64, 1, 2, 1, 3, "pingpong", "auto", "normal", 1},
+  {256, 256, 64, 2, 1, 1, 3, "pingpong", "auto", "normal", 1},
   {64, 128, 32, 1, 1, 1, -1, "ws", "auto", "normal", 1},
   {64, 128, 32, 1, 2, 1, -1, "ws", "auto", "normal", 1},
   {64, 128, 32, 2, 1, 1, -1, "ws", "auto", "normal", 1},
@@ -250,6 +276,8 @@ static PlainSm90AlgoMeta plain_sm90_algo_meta[] = {
   {256, 128, 128, 1, 1, 1, -1, "ws", "auto", "normal", 1},
   {256, 128, 128, 1, 2, 1, -1, "ws", "auto", "normal", 1},
   {256, 128, 128, 2, 1, 1, -1, "ws", "auto", "normal", 1},
+  {256, 256, 64, 1, 2, 1, 3, "ws", "auto", "normal", 1},
+  {256, 256, 64, 2, 1, 1, 3, "ws", "auto", "normal", 1},
 };
 
 } // namespace ooverlap

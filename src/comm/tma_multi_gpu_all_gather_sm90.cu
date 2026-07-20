@@ -214,6 +214,7 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         }
     }
 
+
     const bool use_ready_binding =
         has_ready_binding &&
         launch.collective_epoch > 0;
@@ -227,6 +228,7 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         comm::kernels::get_mapped_window_plan_scratch<MaxTasks>(
             launch.local_device,
             &window_plan_scratch);
+
 
     if (window_plan_scratch_err != cudaSuccess ||
         window_plan_scratch.host_plan == nullptr ||

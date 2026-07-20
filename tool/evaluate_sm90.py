@@ -133,6 +133,10 @@ COMM_RUN_CONFIGS_BY_TP: Dict[int, List[CommRunConfig]] = {
     4: [
         CommRunConfig(comm_sm_slack=9, max_ctas_per_reduce_task=3),
         CommRunConfig(comm_sm_slack=12, max_ctas_per_reduce_task=4),
+
+
+        CommRunConfig(comm_sm_slack=18, max_ctas_per_reduce_task=6),
+        CommRunConfig(comm_sm_slack=24, max_ctas_per_reduce_task=8),
     ],
 }
 
@@ -155,7 +159,7 @@ TEST_SCRIPT = "test/test.py"
 PROFILE_TOP_CSV = 100
 PROFILE_TOP_SAVE = 30
 PROFILE_WARMUP = 50
-PROFILE_ITERS = 500
+PROFILE_ITERS = 150
 
 PROFILE_EXTRA_ARGS = [
     "--csv-accum-dtype", "f16",
