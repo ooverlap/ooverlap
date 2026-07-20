@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstring>
 #include <cstdlib>
 #include <driver_types.h>
 #include <new>
@@ -240,10 +241,18 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         Variant::fill_depth,
         ReduceOp>;
 
-    constexpr int MaxTasks =
+    constexpr int MaxLoweringTasks =
         comm::plan::kTmaMultiGpuAllReduceMaxWindowTasks;
+    constexpr int MaxByValueTasks = 96;
     constexpr int MaxPeers =
         comm::plan::kTmaMultiGpuAllReduceMaxPeers;
+
+    using ByValuePlan =
+        comm::plan::WindowTaskExecutorPlan<MaxByValueTasks>;
+
+    static_assert(
+        sizeof(ByValuePlan) <= 16 * 1024,
+        "all-reduce by-value plan unexpectedly exceeds 16 KiB");
     constexpr int MaxRanks =
         kOoMaxLocalDevices;
     constexpr int MaxStagingSlots = kOoMaxStagingSlots;
@@ -385,31 +394,37 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     const comm::plan::ReadySignalBinding<MaxRanks>* ready_binding_ptr =
         use_ready_binding ? &ready_binding : nullptr;
 
-    comm::kernels::WindowPlanMappedScratch<MaxTasks> window_plan_scratch{};
+    /*
+     * OOVERLAP_ALLREDUCE_PLAN_BY_VALUE_EXPERIMENT_V1
+     *
+     * Lower into ordinary thread-local host memory. Keep only the persistent
+     * CTA barrier counter and its host-side sequence value in a small cache.
+     * There is no mapped plan and no CUDA event in this all-reduce path.
+     */
+    static thread_local
+        comm::plan::WindowTaskExecutorPlan<MaxLoweringTasks> window_plan;
+    static thread_local ByValuePlan by_value_plan;
 
-    const cudaError_t window_plan_scratch_err =
-        comm::kernels::get_mapped_window_plan_scratch<MaxTasks>(
+    comm::kernels::CtaBarrierScratch cta_barrier_scratch{};
+
+    const cudaError_t cta_barrier_scratch_error =
+        comm::kernels::get_cached_cta_barrier_scratch(
             launch.local_device,
             launch.plan_scratch_index,
-            &window_plan_scratch);  // OOVERLAP_ROUND_ROBIN_PLAN_SCRATCH_RING_V1
+            &cta_barrier_scratch);
 
-    if (window_plan_scratch_err != cudaSuccess ||
-        window_plan_scratch.host_plan == nullptr ||
-        window_plan_scratch.device_plan == nullptr ||
-        window_plan_scratch.cta_barrier_counter == nullptr ||
-        window_plan_scratch.cta_barrier_last_value == nullptr) {
-        return window_plan_scratch_err != cudaSuccess
-            ? window_plan_scratch_err
+    if (cta_barrier_scratch_error != cudaSuccess ||
+        cta_barrier_scratch.counter == nullptr ||
+        cta_barrier_scratch.last_value == nullptr) {
+        return cta_barrier_scratch_error != cudaSuccess
+            ? cta_barrier_scratch_error
             : cudaErrorInvalidValue;
     }
-
-    comm::plan::WindowTaskExecutorPlan<MaxTasks>& window_plan =
-        *window_plan_scratch.host_plan;
 
     int num_blocks = 0;
 
     const unsigned int cta_barrier_start =
-        *window_plan_scratch.cta_barrier_last_value + 1u;
+        *cta_barrier_scratch.last_value + 1u;
 
     comm::plan::lowering_detail::LoweringPassOptions lowering_options{};
     lowering_options.enable_reduce_cta_groups = true;
@@ -420,7 +435,7 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<
             comm::plan::kTmaMultiGpuAllReduceMaxTransferTasks,
-            MaxTasks,
+            MaxLoweringTasks,
             MaxRanks,
             MaxStagingSlots>(
                 transfer_plan,
@@ -440,48 +455,60 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         return cudaSuccess;
     }
 
+    if (window_plan.total_tasks > MaxByValueTasks) {
+        /*
+         * Deliberately fail instead of silently lowering with fewer CTAs or
+         * falling back to the event-protected mapped-plan path. This keeps the
+         * benchmark result unambiguous.
+         */
+        return cudaErrorInvalidConfiguration;
+    }
+
+    by_value_plan.total_tasks = window_plan.total_tasks;
+    by_value_plan.tasks_per_cta = window_plan.tasks_per_cta;
+
+    std::memcpy(
+        by_value_plan.tasks,
+        window_plan.tasks,
+        static_cast<std::size_t>(window_plan.total_tasks) *
+            sizeof(comm::task::WindowTask));
+
     const unsigned int cta_barrier_final_value =
         final_cta_barrier_counter_value(
             window_plan,
             cta_barrier_start);
 
     #if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
-        debug_print_window_task_plan<MaxTasks>(
-            "all_gather",
+        debug_print_window_task_plan<MaxLoweringTasks>(
+            "allreduce_by_value",
             launch.rank,
             num_blocks,
             window_plan);
     #endif
 
-
     system::runtime::set_device(launch.local_device);
 
-    comm::kernels::configure_multi_gpu_window_task_executor_once<
+    comm::kernels::configure_multi_gpu_window_task_executor_by_value_once<
         ReduceApply,
         ChunkBytes,
         StageDepth,
-        MaxTasks,
+        MaxByValueTasks,
         MaxPeers,
         Variant::fill_depth,
         Variant::load_fill_depth>(
             launch.local_device,
-            "tma_multi_gpu_allreduce: requested shared memory exceeds opt-in limit");
+            "tma_multi_gpu_allreduce(by-value): requested shared memory exceeds opt-in limit");
 
-    /*
-     * OOVERLAP_WINDOW_PLAN_DEVICE_LAUNCH_HELPER_PATCH:
-     * Pass the large WindowTaskExecutorPlan through device memory instead of
-     * CUDA kernel formal parameter space.
-     */
     const cudaError_t launch_error =
-        comm::kernels::launch_multi_gpu_window_task_executor_sm90<
+        comm::kernels::launch_multi_gpu_window_task_executor_by_value_sm90<
             ReduceApply,
             ChunkBytes,
             StageDepth,
-            MaxTasks,
+            MaxByValueTasks,
             MaxPeers,
             Variant::fill_depth,
             Variant::load_fill_depth>(
-                window_plan_scratch.device_plan,
+                by_value_plan,
                 num_blocks,
                 launch_config.threads,
                 Variant::dynamic_shared_bytes,
@@ -489,29 +516,17 @@ cudaError_t launch_allreduce_rank_variant_sm90(
                 launch.local_ready_signal,
                 ready_plan,
                 launch.collective_epoch,
-                window_plan_scratch.cta_barrier_counter,
+                cta_barrier_scratch.counter,
                 cta_barrier_start);
 
     if (launch_error != cudaSuccess) {
         return launch_error;
     }
 
-    *window_plan_scratch.cta_barrier_last_value =
+    *cta_barrier_scratch.last_value =
         cta_barrier_final_value;
 
-    /* OOVERLAP_PLAN_SCRATCH_NULL_EVENT_RECORD_SKIP_V1 */
-    if (window_plan_scratch.completion_event == nullptr) {
-        return cudaSuccess;
-    }
-
-    /*
-     * The event is queued after the kernel on the same stream. The next use of
-     * this exact plan slot may rewrite its mapped host memory only after this
-     * event has completed.
-     */
-    return cudaEventRecord(
-        window_plan_scratch.completion_event,
-        stream);
+    return cudaSuccess;
 }
 
 template <
