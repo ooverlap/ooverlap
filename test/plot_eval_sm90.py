@@ -6,7 +6,7 @@ Layout:
   - rows: unique M values
   - columns: unique N values
   - x-axis inside each panel: K values
-  - bars: non-overlap baseline, NCCL overlap, ooverlap overlap
+  - bars: no-overlap baseline, NCCL overlap, T-CCL overlap
 
 Outputs:
   - sm90_operator_speedup_by_shape.png
@@ -468,15 +468,23 @@ def global_ymax(rows: List[ShapeKResult]) -> float:
     return max(1.2, ymax * 1.18)
 
 
+# OOVERLAP_FLASHOVERLAP_PAPER_PLOT_STYLE_V2
 def average_speedups(rows: List[ShapeKResult]) -> Dict[str, Any]:
+    """Summarize the mean and observed range for every overlap backend."""
     valid = [r for r in rows if valid_for_plot(r)]
 
     def mean(values: List[float]) -> Optional[float]:
         return sum(values) / len(values) if values else None
 
+    def minimum(values: List[float]) -> Optional[float]:
+        return min(values) if values else None
+
+    def maximum(values: List[float]) -> Optional[float]:
+        return max(values) if values else None
+
     nccl_values = [float(r.nccl_speedup) for r in valid]
-    ooverlap_values = [float(r.ooverlap_speedup) for r in valid]
-    ooverlap_vs_nccl_values = [
+    t_ccl_values = [float(r.ooverlap_speedup) for r in valid]
+    t_ccl_vs_nccl_values = [
         float(r.ooverlap_speedup) / float(r.nccl_speedup)
         for r in valid
         if float(r.nccl_speedup) > 0.0
@@ -488,8 +496,13 @@ def average_speedups(rows: List[ShapeKResult]) -> Dict[str, Any]:
         "valid_row_count": len(valid),
         "mean_baseline_speedup": 1.0 if valid else None,
         "mean_nccl_speedup": mean(nccl_values),
-        "mean_ooverlap_speedup": mean(ooverlap_values),
-        "mean_ooverlap_vs_nccl": mean(ooverlap_vs_nccl_values),
+        "min_nccl_speedup": minimum(nccl_values),
+        "max_nccl_speedup": maximum(nccl_values),
+        # Keep internal ooverlap keys for compatibility with existing JSON/CSV readers.
+        "mean_ooverlap_speedup": mean(t_ccl_values),
+        "min_ooverlap_speedup": minimum(t_ccl_values),
+        "max_ooverlap_speedup": maximum(t_ccl_values),
+        "mean_ooverlap_vs_nccl": mean(t_ccl_vs_nccl_values),
     }
 
 
@@ -501,9 +514,9 @@ def plot_results_grid(
     by_shape: Dict[Tuple[int, int], List[ShapeKResult]],
     out_png: Path,
     out_pdf: Optional[Path],
-    title: str,
     annotate: bool,
 ) -> None:
+    """Plot per-shape speedups without an overall figure title."""
     valid_count = sum(
         1
         for rows in by_shape.values()
@@ -518,7 +531,6 @@ def plot_results_grid(
 
     nrows = len(ms)
     ncols = len(ns)
-
     fig_width = max(10.0, 4.2 * ncols)
     fig_height = max(4.0, 3.25 * nrows)
 
@@ -531,10 +543,8 @@ def plot_results_grid(
     )
 
     ymax = global_ymax([r for rows in by_shape.values() for r in rows])
-
     legend_handles = None
     legend_labels = None
-
     bar_width = 0.25
 
     for row_idx, m in enumerate(ms):
@@ -549,30 +559,28 @@ def plot_results_grid(
 
             xs = list(range(len(rows)))
             k_labels = [fmt_k(r.k) for r in rows]
-
             baseline_vals = [float(r.baseline_speedup) for r in rows]
             nccl_vals = [float(r.nccl_speedup) for r in rows]
-            oo_vals = [float(r.ooverlap_speedup) for r in rows]
+            t_ccl_vals = [float(r.ooverlap_speedup) for r in rows]
 
             bars0 = ax.bar(
                 [x - bar_width for x in xs],
                 baseline_vals,
                 width=bar_width,
-                label="Baseline (No Overlap)",
-                hatch="",
+                label="No Overlap",
             )
             bars1 = ax.bar(
                 xs,
                 nccl_vals,
                 width=bar_width,
-                label="NCCL-Based Overlap",
+                label="NCCL",
                 hatch="//",
             )
             bars2 = ax.bar(
                 [x + bar_width for x in xs],
-                oo_vals,
+                t_ccl_vals,
                 width=bar_width,
-                label="OOverlap-Based Overlap",
+                label="T-CCL",
                 hatch="xx",
             )
 
@@ -583,25 +591,34 @@ def plot_results_grid(
             ax.set_ylim(0.0, ymax)
             ax.set_xticks(xs)
             ax.set_xticklabels(k_labels, rotation=0)
-            ax.set_title(f"M = {fmt_dim(m)}, N = {fmt_dim(n)}", fontsize=11)
             ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.45)
+
+            # Keep the panel name inside the axes so it cannot be clipped outside.
+            ax.text(
+                0.02,
+                0.97,
+                f"M = {fmt_dim(m)}, N = {fmt_dim(n)}",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=10,
+            )
 
             if row_idx == nrows - 1:
                 ax.set_xlabel("K dimension")
-
             if col_idx == 0:
                 ax.set_ylabel("Normalized speedup")
 
             if annotate:
                 for bars in (bars0, bars1, bars2):
-                    for b in bars:
-                        h = b.get_height()
+                    for bar in bars:
+                        height = bar.get_height()
                         ax.text(
-                            b.get_x() + b.get_width() / 2.0,
-                            h + 0.015 * ymax,
-                            f"{h:.2f}",
+                            bar.get_x() + bar.get_width() / 2.0,
+                            max(0.02 * ymax, height - 0.035 * ymax),
+                            f"{height:.2f}",
                             ha="center",
-                            va="bottom",
+                            va="top",
                             fontsize=7,
                             rotation=90,
                         )
@@ -611,21 +628,17 @@ def plot_results_grid(
             legend_handles,
             legend_labels,
             loc="upper center",
-            bbox_to_anchor=(0.5, 0.965),
+            bbox_to_anchor=(0.5, 0.985),
             ncols=3,
             frameon=False,
             fontsize=10,
         )
 
-    fig.suptitle(title, fontsize=15, y=0.995)
-    fig.tight_layout(rect=(0.02, 0.02, 0.98, 0.925))
-
+    fig.tight_layout(rect=(0.02, 0.02, 0.98, 0.94))
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=240, bbox_inches="tight")
-
     if out_pdf is not None:
         fig.savefig(out_pdf, bbox_inches="tight")
-
     plt.close(fig)
 
 
@@ -633,8 +646,8 @@ def plot_tp_average_speedups(
     averages: List[Dict[str, Any]],
     out_png: Path,
     out_pdf: Optional[Path],
-    title: str,
 ) -> None:
+    """Plot TP means with min/max endpoint markers and no figure title."""
     rows = [row for row in averages if int(row.get("valid_row_count", 0)) > 0]
     if not rows:
         raise RuntimeError("No valid per-TP averages to plot.")
@@ -643,7 +656,22 @@ def plot_tp_average_speedups(
     bar_width = 0.25
     baseline_values = [1.0 for _ in rows]
     nccl_values = [float(row["mean_nccl_speedup"]) for row in rows]
-    ooverlap_values = [float(row["mean_ooverlap_speedup"]) for row in rows]
+    t_ccl_values = [float(row["mean_ooverlap_speedup"]) for row in rows]
+    nccl_min_values = [float(row["min_nccl_speedup"]) for row in rows]
+    nccl_max_values = [float(row["max_nccl_speedup"]) for row in rows]
+    t_ccl_min_values = [float(row["min_ooverlap_speedup"]) for row in rows]
+    t_ccl_max_values = [float(row["max_ooverlap_speedup"]) for row in rows]
+
+    all_values = (
+        baseline_values
+        + nccl_values
+        + t_ccl_values
+        + nccl_min_values
+        + nccl_max_values
+        + t_ccl_min_values
+        + t_ccl_max_values
+    )
+    ymax = max(1.2, max(all_values) * 1.18)
 
     fig_width = max(7.0, 2.4 * len(rows) + 2.5)
     fig, ax = plt.subplots(figsize=(fig_width, 4.8))
@@ -652,35 +680,44 @@ def plot_tp_average_speedups(
         [x - bar_width for x in xs],
         baseline_values,
         width=bar_width,
-        label="Baseline (No Overlap)",
+        label="No Overlap",
     )
     bars1 = ax.bar(
         xs,
         nccl_values,
         width=bar_width,
-        label="NCCL-Based Overlap",
+        label="NCCL",
         hatch="//",
     )
     bars2 = ax.bar(
         [x + bar_width for x in xs],
-        ooverlap_values,
+        t_ccl_values,
         width=bar_width,
-        label="OOverlap-Based Overlap",
+        label="T-CCL",
         hatch="xx",
     )
 
-    ymax = max(baseline_values + nccl_values + ooverlap_values)
-    ymax = max(1.2, ymax * 1.22)
+    # A hollow endpoint is the minimum; a filled endpoint is the maximum.
+    # NCCL uses circles and T-CCL uses diamonds.
+    for x, low, high in zip(xs, nccl_min_values, nccl_max_values):
+        ax.scatter([x], [low], marker="o", facecolors="none", edgecolors="black", zorder=5)
+        ax.scatter([x], [high], marker="o", facecolors="black", edgecolors="black", zorder=5)
+
+    for x, low, high in zip(xs, t_ccl_min_values, t_ccl_max_values):
+        marker_x = x + bar_width
+        ax.scatter(
+            [marker_x], [low], marker="D", facecolors="none", edgecolors="black", zorder=5
+        )
+        ax.scatter(
+            [marker_x], [high], marker="D", facecolors="black", edgecolors="black", zorder=5
+        )
+
     ax.set_ylim(0.0, ymax)
     ax.axhline(1.0, linewidth=1.0, linestyle="--", alpha=0.75)
     ax.set_xticks(xs)
-    ax.set_xticklabels([
-        f"TP={int(row['world_size'])}\n(n={int(row['valid_row_count'])})"
-        for row in rows
-    ])
+    ax.set_xticklabels([f"TP={int(row['world_size'])}" for row in rows])
     ax.set_xlabel("Tensor parallel size")
     ax.set_ylabel("Arithmetic mean normalized speedup")
-    ax.set_title(title)
     ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.45)
     ax.legend(loc="upper center", ncols=3, frameon=False)
 
@@ -689,22 +726,22 @@ def plot_tp_average_speedups(
             height = bar.get_height()
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                height + 0.02 * ymax,
+                max(0.02 * ymax, height - 0.035 * ymax),
                 f"{height:.2f}x",
                 ha="center",
-                va="bottom",
+                va="top",
                 fontsize=8,
             )
 
-    for x, row in zip(xs, rows):
-        ax.text(
-            x,
-            0.03 * ymax,
-            f"OO/NCCL {format_speedup(row.get('mean_ooverlap_vs_nccl'))}",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-        )
+    ax.text(
+        0.99,
+        0.02,
+        "Hollow marker: minimum\nFilled marker: maximum",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=8,
+    )
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -782,16 +819,15 @@ def write_summary_txt(path: Path, rows: List[ShapeKResult]) -> None:
         return "NA" if x is None else f"{x:.4f}x"
 
     ordered = sorted(rows, key=lambda r: (r.m, r.n, r.k))
-
     table_rows = []
     for r in ordered:
-        oo_vs_nccl = None
+        t_ccl_vs_nccl = None
         if (
             r.nccl_overlap_ms is not None
             and r.ooverlap_overlap_ms is not None
             and r.ooverlap_overlap_ms > 0.0
         ):
-            oo_vs_nccl = r.nccl_overlap_ms / r.ooverlap_overlap_ms
+            t_ccl_vs_nccl = r.nccl_overlap_ms / r.ooverlap_overlap_ms
 
         table_rows.append([
             str(r.m),
@@ -802,7 +838,7 @@ def write_summary_txt(path: Path, rows: List[ShapeKResult]) -> None:
             fmt_ms(r.ooverlap_overlap_ms),
             fmt_speedup(r.nccl_speedup),
             fmt_speedup(r.ooverlap_speedup),
-            fmt_speedup(oo_vs_nccl),
+            fmt_speedup(t_ccl_vs_nccl),
         ])
 
     headers = [
@@ -811,10 +847,10 @@ def write_summary_txt(path: Path, rows: List[ShapeKResult]) -> None:
         "K",
         "Baseline ms",
         "NCCL ms",
-        "OOverLap ms",
+        "T-CCL ms",
         "NCCL vs baseline",
-        "OOverLap vs baseline",
-        "OOverLap vs NCCL",
+        "T-CCL vs baseline",
+        "T-CCL vs NCCL",
     ]
 
     widths = [len(h) for h in headers]
@@ -825,22 +861,16 @@ def write_summary_txt(path: Path, rows: List[ShapeKResult]) -> None:
     def line(cells: List[str]) -> str:
         return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
 
-    out = []
-    out.append("Operator-Level Communication-Computation Overlap Summary")
-    out.append("")
-    out.append(
-        "Speedups are normalized to the non-overlap baseline for the same M, N, K shape."
-    )
-    out.append(
-        "OOverLap vs NCCL is computed as NCCL overlap time divided by OOverLap overlap time."
-    )
-    out.append("")
-    out.append(line(headers))
-    out.append(line(["-" * w for w in widths]))
-
-    for row in table_rows:
-        out.append(line(row))
-
+    out = [
+        "Operator-Level Communication-Computation Overlap Summary",
+        "",
+        "Speedups are normalized to the no-overlap baseline for the same M, N, K shape.",
+        "T-CCL vs NCCL is computed as NCCL overlap time divided by T-CCL overlap time.",
+        "",
+        line(headers),
+        line(["-" * width for width in widths]),
+    ]
+    out.extend(line(row) for row in table_rows)
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
@@ -852,7 +882,11 @@ def write_tp_average_csv(path: Path, averages: List[Dict[str, Any]]) -> None:
         "valid_row_count",
         "mean_baseline_speedup",
         "mean_nccl_speedup",
+        "min_nccl_speedup",
+        "max_nccl_speedup",
         "mean_ooverlap_speedup",
+        "min_ooverlap_speedup",
+        "max_ooverlap_speedup",
         "mean_ooverlap_vs_nccl",
         "aggregation",
     ]
@@ -864,14 +898,24 @@ def write_tp_average_csv(path: Path, averages: List[Dict[str, Any]]) -> None:
 
 def write_tp_average_txt(path: Path, averages: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    headers = ["TP", "Valid/Total", "NCCL vs base", "OOverlap vs base", "OOverlap vs NCCL"]
+    headers = [
+        "TP",
+        "Valid/Total",
+        "NCCL mean",
+        "NCCL min-max",
+        "T-CCL mean",
+        "T-CCL min-max",
+    ]
     table_rows = [
         [
             str(row["world_size"]),
             f"{row['valid_row_count']}/{row['total_row_count']}",
             format_speedup(row.get("mean_nccl_speedup")),
+            f"{format_speedup(row.get('min_nccl_speedup'))} - "
+            f"{format_speedup(row.get('max_nccl_speedup'))}",
             format_speedup(row.get("mean_ooverlap_speedup")),
-            format_speedup(row.get("mean_ooverlap_vs_nccl")),
+            f"{format_speedup(row.get('min_ooverlap_speedup'))} - "
+            f"{format_speedup(row.get('max_ooverlap_speedup'))}",
         ]
         for row in averages
     ]
@@ -886,7 +930,7 @@ def write_tp_average_txt(path: Path, averages: List[Dict[str, Any]]) -> None:
     out = [
         "Average Operator Speedup by Tensor Parallel Size",
         "",
-        "Arithmetic mean of per-(M,N,K) normalized speedups over valid selected rows.",
+        "Arithmetic mean and observed min-max range over valid selected (M,N,K) rows.",
         "",
         line(headers),
         line(["-" * width for width in widths]),
@@ -946,12 +990,6 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--annotate", action="store_true")
     p.add_argument("--no-pdf", action="store_true")
-    p.add_argument(
-        "--title",
-        type=str,
-        default="End-to-End Operator Speedup from Communication-Computation Overlap",
-    )
-
     return p.parse_args()
 
 
@@ -1051,18 +1089,10 @@ def main() -> int:
         write_summary_csv(out_csv, all_rows)
         write_summary_txt(out_txt, all_rows)
 
-        plot_title = (
-            f"{args.title}\n"
-            f"TP={world_size} | mean NCCL={format_speedup(average['mean_nccl_speedup'])} | "
-            f"mean OOverlap={format_speedup(average['mean_ooverlap_speedup'])} | "
-            f"OOverlap/NCCL={format_speedup(average['mean_ooverlap_vs_nccl'])} | "
-            f"n={average['valid_row_count']}"
-        )
         plot_results_grid(
             by_shape=by_shape,
             out_png=out_png,
             out_pdf=out_pdf,
-            title=plot_title,
             annotate=bool(args.annotate),
         )
 
@@ -1108,7 +1138,6 @@ def main() -> int:
         averages=tp_averages,
         out_png=average_png,
         out_pdf=average_pdf,
-        title="Average Operator Speedup by Tensor Parallel Size",
     )
 
     print(f"wrote: {average_png}")
