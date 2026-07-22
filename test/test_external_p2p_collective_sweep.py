@@ -5,6 +5,7 @@ import argparse
 import csv
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -590,6 +591,212 @@ def write_outputs(
     return csv_path, jsonl_path, text_path
 
 
+# OOVERLAP_EXTERNAL_P2P_SPEEDUP_SUMMARY_V1
+SPEEDUP_BASELINES = (
+    ("nccl", "NCCL"),
+    ("nccl_symmetric", "symmetric NCCL"),
+)
+
+
+def positive_finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return None
+    return parsed
+
+
+def collect_speedup_points(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+
+    for row in rows:
+        if str(row.get("mode", "")) != "bench":
+            continue
+
+        metric = str(row.get("metric_set", ""))
+        if metric not in ("latency", "bandwidth"):
+            continue
+
+        if metric == "latency":
+            ooverlap_value = positive_finite_float(
+                row.get("ooverlap_latency_us")
+            )
+        else:
+            ooverlap_value = positive_finite_float(
+                row.get("ooverlap_bandwidth_gbps")
+            )
+
+        if ooverlap_value is None:
+            continue
+
+        for baseline_key, baseline_label in SPEEDUP_BASELINES:
+            if metric == "latency":
+                baseline_value = positive_finite_float(
+                    row.get(f"{baseline_key}_latency_us")
+                )
+                speedup = (
+                    baseline_value / ooverlap_value
+                    if baseline_value is not None
+                    else None
+                )
+            else:
+                baseline_value = positive_finite_float(
+                    row.get(f"{baseline_key}_bandwidth_gbps")
+                )
+                speedup = (
+                    ooverlap_value / baseline_value
+                    if baseline_value is not None
+                    else None
+                )
+
+            if speedup is None or not math.isfinite(speedup) or speedup <= 0.0:
+                continue
+
+            points.append(
+                {
+                    "metric": metric,
+                    "baseline_key": baseline_key,
+                    "baseline_label": baseline_label,
+                    "speedup": speedup,
+                    "row": row,
+                }
+            )
+
+    return points
+
+
+def format_speedup_point(point: dict[str, Any]) -> str:
+    speedup = float(point["speedup"])
+    row = point["row"]
+    metric = str(point["metric"])
+    collective = str(row.get("collective", "unknown")).replace("_", "-")
+
+    try:
+        size_label = format_size(int(float(row.get("bytes", 0))))
+    except (TypeError, ValueError):
+        size_label = str(row.get("bytes", "unknown"))
+
+    cta_limit = row.get("cta_limit")
+    cta_label = "default" if cta_limit in (None, "") else str(cta_limit)
+    improvement_percent = (speedup - 1.0) * 100.0
+
+    return (
+        f"{speedup:.4f}x ({improvement_percent:+.2f}%) "
+        f"at metric={metric}, collective={collective}, "
+        f"size={size_label}, OOverlap CTAs={cta_label}"
+    )
+
+
+def speedup_extreme_line(
+    points: list[dict[str, Any]],
+    baseline_key: str,
+    baseline_label: str,
+    *,
+    metric: str | None = None,
+    collective: str | None = None,
+) -> str:
+    selected = [
+        point
+        for point in points
+        if point["baseline_key"] == baseline_key
+        and (metric is None or point["metric"] == metric)
+        and (
+            collective is None
+            or str(point["row"].get("collective", "")) == collective
+        )
+    ]
+
+    if not selected:
+        return f"  versus {baseline_label}: no valid measurements"
+
+    minimum = min(selected, key=lambda point: float(point["speedup"]))
+    maximum = max(selected, key=lambda point: float(point["speedup"]))
+    return (
+        f"  versus {baseline_label}:\n"
+        f"    minimum: {format_speedup_point(minimum)}\n"
+        f"    maximum: {format_speedup_point(maximum)}"
+    )
+
+
+def build_speedup_summary(
+    rows: list[dict[str, Any]],
+    *,
+    run_id: str,
+    devices: list[int],
+) -> str:
+    points = collect_speedup_points(rows)
+    lines = [
+        "External P2P collective speedup summary",
+        f"run_id: {run_id}",
+        f"devices: {','.join(str(device) for device in devices)}",
+        f"world_size: {len(devices)}",
+        "scope: current invocation only",
+        "latency speedup: baseline latency / OOverlap latency",
+        "bandwidth speedup: OOverlap bandwidth / baseline bandwidth",
+        "",
+        "Overall across latency and bandwidth points",
+    ]
+
+    for baseline_key, baseline_label in SPEEDUP_BASELINES:
+        lines.append(
+            speedup_extreme_line(
+                points,
+                baseline_key,
+                baseline_label,
+            )
+        )
+
+    for metric in ("latency", "bandwidth"):
+        lines.extend(("", metric.capitalize()))
+        for baseline_key, baseline_label in SPEEDUP_BASELINES:
+            lines.append(
+                speedup_extreme_line(
+                    points,
+                    baseline_key,
+                    baseline_label,
+                    metric=metric,
+                )
+            )
+
+    lines.extend(("", "By collective"))
+    for collective in COLLECTIVES:
+        lines.append(collective.replace("_", "-").title())
+        for metric in ("latency", "bandwidth"):
+            lines.append(f"  {metric}")
+            for baseline_key, baseline_label in SPEEDUP_BASELINES:
+                detail = speedup_extreme_line(
+                    points,
+                    baseline_key,
+                    baseline_label,
+                    metric=metric,
+                    collective=collective,
+                )
+                lines.append("  " + detail.replace("\n", "\n  "))
+
+    return "\n".join(lines) + "\n"
+
+
+def write_speedup_summary(
+    out_prefix: Path,
+    rows: list[dict[str, Any]],
+    *,
+    run_id: str,
+    devices: list[int],
+) -> tuple[Path, str]:
+    summary_path = Path(f"{out_prefix}_speedup.txt")
+    summary_text = build_speedup_summary(
+        rows,
+        run_id=run_id,
+        devices=devices,
+    )
+    summary_path.write_text(summary_text, encoding="utf-8")
+    return summary_path, summary_text
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -728,15 +935,25 @@ def main() -> None:
             )
         )
 
+    out_prefix = Path(args.out_prefix)
     csv_path, jsonl_path, text_path = write_outputs(
-        Path(args.out_prefix),
+        out_prefix,
         all_rows,
         args.append,
+    )
+    speedup_path, speedup_text = write_speedup_summary(
+        out_prefix,
+        all_rows,
+        run_id=run_id,
+        devices=devices,
     )
     print(f"[result] rows={len(all_rows)}")
     print(f"[result] csv={csv_path}")
     print(f"[result] jsonl={jsonl_path}")
     print(f"[result] text={text_path}")
+    print(f"[result] speedup={speedup_path}")
+    print()
+    print(speedup_text.rstrip())
 
 
 if __name__ == "__main__":

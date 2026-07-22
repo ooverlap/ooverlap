@@ -27,9 +27,9 @@ case "$WORLD_SIZE" in
     ;;
   4)
     DEVICES="0,1,2,3"
-    OOVERLAP_MAX_CTAS="9"
-    NCCL_MAX_CTAS="9"
-    MAX_CTAS_PER_REDUCE_TASK="3"
+    OOVERLAP_MAX_CTAS="18"
+    NCCL_MAX_CTAS="-1"
+    MAX_CTAS_PER_REDUCE_TASK="6"
     ;;
   *)
     echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
@@ -84,6 +84,7 @@ rm -f \
   "${OUT_PREFIX}.txt" \
   "${OUT_PREFIX}.csv" \
   "${OUT_PREFIX}.jsonl" \
+  "${OUT_PREFIX}_speedup.txt" \
   "${PLOT_PREFIX}.png" \
   "${PLOT_PREFIX}_latency.png" \
   "${PLOT_PREFIX}_bandwidth.png"
@@ -122,7 +123,9 @@ echo "[evalution] output=${OUT_PREFIX}.txt"
   --tp "$WORLD_SIZE" \
   --out-prefix "$PLOT_PREFIX"
 
+# OOVERLAP_EXTERNAL_P2P_SPEEDUP_SUMMARY_V1
 echo "[evalution] wrote text: ${OUT_PREFIX}.txt"
 echo "[evalution] wrote csv:  ${OUT_PREFIX}.csv"
 echo "[evalution] wrote jsonl:${OUT_PREFIX}.jsonl"
+echo "[evalution] wrote speedup: ${OUT_PREFIX}_speedup.txt"
 echo "[evalution] wrote plot: ${PLOT_PREFIX}.png"
