@@ -567,21 +567,25 @@ def plot_results_grid(
                 [x - bar_width for x in xs],
                 baseline_vals,
                 width=bar_width,
-                label="No Overlap",
+                label="Baseline",
+                edgecolor="none",
+                linewidth=0,
             )
             bars1 = ax.bar(
                 xs,
                 nccl_vals,
                 width=bar_width,
                 label="NCCL",
-                hatch="//",
+                edgecolor="none",
+                linewidth=0,
             )
             bars2 = ax.bar(
                 [x + bar_width for x in xs],
                 t_ccl_vals,
                 width=bar_width,
                 label="T-CCL",
-                hatch="xx",
+                edgecolor="none",
+                linewidth=0,
             )
 
             if legend_handles is None:
@@ -607,7 +611,7 @@ def plot_results_grid(
             if row_idx == nrows - 1:
                 ax.set_xlabel("K dimension")
             if col_idx == 0:
-                ax.set_ylabel("Normalized speedup")
+                ax.set_ylabel("Speedup")
 
             if annotate:
                 for bars in (bars0, bars1, bars2):
@@ -680,21 +684,25 @@ def plot_tp_average_speedups(
         [x - bar_width for x in xs],
         baseline_values,
         width=bar_width,
-        label="No Overlap",
+        label="Baseline",
+        edgecolor="none",
+        linewidth=0,
     )
     bars1 = ax.bar(
         xs,
         nccl_values,
         width=bar_width,
         label="NCCL",
-        hatch="//",
+        edgecolor="none",
+        linewidth=0,
     )
     bars2 = ax.bar(
         [x + bar_width for x in xs],
         t_ccl_values,
         width=bar_width,
         label="T-CCL",
-        hatch="xx",
+        edgecolor="none",
+        linewidth=0,
     )
 
     # A hollow endpoint is the minimum; a filled endpoint is the maximum.
@@ -717,7 +725,7 @@ def plot_tp_average_speedups(
     ax.set_xticks(xs)
     ax.set_xticklabels([f"TP={int(row['world_size'])}" for row in rows])
     ax.set_xlabel("Tensor parallel size")
-    ax.set_ylabel("Arithmetic mean normalized speedup")
+    ax.set_ylabel("Speedup")
     ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.45)
     ax.legend(loc="upper center", ncols=3, frameon=False)
 
@@ -732,16 +740,6 @@ def plot_tp_average_speedups(
                 va="top",
                 fontsize=8,
             )
-
-    ax.text(
-        0.99,
-        0.02,
-        "Hollow marker: minimum\nFilled marker: maximum",
-        transform=ax.transAxes,
-        ha="right",
-        va="bottom",
-        fontsize=8,
-    )
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
