@@ -170,108 +170,131 @@ def cta_suffix(cta_limit: Optional[int], show: bool) -> str:
     return " unrestricted" if cta_limit is None else f" ({cta_limit} CTAs)"
 
 
-def figure_subtitle(cta_values: List[Optional[int]]) -> str:
-    if len(cta_values) == 1:
-        value = cta_values[0]
-        return "No CTA limit" if value is None else f"CTA limit: {value}"
-    return "Multiple CTA limits"
-
-
-def plot_metric(
+def plot_combined(
     rows: List[Dict[str, object]],
-    metric: str,
     tp: int,
     output_path: Path,
 ) -> None:
-    grouped = group_rows(rows, metric)
+    del tp  # TP belongs in the paper caption, not in the figure title.
+
+    grouped_by_metric = {
+        "bandwidth": group_rows(rows, "bandwidth"),
+        "latency": group_rows(rows, "latency"),
+    }
     cta_values = sorted(
-        {cta for collective_rows in grouped.values() for cta in collective_rows},
+        {
+            cta
+            for grouped in grouped_by_metric.values()
+            for collective_rows in grouped.values()
+            for cta in collective_rows
+        },
         key=lambda value: (-1 if value is None else value),
     )
     show_cta_in_legend = len(cta_values) > 1
 
-    if metric == "latency":
-        t_ccl_key = "t_ccl_latency_us"
-        nccl_key = "nccl_latency_us"
-        symmetric_key = "nccl_symmetric_latency_us"
-        ylabel = "Latency (µs)"
-        metric_title = "External P2P Collective Latency"
-    elif metric == "bandwidth":
-        t_ccl_key = "t_ccl_bandwidth_gbps"
-        nccl_key = "nccl_bandwidth_gbps"
-        symmetric_key = "nccl_symmetric_bandwidth_gbps"
-        ylabel = "AlgoBW (GB/s)"
-        metric_title = "External P2P Collective Algorithm Bandwidth"
-    else:
-        raise ValueError(f"unsupported metric: {metric}")
+    metric_specs = (
+        (
+            "bandwidth",
+            "t_ccl_bandwidth_gbps",
+            "nccl_bandwidth_gbps",
+            "nccl_symmetric_bandwidth_gbps",
+            "AlgoBW (GB/s)",
+        ),
+        (
+            "latency",
+            "t_ccl_latency_us",
+            "nccl_latency_us",
+            "nccl_symmetric_latency_us",
+            "Latency (µs)",
+        ),
+    )
 
-    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(15, 4), sharex=False)
-    legend_handles = None
-    legend_labels = None
+    fig, axes = plt.subplots(
+        nrows=2,
+        ncols=3,
+        figsize=(15, 7.6),
+        sharex=False,
+    )
 
-    for axis, collective in zip(axes, COLLECTIVES):
-        collective_groups = grouped[collective]
-        first_rows = next(iter(collective_groups.values()))
+    legend_by_label = {}
 
-        for cta_limit, series in collective_groups.items():
-            x_values = [int(row["bytes"]) for row in series]
-            t_ccl_values = [float(row[t_ccl_key]) for row in series]
-            nccl_values = [float(row[nccl_key]) for row in series]
-            symmetric_values = [float(row[symmetric_key]) for row in series]
-            suffix = cta_suffix(cta_limit, show_cta_in_legend)
+    for row_idx, (
+        metric,
+        t_ccl_key,
+        nccl_key,
+        symmetric_key,
+        ylabel,
+    ) in enumerate(metric_specs):
+        grouped = grouped_by_metric[metric]
 
-            axis.plot(
-                x_values,
-                t_ccl_values,
-                marker="o",
-                label=f"T-CCL{suffix}",
-            )
-            axis.plot(
-                x_values,
-                nccl_values,
-                marker="s",
-                linestyle="--",
-                label=f"NCCL{suffix}",
-            )
-            if finite_positive(symmetric_values):
+        for col_idx, collective in enumerate(COLLECTIVES):
+            axis = axes[row_idx][col_idx]
+            collective_groups = grouped[collective]
+            first_rows = next(iter(collective_groups.values()))
+
+            for cta_limit, series in sorted(
+                collective_groups.items(),
+                key=lambda item: (-1 if item[0] is None else item[0]),
+            ):
+                x_values = [int(row["bytes"]) for row in series]
+                t_ccl_values = [float(row[t_ccl_key]) for row in series]
+                nccl_values = [float(row[nccl_key]) for row in series]
+                symmetric_values = [float(row[symmetric_key]) for row in series]
+                suffix = cta_suffix(cta_limit, show_cta_in_legend)
+
                 axis.plot(
                     x_values,
-                    symmetric_values,
-                    marker="^",
-                    linestyle=":",
-                    label=f"symmetric NCCL{suffix}",
+                    t_ccl_values,
+                    marker="o",
+                    label=f"T-CCL{suffix}",
                 )
+                axis.plot(
+                    x_values,
+                    nccl_values,
+                    marker="s",
+                    linestyle="--",
+                    label=f"NCCL{suffix}",
+                )
+                if finite_positive(symmetric_values):
+                    axis.plot(
+                        x_values,
+                        symmetric_values,
+                        marker="^",
+                        linestyle=":",
+                        label=f"symmetric NCCL{suffix}",
+                    )
 
-        if legend_handles is None:
-            legend_handles, legend_labels = axis.get_legend_handles_labels()
+            for handle, label in zip(*axis.get_legend_handles_labels()):
+                legend_by_label.setdefault(label, handle)
 
-        x_ticks = [int(row["bytes"]) for row in first_rows]
-        axis.set_xscale("log", base=2)
-        axis.set_xticks(x_ticks)
-        axis.set_xticklabels(
-            [format_size_bytes(value) for value in x_ticks],
-            rotation=30,
-            ha="right",
-        )
-        axis.set_title(COLLECTIVE_TITLES[collective], fontsize=12)
-        axis.grid(True, which="both", linestyle="--", alpha=0.35)
+            x_ticks = [int(row["bytes"]) for row in first_rows]
+            axis.set_xscale("log", base=2)
+            axis.set_xticks(x_ticks)
+            axis.set_xticklabels(
+                [format_size_bytes(value) for value in x_ticks],
+                rotation=30,
+                ha="right",
+            )
+            axis.grid(True, which="both", linestyle="--", alpha=0.35)
 
-    fig.suptitle(
-        f"{metric_title} (TP={tp})\n{figure_subtitle(cta_values)}",
-        y=1.08,
-        fontsize=14,
-    )
-    fig.supylabel(ylabel)
-    fig.supxlabel("Buffer size")
+            if row_idx == 0:
+                axis.set_title(COLLECTIVE_TITLES[collective], fontsize=12)
+            if col_idx == 0:
+                axis.set_ylabel(ylabel)
+            if row_idx == 1:
+                axis.set_xlabel("Buffer size")
+
+    legend_labels = list(legend_by_label)
+    legend_handles = [legend_by_label[label] for label in legend_labels]
     fig.legend(
         legend_handles,
         legend_labels,
         loc="upper center",
-        ncol=min(len(legend_labels or []), 6),
-        bbox_to_anchor=(0.5, 1.0),
+        ncol=min(len(legend_labels), 6),
+        bbox_to_anchor=(0.5, 0.995),
         frameon=False,
     )
-    fig.tight_layout(rect=(0.02, 0.02, 1.0, 0.88))
+    fig.tight_layout(rect=(0.02, 0.02, 1.0, 0.93))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
@@ -281,7 +304,7 @@ def plot_metric(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot external-P2P collective sweep latency and bandwidth"
+        description="Plot external-P2P collective latency and bandwidth in one figure"
     )
     parser.add_argument("--text", required=True, help="Sweep tab-separated text file")
     parser.add_argument(
@@ -312,8 +335,7 @@ def main() -> int:
     )
     rows = load_rows(text_path)
 
-    plot_metric(rows, "latency", tp, Path(f"{out_prefix}_latency.png"))
-    plot_metric(rows, "bandwidth", tp, Path(f"{out_prefix}_bandwidth.png"))
+    plot_combined(rows, tp, Path(f"{out_prefix}.png"))
     return 0
 
 
