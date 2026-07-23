@@ -7,9 +7,18 @@ set -euo pipefail
 #   ./evalution/run_vllm_paperlike.sh 2
 #   ./evalution/run_vllm_paperlike.sh 4
 #
-# The only positional argument is the tensor-parallel/world size. The model,
-# workloads, batching matrix, backend order, repetitions, and runtime settings
-# are fixed below so the paper experiment is reproducible.
+# Default platform/model matrix:
+#   TP=2: 2x H100, Qwen2.5-7B-Instruct
+#   TP=4: 4x GH200, Qwen2.5-72B-Instruct
+#
+# Optional overrides:
+#   OOVERLAP_MAX_CTAS=8 \
+#   OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=4 \
+#     ./evalution/run_vllm_paperlike.sh 4
+#
+# The CTA variables are passed with benchmark_vllm_paperlike.py --env. The
+# Python controller applies explicit --env values to every fresh vLLM child
+# process after sourcing the generated runtime environment.
 
 usage() {
   echo "Usage: $0 {2|4}" >&2
@@ -21,15 +30,36 @@ fail() {
   exit 1
 }
 
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+    fail "$name must be a positive integer; got: $value"
+  fi
+}
+
 [[ $# -eq 1 ]] || usage
 WORLD_SIZE="$1"
 
 case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
+    MODEL="Qwen/Qwen2.5-7B-Instruct"
+    MAX_MODEL_LEN="2048"
+    GPU_MEMORY_UTILIZATION="0.85"
+
+    DEFAULT_OOVERLAP_MAX_CTAS="8"
+    DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="8"
     ;;
   4)
     DEVICES="0,1,2,3"
+    MODEL="Qwen/Qwen2.5-72B-Instruct"
+    MAX_MODEL_LEN="2048"
+    GPU_MEMORY_UTILIZATION="0.90"
+
+    DEFAULT_OOVERLAP_MAX_CTAS="12"
+    DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="4"
     ;;
   *)
     echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
@@ -37,21 +67,31 @@ case "$WORLD_SIZE" in
     ;;
 esac
 
+OOVERLAP_MAX_CTAS="${OOVERLAP_MAX_CTAS:-$DEFAULT_OOVERLAP_MAX_CTAS}"
+OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="${OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:-$DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK}"
+
+require_positive_integer "OOVERLAP_MAX_CTAS" "$OOVERLAP_MAX_CTAS"
+require_positive_integer \
+  "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
+  "$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
+
 # -----------------------------------------------------------------------------
 # Fixed paper matrix. Edit these constants in the repository only when the
 # paper methodology changes; they are intentionally not command-line options.
 # -----------------------------------------------------------------------------
-MODEL="Qwen/Qwen2.5-7B-Instruct"
-MAX_MODEL_LEN="2048"
-GPU_MEMORY_UTILIZATION="0.85"
-
 BACKENDS="pynccl,ooverlap"
 BASELINE_BACKEND="pynccl"
-WORKLOADS="decode,mixed,long,prefill"
-BATCH_SIZES="64,128,256"
-MAX_BATCHED_TOKENS="4096,8192"
-REPETITIONS="3"
-PROMPT_MULTIPLIER="4"
+#WORKLOADS="decode,mixed,long,prefill"
+#BATCH_SIZES="64,128,256"
+#MAX_BATCHED_TOKENS="4096,8192"
+#REPETITIONS="3"
+#PROMPT_MULTIPLIER="4"
+
+WORKLOADS="decode,prefill"
+BATCH_SIZES="64,128"
+MAX_BATCHED_TOKENS="4096"
+REPETITIONS="1"
+PROMPT_MULTIPLIER="1"
 
 DATASET_NAME="random"
 RANDOM_RANGE_RATIO="0.0"
@@ -143,6 +183,10 @@ echo "[evalution] vLLM paper throughput evaluation"
 echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
 echo "[evalution] runtime_env=$RUNTIME_ENV_FILE"
 echo "[evalution] model=$MODEL"
+echo "[evalution] max_model_len=$MAX_MODEL_LEN"
+echo "[evalution] gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
+echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
+echo "[evalution] ooverlap_max_ctas_per_reduce_task=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
 echo "[evalution] backends=$BACKENDS baseline=$BASELINE_BACKEND"
 echo "[evalution] workloads=$WORKLOADS"
 echo "[evalution] batch_sizes=$BATCH_SIZES"
@@ -175,6 +219,8 @@ echo "[evalution] output=$OUT_DIR"
   --rr-dtype "$RR_DTYPE" \
   --rr-slots "$RR_SLOTS" \
   --rr-capacity-bytes "$RR_CAPACITY_BYTES" \
+  --env "OOVERLAP_MAX_CTAS=$OOVERLAP_MAX_CTAS" \
+  --env "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
   2>&1 | tee "$PIPELINE_LOG"
 
 for required_output in \
