@@ -131,6 +131,8 @@ RUNTIME_PATH_KEYS = CACHE_PATH_KEYS + (
 MANIFEST_ENV_KEYS = RUNTIME_PATH_KEYS + (
     "OOTMP",
     "CUDA_VISIBLE_DEVICES",
+    "NCCL_NET_PLUGIN",
+    "NCCL_NET",
     "VLLM_USE_FLASHINFER_SAMPLER",
     "VLLM_OOVERLAP_DEBUG",
     "VLLM_OOVERLAP_RR_DTYPE",
@@ -818,6 +820,7 @@ def execute_streaming(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
         try:
             assert process.stdout is not None
@@ -827,12 +830,30 @@ def execute_streaming(
                 log_handle.write(line)
             return_code = process.wait()
         except KeyboardInterrupt:
-            process.send_signal(signal.SIGINT)
+            # OOVERLAP_VLLM_PROCESS_GROUP_CLEANUP_V1
+            # vLLM launches an engine process and multiple workers. Signalling
+            # only the CLI parent can leave GPU-owning workers alive. Because
+            # the child starts a new session, its PID is also its process-group
+            # ID; signal the whole group and escalate only after timeouts.
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
             try:
                 return_code = process.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                process.kill()
-                return_code = process.wait()
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    return_code = process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return_code = process.wait()
             raise
     return return_code, time.monotonic() - start
 

@@ -70,6 +70,14 @@ esac
 OOVERLAP_MAX_CTAS="${OOVERLAP_MAX_CTAS:-$DEFAULT_OOVERLAP_MAX_CTAS}"
 OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="${OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:-$DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK}"
 
+# OOVERLAP_VLLM_NCCL_ENV_FORWARDING_V1
+# These are single-node paper experiments. The cluster-provided AWS OFI
+# plugin fails in this job environment, so use NCCL's internal network path.
+# Explicit --env forwarding below reapplies these values after the generated
+# runtime environment has been sourced.
+NCCL_NET_PLUGIN="${NCCL_NET_PLUGIN:-none}"
+NCCL_NET="${NCCL_NET:-Socket}"
+
 require_positive_integer "OOVERLAP_MAX_CTAS" "$OOVERLAP_MAX_CTAS"
 require_positive_integer \
   "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
@@ -187,6 +195,8 @@ echo "[evalution] max_model_len=$MAX_MODEL_LEN"
 echo "[evalution] gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
 echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
 echo "[evalution] ooverlap_max_ctas_per_reduce_task=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
+echo "[evalution] nccl_net_plugin=$NCCL_NET_PLUGIN"
+echo "[evalution] nccl_net=$NCCL_NET"
 echo "[evalution] backends=$BACKENDS baseline=$BASELINE_BACKEND"
 echo "[evalution] workloads=$WORKLOADS"
 echo "[evalution] batch_sizes=$BATCH_SIZES"
@@ -221,6 +231,9 @@ echo "[evalution] output=$OUT_DIR"
   --rr-capacity-bytes "$RR_CAPACITY_BYTES" \
   --env "OOVERLAP_MAX_CTAS=$OOVERLAP_MAX_CTAS" \
   --env "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
+  --env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN" \
+  --env "NCCL_NET=$NCCL_NET" \
+  --fail-fast \
   2>&1 | tee "$PIPELINE_LOG"
 
 for required_output in \
