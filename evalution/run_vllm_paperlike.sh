@@ -12,13 +12,15 @@ set -euo pipefail
 #   TP=4: 4x GH200, Qwen2.5-72B-Instruct
 #
 # Optional overrides:
-#   OOVERLAP_MAX_CTAS=8 \
+#   VLLM_MODEL_DIR=/scratch/local/models/Qwen2.5-72B-Instruct \
+#   VLLM_OOVERLAP_RR_SLOTS=200 \
+#   VLLM_OOVERLAP_RR_CAPACITY_BYTES=67108864 \
+#   OOVERLAP_MAX_CTAS=12 \
 #   OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=4 \
 #     ./evalution/run_vllm_paperlike.sh 4
 #
-# The CTA variables are passed with benchmark_vllm_paperlike.py --env. The
-# Python controller applies explicit --env values to every fresh vLLM child
-# process after sourcing the generated runtime environment.
+# The model, round-robin, CTA, NCCL, and offline variables are forwarded to
+# every fresh vLLM child after the generated runtime environment is sourced.
 
 usage() {
   echo "Usage: $0 {2|4}" >&2
@@ -45,21 +47,27 @@ WORLD_SIZE="$1"
 case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
-    MODEL="Qwen/Qwen2.5-7B-Instruct"
+    MODEL_REPO_ID="Qwen/Qwen2.5-7B-Instruct"
+    MODEL_BASENAME="Qwen2.5-7B-Instruct"
     MAX_MODEL_LEN="2048"
     GPU_MEMORY_UTILIZATION="0.85"
 
     DEFAULT_OOVERLAP_MAX_CTAS="8"
     DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="8"
+    DEFAULT_RR_SLOTS="32"
+    DEFAULT_RR_CAPACITY_BYTES="33554432"  # 32 MiB
     ;;
   4)
     DEVICES="0,1,2,3"
-    MODEL="Qwen/Qwen2.5-72B-Instruct"
+    MODEL_REPO_ID="Qwen/Qwen2.5-72B-Instruct"
+    MODEL_BASENAME="Qwen2.5-72B-Instruct"
     MAX_MODEL_LEN="2048"
-    GPU_MEMORY_UTILIZATION="0.90"
+    GPU_MEMORY_UTILIZATION="0.85"
 
     DEFAULT_OOVERLAP_MAX_CTAS="12"
     DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="4"
+    DEFAULT_RR_SLOTS="165"
+    DEFAULT_RR_CAPACITY_BYTES="67108864"  # 64 MiB
     ;;
   *)
     echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
@@ -67,8 +75,14 @@ case "$WORLD_SIZE" in
     ;;
 esac
 
+# OOVERLAP_VLLM_LOCAL_MODEL_AND_RR_OVERRIDES_V1
 OOVERLAP_MAX_CTAS="${OOVERLAP_MAX_CTAS:-$DEFAULT_OOVERLAP_MAX_CTAS}"
 OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="${OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:-$DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK}"
+RR_DTYPE="${VLLM_OOVERLAP_RR_DTYPE:-bf16}"
+RR_SLOTS="${VLLM_OOVERLAP_RR_SLOTS:-$DEFAULT_RR_SLOTS}"
+RR_CAPACITY_BYTES="${VLLM_OOVERLAP_RR_CAPACITY_BYTES:-$DEFAULT_RR_CAPACITY_BYTES}"
+HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 # OOVERLAP_VLLM_NCCL_ENV_FORWARDING_V1
 # These are single-node paper experiments. The cluster-provided AWS OFI
@@ -82,12 +96,29 @@ require_positive_integer "OOVERLAP_MAX_CTAS" "$OOVERLAP_MAX_CTAS"
 require_positive_integer \
   "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
   "$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
+require_positive_integer "VLLM_OOVERLAP_RR_SLOTS" "$RR_SLOTS"
+require_positive_integer \
+  "VLLM_OOVERLAP_RR_CAPACITY_BYTES" \
+  "$RR_CAPACITY_BYTES"
+
+MAX_SUPPORTED_RR_SLOTS="257"
+if (( RR_SLOTS > MAX_SUPPORTED_RR_SLOTS )); then
+  fail "VLLM_OOVERLAP_RR_SLOTS must be <= $MAX_SUPPORTED_RR_SLOTS; got: $RR_SLOTS"
+fi
+
+case "$RR_DTYPE" in
+  bf16|bfloat16|fp16|float16|fp32|float32)
+    ;;
+  *)
+    fail "VLLM_OOVERLAP_RR_DTYPE must be bf16, fp16, or fp32; got: $RR_DTYPE"
+    ;;
+esac
 
 # -----------------------------------------------------------------------------
 # Fixed paper matrix. Edit these constants in the repository only when the
 # paper methodology changes; they are intentionally not command-line options.
 # -----------------------------------------------------------------------------
-BACKENDS="pynccl,ooverlap"
+BACKENDS="pynccl,nccl_symm,ooverlap"
 BASELINE_BACKEND="pynccl"
 #WORKLOADS="decode,mixed,long,prefill"
 #BATCH_SIZES="64,128,256"
@@ -107,9 +138,6 @@ SEED="0"
 
 FLASHINFER_SAMPLER="0"
 OOVERLAP_DEBUG="0"
-RR_DTYPE="bf16"
-RR_SLOTS="32"
-RR_CAPACITY_BYTES="33554432"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
@@ -153,6 +181,17 @@ resolve_runtime_env_file() {
 }
 
 RUNTIME_ENV_FILE="$(resolve_runtime_env_file)"
+RUNTIME_ENV_DIR="$(cd -- "$(dirname -- "$RUNTIME_ENV_FILE")" && pwd)"
+DEFAULT_MODEL_DIR="$RUNTIME_ENV_DIR/models/$MODEL_BASENAME"
+MODEL_DIR="${VLLM_MODEL_DIR:-$DEFAULT_MODEL_DIR}"
+
+[[ -d "$MODEL_DIR" ]] || fail \
+  "model directory does not exist: $MODEL_DIR; download $MODEL_REPO_ID there or set VLLM_MODEL_DIR"
+[[ -f "$MODEL_DIR/config.json" ]] || fail \
+  "model directory is missing config.json: $MODEL_DIR"
+
+MODEL="$(cd -- "$MODEL_DIR" && pwd)"
+
 mkdir -p "$OUT_DIR"
 cd "$REPO_ROOT"
 
@@ -190,11 +229,17 @@ bash -lc '
 echo "[evalution] vLLM paper throughput evaluation"
 echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
 echo "[evalution] runtime_env=$RUNTIME_ENV_FILE"
-echo "[evalution] model=$MODEL"
+echo "[evalution] model_repo_id=$MODEL_REPO_ID"
+echo "[evalution] model_dir=$MODEL"
 echo "[evalution] max_model_len=$MAX_MODEL_LEN"
 echo "[evalution] gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
 echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
 echo "[evalution] ooverlap_max_ctas_per_reduce_task=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
+echo "[evalution] rr_dtype=$RR_DTYPE"
+echo "[evalution] rr_slots=$RR_SLOTS"
+echo "[evalution] rr_capacity_bytes=$RR_CAPACITY_BYTES"
+echo "[evalution] hf_hub_offline=$HF_HUB_OFFLINE"
+echo "[evalution] transformers_offline=$TRANSFORMERS_OFFLINE"
 echo "[evalution] nccl_net_plugin=$NCCL_NET_PLUGIN"
 echo "[evalution] nccl_net=$NCCL_NET"
 echo "[evalution] backends=$BACKENDS baseline=$BASELINE_BACKEND"
@@ -231,6 +276,8 @@ echo "[evalution] output=$OUT_DIR"
   --rr-capacity-bytes "$RR_CAPACITY_BYTES" \
   --env "OOVERLAP_MAX_CTAS=$OOVERLAP_MAX_CTAS" \
   --env "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
+  --env "HF_HUB_OFFLINE=$HF_HUB_OFFLINE" \
+  --env "TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE" \
   --env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN" \
   --env "NCCL_NET=$NCCL_NET" \
   --fail-fast \
