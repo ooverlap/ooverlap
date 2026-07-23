@@ -85,12 +85,23 @@ HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 # OOVERLAP_VLLM_NCCL_ENV_FORWARDING_V1
-# These are single-node paper experiments. The cluster-provided AWS OFI
-# plugin fails in this job environment, so use NCCL's internal network path.
+# These are single-node paper experiments. Do not inherit the cluster-provided
+# AWS OFI settings by accident. Dedicated OOVERLAP_* overrides are available
+# when another NCCL network configuration is intentionally required.
+NCCL_NET_PLUGIN="${OOVERLAP_NCCL_NET_PLUGIN:-none}"
+NCCL_NET="${OOVERLAP_NCCL_NET:-Socket}"
+
+# OOVERLAP_VLLM_NCCL_SYMM_MEM_V1
+# Enable the vLLM NCCL symmetric-memory allocator and the NCCL features it
+# depends on. The benchmark backend name "nccl_symm" is converted by the
+# Python controller to VLLM_FORCE_ALLREDUCE_BACKEND=nccl_symm for that child.
 # Explicit --env forwarding below reapplies these values after the generated
 # runtime environment has been sourced.
-NCCL_NET_PLUGIN="${NCCL_NET_PLUGIN:-none}"
-NCCL_NET="${NCCL_NET:-Socket}"
+VLLM_USE_NCCL_SYMM_MEM="${VLLM_USE_NCCL_SYMM_MEM:-1}"
+NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-1}"
+NCCL_WIN_ENABLE="${NCCL_WIN_ENABLE:-1}"
+NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
 
 require_positive_integer "OOVERLAP_MAX_CTAS" "$OOVERLAP_MAX_CTAS"
 require_positive_integer \
@@ -199,6 +210,9 @@ cd "$REPO_ROOT"
 # This uses the same source semantics as the Python driver and checks only
 # non-secret runtime facts: vLLM availability, extension path, and GPU count.
 CHECK_CODE='import os, sys, torch
+import vllm.envs as envs
+from vllm.distributed.device_communicators.pynccl_allocator import get_nccl_mem_pool
+
 expected = int(sys.argv[1])
 if not torch.cuda.is_available():
     raise SystemExit("CUDA is not available in the vLLM runtime environment")
@@ -209,22 +223,54 @@ if count != expected:
 extension = os.environ.get("VLLM_OOVERLAP_TORCH_EXT", "")
 if not extension or not os.path.isfile(extension):
     raise SystemExit(f"VLLM_OOVERLAP_TORCH_EXT is missing or invalid: {extension!r}")
+
+required_symm_env = {
+    "VLLM_USE_NCCL_SYMM_MEM": "1",
+    "NCCL_CUMEM_ENABLE": "1",
+    "NCCL_WIN_ENABLE": "1",
+}
+for name, expected_value in required_symm_env.items():
+    actual = os.environ.get(name)
+    if actual != expected_value:
+        raise SystemExit(f"{name} must be {expected_value!r}; got {actual!r}")
+if not envs.VLLM_USE_NCCL_SYMM_MEM:
+    raise SystemExit("vLLM did not accept VLLM_USE_NCCL_SYMM_MEM=1")
+
+nccl_version = tuple(int(value) for value in torch.cuda.nccl.version())
+if nccl_version < (2, 27, 3):
+    raise SystemExit(f"NCCL >= 2.27.3 is required; found {nccl_version}")
+torch.cuda.set_device(0)
+if get_nccl_mem_pool() is None:
+    raise SystemExit("vLLM NCCL symmetric-memory allocator is unavailable")
+
 print(f"[evalution] torch={torch.__version__} cuda={torch.version.cuda}")
+print(f"[evalution] nccl={nccl_version}")
 for index in range(count):
     print(f"[evalution] cuda:{index} name={torch.cuda.get_device_name(index)} capability={torch.cuda.get_device_capability(index)}")
-print(f"[evalution] ooverlap_extension={extension}")'
+print(f"[evalution] ooverlap_extension={extension}")
+print("[evalution] nccl_symmetric_allocator=ready")'
 
 bash -lc '
   set -e
   source "$1" >/dev/null
   export CUDA_VISIBLE_DEVICES="$2"
+  export VLLM_USE_NCCL_SYMM_MEM="$5"
+  export NCCL_CUMEM_ENABLE="$6"
+  export NCCL_WIN_ENABLE="$7"
+  export NCCL_NVLS_ENABLE="$8"
+  export NCCL_MNNVL_ENABLE="$9"
   command -v vllm >/dev/null
   exec python -c "$3" "$4"
 ' "ooverlap-vllm-preflight" \
   "$RUNTIME_ENV_FILE" \
   "$DEVICES" \
   "$CHECK_CODE" \
-  "$WORLD_SIZE"
+  "$WORLD_SIZE" \
+  "$VLLM_USE_NCCL_SYMM_MEM" \
+  "$NCCL_CUMEM_ENABLE" \
+  "$NCCL_WIN_ENABLE" \
+  "$NCCL_NVLS_ENABLE" \
+  "$NCCL_MNNVL_ENABLE"
 
 echo "[evalution] vLLM paper throughput evaluation"
 echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
@@ -242,6 +288,11 @@ echo "[evalution] hf_hub_offline=$HF_HUB_OFFLINE"
 echo "[evalution] transformers_offline=$TRANSFORMERS_OFFLINE"
 echo "[evalution] nccl_net_plugin=$NCCL_NET_PLUGIN"
 echo "[evalution] nccl_net=$NCCL_NET"
+echo "[evalution] vllm_use_nccl_symm_mem=$VLLM_USE_NCCL_SYMM_MEM"
+echo "[evalution] nccl_cumem_enable=$NCCL_CUMEM_ENABLE"
+echo "[evalution] nccl_win_enable=$NCCL_WIN_ENABLE"
+echo "[evalution] nccl_nvls_enable=$NCCL_NVLS_ENABLE"
+echo "[evalution] nccl_mnnvl_enable=$NCCL_MNNVL_ENABLE"
 echo "[evalution] backends=$BACKENDS baseline=$BASELINE_BACKEND"
 echo "[evalution] workloads=$WORKLOADS"
 echo "[evalution] batch_sizes=$BATCH_SIZES"
@@ -280,6 +331,11 @@ echo "[evalution] output=$OUT_DIR"
   --env "TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE" \
   --env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN" \
   --env "NCCL_NET=$NCCL_NET" \
+  --env "VLLM_USE_NCCL_SYMM_MEM=$VLLM_USE_NCCL_SYMM_MEM" \
+  --env "NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE" \
+  --env "NCCL_WIN_ENABLE=$NCCL_WIN_ENABLE" \
+  --env "NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE" \
+  --env "NCCL_MNNVL_ENABLE=$NCCL_MNNVL_ENABLE" \
   --fail-fast \
   2>&1 | tee "$PIPELINE_LOG"
 
