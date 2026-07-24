@@ -6,6 +6,7 @@
 #include "comm/kernels/window_task_executor.cuh"
 #include "comm/plan/transfer_plan.h"
 #include "comm/plan/window_plan.cuh"
+#include "comm/plan/plan_params.cuh"
 #include "comm/tma_variant_config.h"
 #include "comm/params.h"
 
@@ -363,6 +364,222 @@ void configure_multi_gpu_window_task_executor_once(
         "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
 
     configured_mask |= bit;
+}
+
+
+/* OOVERLAP_BY_VALUE_CAPACITY_DISPATCH_V1 */
+template <
+    int ByValueMaxTasks,
+    typename ReduceApply,
+    int ChunkBytes,
+    int StageDepth,
+    int MaxSourceTasks,
+    int MaxPeers,
+    int FillDepth = StageDepth / 2,
+    int LoadFillDepth = FillDepth,
+    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
+    const comm::plan::WindowTaskExecutorPlan<MaxSourceTasks>& window_plan,
+    int num_blocks,
+    int threads,
+    size_t dynamic_shared_bytes,
+    cudaStream_t stream,
+    int device,
+    int* local_ready_signal,
+    MultiGpuReadySignalPlan<MaxPeers> ready_plan,
+    int collective_epoch,
+    const char* error_prefix,
+    unsigned int* cta_barrier_counter = nullptr,
+    unsigned int cta_barrier_start = 0u) {
+    using ByValuePlan =
+        comm::plan::WindowTaskExecutorPlan<ByValueMaxTasks>;
+
+    static_assert(
+        sizeof(ByValuePlan) <= 16 * 1024,
+        "by-value WindowTask plan unexpectedly exceeds 16 KiB");
+
+    if (window_plan.total_tasks <= 0) {
+        return cudaSuccess;
+    }
+
+    if (window_plan.total_tasks > ByValueMaxTasks) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    static thread_local ByValuePlan by_value_plan;
+
+    if (!comm::plan::window_task_executor_plan_pack(
+            window_plan,
+            &by_value_plan)) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    configure_multi_gpu_window_task_executor_once<
+        ReduceApply,
+        ChunkBytes,
+        StageDepth,
+        ByValueMaxTasks,
+        MaxPeers,
+        FillDepth,
+        LoadFillDepth,
+        SmallTaskBytes>(
+            device,
+            error_prefix);
+
+    return launch_multi_gpu_window_task_executor_sm90<
+        ReduceApply,
+        ChunkBytes,
+        StageDepth,
+        ByValueMaxTasks,
+        MaxPeers,
+        FillDepth,
+        LoadFillDepth,
+        SmallTaskBytes>(
+            by_value_plan,
+            num_blocks,
+            threads,
+            dynamic_shared_bytes,
+            stream,
+            local_ready_signal,
+            ready_plan,
+            collective_epoch,
+            cta_barrier_counter,
+            cta_barrier_start);
+}
+
+
+template <
+    typename ReduceApply,
+    int ChunkBytes,
+    int StageDepth,
+    int MaxSourceTasks,
+    int MaxPeers,
+    int FillDepth = StageDepth / 2,
+    int LoadFillDepth = FillDepth,
+    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
+    const comm::plan::WindowTaskExecutorPlan<MaxSourceTasks>& window_plan,
+    int num_blocks,
+    int threads,
+    size_t dynamic_shared_bytes,
+    cudaStream_t stream,
+    int device,
+    int* local_ready_signal,
+    MultiGpuReadySignalPlan<MaxPeers> ready_plan,
+    int collective_epoch,
+    const char* error_prefix,
+    unsigned int* cta_barrier_counter = nullptr,
+    unsigned int cta_barrier_start = 0u) {
+    if (window_plan.total_tasks < 0 ||
+        window_plan.total_tasks > MaxSourceTasks) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    if (window_plan.total_tasks <=
+        comm::plan::kTmaMultiGpuByValueCapacity16) {
+        return pack_configure_launch_multi_gpu_window_task_executor_sm90<
+            comm::plan::kTmaMultiGpuByValueCapacity16,
+            ReduceApply,
+            ChunkBytes,
+            StageDepth,
+            MaxSourceTasks,
+            MaxPeers,
+            FillDepth,
+            LoadFillDepth,
+            SmallTaskBytes>(
+                window_plan,
+                num_blocks,
+                threads,
+                dynamic_shared_bytes,
+                stream,
+                device,
+                local_ready_signal,
+                ready_plan,
+                collective_epoch,
+                error_prefix,
+                cta_barrier_counter,
+                cta_barrier_start);
+    }
+
+    if (window_plan.total_tasks <=
+        comm::plan::kTmaMultiGpuByValueCapacity32) {
+        return pack_configure_launch_multi_gpu_window_task_executor_sm90<
+            comm::plan::kTmaMultiGpuByValueCapacity32,
+            ReduceApply,
+            ChunkBytes,
+            StageDepth,
+            MaxSourceTasks,
+            MaxPeers,
+            FillDepth,
+            LoadFillDepth,
+            SmallTaskBytes>(
+                window_plan,
+                num_blocks,
+                threads,
+                dynamic_shared_bytes,
+                stream,
+                device,
+                local_ready_signal,
+                ready_plan,
+                collective_epoch,
+                error_prefix,
+                cta_barrier_counter,
+                cta_barrier_start);
+    }
+
+    if (window_plan.total_tasks <=
+        comm::plan::kTmaMultiGpuByValueCapacity64) {
+        return pack_configure_launch_multi_gpu_window_task_executor_sm90<
+            comm::plan::kTmaMultiGpuByValueCapacity64,
+            ReduceApply,
+            ChunkBytes,
+            StageDepth,
+            MaxSourceTasks,
+            MaxPeers,
+            FillDepth,
+            LoadFillDepth,
+            SmallTaskBytes>(
+                window_plan,
+                num_blocks,
+                threads,
+                dynamic_shared_bytes,
+                stream,
+                device,
+                local_ready_signal,
+                ready_plan,
+                collective_epoch,
+                error_prefix,
+                cta_barrier_counter,
+                cta_barrier_start);
+    }
+
+    if (window_plan.total_tasks <=
+        comm::plan::kTmaMultiGpuByValueCapacity128) {
+        return pack_configure_launch_multi_gpu_window_task_executor_sm90<
+            comm::plan::kTmaMultiGpuByValueCapacity128,
+            ReduceApply,
+            ChunkBytes,
+            StageDepth,
+            MaxSourceTasks,
+            MaxPeers,
+            FillDepth,
+            LoadFillDepth,
+            SmallTaskBytes>(
+                window_plan,
+                num_blocks,
+                threads,
+                dynamic_shared_bytes,
+                stream,
+                device,
+                local_ready_signal,
+                ready_plan,
+                collective_epoch,
+                error_prefix,
+                cta_barrier_counter,
+                cta_barrier_start);
+    }
+
+    return cudaErrorInvalidConfiguration;
 }
 
 } // namespace kernels

@@ -116,17 +116,8 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
 
     constexpr int MaxLoweringTasks =
         comm::plan::kTmaMultiGpuReduceScatterMaxWindowTasks;
-    constexpr int MaxByValueTasks =
-        comm::plan::kTmaMultiGpuByValueMaxWindowTasks;
     constexpr int MaxPeers =
         comm::plan::kTmaMultiGpuReduceScatterMaxPeers;
-
-    using ByValuePlan =
-        comm::plan::WindowTaskExecutorPlan<MaxByValueTasks>;
-
-    static_assert(
-        sizeof(ByValuePlan) <= 16 * 1024,
-        "reduce-scatter by-value plan unexpectedly exceeds 16 KiB");
 
     constexpr int MaxRanks =
         kOoMaxLocalDevices;
@@ -253,7 +244,6 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
     /* OOVERLAP_ALL_COLLECTIVES_PLAN_BY_VALUE_V1 */
     static thread_local
         comm::plan::WindowTaskExecutorPlan<MaxLoweringTasks> window_plan;
-    static thread_local ByValuePlan by_value_plan;
 
     int num_blocks = 0;
 
@@ -285,41 +275,26 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
         return cudaSuccess;
     }
 
-    if (!comm::plan::window_task_executor_plan_pack(
-            window_plan,
-            &by_value_plan)) {
-        return cudaErrorInvalidConfiguration;
-    }
-
     system::runtime::set_device(launch.local_device);
 
-    comm::kernels::configure_multi_gpu_window_task_executor_once<
+    return comm::kernels::dispatch_multi_gpu_window_task_executor_by_value_sm90<
         ReduceApply,
         ChunkBytes,
         StageDepth,
-        MaxByValueTasks,
+        MaxLoweringTasks,
         MaxPeers,
         Variant::fill_depth,
         Variant::load_fill_depth>(
-            launch.local_device,
-            "tma_multi_gpu_reduce_scatter(by-value): requested shared memory exceeds opt-in limit");
-
-    return comm::kernels::launch_multi_gpu_window_task_executor_sm90<
-        ReduceApply,
-        ChunkBytes,
-        StageDepth,
-        MaxByValueTasks,
-        MaxPeers,
-        Variant::fill_depth,
-        Variant::load_fill_depth>(
-            by_value_plan,
+            window_plan,
             num_blocks,
             launch_config.threads,
             Variant::dynamic_shared_bytes,
             stream,
+            launch.local_device,
             launch.local_ready_signal,
             ready_plan,
-            launch.collective_epoch);
+            launch.collective_epoch,
+            "tma_multi_gpu_reduce_scatter(by-value): requested shared memory exceeds opt-in limit");
 }
 
 template <

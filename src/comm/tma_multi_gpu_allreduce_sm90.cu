@@ -281,17 +281,8 @@ cudaError_t launch_allreduce_rank_variant_sm90(
 
     constexpr int MaxLoweringTasks =
         comm::plan::kTmaMultiGpuAllReduceMaxWindowTasks;
-    constexpr int MaxByValueTasks =
-        comm::plan::kTmaMultiGpuByValueMaxWindowTasks;
     constexpr int MaxPeers =
         comm::plan::kTmaMultiGpuAllReduceMaxPeers;
-
-    using ByValuePlan =
-        comm::plan::WindowTaskExecutorPlan<MaxByValueTasks>;
-
-    static_assert(
-        sizeof(ByValuePlan) <= 16 * 1024,
-        "all-reduce by-value plan unexpectedly exceeds 16 KiB");
     constexpr int MaxRanks =
         kOoMaxLocalDevices;
     constexpr int MaxStagingSlots = kOoMaxStagingSlots;
@@ -437,7 +428,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
      */
     static thread_local
         comm::plan::WindowTaskExecutorPlan<MaxLoweringTasks> window_plan;
-    static thread_local ByValuePlan by_value_plan;
 
     comm::kernels::CtaBarrierScratch cta_barrier_scratch{};
 
@@ -489,16 +479,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         return cudaSuccess;
     }
 
-    if (!comm::plan::window_task_executor_plan_pack(
-            window_plan,
-            &by_value_plan)) {
-        /*
-         * Deliberately fail instead of silently lowering with fewer CTAs.
-         * Every launch in this build must use the by-value executor.
-         */
-        return cudaErrorInvalidConfiguration;
-    }
-
     const unsigned int cta_barrier_final_value =
         final_cta_barrier_counter_value(
             window_plan,
@@ -514,34 +494,25 @@ cudaError_t launch_allreduce_rank_variant_sm90(
 
     system::runtime::set_device(launch.local_device);
 
-    comm::kernels::configure_multi_gpu_window_task_executor_once<
-        ReduceApply,
-        ChunkBytes,
-        StageDepth,
-        MaxByValueTasks,
-        MaxPeers,
-        Variant::fill_depth,
-        Variant::load_fill_depth>(
-            launch.local_device,
-            "tma_multi_gpu_allreduce(by-value): requested shared memory exceeds opt-in limit");
-
     const cudaError_t launch_error =
-        comm::kernels::launch_multi_gpu_window_task_executor_sm90<
+        comm::kernels::dispatch_multi_gpu_window_task_executor_by_value_sm90<
             ReduceApply,
             ChunkBytes,
             StageDepth,
-            MaxByValueTasks,
+            MaxLoweringTasks,
             MaxPeers,
             Variant::fill_depth,
             Variant::load_fill_depth>(
-                by_value_plan,
+                window_plan,
                 num_blocks,
                 launch_config.threads,
                 Variant::dynamic_shared_bytes,
                 stream,
+                launch.local_device,
                 launch.local_ready_signal,
                 ready_plan,
                 launch.collective_epoch,
+                "tma_multi_gpu_allreduce(by-value): requested shared memory exceeds opt-in limit",
                 cta_barrier_scratch.counter,
                 cta_barrier_start);
 
