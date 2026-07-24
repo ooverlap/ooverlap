@@ -28,7 +28,7 @@
 // Fast global-memory copy path remains compile-time for now.
 #define TMA_TWO_GPU_PEER_FAST_COPY_UNROLL 16
 
-#define TMA_TWO_GPU_PEER_SMALL_TASK_BYTES (8 * 1024)
+#define TMA_TWO_GPU_PEER_SMALL_TASK_BYTES (32 * 1024)
 
 #define TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS 4
 

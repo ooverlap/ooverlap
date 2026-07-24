@@ -11,6 +11,7 @@
 #include "comm/utils/utils.h"
 #include "comm/params.h"
 
+#include <cstdio>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -1323,13 +1324,6 @@ __device__ void copy_window_range_tma_fanout(
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
     static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
-    if (begin_window >= end_window ||
-        window_chunks <= 0 ||
-        total_bytes == 0 ||
-        fanout_dst_count <= 0) {
-        return;
-    }
-
     if (SmallTaskBytes > 0) {
         const ByteRange byte_range =
             byte_range_for_window_range<ChunkBytes>(
@@ -1420,13 +1414,6 @@ __device__ void reduce_window_range_tma_fanout(
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
     static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
-
-    if (begin_window >= end_window ||
-        window_chunks <= 0 ||
-        total_bytes == 0 ||
-        fanout_dst_count <= 0) {
-        return;
-    }
 
     if (SmallTaskBytes > 0) {
         const ByteRange byte_range =
@@ -1586,12 +1573,6 @@ __device__ void run_window_range_signal(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-
-    if (begin_window >= end_window ||
-        window_chunks <= 0 ||
-        total_bytes == 0) {
-        return;
-    }
 
     static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 

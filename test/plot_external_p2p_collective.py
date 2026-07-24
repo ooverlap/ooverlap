@@ -177,53 +177,47 @@ def cta_suffix(cta_limit: Optional[int], show: bool) -> str:
     return " unrestricted" if cta_limit is None else f" ({cta_limit} CTAs)"
 
 
-def plot_combined(
-    rows: List[Dict[str, object]],
-    tp: int,
-    output_path: Path,
-) -> None:
-    del tp  # TP belongs in the paper caption, not in the figure title.
+# OOVERLAP_EXTERNAL_PLOT_PAIRED_TP_V1
+METRIC_SPECS = (
+    (
+        "bandwidth",
+        "t_ccl_bandwidth_gbps",
+        "nccl_bandwidth_gbps",
+        "nccl_symmetric_bandwidth_gbps",
+        "AlgoBW (GB/s)",
+    ),
+    (
+        "latency",
+        "t_ccl_latency_us",
+        "nccl_latency_us",
+        "nccl_symmetric_latency_us",
+        "Latency (µs)",
+    ),
+)
 
+
+def prepare_plot_data(rows: List[Dict[str, object]]):
     grouped_by_metric = {
         "bandwidth": group_rows(rows, "bandwidth"),
         "latency": group_rows(rows, "latency"),
     }
-    cta_values = sorted(
-        {
-            cta
-            for grouped in grouped_by_metric.values()
-            for collective_rows in grouped.values()
-            for cta in collective_rows
-        },
-        key=lambda value: (-1 if value is None else value),
-    )
-    show_cta_in_legend = len(cta_values) > 1
+    cta_values = {
+        cta
+        for grouped in grouped_by_metric.values()
+        for collective_rows in grouped.values()
+        for cta in collective_rows
+    }
+    return grouped_by_metric, len(cta_values) > 1
 
-    metric_specs = (
-        (
-            "bandwidth",
-            "t_ccl_bandwidth_gbps",
-            "nccl_bandwidth_gbps",
-            "nccl_symmetric_bandwidth_gbps",
-            "AlgoBW (GB/s)",
-        ),
-        (
-            "latency",
-            "t_ccl_latency_us",
-            "nccl_latency_us",
-            "nccl_symmetric_latency_us",
-            "Latency (µs)",
-        ),
-    )
 
-    fig, axes = plt.subplots(
-        nrows=2,
-        ncols=3,
-        figsize=(15, 7.6),
-        sharex=False,
-    )
-
-    legend_by_label = {}
+def plot_tp_group(
+    rows: List[Dict[str, object]],
+    axes,
+    legend_by_label: Dict[str, object],
+    *,
+    show_ylabels: bool,
+) -> None:
+    grouped_by_metric, show_cta_in_legend = prepare_plot_data(rows)
 
     for row_idx, (
         metric,
@@ -231,7 +225,7 @@ def plot_combined(
         nccl_key,
         symmetric_key,
         ylabel,
-    ) in enumerate(metric_specs):
+    ) in enumerate(METRIC_SPECS):
         grouped = grouped_by_metric[metric]
 
         for col_idx, collective in enumerate(COLLECTIVES):
@@ -284,19 +278,10 @@ def plot_combined(
                 legend_by_label.setdefault(label, handle)
 
             x_ticks = [int(row["bytes"]) for row in first_rows]
-            labeled_tick_indices = set(range(0, len(x_ticks), 1))
-            if x_ticks:
-                labeled_tick_indices.add(len(x_ticks) - 1)
-
             axis.set_xscale("log", base=2)
             axis.set_xticks(x_ticks)
             axis.set_xticklabels(
-                [
-                    format_size_bytes(value)
-                    if index in labeled_tick_indices
-                    else ""
-                    for index, value in enumerate(x_ticks)
-                ],
+                [format_size_bytes(value) for value in x_ticks],
                 rotation=90,
                 ha="center",
             )
@@ -304,11 +289,11 @@ def plot_combined(
 
             if row_idx == 0:
                 axis.set_title(COLLECTIVE_TITLES[collective], fontsize=12)
-            if col_idx == 0:
+            if show_ylabels and col_idx == 0:
                 axis.set_ylabel(ylabel)
 
-    fig.supxlabel("Buffer size", y=0.022)
 
+def add_figure_legend(fig, legend_by_label: Dict[str, object], y: float) -> None:
     legend_labels = list(legend_by_label)
     legend_handles = [legend_by_label[label] for label in legend_labels]
     fig.legend(
@@ -316,11 +301,38 @@ def plot_combined(
         legend_labels,
         loc="upper center",
         ncol=min(len(legend_labels), 6),
-        bbox_to_anchor=(0.5, 0.988),
+        bbox_to_anchor=(0.5, y),
         frameon=False,
         handlelength=2.0,
         columnspacing=1.25,
     )
+
+
+def save_figure(fig, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {output_path}")
+
+
+def plot_combined(
+    rows: List[Dict[str, object]],
+    tp: int,
+    output_path: Path,
+) -> None:
+    del tp  # TP belongs in the paper caption, not in the standalone figure title.
+
+    fig, axes = plt.subplots(
+        nrows=2,
+        ncols=3,
+        figsize=(15, 7.6),
+        sharex=False,
+    )
+    legend_by_label: Dict[str, object] = {}
+    plot_tp_group(rows, axes, legend_by_label, show_ylabels=True)
+
+    fig.supxlabel("Buffer size", y=0.022)
+    add_figure_legend(fig, legend_by_label, 0.988)
     fig.subplots_adjust(
         left=0.06,
         right=0.995,
@@ -329,47 +341,212 @@ def plot_combined(
         wspace=0.18,
         hspace=0.22,
     )
+    save_figure(fig, output_path)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    print(f"[plot] wrote {output_path}")
+
+def plot_paired_tp(
+    left_rows: List[Dict[str, object]],
+    left_tp: int,
+    right_rows: List[Dict[str, object]],
+    right_tp: int,
+    output_path: Path,
+) -> None:
+    fig = plt.figure(figsize=(15.5, 5.4))
+    outer = fig.add_gridspec(nrows=1, ncols=2, wspace=0.065)
+
+    group_axes = []
+    for group_idx in range(2):
+        inner = outer[group_idx].subgridspec(
+            nrows=2,
+            ncols=3,
+            wspace=0.16,
+            hspace=0.22,
+        )
+        group_axes.append(
+            [
+                [fig.add_subplot(inner[row_idx, col_idx]) for col_idx in range(3)]
+                for row_idx in range(2)
+            ]
+        )
+
+    legend_by_label: Dict[str, object] = {}
+    plot_tp_group(
+        left_rows,
+        group_axes[0],
+        legend_by_label,
+        show_ylabels=False,
+    )
+    plot_tp_group(
+        right_rows,
+        group_axes[1],
+        legend_by_label,
+        show_ylabels=False,
+    )
+
+    fig.subplots_adjust(
+        left=0.045,
+        right=0.995,
+        bottom=0.17,
+        top=0.80,
+    )
+
+    for axes, tp in zip(group_axes, (left_tp, right_tp)):
+        group_left = axes[0][0].get_position().x0
+        group_right = axes[0][-1].get_position().x1
+        fig.text(
+            (group_left + group_right) / 2.0,
+            0.865,
+            f"TP={tp}",
+            ha="center",
+            va="center",
+            fontsize=13,
+            fontweight="semibold",
+        )
+
+    fig.text(
+        0.012,
+        0.64,
+        "AlgoBW (GB/s)",
+        rotation=90,
+        ha="center",
+        va="center",
+    )
+    fig.text(
+        0.012,
+        0.315,
+        "Latency (µs)",
+        rotation=90,
+        ha="center",
+        va="center",
+    )
+    fig.supxlabel("Buffer size", y=0.025)
+    add_figure_legend(fig, legend_by_label, 0.995)
+    save_figure(fig, output_path)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot external-P2P collective latency and bandwidth in one figure"
+        description=(
+            "Plot one external-P2P TP sweep or combine two TP sweeps in one figure"
+        )
     )
-    parser.add_argument("--text", required=True, help="Sweep tab-separated text file")
+    parser.add_argument(
+        "--text",
+        default=None,
+        help="Single-TP sweep tab-separated text file.",
+    )
     parser.add_argument(
         "--tp",
         type=int,
         default=None,
-        help="Tensor-parallel size. If omitted, infer it from a tpN path component.",
+        help="Single-TP size. If omitted, infer it from a tpN path component.",
+    )
+    parser.add_argument(
+        "--left-text",
+        default=None,
+        help="Left TP-group sweep text file for paired mode.",
+    )
+    parser.add_argument(
+        "--left-tp",
+        type=int,
+        default=None,
+        help="Left TP-group size. If omitted, infer it from the path.",
+    )
+    parser.add_argument(
+        "--right-text",
+        default=None,
+        help="Right TP-group sweep text file for paired mode.",
+    )
+    parser.add_argument(
+        "--right-tp",
+        type=int,
+        default=None,
+        help="Right TP-group size. If omitted, infer it from the path.",
     )
     parser.add_argument(
         "--out-prefix",
         default=None,
-        help="Output prefix. Defaults to the input path without its .txt suffix.",
+        help=(
+            "Output prefix. In single mode, defaults to the input path without "
+            "its suffix. In paired mode, defaults beside the left input."
+        ),
     )
     return parser.parse_args()
 
 
+def resolve_tp(path: Path, explicit_tp: Optional[int], option_name: str) -> int:
+    tp = explicit_tp if explicit_tp is not None else infer_tp(path)
+    if tp is None or tp < 2:
+        raise PlotInputError(
+            f"{option_name} must be at least 2 or inferable from a tpN path"
+        )
+    return tp
+
+
 def main() -> int:
     args = parse_args()
-    text_path = Path(args.text).expanduser().resolve()
-    tp = args.tp if args.tp is not None else infer_tp(text_path)
-    if tp is None or tp < 2:
-        raise PlotInputError("--tp must be at least 2 or inferable from a tpN path")
+
+    single_options_used = args.text is not None or args.tp is not None
+    paired_options_used = any(
+        value is not None
+        for value in (
+            args.left_text,
+            args.left_tp,
+            args.right_text,
+            args.right_tp,
+        )
+    )
+
+    if single_options_used and paired_options_used:
+        raise PlotInputError(
+            "use either --text/--tp or --left-text/--right-text, not both"
+        )
+
+    if args.text is not None:
+        text_path = Path(args.text).expanduser().resolve()
+        tp = resolve_tp(text_path, args.tp, "--tp")
+        out_prefix = (
+            Path(args.out_prefix).expanduser().resolve()
+            if args.out_prefix
+            else text_path.with_suffix("")
+        )
+        plot_combined(load_rows(text_path), tp, Path(f"{out_prefix}.png"))
+        return 0
+
+    if args.tp is not None:
+        raise PlotInputError("--tp requires --text")
+
+    if not paired_options_used:
+        raise PlotInputError(
+            "provide --text for single mode or both --left-text and --right-text "
+            "for paired mode"
+        )
+
+    if args.left_text is None or args.right_text is None:
+        raise PlotInputError(
+            "paired mode requires both --left-text and --right-text"
+        )
+
+    left_path = Path(args.left_text).expanduser().resolve()
+    right_path = Path(args.right_text).expanduser().resolve()
+    left_tp = resolve_tp(left_path, args.left_tp, "--left-tp")
+    right_tp = resolve_tp(right_path, args.right_tp, "--right-tp")
 
     out_prefix = (
         Path(args.out_prefix).expanduser().resolve()
         if args.out_prefix
-        else text_path.with_suffix("")
+        else left_path.with_name(
+            f"{left_path.stem}_tp{left_tp}_tp{right_tp}_combined"
+        )
     )
-    rows = load_rows(text_path)
 
-    plot_combined(rows, tp, Path(f"{out_prefix}.png"))
+    plot_paired_tp(
+        load_rows(left_path),
+        left_tp,
+        load_rows(right_path),
+        right_tp,
+        Path(f"{out_prefix}.png"),
+    )
     return 0
 
 
