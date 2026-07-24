@@ -297,8 +297,8 @@ def plot_combined(
                     else ""
                     for index, value in enumerate(x_ticks)
                 ],
-                rotation=25,
-                ha="right",
+                rotation=90,
+                ha="center",
             )
             axis.grid(True, which="both", linestyle="--", alpha=0.35)
 
