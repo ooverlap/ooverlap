@@ -6,19 +6,24 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace ooverlap {
 namespace comm {
 namespace task {
 
-constexpr int kWindowTaskMaxCtas = 64;
+constexpr int kWindowTaskMaxCtas = TMA_TWO_GPU_PEER_MAX_CTAS;
 
-using WindowTaskCtaMask = uint64_t;
+using WindowTaskCtaMask = std::uint32_t;
+using WindowTaskByteCount = std::uint32_t;
 
-constexpr WindowTaskCtaMask kWindowTaskAllCtas = ~WindowTaskCtaMask{0};
+constexpr WindowTaskCtaMask kWindowTaskAllCtas =
+    ~WindowTaskCtaMask{0};
+constexpr WindowTaskByteCount kWindowTaskMaxBytes =
+    ~WindowTaskByteCount{0};
 
-/* OOVERLAP_WINDOW_TASK_SIGNAL_COMPACTION_V1 */
-enum class WindowTaskOp : uint8_t {
+/* OOVERLAP_WINDOW_TASK_UNION_COMPACTION_V1 */
+enum class WindowTaskOp : std::uint8_t {
     None = 0,
 
     /* TMA load from task.src, then reduce/apply into task.dst. */
@@ -40,48 +45,60 @@ enum class WindowTaskOp : uint8_t {
     Barrier = 13,
 };
 
+struct WindowTaskWindowPayload {
+    const void* src;
+    void* dst;
+    WindowTaskByteCount total_bytes;
+    int begin_window;
+    int end_window;
+    int window_chunks;
+};
+
+struct WindowTaskFanoutPayload {
+    const void* src;
+    void* fanout_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS];
+    WindowTaskByteCount total_bytes;
+    int begin_window;
+    int end_window;
+    int window_chunks;
+    std::uint8_t fanout_dst_count;
+    std::uint8_t fanout_reduce_scope
+        [TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS];
+};
+
+struct WindowTaskReadyPayload {
+    int* ready_signal;
+    const int* ready_wait_signal;
+    int ready_epoch;
+    int ready_protocol;
+    int ready_wait_epoch;
+    int ready_owner_cta;
+};
+
+union WindowTaskPayload {
+    WindowTaskWindowPayload window;
+    WindowTaskFanoutPayload fanout;
+    WindowTaskReadyPayload ready;
+    std::uint32_t barrier_target;
+
+    __host__ __device__ constexpr WindowTaskPayload()
+        : window{} {}
+};
+
 struct WindowTask {
     WindowTaskOp op = WindowTaskOp::None;
-
-    WindowTaskCtaMask cta_mask = kWindowTaskAllCtas;
-
-    uint32_t barrier_target = 0;
-
-    const void* src = nullptr;
-    void* dst = nullptr;
-    
-    void* fanout_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
-    uint8_t fanout_dst_count = 0;
-    uint8_t fanout_reduce_scope[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
-
-    /*
-     * total_bytes is the logical span of src/dst. Window indices are absolute
-     * over this span:
-     *
-     *   byte_begin = begin_window * window_chunks * ChunkBytes
-     *   byte_end   = end_window   * window_chunks * ChunkBytes
-     */
-    size_t total_bytes = 0;
-
-    int begin_window = 0;
-    int end_window = 0;
-    int window_chunks = 0;
-
-    /* Ready-signal state used by ReadyPublish/ReadyWait tasks. */
-    int* ready_signal = nullptr;
-    const int* ready_wait_signal = nullptr;
-
-    int ready_epoch = 0;
-    int ready_protocol = 0;
-    int ready_wait_epoch = 0;
-    int ready_owner_cta = 0;
-
-    /*
-     * terminal means: after this task, the CTA returns and does not execute
-     * more tasks in its stripe.
-     */
     bool terminal = false;
+    WindowTaskCtaMask cta_mask = kWindowTaskAllCtas;
+    WindowTaskPayload payload{};
 };
+
+static_assert(
+    std::is_trivially_copyable<WindowTask>::value,
+    "WindowTask must remain trivially copyable for by-value kernel launch");
+static_assert(
+    sizeof(WindowTask) <= 80,
+    "WindowTask union compaction unexpectedly exceeds 80 bytes");
+
 
 /*
  * Static CTA assignment for one lowered WindowTask.
@@ -104,10 +121,10 @@ __host__ __device__ __forceinline__ bool window_task_runs_on_cta(
 }
 
 __host__ __device__ __forceinline__ WindowTask make_barrier_task(
-    uint32_t barrier_target) {
+    std::uint32_t barrier_target) {
     WindowTask task{};
     task.op = WindowTaskOp::Barrier;
-    task.barrier_target = barrier_target;
+    task.payload.barrier_target = barrier_target;
     return task;
 }
 
@@ -121,14 +138,22 @@ __host__ __device__ __forceinline__ WindowTask make_window_task(
     int window_chunks,
     bool terminal = false) {
     WindowTask task{};
+
+    if (total_bytes >
+        static_cast<size_t>(kWindowTaskMaxBytes)) {
+        return task;
+    }
+
     task.op = op;
-    task.src = src;
-    task.dst = dst;
-    task.total_bytes = total_bytes;
-    task.begin_window = begin_window;
-    task.end_window = end_window;
-    task.window_chunks = window_chunks;
     task.terminal = terminal;
+    task.payload.window = WindowTaskWindowPayload{
+        src,
+        dst,
+        static_cast<WindowTaskByteCount>(total_bytes),
+        begin_window,
+        end_window,
+        window_chunks,
+    };
     return task;
 }
 
@@ -186,16 +211,12 @@ __host__ __device__ __forceinline__ WindowTask make_copy_tma_fanout_task(
     int end_window,
     int window_chunks,
     bool terminal = false) {
-    WindowTask task =
-        make_window_task(
-            WindowTaskOp::CopyTMAFanout,
-            src,
-            nullptr,
-            total_bytes,
-            begin_window,
-            end_window,
-            window_chunks,
-            terminal);
+    WindowTask task{};
+
+    if (total_bytes >
+        static_cast<size_t>(kWindowTaskMaxBytes)) {
+        return task;
+    }
 
     if (fanout_dst_count < 0) {
         fanout_dst_count = 0;
@@ -205,11 +226,20 @@ __host__ __device__ __forceinline__ WindowTask make_copy_tma_fanout_task(
         fanout_dst_count = TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS;
     }
 
-    task.fanout_dst_count =
-        static_cast<uint8_t>(fanout_dst_count);
+    task.op = WindowTaskOp::CopyTMAFanout;
+    task.terminal = terminal;
+    task.payload.fanout = WindowTaskFanoutPayload{};
+    task.payload.fanout.src = src;
+    task.payload.fanout.total_bytes =
+        static_cast<WindowTaskByteCount>(total_bytes);
+    task.payload.fanout.begin_window = begin_window;
+    task.payload.fanout.end_window = end_window;
+    task.payload.fanout.window_chunks = window_chunks;
+    task.payload.fanout.fanout_dst_count =
+        static_cast<std::uint8_t>(fanout_dst_count);
 
     for (int i = 0; i < fanout_dst_count; ++i) {
-        task.fanout_dsts[i] =
+        task.payload.fanout.fanout_dsts[i] =
             fanout_dsts != nullptr ? fanout_dsts[i] : nullptr;
     }
 
@@ -226,16 +256,12 @@ __host__ __device__ __forceinline__ WindowTask make_reduce_tma_fanout_task(
     int end_window,
     int window_chunks,
     bool terminal = false) {
-    WindowTask task =
-        make_window_task(
-            WindowTaskOp::ReduceTMAFanout,
-            src,
-            nullptr,
-            total_bytes,
-            begin_window,
-            end_window,
-            window_chunks,
-            terminal);
+    WindowTask task{};
+
+    if (total_bytes >
+        static_cast<size_t>(kWindowTaskMaxBytes)) {
+        return task;
+    }
 
     if (fanout_dst_count < 0) {
         fanout_dst_count = 0;
@@ -245,20 +271,23 @@ __host__ __device__ __forceinline__ WindowTask make_reduce_tma_fanout_task(
         fanout_dst_count = TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS;
     }
 
-    task.fanout_dst_count =
-        static_cast<uint8_t>(fanout_dst_count);
+    task.op = WindowTaskOp::ReduceTMAFanout;
+    task.terminal = terminal;
+    task.payload.fanout = WindowTaskFanoutPayload{};
+    task.payload.fanout.src = src;
+    task.payload.fanout.total_bytes =
+        static_cast<WindowTaskByteCount>(total_bytes);
+    task.payload.fanout.begin_window = begin_window;
+    task.payload.fanout.end_window = end_window;
+    task.payload.fanout.window_chunks = window_chunks;
+    task.payload.fanout.fanout_dst_count =
+        static_cast<std::uint8_t>(fanout_dst_count);
 
     for (int i = 0; i < fanout_dst_count; ++i) {
-        task.fanout_dsts[i] =
+        task.payload.fanout.fanout_dsts[i] =
             fanout_dsts != nullptr ? fanout_dsts[i] : nullptr;
-
-        /*
-         * Keep the scope value as an integer here so window_task.cuh does not
-         * need to include tma_reduce.cuh. The fanout pipeline will cast it back
-         * to tma::TmaReduceScope when it builds runtime reduce targets.
-         */
-        task.fanout_reduce_scope[i] =
-            static_cast<uint8_t>(
+        task.payload.fanout.fanout_reduce_scope[i] =
+            static_cast<std::uint8_t>(
                 fanout_reduce_scope != nullptr
                     ? fanout_reduce_scope[i]
                     : 0);
@@ -294,10 +323,11 @@ __host__ __device__ __forceinline__ WindowTask make_ready_publish_task(
     bool terminal = false) {
     WindowTask task{};
     task.op = WindowTaskOp::ReadyPublish;
-    task.ready_signal = ready_signal;
-    task.ready_epoch = epoch;
-    task.ready_protocol = protocol;
     task.terminal = terminal;
+    task.payload.ready = WindowTaskReadyPayload{};
+    task.payload.ready.ready_signal = ready_signal;
+    task.payload.ready.ready_epoch = epoch;
+    task.payload.ready.ready_protocol = protocol;
     return task;
 }
 
@@ -307,14 +337,15 @@ __host__ __device__ __forceinline__ WindowTask make_ready_wait_task(
     bool terminal = false) {
     WindowTask task{};
     task.op = WindowTaskOp::ReadyWait;
-    task.ready_signal = const_cast<int*>(ready_signal);
-    task.ready_epoch = epoch;
     task.terminal = terminal;
+    task.payload.ready = WindowTaskReadyPayload{};
+    task.payload.ready.ready_signal =
+        const_cast<int*>(ready_signal);
+    task.payload.ready.ready_epoch = epoch;
     return task;
 }
 
-
-/* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: maker for merged consecutive ReadyPublish + ReadyWait. */
+/* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH */
 __host__ __device__ __forceinline__ WindowTask make_ready_publish_wait_task(
     int* publish_signal,
     int publish_epoch,
@@ -325,46 +356,57 @@ __host__ __device__ __forceinline__ WindowTask make_ready_publish_wait_task(
     bool terminal = false) {
     WindowTask task{};
     task.op = WindowTaskOp::ReadyPublishWait;
-    task.ready_signal = publish_signal;
-    task.ready_epoch = publish_epoch;
-    task.ready_protocol = publish_protocol;
-    task.ready_wait_signal = wait_signal;
-    task.ready_wait_epoch = wait_epoch;
-    task.ready_owner_cta = owner_cta;
     task.terminal = terminal;
+    task.payload.ready = WindowTaskReadyPayload{};
+    task.payload.ready.ready_signal = publish_signal;
+    task.payload.ready.ready_epoch = publish_epoch;
+    task.payload.ready.ready_protocol = publish_protocol;
+    task.payload.ready.ready_wait_signal = wait_signal;
+    task.payload.ready.ready_wait_epoch = wait_epoch;
+    task.payload.ready.ready_owner_cta = owner_cta;
     return task;
 }
 
 __host__ __device__ __forceinline__ bool window_task_has_work(
     const WindowTask& task) {
-    if (task.op == WindowTaskOp::ReadyPublishWait) {
-        return task.ready_signal != nullptr &&
-               task.ready_epoch > 0 &&
-               task.ready_wait_signal != nullptr &&
-               task.ready_wait_epoch > 0;
-    }
+    switch (task.op) {
+        case WindowTaskOp::ReadyPublishWait:
+            return task.payload.ready.ready_signal != nullptr &&
+                   task.payload.ready.ready_epoch > 0 &&
+                   task.payload.ready.ready_wait_signal != nullptr &&
+                   task.payload.ready.ready_wait_epoch > 0;
 
-    if (task.op == WindowTaskOp::ReadyPublish ||
-        task.op == WindowTaskOp::ReadyWait) {
-        return task.ready_signal != nullptr &&
-               task.ready_epoch > 0;
-    }
+        case WindowTaskOp::ReadyPublish:
+        case WindowTaskOp::ReadyWait:
+            return task.payload.ready.ready_signal != nullptr &&
+                   task.payload.ready.ready_epoch > 0;
 
-    if (task.op == WindowTaskOp::CopyTMAFanout ||
-        task.op == WindowTaskOp::ReduceTMAFanout) {
-        return task.src != nullptr &&
-               task.fanout_dst_count > 0 &&
-               task.total_bytes > 0 &&
-               task.window_chunks > 0 &&
-               task.begin_window < task.end_window;
-    }
+        case WindowTaskOp::CopyTMAFanout:
+        case WindowTaskOp::ReduceTMAFanout:
+            return task.payload.fanout.src != nullptr &&
+                   task.payload.fanout.fanout_dst_count > 0 &&
+                   task.payload.fanout.total_bytes > 0 &&
+                   task.payload.fanout.window_chunks > 0 &&
+                   task.payload.fanout.begin_window <
+                       task.payload.fanout.end_window;
 
-    return task.op != WindowTaskOp::None &&
-           task.src != nullptr &&
-           task.dst != nullptr &&
-           task.total_bytes > 0 &&
-           task.window_chunks > 0 &&
-           task.begin_window < task.end_window;
+        case WindowTaskOp::ReduceTMA:
+        case WindowTaskOp::CopyTMA:
+        case WindowTaskOp::CopyFast:
+            return task.payload.window.src != nullptr &&
+                   task.payload.window.dst != nullptr &&
+                   task.payload.window.total_bytes > 0 &&
+                   task.payload.window.window_chunks > 0 &&
+                   task.payload.window.begin_window <
+                       task.payload.window.end_window;
+
+        case WindowTaskOp::Barrier:
+            return task.payload.barrier_target > 0;
+
+        case WindowTaskOp::None:
+        default:
+            return false;
+    }
 }
 
 } // namespace task

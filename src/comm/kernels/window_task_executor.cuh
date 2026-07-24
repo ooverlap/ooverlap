@@ -97,12 +97,12 @@ __device__ __forceinline__ void execute_window_task(
                 ReduceApply,
                 LoadFillDepth,
                 SmallTaskBytes>(
-                    task.src,
-                    task.dst,
-                    task.total_bytes,
-                    task.begin_window,
-                    task.end_window,
-                    task.window_chunks,
+                    task.payload.window.src,
+                    task.payload.window.dst,
+                    task.payload.window.total_bytes,
+                    task.payload.window.begin_window,
+                    task.payload.window.end_window,
+                    task.payload.window.window_chunks,
                     shared_raw,
                     barriers);
             return;
@@ -114,12 +114,12 @@ __device__ __forceinline__ void execute_window_task(
                 ChunkBytes,
                 LoadFillDepth,
                 SmallTaskBytes>(
-                    task.src,
-                    task.dst,
-                    task.total_bytes,
-                    task.begin_window,
-                    task.end_window,
-                    task.window_chunks,
+                    task.payload.window.src,
+                    task.payload.window.dst,
+                    task.payload.window.total_bytes,
+                    task.payload.window.begin_window,
+                    task.payload.window.end_window,
+                    task.payload.window.window_chunks,
                     shared_raw,
                     barriers);
             return;
@@ -131,13 +131,14 @@ __device__ __forceinline__ void execute_window_task(
                 ChunkBytes,
                 LoadFillDepth,
                 SmallTaskBytes>(
-                    task.src,
-                    task.fanout_dsts,
-                    static_cast<int>(task.fanout_dst_count),
-                    task.total_bytes,
-                    task.begin_window,
-                    task.end_window,
-                    task.window_chunks,
+                    task.payload.fanout.src,
+                    task.payload.fanout.fanout_dsts,
+                    static_cast<int>(
+                        task.payload.fanout.fanout_dst_count),
+                    task.payload.fanout.total_bytes,
+                    task.payload.fanout.begin_window,
+                    task.payload.fanout.end_window,
+                    task.payload.fanout.window_chunks,
                     shared_raw,
                     barriers);
             return;
@@ -150,14 +151,15 @@ __device__ __forceinline__ void execute_window_task(
                 ReduceApply,
                 LoadFillDepth,
                 SmallTaskBytes>(
-                    task.src,
-                    task.fanout_dsts,
-                    task.fanout_reduce_scope,
-                    static_cast<int>(task.fanout_dst_count),
-                    task.total_bytes,
-                    task.begin_window,
-                    task.end_window,
-                    task.window_chunks,
+                    task.payload.fanout.src,
+                    task.payload.fanout.fanout_dsts,
+                    task.payload.fanout.fanout_reduce_scope,
+                    static_cast<int>(
+                        task.payload.fanout.fanout_dst_count),
+                    task.payload.fanout.total_bytes,
+                    task.payload.fanout.begin_window,
+                    task.payload.fanout.end_window,
+                    task.payload.fanout.window_chunks,
                     shared_raw,
                     barriers);
             return;
@@ -165,18 +167,18 @@ __device__ __forceinline__ void execute_window_task(
         case task::WindowTaskOp::ReadyPublish:
             if (threadIdx.x == 0) {
                 publish_ready_signal(
-                    task.ready_signal,
-                    task.ready_epoch,
+                    task.payload.ready.ready_signal,
+                    task.payload.ready.ready_epoch,
                     static_cast<MultiGpuReadySignalProtocol>(
-                        task.ready_protocol));
+                        task.payload.ready.ready_protocol));
             }
             return;
-        
+
         case task::WindowTaskOp::ReadyWait:
             if (threadIdx.x == 0) {
                 wait_until_ready_signal_at_least(
-                    task.ready_signal,
-                    task.ready_epoch,
+                    task.payload.ready.ready_signal,
+                    task.payload.ready.ready_epoch,
                     64);
             }
             return;
@@ -185,13 +187,13 @@ __device__ __forceinline__ void execute_window_task(
             if (threadIdx.x == 0) {
                 publish_then_wait_ready_signal_for_cta(
                     static_cast<int>(blockIdx.x),
-                    task.ready_owner_cta,
-                    task.ready_signal,
-                    task.ready_epoch,
+                    task.payload.ready.ready_owner_cta,
+                    task.payload.ready.ready_signal,
+                    task.payload.ready.ready_epoch,
                     static_cast<MultiGpuReadySignalProtocol>(
-                        task.ready_protocol),
-                    task.ready_wait_signal,
-                    task.ready_wait_epoch,
+                        task.payload.ready.ready_protocol),
+                    task.payload.ready.ready_wait_signal,
+                    task.payload.ready.ready_wait_epoch,
                     64);
             }
             return;
@@ -199,13 +201,14 @@ __device__ __forceinline__ void execute_window_task(
         case task::WindowTaskOp::Barrier:
             arrive_and_wait_cta_barrier(
                 cta_barrier_counter,
-                task.barrier_target);
+                task.payload.barrier_target);
             return;
 
         case task::WindowTaskOp::None:
         default:
             return;
     }
+
 }
 
 /*

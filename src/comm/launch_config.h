@@ -146,7 +146,8 @@ __host__ __device__ __forceinline__ bool launch_config_valid_common(
         return false;
     }
 
-    if (config.max_ctas <= 0) {
+    if (config.max_ctas <= 0 ||
+        config.max_ctas > TMA_TWO_GPU_PEER_MAX_CTAS) {
         return false;
     }
 

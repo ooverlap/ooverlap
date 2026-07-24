@@ -416,7 +416,10 @@ inline bool lower_transfer_task_to_window_task(
         dst == nullptr ||
         begin_window >= end_window ||
         transfer.window_chunks <= 0 ||
-        transfer.bytes == 0) {
+        transfer.bytes == 0 ||
+        transfer.bytes >
+            static_cast<std::size_t>(
+                task::kWindowTaskMaxBytes)) {
         return false;
     }
 
@@ -520,6 +523,9 @@ inline bool lower_fanout_transfer_task_to_window_task(
         begin_window >= end_window ||
         transfer.window_chunks <= 0 ||
         transfer.bytes == 0 ||
+        transfer.bytes >
+            static_cast<std::size_t>(
+                task::kWindowTaskMaxBytes) ||
         transfer.fanout_dst_count <= 0 ||
         transfer.fanout_dst_count > TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS) {
         return false;
@@ -649,7 +655,8 @@ inline bool make_lowering_context(
         binding.current_rank >= binding.world_size ||
         binding.world_size <= 0 ||
         binding.world_size > MaxRanks ||
-        launch_config.max_ctas < 0 ||
+        launch_config.max_ctas <= 0 ||
+        launch_config.max_ctas > task::kWindowTaskMaxCtas ||
         reserved_prefix_tasks_per_cta < 0 ||
         (options.enable_reduce_cta_groups &&
          (options.max_ctas_per_reduce_task <= 0 ||

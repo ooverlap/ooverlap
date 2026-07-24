@@ -13,6 +13,7 @@
 
 #define TMA_TWO_GPU_PEER_DEFAULT_THREADS 32
 #define TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS 32
+#define TMA_TWO_GPU_PEER_MAX_CTAS 32
 #define TMA_TWO_GPU_PEER_DEFAULT_WINDOW_CHUNKS 1
 
 #define TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES (8 * 1024)
@@ -40,6 +41,9 @@ static_assert((TMA_TWO_GPU_PEER_DEFAULT_THREADS % 32) == 0,
 
 static_assert(TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS >= 1,
               "default max CTAs must be >= 1");
+static_assert(TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS <=
+                  TMA_TWO_GPU_PEER_MAX_CTAS,
+              "default max CTAs exceed WindowTask mask capacity");
 static_assert(TMA_TWO_GPU_PEER_DEFAULT_WINDOW_CHUNKS >= 1,
               "default window chunks must be >= 1");
 

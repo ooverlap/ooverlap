@@ -162,30 +162,75 @@ void debug_print_window_task_plan(
 
             std::fprintf(
                 stderr,
-                "    task[%d] local=%d op=%s(%d) "
-                "src=%p dst=%p total_bytes=%zu "
-                "begin_window=%d end_window=%d window_chunks=%d "
-                "ready_signal=%p ready_wait_signal=%p "
-                "ready_epoch=%d ready_protocol=%d "
-                "ready_wait_epoch=%d ready_owner_cta=%d "
-                "terminal=%d mask=%ld\n",
+                "    task[%d] local=%d op=%s(%d) terminal=%d mask=%u",
                 task_idx,
                 local_task,
                 debug_window_task_op_name(task.op),
                 static_cast<int>(task.op),
-                task.src,
-                task.dst,
-                task.total_bytes,
-                task.begin_window,
-                task.end_window,
-                task.window_chunks,
-                static_cast<void*>(task.ready_signal),
-                static_cast<const void*>(task.ready_wait_signal),
-                task.ready_epoch,
-                task.ready_protocol,
-                task.ready_wait_epoch,
-                task.ready_owner_cta,
-                static_cast<int>(task.terminal), static_cast<unsigned long>(task.cta_mask));
+                static_cast<int>(task.terminal),
+                static_cast<unsigned int>(task.cta_mask));
+
+            switch (task.op) {
+                case comm::task::WindowTaskOp::ReduceTMA:
+                case comm::task::WindowTaskOp::CopyTMA:
+                case comm::task::WindowTaskOp::CopyFast:
+                    std::fprintf(
+                        stderr,
+                        " src=%p dst=%p total_bytes=%u begin_window=%d end_window=%d window_chunks=%d",
+                        task.payload.window.src,
+                        task.payload.window.dst,
+                        static_cast<unsigned int>(
+                            task.payload.window.total_bytes),
+                        task.payload.window.begin_window,
+                        task.payload.window.end_window,
+                        task.payload.window.window_chunks);
+                    break;
+
+                case comm::task::WindowTaskOp::CopyTMAFanout:
+                case comm::task::WindowTaskOp::ReduceTMAFanout:
+                    std::fprintf(
+                        stderr,
+                        " src=%p fanout_count=%u total_bytes=%u begin_window=%d end_window=%d window_chunks=%d",
+                        task.payload.fanout.src,
+                        static_cast<unsigned int>(
+                            task.payload.fanout.fanout_dst_count),
+                        static_cast<unsigned int>(
+                            task.payload.fanout.total_bytes),
+                        task.payload.fanout.begin_window,
+                        task.payload.fanout.end_window,
+                        task.payload.fanout.window_chunks);
+                    break;
+
+                case comm::task::WindowTaskOp::ReadyPublish:
+                case comm::task::WindowTaskOp::ReadyWait:
+                case comm::task::WindowTaskOp::ReadyPublishWait:
+                    std::fprintf(
+                        stderr,
+                        " ready_signal=%p ready_wait_signal=%p ready_epoch=%d ready_protocol=%d ready_wait_epoch=%d ready_owner_cta=%d",
+                        static_cast<void*>(
+                            task.payload.ready.ready_signal),
+                        static_cast<const void*>(
+                            task.payload.ready.ready_wait_signal),
+                        task.payload.ready.ready_epoch,
+                        task.payload.ready.ready_protocol,
+                        task.payload.ready.ready_wait_epoch,
+                        task.payload.ready.ready_owner_cta);
+                    break;
+
+                case comm::task::WindowTaskOp::Barrier:
+                    std::fprintf(
+                        stderr,
+                        " barrier_target=%u",
+                        static_cast<unsigned int>(
+                            task.payload.barrier_target));
+                    break;
+
+                case comm::task::WindowTaskOp::None:
+                default:
+                    break;
+            }
+
+            std::fprintf(stderr, "\n");
         }
     }
 
@@ -205,7 +250,7 @@ unsigned int final_cta_barrier_counter_value(
 
     for (int i = 0; i < first_stripe_tasks; ++i) {
         if (plan.tasks[i].op == comm::task::WindowTaskOp::Barrier) {
-            value = plan.tasks[i].barrier_target;
+            value = plan.tasks[i].payload.barrier_target;
         }
     }
 
