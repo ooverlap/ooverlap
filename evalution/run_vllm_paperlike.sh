@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fixed paper-evaluation wrapper for vLLM throughput.
+# Three paper-evaluation sweeps for vLLM:
+#   1. prefill latency versus prompt length
+#   2. incremental decode latency versus output length
+#   3. decode throughput versus active-sequence limit
 #
 # Usage:
-#   ./evalution/run_vllm_paperlike.sh 2
-#   ./evalution/run_vllm_paperlike.sh 4
+#   ./evalution/run_vllm_paperlike.sh 2 [all|prefill|decode|batch|plot]
+#   ./evalution/run_vllm_paperlike.sh 4 [all|prefill|decode|batch|plot]
 #
-# Default platform/model matrix:
-#   TP=2: 2x H100, Qwen2.5-7B-Instruct
-#   TP=4: 4x GH200, Qwen2.5-72B-Instruct
-#
-# Optional overrides:
-#   VLLM_MODEL_DIR=/scratch/local/models/Qwen2.5-72B-Instruct \
-#   VLLM_OOVERLAP_RR_SLOTS=200 \
-#   VLLM_OOVERLAP_RR_CAPACITY_BYTES=67108864 \
-#   OOVERLAP_MAX_CTAS=12 \
-#   OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=4 \
-#     ./evalution/run_vllm_paperlike.sh 4
-#
-# The model, round-robin, CTA, NCCL, and offline variables are forwarded to
-# every fresh vLLM child after the generated runtime environment is sourced.
+# Useful overrides:
+#   VLLM_MODEL_DIR=/scratch/local/models/Qwen2.5-72B-Instruct
+#   VLLM_EVAL_BACKENDS=pynccl,nccl_symm,ooverlap
+#   VLLM_PLOT_INCLUDE_BACKENDS=nccl_symm,ooverlap
+#   VLLM_PLOT_EXCLUDE_BACKENDS=pynccl
+#   VLLM_EVAL_REPETITIONS=3
+#   VLLM_PREFILL_NUM_PROMPTS=8
+#   VLLM_DECODE_NUM_PROMPTS=8
+#   VLLM_BATCH_PROMPT_MULTIPLIER=4
 
 usage() {
-  echo "Usage: $0 {2|4}" >&2
+  echo "Usage: $0 {2|4} [all|prefill|decode|batch|plot]" >&2
   exit 2
 }
 
@@ -35,47 +33,45 @@ fail() {
 require_positive_integer() {
   local name="$1"
   local value="$2"
-
   if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
     fail "$name must be a positive integer; got: $value"
   fi
 }
 
-[[ $# -eq 1 ]] || usage
+[[ $# -ge 1 && $# -le 2 ]] || usage
 WORLD_SIZE="$1"
+MODE="${2:-all}"
+case "$MODE" in
+  all|prefill|decode|batch|plot) ;;
+  *) usage ;;
+esac
 
 case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
     MODEL_REPO_ID="Qwen/Qwen2.5-7B-Instruct"
     MODEL_BASENAME="Qwen2.5-7B-Instruct"
-    MAX_MODEL_LEN="2048"
     GPU_MEMORY_UTILIZATION="0.85"
-
     DEFAULT_OOVERLAP_MAX_CTAS="8"
     DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="8"
     DEFAULT_RR_SLOTS="32"
-    DEFAULT_RR_CAPACITY_BYTES="33554432"  # 32 MiB
+    DEFAULT_RR_CAPACITY_BYTES="33554432"
     ;;
   4)
     DEVICES="0,1,2,3"
     MODEL_REPO_ID="Qwen/Qwen2.5-72B-Instruct"
     MODEL_BASENAME="Qwen2.5-72B-Instruct"
-    MAX_MODEL_LEN="2048"
     GPU_MEMORY_UTILIZATION="0.85"
-
     DEFAULT_OOVERLAP_MAX_CTAS="12"
     DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="4"
     DEFAULT_RR_SLOTS="165"
-    DEFAULT_RR_CAPACITY_BYTES="67108864"  # 64 MiB
+    DEFAULT_RR_CAPACITY_BYTES="67108864"
     ;;
-  *)
-    echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
-    usage
-    ;;
+  *) usage ;;
 esac
 
-# OOVERLAP_VLLM_LOCAL_MODEL_AND_RR_OVERRIDES_V1
+# 4096 prompt tokens plus up to 512 generated tokens fit below this limit.
+MAX_MODEL_LEN="${VLLM_EVAL_MAX_MODEL_LEN:-8192}"
 OOVERLAP_MAX_CTAS="${OOVERLAP_MAX_CTAS:-$DEFAULT_OOVERLAP_MAX_CTAS}"
 OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="${OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:-$DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK}"
 RR_DTYPE="${VLLM_OOVERLAP_RR_DTYPE:-bf16}"
@@ -83,34 +79,41 @@ RR_SLOTS="${VLLM_OOVERLAP_RR_SLOTS:-$DEFAULT_RR_SLOTS}"
 RR_CAPACITY_BYTES="${VLLM_OOVERLAP_RR_CAPACITY_BYTES:-$DEFAULT_RR_CAPACITY_BYTES}"
 HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
-
-# OOVERLAP_VLLM_NCCL_ENV_FORWARDING_V1
-# These are single-node paper experiments. Do not inherit the cluster-provided
-# AWS OFI settings by accident. Dedicated OOVERLAP_* overrides are available
-# when another NCCL network configuration is intentionally required.
 NCCL_NET_PLUGIN="${OOVERLAP_NCCL_NET_PLUGIN:-none}"
 NCCL_NET="${OOVERLAP_NCCL_NET:-Socket}"
-
-# OOVERLAP_VLLM_NCCL_SYMM_MEM_V1
-# Enable the vLLM NCCL symmetric-memory allocator and the NCCL features it
-# depends on. The benchmark backend name "nccl_symm" is converted by the
-# Python controller to VLLM_FORCE_ALLREDUCE_BACKEND=nccl_symm for that child.
-# Explicit --env forwarding below reapplies these values after the generated
-# runtime environment has been sourced.
 VLLM_USE_NCCL_SYMM_MEM="${VLLM_USE_NCCL_SYMM_MEM:-1}"
 NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-1}"
 NCCL_WIN_ENABLE="${NCCL_WIN_ENABLE:-1}"
 NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
 
-require_positive_integer "OOVERLAP_MAX_CTAS" "$OOVERLAP_MAX_CTAS"
-require_positive_integer \
-  "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
-  "$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
-require_positive_integer "VLLM_OOVERLAP_RR_SLOTS" "$RR_SLOTS"
-require_positive_integer \
-  "VLLM_OOVERLAP_RR_CAPACITY_BYTES" \
-  "$RR_CAPACITY_BYTES"
+BACKENDS="${VLLM_EVAL_BACKENDS:-pynccl,nccl_symm,ooverlap}"
+BASELINE_BACKEND="${VLLM_EVAL_BASELINE_BACKEND:-pynccl}"
+REPETITIONS="${VLLM_EVAL_REPETITIONS:-3}"
+DATASET_NAME="random"
+RANDOM_RANGE_RATIO="0.0"
+SEED="0"
+FLASHINFER_SAMPLER="0"
+OOVERLAP_DEBUG="0"
+MAX_BATCHED_TOKENS="4096"
+
+PREFILL_NUM_PROMPTS="${VLLM_PREFILL_NUM_PROMPTS:-8}"
+PREFILL_NUM_WARMUPS="${VLLM_PREFILL_NUM_WARMUPS:-2}"
+DECODE_NUM_PROMPTS="${VLLM_DECODE_NUM_PROMPTS:-8}"
+DECODE_NUM_WARMUPS="${VLLM_DECODE_NUM_WARMUPS:-2}"
+BATCH_PROMPT_MULTIPLIER="${VLLM_BATCH_PROMPT_MULTIPLIER:-4}"
+
+for pair in \
+  "OOVERLAP_MAX_CTAS:$OOVERLAP_MAX_CTAS" \
+  "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
+  "VLLM_OOVERLAP_RR_SLOTS:$RR_SLOTS" \
+  "VLLM_OOVERLAP_RR_CAPACITY_BYTES:$RR_CAPACITY_BYTES" \
+  "VLLM_EVAL_REPETITIONS:$REPETITIONS" \
+  "VLLM_PREFILL_NUM_PROMPTS:$PREFILL_NUM_PROMPTS" \
+  "VLLM_DECODE_NUM_PROMPTS:$DECODE_NUM_PROMPTS" \
+  "VLLM_BATCH_PROMPT_MULTIPLIER:$BATCH_PROMPT_MULTIPLIER"; do
+  require_positive_integer "${pair%%:*}" "${pair#*:}"
+done
 
 MAX_SUPPORTED_RR_SLOTS="257"
 if (( RR_SLOTS > MAX_SUPPORTED_RR_SLOTS )); then
@@ -118,239 +121,185 @@ if (( RR_SLOTS > MAX_SUPPORTED_RR_SLOTS )); then
 fi
 
 case "$RR_DTYPE" in
-  bf16|bfloat16|fp16|float16|fp32|float32)
-    ;;
-  *)
-    fail "VLLM_OOVERLAP_RR_DTYPE must be bf16, fp16, or fp32; got: $RR_DTYPE"
-    ;;
+  bf16|bfloat16|fp16|float16|fp32|float32) ;;
+  *) fail "VLLM_OOVERLAP_RR_DTYPE must be bf16, fp16, or fp32; got: $RR_DTYPE" ;;
 esac
-
-# -----------------------------------------------------------------------------
-# Fixed paper matrix. Edit these constants in the repository only when the
-# paper methodology changes; they are intentionally not command-line options.
-# -----------------------------------------------------------------------------
-BACKENDS="pynccl,nccl_symm,ooverlap"
-BASELINE_BACKEND="pynccl"
-#WORKLOADS="decode,mixed,long,prefill"
-#BATCH_SIZES="64,128,256"
-#MAX_BATCHED_TOKENS="4096,8192"
-#REPETITIONS="3"
-#PROMPT_MULTIPLIER="4"
-
-WORKLOADS="decode,prefill"
-BATCH_SIZES="64,128"
-MAX_BATCHED_TOKENS="4096"
-REPETITIONS="1"
-PROMPT_MULTIPLIER="1"
-
-DATASET_NAME="random"
-RANDOM_RANGE_RATIO="0.0"
-SEED="0"
-
-FLASHINFER_SAMPLER="0"
-OOVERLAP_DEBUG="0"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER="$REPO_ROOT/test/benchmark_vllm_paperlike.py"
-OUT_DIR="$REPO_ROOT/results/evalution/vllm/tp${WORLD_SIZE}"
-PIPELINE_LOG="$OUT_DIR/run_vllm_paperlike_tp${WORLD_SIZE}.log"
+PLOTTER="$REPO_ROOT/test/plot_vllm_sweeps.py"
+OUT_ROOT="$REPO_ROOT/results/evalution/vllm/tp${WORLD_SIZE}"
 
-command -v "$PYTHON_BIN" >/dev/null 2>&1 || \
-  fail "Python executable not found: $PYTHON_BIN"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail "Python executable not found: $PYTHON_BIN"
 command -v bash >/dev/null 2>&1 || fail "bash was not found"
 command -v tee >/dev/null 2>&1 || fail "tee was not found"
 [[ -f "$DRIVER" ]] || fail "vLLM benchmark driver not found: $DRIVER"
+[[ -f "$PLOTTER" ]] || fail "vLLM sweep plotter not found: $PLOTTER"
 
 resolve_runtime_env_file() {
   local candidate=""
-
   if [[ -n "${OOVERLAP_VLLM_ENV_FILE:-}" ]]; then
     candidate="$OOVERLAP_VLLM_ENV_FILE"
-    [[ -f "$candidate" ]] || \
-      fail "OOVERLAP_VLLM_ENV_FILE does not exist: $candidate"
+    [[ -f "$candidate" ]] || fail "OOVERLAP_VLLM_ENV_FILE does not exist: $candidate"
     printf '%s\n' "$candidate"
     return
   fi
-
   if [[ -n "${OOTMP:-}" && -f "$OOTMP/ooverlap_vllm_env.sh" ]]; then
     printf '%s\n' "$OOTMP/ooverlap_vllm_env.sh"
     return
   fi
-
-  # setup_env.sh normally writes:
-  #   /local/tmp.*/$USER/ooverlap_vllm_env.sh
   for candidate in /local/tmp.*/"${USER:-}"/ooverlap_vllm_env.sh; do
     if [[ -f "$candidate" ]]; then
       printf '%s\n' "$candidate"
       return
     fi
   done
-
-  fail "could not find ooverlap_vllm_env.sh; run 'bash ./setup_env.sh' first or set OOVERLAP_VLLM_ENV_FILE"
+  fail "could not find ooverlap_vllm_env.sh; run setup_env.sh or set OOVERLAP_VLLM_ENV_FILE"
 }
 
 RUNTIME_ENV_FILE="$(resolve_runtime_env_file)"
 RUNTIME_ENV_DIR="$(cd -- "$(dirname -- "$RUNTIME_ENV_FILE")" && pwd)"
 DEFAULT_MODEL_DIR="$RUNTIME_ENV_DIR/models/$MODEL_BASENAME"
 MODEL_DIR="${VLLM_MODEL_DIR:-$DEFAULT_MODEL_DIR}"
-
-[[ -d "$MODEL_DIR" ]] || fail \
-  "model directory does not exist: $MODEL_DIR; download $MODEL_REPO_ID there or set VLLM_MODEL_DIR"
-[[ -f "$MODEL_DIR/config.json" ]] || fail \
-  "model directory is missing config.json: $MODEL_DIR"
-
+[[ -d "$MODEL_DIR" ]] || fail "model directory does not exist: $MODEL_DIR"
+[[ -f "$MODEL_DIR/config.json" ]] || fail "model directory is missing config.json: $MODEL_DIR"
 MODEL="$(cd -- "$MODEL_DIR" && pwd)"
-
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_ROOT"
 cd "$REPO_ROOT"
 
-# Validate the generated runtime environment before starting the long matrix.
-# This uses the same source semantics as the Python driver and checks only
-# non-secret runtime facts: vLLM availability, extension path, and GPU count.
-CHECK_CODE='import os, sys, torch
+# Validate all three backends before a long run. This intentionally retains the
+# existing symmetric-memory and ooverlap checks even when plotting only.
+preflight() {
+  local check_code
+  check_code='import os, sys, torch
 import vllm.envs as envs
 from vllm.distributed.device_communicators.pynccl_allocator import get_nccl_mem_pool
-
 expected = int(sys.argv[1])
-if not torch.cuda.is_available():
-    raise SystemExit("CUDA is not available in the vLLM runtime environment")
-count = torch.cuda.device_count()
-visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
-if count != expected:
-    raise SystemExit(f"expected {expected} visible GPUs but torch sees {count}; CUDA_VISIBLE_DEVICES={visible_devices}")
+if not torch.cuda.is_available(): raise SystemExit("CUDA is not available")
+if torch.cuda.device_count() != expected: raise SystemExit(f"expected {expected} GPUs, found {torch.cuda.device_count()}")
 extension = os.environ.get("VLLM_OOVERLAP_TORCH_EXT", "")
-if not extension or not os.path.isfile(extension):
-    raise SystemExit(f"VLLM_OOVERLAP_TORCH_EXT is missing or invalid: {extension!r}")
-
-required_symm_env = {
-    "VLLM_USE_NCCL_SYMM_MEM": "1",
-    "NCCL_CUMEM_ENABLE": "1",
-    "NCCL_WIN_ENABLE": "1",
-}
-for name, expected_value in required_symm_env.items():
-    actual = os.environ.get(name)
-    if actual != expected_value:
-        raise SystemExit(f"{name} must be {expected_value!r}; got {actual!r}")
-if not envs.VLLM_USE_NCCL_SYMM_MEM:
-    raise SystemExit("vLLM did not accept VLLM_USE_NCCL_SYMM_MEM=1")
-
-nccl_version = tuple(int(value) for value in torch.cuda.nccl.version())
-if nccl_version < (2, 27, 3):
-    raise SystemExit(f"NCCL >= 2.27.3 is required; found {nccl_version}")
+if not extension or not os.path.isfile(extension): raise SystemExit(f"invalid VLLM_OOVERLAP_TORCH_EXT: {extension!r}")
+for name in ("VLLM_USE_NCCL_SYMM_MEM", "NCCL_CUMEM_ENABLE", "NCCL_WIN_ENABLE"):
+    if os.environ.get(name) != "1": raise SystemExit(f"{name} must be 1")
+if not envs.VLLM_USE_NCCL_SYMM_MEM: raise SystemExit("vLLM rejected symmetric memory")
+if tuple(int(v) for v in torch.cuda.nccl.version()) < (2, 27, 3): raise SystemExit("NCCL >= 2.27.3 is required")
 torch.cuda.set_device(0)
-if get_nccl_mem_pool() is None:
-    raise SystemExit("vLLM NCCL symmetric-memory allocator is unavailable")
+if get_nccl_mem_pool() is None: raise SystemExit("NCCL symmetric allocator unavailable")
+print("[evalution] preflight ready")'
+  bash -lc '
+    set -e
+    source "$1" >/dev/null
+    export CUDA_VISIBLE_DEVICES="$2"
+    export VLLM_USE_NCCL_SYMM_MEM="$5"
+    export NCCL_CUMEM_ENABLE="$6"
+    export NCCL_WIN_ENABLE="$7"
+    export NCCL_NVLS_ENABLE="$8"
+    export NCCL_MNNVL_ENABLE="$9"
+    exec python -c "$3" "$4"
+  ' "ooverlap-vllm-preflight" "$RUNTIME_ENV_FILE" "$DEVICES" "$check_code" "$WORLD_SIZE" \
+    "$VLLM_USE_NCCL_SYMM_MEM" "$NCCL_CUMEM_ENABLE" "$NCCL_WIN_ENABLE" \
+    "$NCCL_NVLS_ENABLE" "$NCCL_MNNVL_ENABLE"
+}
 
-print(f"[evalution] torch={torch.__version__} cuda={torch.version.cuda}")
-print(f"[evalution] nccl={nccl_version}")
-for index in range(count):
-    print(f"[evalution] cuda:{index} name={torch.cuda.get_device_name(index)} capability={torch.cuda.get_device_capability(index)}")
-print(f"[evalution] ooverlap_extension={extension}")
-print("[evalution] nccl_symmetric_allocator=ready")'
+common_driver_args=()
+common_driver_args+=(--runtime-env-file "$RUNTIME_ENV_FILE")
+common_driver_args+=(--working-dir "$REPO_ROOT")
+common_driver_args+=(--models "$MODEL")
+common_driver_args+=(--max-model-len "$MAX_MODEL_LEN")
+common_driver_args+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
+common_driver_args+=(--backends "$BACKENDS")
+common_driver_args+=(--baseline-backend "$BASELINE_BACKEND")
+common_driver_args+=(--device-groups "$DEVICES")
+common_driver_args+=(--max-batched-tokens "$MAX_BATCHED_TOKENS")
+common_driver_args+=(--repetitions "$REPETITIONS")
+common_driver_args+=(--dataset-name "$DATASET_NAME")
+common_driver_args+=(--random-range-ratio "$RANDOM_RANGE_RATIO")
+common_driver_args+=(--seed "$SEED")
+common_driver_args+=(--enforce-eager --disable-detokenize)
+common_driver_args+=(--flashinfer-sampler "$FLASHINFER_SAMPLER")
+common_driver_args+=(--ooverlap-debug "$OOVERLAP_DEBUG")
+common_driver_args+=(--rr-dtype "$RR_DTYPE")
+common_driver_args+=(--rr-slots "$RR_SLOTS")
+common_driver_args+=(--rr-capacity-bytes "$RR_CAPACITY_BYTES")
+common_driver_args+=(--env "OOVERLAP_MAX_CTAS=$OOVERLAP_MAX_CTAS")
+common_driver_args+=(--env "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK")
+common_driver_args+=(--env "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
+common_driver_args+=(--env "TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE")
+common_driver_args+=(--env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN")
+common_driver_args+=(--env "NCCL_NET=$NCCL_NET")
+common_driver_args+=(--env "VLLM_USE_NCCL_SYMM_MEM=$VLLM_USE_NCCL_SYMM_MEM")
+common_driver_args+=(--env "NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE")
+common_driver_args+=(--env "NCCL_WIN_ENABLE=$NCCL_WIN_ENABLE")
+common_driver_args+=(--env "NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE")
+common_driver_args+=(--env "NCCL_MNNVL_ENABLE=$NCCL_MNNVL_ENABLE")
+common_driver_args+=(--fail-fast)
 
-bash -lc '
-  set -e
-  source "$1" >/dev/null
-  export CUDA_VISIBLE_DEVICES="$2"
-  export VLLM_USE_NCCL_SYMM_MEM="$5"
-  export NCCL_CUMEM_ENABLE="$6"
-  export NCCL_WIN_ENABLE="$7"
-  export NCCL_NVLS_ENABLE="$8"
-  export NCCL_MNNVL_ENABLE="$9"
-  command -v vllm >/dev/null
-  exec python -c "$3" "$4"
-' "ooverlap-vllm-preflight" \
-  "$RUNTIME_ENV_FILE" \
-  "$DEVICES" \
-  "$CHECK_CODE" \
-  "$WORLD_SIZE" \
-  "$VLLM_USE_NCCL_SYMM_MEM" \
-  "$NCCL_CUMEM_ENABLE" \
-  "$NCCL_WIN_ENABLE" \
-  "$NCCL_NVLS_ENABLE" \
-  "$NCCL_MNNVL_ENABLE"
+run_prefill() {
+  local out_dir="$OUT_ROOT/prefill_length"
+  mkdir -p "$out_dir"
+  "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
+    --out-dir "$out_dir" --workloads "" --batch-sizes "1" \
+    --num-prompts "$PREFILL_NUM_PROMPTS" --num-warmups "$PREFILL_NUM_WARMUPS" \
+    --workload prefill-128:128:1 \
+    --workload prefill-256:256:1 \
+    --workload prefill-512:512:1 \
+    --workload prefill-1024:1024:1 \
+    --workload prefill-2048:2048:1 \
+    --workload prefill-4096:4096:1 \
+    2>&1 | tee "$out_dir/pipeline.log"
+}
 
-echo "[evalution] vLLM paper throughput evaluation"
-echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
-echo "[evalution] runtime_env=$RUNTIME_ENV_FILE"
-echo "[evalution] model_repo_id=$MODEL_REPO_ID"
-echo "[evalution] model_dir=$MODEL"
-echo "[evalution] max_model_len=$MAX_MODEL_LEN"
-echo "[evalution] gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
-echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
-echo "[evalution] ooverlap_max_ctas_per_reduce_task=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
-echo "[evalution] rr_dtype=$RR_DTYPE"
-echo "[evalution] rr_slots=$RR_SLOTS"
-echo "[evalution] rr_capacity_bytes=$RR_CAPACITY_BYTES"
-echo "[evalution] hf_hub_offline=$HF_HUB_OFFLINE"
-echo "[evalution] transformers_offline=$TRANSFORMERS_OFFLINE"
-echo "[evalution] nccl_net_plugin=$NCCL_NET_PLUGIN"
-echo "[evalution] nccl_net=$NCCL_NET"
-echo "[evalution] vllm_use_nccl_symm_mem=$VLLM_USE_NCCL_SYMM_MEM"
-echo "[evalution] nccl_cumem_enable=$NCCL_CUMEM_ENABLE"
-echo "[evalution] nccl_win_enable=$NCCL_WIN_ENABLE"
-echo "[evalution] nccl_nvls_enable=$NCCL_NVLS_ENABLE"
-echo "[evalution] nccl_mnnvl_enable=$NCCL_MNNVL_ENABLE"
-echo "[evalution] backends=$BACKENDS baseline=$BASELINE_BACKEND"
-echo "[evalution] workloads=$WORKLOADS"
-echo "[evalution] batch_sizes=$BATCH_SIZES"
-echo "[evalution] max_batched_tokens=$MAX_BATCHED_TOKENS"
-echo "[evalution] repetitions=$REPETITIONS prompt_multiplier=$PROMPT_MULTIPLIER"
-echo "[evalution] output=$OUT_DIR"
+run_decode() {
+  local out_dir="$OUT_ROOT/decode_length"
+  mkdir -p "$out_dir"
+  "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
+    --out-dir "$out_dir" --workloads "" --batch-sizes "1" \
+    --num-prompts "$DECODE_NUM_PROMPTS" --num-warmups "$DECODE_NUM_WARMUPS" \
+    --workload decode-1:512:1 \
+    --workload decode-4:512:4 \
+    --workload decode-16:512:16 \
+    --workload decode-64:512:64 \
+    --workload decode-128:512:128 \
+    --workload decode-256:512:256 \
+    --workload decode-512:512:512 \
+    2>&1 | tee "$out_dir/pipeline.log"
+}
 
-"$PYTHON_BIN" "$DRIVER" \
-  --runtime-env-file "$RUNTIME_ENV_FILE" \
-  --working-dir "$REPO_ROOT" \
-  --out-dir "$OUT_DIR" \
-  --models "$MODEL" \
-  --max-model-len "$MAX_MODEL_LEN" \
-  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
-  --backends "$BACKENDS" \
-  --baseline-backend "$BASELINE_BACKEND" \
-  --device-groups "$DEVICES" \
-  --workloads "$WORKLOADS" \
-  --batch-sizes "$BATCH_SIZES" \
-  --max-batched-tokens "$MAX_BATCHED_TOKENS" \
-  --repetitions "$REPETITIONS" \
-  --prompt-multiplier "$PROMPT_MULTIPLIER" \
-  --dataset-name "$DATASET_NAME" \
-  --random-range-ratio "$RANDOM_RANGE_RATIO" \
-  --seed "$SEED" \
-  --enforce-eager \
-  --disable-detokenize \
-  --flashinfer-sampler "$FLASHINFER_SAMPLER" \
-  --ooverlap-debug "$OOVERLAP_DEBUG" \
-  --rr-dtype "$RR_DTYPE" \
-  --rr-slots "$RR_SLOTS" \
-  --rr-capacity-bytes "$RR_CAPACITY_BYTES" \
-  --env "OOVERLAP_MAX_CTAS=$OOVERLAP_MAX_CTAS" \
-  --env "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
-  --env "HF_HUB_OFFLINE=$HF_HUB_OFFLINE" \
-  --env "TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE" \
-  --env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN" \
-  --env "NCCL_NET=$NCCL_NET" \
-  --env "VLLM_USE_NCCL_SYMM_MEM=$VLLM_USE_NCCL_SYMM_MEM" \
-  --env "NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE" \
-  --env "NCCL_WIN_ENABLE=$NCCL_WIN_ENABLE" \
-  --env "NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE" \
-  --env "NCCL_MNNVL_ENABLE=$NCCL_MNNVL_ENABLE" \
-  --fail-fast \
-  2>&1 | tee "$PIPELINE_LOG"
+run_batch() {
+  local out_dir="$OUT_ROOT/batch_scaling"
+  mkdir -p "$out_dir"
+  "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
+    --out-dir "$out_dir" --workloads "" \
+    --workload batch-decode:16:256 \
+    --batch-sizes "1,2,4,8,16,32,64,128,256" \
+    --prompt-multiplier "$BATCH_PROMPT_MULTIPLIER" \
+    2>&1 | tee "$out_dir/pipeline.log"
+}
 
-for required_output in \
-  "$OUT_DIR/manifest.json" \
-  "$OUT_DIR/runs.jsonl" \
-  "$OUT_DIR/summary.csv" \
-  "$OUT_DIR/summary_aggregate.csv" \
-  "$OUT_DIR/summary.txt"; do
-  [[ -s "$required_output" ]] || \
-    fail "benchmark completed but required output is missing or empty: $required_output"
-done
+run_plot() {
+  local args=(--root "$OUT_ROOT" --out-dir "$OUT_ROOT/plots")
+  if [[ -n "${VLLM_PLOT_INCLUDE_BACKENDS:-}" ]]; then
+    args+=(--include-backends "$VLLM_PLOT_INCLUDE_BACKENDS")
+  fi
+  if [[ -n "${VLLM_PLOT_EXCLUDE_BACKENDS:-}" ]]; then
+    args+=(--exclude-backends "$VLLM_PLOT_EXCLUDE_BACKENDS")
+  fi
+  "$PYTHON_BIN" "$PLOTTER" "${args[@]}"
+}
+
+if [[ "$MODE" != "plot" ]]; then
+  preflight
+fi
+case "$MODE" in
+  all) run_prefill; run_decode; run_batch; run_plot ;;
+  prefill) run_prefill; run_plot ;;
+  decode) run_decode; run_plot ;;
+  batch) run_batch; run_plot ;;
+  plot) run_plot ;;
+esac
 
 echo "[evalution] complete"
-echo "[evalution] summary=$OUT_DIR/summary.txt"
-echo "[evalution] aggregate_csv=$OUT_DIR/summary_aggregate.csv"
-echo "[evalution] per_run_data=$OUT_DIR/runs.jsonl"
-echo "[evalution] pipeline_log=$PIPELINE_LOG"
+echo "[evalution] root=$OUT_ROOT"
+echo "[evalution] plots=$OUT_ROOT/plots"
