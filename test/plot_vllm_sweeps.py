@@ -28,15 +28,11 @@ BACKEND_LABELS = {
     "nccl_symm": "NCCL symmetric",
     "ooverlap": "Ooverlap",
 }
-BACKEND_MARKERS = {
-    "pynccl": "o",
-    "nccl_symm": "^",
-    "ooverlap": "s",
-}
-BACKEND_LINESTYLES = {
-    "pynccl": "--",
-    "nccl_symm": ":",
-    "ooverlap": "-",
+# OOVERLAP_VLLM_GROUPED_HATCHED_BAR_PLOTS_V1
+BACKEND_HATCHES = {
+    "pynccl": "///",
+    "nccl_symm": r"\\",
+    "ooverlap": "xxx",
 }
 
 
@@ -151,30 +147,45 @@ def plot_series(
     xlog2: bool,
     lower_is_better: bool,
 ) -> None:
+    # OOVERLAP_VLLM_GROUPED_HATCHED_BAR_PLOTS_V1
+    # Use categorical spacing so every sweep is a grouped bar chart. The third
+    # tuple item is the repetition standard deviation; it is intentionally not
+    # drawn because these paper plots should not contain error bars.
+    _ = xlog2
     fig, axis = plt.subplots(figsize=(7.4, 4.8))
-    for backend, points in series.items():
-        points = sorted(points)
-        xs = [point[0] for point in points]
-        ys = [point[1] for point in points]
-        errors = [point[2] for point in points]
-        axis.errorbar(
-            xs,
-            ys,
-            yerr=errors,
-            marker=BACKEND_MARKERS.get(backend, "o"),
-            linestyle=BACKEND_LINESTYLES.get(backend, "-"),
-            linewidth=1.8,
-            capsize=3,
+
+    backends = list(series)
+    all_xs = sorted(
+        {point[0] for backend_points in series.values() for point in backend_points}
+    )
+    centers = list(range(len(all_xs)))
+    center_by_x = {value: center for value, center in zip(all_xs, centers)}
+
+    group_width = 0.82
+    bar_width = group_width / max(1, len(backends))
+
+    for backend_index, backend in enumerate(backends):
+        mean_by_x = {point[0]: point[1] for point in sorted(series[backend])}
+        present_xs = [value for value in all_xs if value in mean_by_x]
+        offset = (backend_index - (len(backends) - 1) / 2.0) * bar_width
+        bar_positions = [center_by_x[value] + offset for value in present_xs]
+        bar_values = [mean_by_x[value] for value in present_xs]
+
+        axis.bar(
+            bar_positions,
+            bar_values,
+            width=bar_width * 0.9,
+            hatch=BACKEND_HATCHES.get(backend, "..."),
+            edgecolor="black",
+            linewidth=0.8,
             label=label_for(backend),
         )
-    if xlog2:
-        axis.set_xscale("log", base=2)
-        all_xs = sorted({point[0] for points in series.values() for point in points})
-        axis.set_xticks(all_xs)
-        axis.set_xticklabels([str(value) for value in all_xs])
+
+    axis.set_xticks(centers)
+    axis.set_xticklabels([str(value) for value in all_xs])
     axis.set_xlabel(xlabel)
     axis.set_ylabel(ylabel)
-    axis.grid(True, which="both", linestyle="--", alpha=0.35)
+    axis.grid(True, axis="y", linestyle="--", alpha=0.35)
     axis.legend(frameon=False)
     direction = "Lower is better" if lower_is_better else "Higher is better"
     axis.text(0.99, 0.02, direction, transform=axis.transAxes, ha="right", va="bottom", fontsize=9)
