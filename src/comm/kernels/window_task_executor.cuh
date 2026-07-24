@@ -165,7 +165,7 @@ __device__ __forceinline__ void execute_window_task(
         case task::WindowTaskOp::ReadyPublish:
             if (threadIdx.x == 0) {
                 publish_ready_signal(
-                    task.signal_flags,
+                    task.ready_signal,
                     task.ready_epoch,
                     static_cast<MultiGpuReadySignalProtocol>(
                         task.ready_protocol));
@@ -175,9 +175,9 @@ __device__ __forceinline__ void execute_window_task(
         case task::WindowTaskOp::ReadyWait:
             if (threadIdx.x == 0) {
                 wait_until_ready_signal_at_least(
-                    task.signal_flags,
+                    task.ready_signal,
                     task.ready_epoch,
-                    task.ready_poll_sleep_cycles);
+                    64);
             }
             return;
 
@@ -186,13 +186,13 @@ __device__ __forceinline__ void execute_window_task(
                 publish_then_wait_ready_signal_for_cta(
                     static_cast<int>(blockIdx.x),
                     task.ready_owner_cta,
-                    task.signal_flags,
+                    task.ready_signal,
                     task.ready_epoch,
                     static_cast<MultiGpuReadySignalProtocol>(
                         task.ready_protocol),
                     task.ready_wait_signal,
                     task.ready_wait_epoch,
-                    task.ready_poll_sleep_cycles);
+                    64);
             }
             return;
 
@@ -219,11 +219,8 @@ __device__ __forceinline__ void execute_window_task(
  *
  * are ordered for that CTA.
  *
- * Tasks in different CTA stripes are assumed independent unless they use an
- * explicit signal pair:
- *
- *   ReduceTMASignal
- *   CopyFastAfterSignal
+ * Tasks in different CTA stripes are independent unless the lowered plan adds
+ * explicit ready-signal or barrier tasks.
  *
  * This is deliberately not a work-stealing queue.
  */

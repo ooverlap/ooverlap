@@ -17,65 +17,22 @@ using WindowTaskCtaMask = uint64_t;
 
 constexpr WindowTaskCtaMask kWindowTaskAllCtas = ~WindowTaskCtaMask{0};
 
+/* OOVERLAP_WINDOW_TASK_SIGNAL_COMPACTION_V1 */
 enum class WindowTaskOp : uint8_t {
     None = 0,
 
-    /*
-     * TMA load from task.src into shared memory, then reduce/apply into
-     * task.dst. No inter-CTA window signal.
-     */
+    /* TMA load from task.src, then reduce/apply into task.dst. */
     ReduceTMA = 1,
 
-    /*
-     * Same as ReduceTMA, but publishes task.signal_flags as windows complete.
-     * This is the producer side for overlapped copy.
-     */
-    ReduceTMASignal = 2,
-
-    /*
-     * TMA copy task.src -> task.dst over the task window range.
-     */
+    /* TMA copy task.src -> task.dst over the task window range. */
     CopyTMA = 3,
 
-    /*
-     * Fast global-memory copy task.src -> task.dst over the task window range.
-     */
+    /* Fast global-memory copy task.src -> task.dst. */
     CopyFast = 4,
 
-    /*
-     * Fast global-memory copy task.src -> task.dst, waiting for the matching
-     * per-window producer signal before copying each window.
-     */
-    CopyFastAfterSignal = 5,
-
-    /*
-     * TMA copy task.src -> task.dst and publish task.signal_flags as windows
-     * complete.
-     */
-    CopyTMASignal = 6,
-
-    /*
-     * Wait for task.signal_flags window-by-window, then TMA-reduce task.src
-     * into task.dst.
-     */
-    ReduceTMAAfterSignal = 7,
-
-    /*
-     * Waiting Tasks
-     */
+    /* Ready-signal operations. */
     ReadyPublish = 8,
     ReadyWait = 9,
-
-    /*
-     * OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: merged consecutive ReadyPublish + ReadyWait.
-     *
-     * signal_flags      = local publish signal
-     * ready_epoch       = publish epoch/value
-     * ready_protocol    = publish protocol
-     * ready_wait_signal = peer signal to wait on
-     * ready_wait_epoch  = wait epoch/value
-     * ready_owner_cta   = CTA that performs the publish; all CTAs wait
-     */
     ReadyPublishWait = 10,
 
     CopyTMAFanout = 11,
@@ -110,26 +67,12 @@ struct WindowTask {
     int end_window = 0;
     int window_chunks = 0;
 
-    /*
-     * Signal fields are only used by:
-     *
-     *   ReduceTMASignal
-     *   CopyFastAfterSignal
-     *
-     * signal_base_window is the absolute window index corresponding to
-     * signal_flags[0].
-     */
-    int* signal_flags = nullptr;
-    int signal_base_window = 0;
+    /* Ready-signal state used by ReadyPublish/ReadyWait tasks. */
+    int* ready_signal = nullptr;
+    const int* ready_wait_signal = nullptr;
 
-    /*
-     * Ready variables
-     */
     int ready_epoch = 0;
     int ready_protocol = 0;
-    int ready_poll_sleep_cycles = 0;
-
-    const int* ready_wait_signal = nullptr;
     int ready_wait_epoch = 0;
     int ready_owner_cta = 0;
 
@@ -206,32 +149,6 @@ __host__ __device__ __forceinline__ WindowTask make_reduce_tma_task(
         end_window,
         window_chunks,
         terminal);
-}
-
-__host__ __device__ __forceinline__ WindowTask make_reduce_tma_signal_task(
-    const void* src,
-    void* dst,
-    size_t total_bytes,
-    int begin_window,
-    int end_window,
-    int window_chunks,
-    int* signal_flags,
-    int signal_base_window,
-    bool terminal = false) {
-    WindowTask task =
-        make_window_task(
-            WindowTaskOp::ReduceTMASignal,
-            src,
-            dst,
-            total_bytes,
-            begin_window,
-            end_window,
-            window_chunks,
-            terminal);
-
-    task.signal_flags = signal_flags;
-    task.signal_base_window = signal_base_window;
-    return task;
 }
 
 __host__ __device__ __forceinline__ WindowTask make_copy_tma_task(
@@ -351,58 +268,6 @@ __host__ __device__ __forceinline__ WindowTask make_reduce_tma_fanout_task(
 }
 
 
-__host__ __device__ __forceinline__ WindowTask make_copy_tma_signal_task(
-    const void* src,
-    void* dst,
-    size_t total_bytes,
-    int begin_window,
-    int end_window,
-    int window_chunks,
-    int* signal_flags,
-    int signal_base_window,
-    bool terminal = false) {
-    WindowTask task =
-        make_window_task(
-            WindowTaskOp::CopyTMASignal,
-            src,
-            dst,
-            total_bytes,
-            begin_window,
-            end_window,
-            window_chunks,
-            terminal);
-
-    task.signal_flags = signal_flags;
-    task.signal_base_window = signal_base_window;
-    return task;
-}
-
-__host__ __device__ __forceinline__ WindowTask make_reduce_tma_after_signal_task(
-    const void* src,
-    void* dst,
-    size_t total_bytes,
-    int begin_window,
-    int end_window,
-    int window_chunks,
-    const int* signal_flags,
-    int signal_base_window,
-    bool terminal = false) {
-    WindowTask task =
-        make_window_task(
-            WindowTaskOp::ReduceTMAAfterSignal,
-            src,
-            dst,
-            total_bytes,
-            begin_window,
-            end_window,
-            window_chunks,
-            terminal);
-
-    task.signal_flags = const_cast<int*>(signal_flags);
-    task.signal_base_window = signal_base_window;
-    return task;
-}
-
 __host__ __device__ __forceinline__ WindowTask make_copy_fast_task(
     const void* src,
     void* dst,
@@ -422,36 +287,6 @@ __host__ __device__ __forceinline__ WindowTask make_copy_fast_task(
         terminal);
 }
 
-__host__ __device__ __forceinline__ WindowTask make_copy_fast_after_signal_task(
-    const void* src,
-    void* dst,
-    size_t total_bytes,
-    int begin_window,
-    int end_window,
-    int window_chunks,
-    const int* signal_flags,
-    int signal_base_window,
-    bool terminal = false) {
-    WindowTask task =
-        make_window_task(
-            WindowTaskOp::CopyFastAfterSignal,
-            src,
-            dst,
-            total_bytes,
-            begin_window,
-            end_window,
-            window_chunks,
-            terminal);
-
-    /*
-     * WindowTask stores non-const signal_flags so one struct can serve both
-     * producer and consumer tasks. Consumer execution treats it as const.
-     */
-    task.signal_flags = const_cast<int*>(signal_flags);
-    task.signal_base_window = signal_base_window;
-    return task;
-}
-
 __host__ __device__ __forceinline__ WindowTask make_ready_publish_task(
     int* ready_signal,
     int epoch,
@@ -459,7 +294,7 @@ __host__ __device__ __forceinline__ WindowTask make_ready_publish_task(
     bool terminal = false) {
     WindowTask task{};
     task.op = WindowTaskOp::ReadyPublish;
-    task.signal_flags = ready_signal;
+    task.ready_signal = ready_signal;
     task.ready_epoch = epoch;
     task.ready_protocol = protocol;
     task.terminal = terminal;
@@ -469,13 +304,11 @@ __host__ __device__ __forceinline__ WindowTask make_ready_publish_task(
 __host__ __device__ __forceinline__ WindowTask make_ready_wait_task(
     const int* ready_signal,
     int epoch,
-    int poll_sleep_cycles,
     bool terminal = false) {
     WindowTask task{};
     task.op = WindowTaskOp::ReadyWait;
-    task.signal_flags = const_cast<int*>(ready_signal);
+    task.ready_signal = const_cast<int*>(ready_signal);
     task.ready_epoch = epoch;
-    task.ready_poll_sleep_cycles = poll_sleep_cycles;
     task.terminal = terminal;
     return task;
 }
@@ -488,17 +321,15 @@ __host__ __device__ __forceinline__ WindowTask make_ready_publish_wait_task(
     int publish_protocol,
     const int* wait_signal,
     int wait_epoch,
-    int wait_poll_sleep_cycles,
     int owner_cta,
     bool terminal = false) {
     WindowTask task{};
     task.op = WindowTaskOp::ReadyPublishWait;
-    task.signal_flags = publish_signal;
+    task.ready_signal = publish_signal;
     task.ready_epoch = publish_epoch;
     task.ready_protocol = publish_protocol;
     task.ready_wait_signal = wait_signal;
     task.ready_wait_epoch = wait_epoch;
-    task.ready_poll_sleep_cycles = wait_poll_sleep_cycles;
     task.ready_owner_cta = owner_cta;
     task.terminal = terminal;
     return task;
@@ -507,7 +338,7 @@ __host__ __device__ __forceinline__ WindowTask make_ready_publish_wait_task(
 __host__ __device__ __forceinline__ bool window_task_has_work(
     const WindowTask& task) {
     if (task.op == WindowTaskOp::ReadyPublishWait) {
-        return task.signal_flags != nullptr &&
+        return task.ready_signal != nullptr &&
                task.ready_epoch > 0 &&
                task.ready_wait_signal != nullptr &&
                task.ready_wait_epoch > 0;
@@ -515,7 +346,7 @@ __host__ __device__ __forceinline__ bool window_task_has_work(
 
     if (task.op == WindowTaskOp::ReadyPublish ||
         task.op == WindowTaskOp::ReadyWait) {
-        return task.signal_flags != nullptr &&
+        return task.ready_signal != nullptr &&
                task.ready_epoch > 0;
     }
 
@@ -534,14 +365,6 @@ __host__ __device__ __forceinline__ bool window_task_has_work(
            task.total_bytes > 0 &&
            task.window_chunks > 0 &&
            task.begin_window < task.end_window;
-}
-
-__host__ __device__ __forceinline__ bool window_task_uses_signal(
-    const WindowTask& task) {
-    return task.op == WindowTaskOp::ReduceTMASignal ||
-           task.op == WindowTaskOp::CopyFastAfterSignal ||
-           task.op == WindowTaskOp::CopyTMASignal ||
-           task.op == WindowTaskOp::ReduceTMAAfterSignal;
 }
 
 } // namespace task

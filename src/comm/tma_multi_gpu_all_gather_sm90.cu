@@ -180,8 +180,6 @@ cudaError_t launch_all_gather_rank_variant_sm90(
             launch.local_ready_signal_by_channel[channel];
         ready_binding.protocol_by_channel[channel] =
             launch.ready_signal_protocol_by_channel[channel];
-        ready_binding.poll_sleep_cycles_by_channel[channel] =
-            launch.ready_signal_poll_sleep_cycles_by_channel[channel];
 
         if (launch.local_ready_signal_by_channel[channel] != nullptr) {
             has_ready_binding = true;
@@ -192,9 +190,6 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         launch.local_ready_signal;
     ready_binding.protocol =
         launch.ready_signal_protocol_by_channel
-            [::kOoReadySignalChannelDeviceMemory];
-    ready_binding.poll_sleep_cycles =
-        launch.ready_signal_poll_sleep_cycles_by_channel
             [::kOoReadySignalChannelDeviceMemory];
 
     if (launch.rank >= 0 && launch.rank < MaxRanks) {

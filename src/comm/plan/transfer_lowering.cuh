@@ -19,8 +19,8 @@ namespace plan {
  *
  * TransferPlan remains pointer-free/cacheable. ReadyPublish/ReadyWait
  * TransferTasks only describe logical ready ranks. The actual ready-signal
- * pointers, epoch, protocol, and polling policy are supplied here at lowering
- * time by the enqueue path.
+ * pointers, epoch, and protocol are supplied here at lowering time by the
+ * enqueue path. WindowTask ready waits use a fixed 64-cycle sleep.
  */
 template <int MaxRanks>
 struct ReadySignalBinding {
@@ -31,7 +31,6 @@ struct ReadySignalBinding {
     const int* ready_signal_by_rank_channel
         [MaxRanks][kReadySignalChannelCount] = {};
     int protocol_by_channel[kReadySignalChannelCount] = {};
-    int poll_sleep_cycles_by_channel[kReadySignalChannelCount] = {};
 
     /*
      * Compatibility fields for old launchers. These are interpreted as the
@@ -41,7 +40,6 @@ struct ReadySignalBinding {
     const int* ready_signal_by_rank[MaxRanks] = {};
     int epoch = 0;
     int protocol = 0;
-    int poll_sleep_cycles = 0;
 };
 
 __host__ __device__ __forceinline__ bool valid_ready_signal_channel(
@@ -269,9 +267,6 @@ inline bool lower_ready_transfer_task_to_window_task(
     int protocol =
         ready.protocol_by_channel[channel];
 
-    int poll_sleep_cycles =
-        ready.poll_sleep_cycles_by_channel[channel];
-
     /*
      * Backward compatibility for old single-channel launchers.
      */
@@ -286,10 +281,6 @@ inline bool lower_ready_transfer_task_to_window_task(
 
         if (protocol == 0) {
             protocol = ready.protocol;
-        }
-
-        if (poll_sleep_cycles == 0) {
-            poll_sleep_cycles = ready.poll_sleep_cycles;
         }
     }
 
@@ -317,7 +308,6 @@ inline bool lower_ready_transfer_task_to_window_task(
             task::make_ready_wait_task(
                 peer_signal,
                 ready_value,
-                poll_sleep_cycles,
                 transfer.terminal);
 
         return true;
@@ -364,9 +354,6 @@ inline bool lower_ready_publish_wait_transfer_tasks_to_window_task(
     const int* wait_signal =
         ready.ready_signal_by_rank_channel[wait.ready_rank][wait_channel];
 
-    int wait_poll_sleep_cycles =
-        ready.poll_sleep_cycles_by_channel[wait_channel];
-
     /*
      * Backward compatibility for old single-channel launchers.
      */
@@ -383,10 +370,6 @@ inline bool lower_ready_publish_wait_transfer_tasks_to_window_task(
     if (wait_channel == static_cast<int>(ReadySignalChannel::DeviceMemory)) {
         if (wait_signal == nullptr) {
             wait_signal = ready.ready_signal_by_rank[wait.ready_rank];
-        }
-
-        if (wait_poll_sleep_cycles == 0) {
-            wait_poll_sleep_cycles = ready.poll_sleep_cycles;
         }
     }
 
@@ -406,7 +389,6 @@ inline bool lower_ready_publish_wait_transfer_tasks_to_window_task(
             publish_protocol,
             wait_signal,
             wait_value,
-            wait_poll_sleep_cycles,
             owner_cta,
             wait.terminal);
 

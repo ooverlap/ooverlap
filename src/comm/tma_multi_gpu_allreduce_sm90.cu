@@ -110,18 +110,10 @@ const char* debug_window_task_op_name(
             return "None";
         case comm::task::WindowTaskOp::ReduceTMA:
             return "ReduceTMA";
-        case comm::task::WindowTaskOp::ReduceTMASignal:
-            return "ReduceTMASignal";
         case comm::task::WindowTaskOp::CopyTMA:
             return "CopyTMA";
         case comm::task::WindowTaskOp::CopyFast:
             return "CopyFast";
-        case comm::task::WindowTaskOp::CopyFastAfterSignal:
-            return "CopyFastAfterSignal";
-        case comm::task::WindowTaskOp::CopyTMASignal:
-            return "CopyTMASignal";
-        case comm::task::WindowTaskOp::ReduceTMAAfterSignal:
-            return "ReduceTMAAfterSignal";
         case comm::task::WindowTaskOp::ReadyPublish:
             return "ReadyPublish";
         case comm::task::WindowTaskOp::ReadyWait:
@@ -173,8 +165,9 @@ void debug_print_window_task_plan(
                 "    task[%d] local=%d op=%s(%d) "
                 "src=%p dst=%p total_bytes=%zu "
                 "begin_window=%d end_window=%d window_chunks=%d "
-                "signal_flags=%p signal_base_window=%d "
-                "ready_epoch=%d ready_protocol=%d ready_poll_sleep_cycles=%d "
+                "ready_signal=%p ready_wait_signal=%p "
+                "ready_epoch=%d ready_protocol=%d "
+                "ready_wait_epoch=%d ready_owner_cta=%d "
                 "terminal=%d mask=%ld\n",
                 task_idx,
                 local_task,
@@ -186,11 +179,12 @@ void debug_print_window_task_plan(
                 task.begin_window,
                 task.end_window,
                 task.window_chunks,
-                static_cast<void*>(task.signal_flags),
-                task.signal_base_window,
+                static_cast<void*>(task.ready_signal),
+                static_cast<const void*>(task.ready_wait_signal),
                 task.ready_epoch,
                 task.ready_protocol,
-                task.ready_poll_sleep_cycles,
+                task.ready_wait_epoch,
+                task.ready_owner_cta,
                 static_cast<int>(task.terminal), static_cast<unsigned long>(task.cta_mask));
         }
     }
@@ -343,8 +337,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
             launch.local_ready_signal_by_channel[channel];
         ready_binding.protocol_by_channel[channel] =
             launch.ready_signal_protocol_by_channel[channel];
-        ready_binding.poll_sleep_cycles_by_channel[channel] =
-            launch.ready_signal_poll_sleep_cycles_by_channel[channel];
 
         if (launch.local_ready_signal_by_channel[channel] != nullptr) {
             has_ready_binding = true;
@@ -355,9 +347,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         launch.local_ready_signal;
     ready_binding.protocol =
         launch.ready_signal_protocol_by_channel
-            [::kOoReadySignalChannelDeviceMemory];
-    ready_binding.poll_sleep_cycles =
-        launch.ready_signal_poll_sleep_cycles_by_channel
             [::kOoReadySignalChannelDeviceMemory];
 
     if (launch.rank >= 0 && launch.rank < MaxRanks) {
