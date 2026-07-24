@@ -60,10 +60,30 @@ __host__ __forceinline__ bool window_task_executor_plan_pack(
     destination->total_tasks = source.total_tasks;
     destination->tasks_per_cta = source.tasks_per_cta;
 
+   
     for (int task_idx = 0;
          task_idx < source.total_tasks;
          ++task_idx) {
-        destination->tasks[task_idx] = source.tasks[task_idx];
+        const task::WindowTask& source_task =
+            source.tasks[task_idx];
+    
+        task::WindowTask& destination_task =
+            destination->tasks[task_idx];
+    
+        if (source_task.op == task::WindowTaskOp::None) {
+            /*
+             * Do not copy the complete WindowTask for an empty slot.
+             *
+             * destination is reused between launches, so we cannot simply
+             * continue: an old non-None task may still be stored here.
+             */
+            destination_task.op = task::WindowTaskOp::None;
+            destination_task.cta_mask = 0;
+            destination_task.terminal = false;
+            continue;
+        }
+    
+        destination_task = source_task;
     }
 
     return true;
