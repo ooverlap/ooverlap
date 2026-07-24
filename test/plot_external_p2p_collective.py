@@ -23,6 +23,13 @@ COLLECTIVE_TITLES = {
     "all_gather": "All-Gather",
 }
 
+# OOVERLAP_EXTERNAL_PLOT_READABILITY_V1
+# Keep the existing visual design, but make the curves survive paper scaling
+# slightly better without making the figure look heavy.
+PLOT_LINEWIDTH = 1.8
+PLOT_MARKERSIZE = 6.5
+PLOT_MARKEREDGEWIDTH = 0.8
+
 
 class PlotInputError(ValueError):
     pass
@@ -246,6 +253,9 @@ def plot_combined(
                     x_values,
                     t_ccl_values,
                     marker="o",
+                    linewidth=PLOT_LINEWIDTH,
+                    markersize=PLOT_MARKERSIZE,
+                    markeredgewidth=PLOT_MARKEREDGEWIDTH,
                     label=f"T-CCL{suffix}",
                 )
                 axis.plot(
@@ -253,6 +263,9 @@ def plot_combined(
                     nccl_values,
                     marker="s",
                     linestyle="--",
+                    linewidth=PLOT_LINEWIDTH,
+                    markersize=PLOT_MARKERSIZE,
+                    markeredgewidth=PLOT_MARKEREDGEWIDTH,
                     label=f"NCCL{suffix}",
                 )
                 if finite_positive(symmetric_values):
@@ -261,6 +274,9 @@ def plot_combined(
                         symmetric_values,
                         marker="^",
                         linestyle=":",
+                        linewidth=PLOT_LINEWIDTH,
+                        markersize=PLOT_MARKERSIZE,
+                        markeredgewidth=PLOT_MARKEREDGEWIDTH,
                         label=f"symmetric NCCL{suffix}",
                     )
 
@@ -268,11 +284,20 @@ def plot_combined(
                 legend_by_label.setdefault(label, handle)
 
             x_ticks = [int(row["bytes"]) for row in first_rows]
+            labeled_tick_indices = set(range(0, len(x_ticks), 1))
+            if x_ticks:
+                labeled_tick_indices.add(len(x_ticks) - 1)
+
             axis.set_xscale("log", base=2)
             axis.set_xticks(x_ticks)
             axis.set_xticklabels(
-                [format_size_bytes(value) for value in x_ticks],
-                rotation=30,
+                [
+                    format_size_bytes(value)
+                    if index in labeled_tick_indices
+                    else ""
+                    for index, value in enumerate(x_ticks)
+                ],
+                rotation=25,
                 ha="right",
             )
             axis.grid(True, which="both", linestyle="--", alpha=0.35)
@@ -281,8 +306,8 @@ def plot_combined(
                 axis.set_title(COLLECTIVE_TITLES[collective], fontsize=12)
             if col_idx == 0:
                 axis.set_ylabel(ylabel)
-            if row_idx == 1:
-                axis.set_xlabel("Buffer size")
+
+    fig.supxlabel("Buffer size", y=0.022)
 
     legend_labels = list(legend_by_label)
     legend_handles = [legend_by_label[label] for label in legend_labels]
@@ -291,10 +316,19 @@ def plot_combined(
         legend_labels,
         loc="upper center",
         ncol=min(len(legend_labels), 6),
-        bbox_to_anchor=(0.5, 0.995),
+        bbox_to_anchor=(0.5, 0.988),
         frameon=False,
+        handlelength=2.0,
+        columnspacing=1.25,
     )
-    fig.tight_layout(rect=(0.02, 0.02, 1.0, 0.93))
+    fig.subplots_adjust(
+        left=0.06,
+        right=0.995,
+        bottom=0.12,
+        top=0.90,
+        wspace=0.18,
+        hspace=0.22,
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
