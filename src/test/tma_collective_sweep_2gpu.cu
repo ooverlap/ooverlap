@@ -2,11 +2,13 @@
 
 #include "comm/launch_config.h"
 #include "comm/ooverlap_comm_internal.h"
-#include "comm/params.h"
+#include "comm/ooverlap_comm_private.h"
+#include "comm/plan/transfer_plan_distribution.h"
 #include "comm/tma_multi_gpu_all_gather_sm90.h"
 #include "comm/tma_multi_gpu_allreduce_sm90.h"
 #include "comm/tma_multi_gpu_reduce_scatter_sm90.h"
 
+#include "ooverlap/comm.h"
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/checks.cuh"
 #include "ooverlap/testing/collective_test_utils.cuh"
@@ -16,1097 +18,746 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <nccl.h>
 
-#include <nlohmann/json.hpp>
-
+#include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ooverlap {
 namespace {
 
-using json = nlohmann::json;
 using testing::TestCollective;
 
-enum class SweepKernelKind {
-    Tma = 0,
-    SeqFastGmem = 1,
-    OverlapFastGmem = 2,
+constexpr const char* kMaxCtasEnv = "OOVERLAP_MAX_CTAS";
+constexpr const char* kMaxCtasPerReduceTaskEnv =
+    "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK";
+
+struct SweepContext {
+    std::vector<int> devices;
+    oo_group_t* group = nullptr;
+    std::vector<oo_node_t*> nodes;
+    std::vector<cudaStream_t> streams;
 };
 
-const char* kernel_kind_name(
-    SweepKernelKind kind) {
-    switch (kind) {
-        case SweepKernelKind::Tma:
-            return "tma";
-        case SweepKernelKind::SeqFastGmem:
-            return "seq_fast_gmem";
-        case SweepKernelKind::OverlapFastGmem:
-            return "overlap_fast_gmem";
+struct SizeBuffers {
+    std::vector<half*> sources;
+    std::vector<half*> work;
+    std::vector<oo_buffer_t*> buffers;
+};
+
+struct TimingEvents {
+    std::vector<cudaEvent_t> starts;
+    std::vector<cudaEvent_t> stops;
+};
+
+int required_positive_env(const char* name) {
+    if (name == nullptr || name[0] == '\0') {
+        throw std::invalid_argument("environment variable name is empty");
+    }
+
+    const char* text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') {
+        throw std::invalid_argument(
+            std::string(name) + " must be set for the CTA tuning sweep");
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(text, &end, 10);
+
+    if (errno != 0 ||
+        end == text ||
+        *end != '\0' ||
+        parsed <= 0 ||
+        parsed > INT_MAX) {
+        throw std::invalid_argument(
+            std::string(name) + " must be a positive integer");
+    }
+
+    return static_cast<int>(parsed);
+}
+
+comm::CollectivePlanFor collective_plan_for(TestCollective collective) {
+    switch (collective) {
+        case TestCollective::AllReduce:
+            return comm::CollectivePlanFor::AllReduce;
+        case TestCollective::ReduceScatter:
+            return comm::CollectivePlanFor::ReduceScatter;
+        case TestCollective::AllGather:
+            return comm::CollectivePlanFor::AllGather;
         default:
-            return "unknown";
+            throw std::invalid_argument("unsupported collective");
     }
 }
 
-SweepKernelKind parse_kernel_kind(
-    const std::string& name) {
-    if (name == "tma" ||
-        name == "tma_copy" ||
-        name == "normal") {
-        return SweepKernelKind::Tma;
-    }
+comm::LaunchConfig explicit_tma_launch_config(TestCollective collective) {
+    comm::LaunchConfig config{};
 
-    if (name == "seq_fast_gmem" ||
-        name == "not_fused" ||
-        name == "fast_gmem_seq") {
-        return SweepKernelKind::SeqFastGmem;
-    }
-
-    if (name == "overlap_fast_gmem" ||
-        name == "fused" ||
-        name == "fast_gmem_overlap") {
-        return SweepKernelKind::OverlapFastGmem;
-    }
-
-    throw std::invalid_argument("unknown kernel kind: " + name);
-}
-
-bool kernel_supported_for_collective(
-    TestCollective collective,
-    SweepKernelKind kernel) {
-    if (kernel != SweepKernelKind::OverlapFastGmem) {
-        return true;
-    }
-
-    return collective == TestCollective::AllReduce;
-}
-
-comm::LaunchConfig make_launch_config(
-    TestCollective collective,
-    SweepKernelKind kernel) {
-    if (collective == TestCollective::AllReduce) {
-        if (kernel == SweepKernelKind::Tma) {
-            return comm::make_allreduce_launch_config(
+    switch (collective) {
+        case TestCollective::AllReduce:
+            config = comm::make_allreduce_launch_config(
                 comm::AllReducePlanKind::TmaCopy);
-        }
-
-        if (kernel == SweepKernelKind::SeqFastGmem) {
-            return comm::make_allreduce_launch_config(
-                comm::AllReducePlanKind::SeqFastCopyGmem);
-        }
-
-        return comm::make_allreduce_launch_config(
-            comm::AllReducePlanKind::OverlapFastCopyGmem);
-    }
-
-    if (collective == TestCollective::ReduceScatter) {
-        if (kernel == SweepKernelKind::Tma) {
-            return comm::make_reduce_scatter_launch_config(
+            break;
+        case TestCollective::ReduceScatter:
+            config = comm::make_reduce_scatter_launch_config(
                 comm::ReduceScatterPlanKind::TmaReduce);
-        }
-
-        if (kernel == SweepKernelKind::SeqFastGmem) {
-            return comm::make_reduce_scatter_launch_config(
-                comm::ReduceScatterPlanKind::SeqFastAddGmem);
-        }
-    }
-
-    if (collective == TestCollective::AllGather) {
-        if (kernel == SweepKernelKind::Tma) {
-            return comm::make_all_gather_launch_config(
+            break;
+        case TestCollective::AllGather:
+            config = comm::make_all_gather_launch_config(
                 comm::AllGatherPlanKind::TmaCopy);
-        }
-
-        if (kernel == SweepKernelKind::SeqFastGmem) {
-            return comm::make_all_gather_launch_config(
-                comm::AllGatherPlanKind::SeqFastCopyGmem);
-        }
+            break;
+        default:
+            throw std::invalid_argument("unsupported collective");
     }
 
-    throw std::invalid_argument("unsupported collective/kernel combination");
-}
+    config.max_ctas = required_positive_env(kMaxCtasEnv);
+    config.max_ctas_per_reduce_task =
+        required_positive_env(kMaxCtasPerReduceTaskEnv);
 
-std::string getenv_string(
-    const char* name) {
-    const char* value = std::getenv(name);
-    return value ? std::string(value) : std::string();
-}
-
-int getenv_int_or(
-    const char* name,
-    int fallback) {
-    const char* value = std::getenv(name);
-
-    if (value == nullptr || value[0] == '\0') {
-        return fallback;
+    if (config.max_ctas_per_reduce_task > config.max_ctas) {
+        throw std::invalid_argument(
+            "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK must not exceed "
+            "OOVERLAP_MAX_CTAS");
     }
 
-    return std::atoi(value);
-}
-
-template <typename T>
-T get_with_fallback(
-    const json& scenario,
-    const json& root,
-    const char* key,
-    T fallback) {
-    if (scenario.contains(key) && !scenario.at(key).is_null()) {
-        return scenario.at(key).get<T>();
+    if (!comm::launch_config_valid(config)) {
+        throw std::invalid_argument(
+            "CTA environment values produce an invalid LaunchConfig");
     }
-
-    if (root.contains(key) && !root.at(key).is_null()) {
-        return root.at(key).get<T>();
-    }
-
-    return fallback;
-}
-
-json scenario_id(
-    const json& scenario,
-    int index) {
-    if (scenario.contains("id")) {
-        return scenario.at("id");
-    }
-
-    return index;
-}
-
-size_t scenario_numel(
-    const json& scenario) {
-    if (scenario.contains("numel")) {
-        const int64_t numel =
-            scenario.at("numel").get<int64_t>();
-
-        if (numel <= 0) {
-            throw std::invalid_argument("numel must be > 0");
-        }
-
-        return static_cast<size_t>(numel);
-    }
-
-    if (scenario.contains("bytes_per_rank")) {
-        const int64_t bytes =
-            scenario.at("bytes_per_rank").get<int64_t>();
-
-        if (bytes <= 0 ||
-            (bytes % static_cast<int64_t>(sizeof(half))) != 0) {
-            throw std::invalid_argument(
-                "bytes_per_rank must be positive and divisible by sizeof(half)");
-        }
-
-        return static_cast<size_t>(
-            bytes / static_cast<int64_t>(sizeof(half)));
-    }
-
-    throw std::invalid_argument("scenario must contain numel or bytes_per_rank");
-}
-
-void add_env_metadata(json& row) {
-    const std::string ooverlap_max_ctas =
-        getenv_string("OOVERLAP_MAX_CTAS");
-
-    const std::string nccl_max_ctas =
-        getenv_string("NCCL_MAX_CTAS");
-
-    row["ooverlap_max_ctas_env"] =
-        ooverlap_max_ctas.empty() ? json(nullptr) : json(ooverlap_max_ctas);
-
-    row["nccl_max_ctas_env"] =
-        nccl_max_ctas.empty() ? json(nullptr) : json(nccl_max_ctas);
-}
-
-void add_common_metrics(
-    json& row,
-    size_t numel,
-    size_t bytes,
-    int iters,
-    int warmup,
-    int dev0,
-    int dev1,
-    double total_ms) {
-    const double avg_ms =
-        total_ms / static_cast<double>(iters);
-
-    const double gbps_per_rank =
-        avg_ms > 0.0
-            ? static_cast<double>(bytes) / (avg_ms * 1.0e-3) / 1.0e9
-            : 0.0;
-
-    const double gbps_aggregate =
-        avg_ms > 0.0
-            ? 2.0 * static_cast<double>(bytes) / (avg_ms * 1.0e-3) / 1.0e9
-            : 0.0;
-
-    row["numel"] = numel;
-    row["bytes_per_rank"] = bytes;
-    row["iters"] = iters;
-    row["warmup"] = warmup;
-    row["dev0"] = dev0;
-    row["dev1"] = dev1;
-    row["total_ms"] = total_ms;
-    row["avg_ms"] = avg_ms;
-    row["latency_us"] = avg_ms * 1000.0;
-    row["effective_gbps_per_rank"] = gbps_per_rank;
-    row["effective_gbps_aggregate_2gpu"] = gbps_aggregate;
-}
-
-void launch_ooverlap_rank_once(
-    TestCollective collective,
-    half* local_work,
-    half* peer_work,
-    size_t numel,
-    int rank,
-    int local_device,
-    cudaStream_t stream,
-    int* local_ready,
-    int* peer_ready,
-    int collective_epoch,
-    comm::LaunchConfig config) {
-    void* peer_bufs[] = {
-        peer_work,
-    };
-
-    const int* peer_ready_signals[] = {
-        peer_ready,
-    };
-
-    cudaError_t err = cudaSuccess;
-
-    if (collective == TestCollective::AllReduce) {
-        err =
-            enqueue_tma_multi_gpu_allreduce_rank_sm90(
-                local_work,
-                local_work,
-                peer_bufs,
-                1,
-                numel,
-                OO_DTYPE_FLOAT16,
-                OO_REDUCE_SUM,
-                rank,
-                2,
-                local_device,
-                stream,
-                local_ready,
-                peer_ready_signals,
-                collective_epoch,
-                config);
-    } else if (collective == TestCollective::ReduceScatter) {
-        err =
-            enqueue_tma_multi_gpu_reduce_scatter_rank_sm90(
-                local_work,
-                local_work,
-                peer_bufs,
-                1,
-                numel,
-                OO_DTYPE_FLOAT16,
-                OO_REDUCE_SUM,
-                rank,
-                2,
-                local_device,
-                stream,
-                local_ready,
-                peer_ready_signals,
-                collective_epoch,
-                config);
-    } else if (collective == TestCollective::AllGather) {
-        err =
-            enqueue_tma_multi_gpu_all_gather_rank_sm90(
-                local_work,
-                local_work,
-                peer_bufs,
-                1,
-                numel,
-                OO_DTYPE_FLOAT16,
-                rank,
-                2,
-                local_device,
-                stream,
-                local_ready,
-                peer_ready_signals,
-                collective_epoch,
-                config);
-    } else {
-        throw std::invalid_argument("unknown ooverlap collective");
-    }
-
-    testing::check_cuda(err, "enqueue ooverlap sweep rank");
-}
-
-void launch_ooverlap_candidate_once(
-    TestCollective collective,
-    half* rank0_work,
-    half* rank1_work,
-    size_t numel,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    int* rank0_ready,
-    int* rank1_ready,
-    int collective_epoch,
-    comm::LaunchConfig config) {
-    launch_ooverlap_rank_once(
-        collective,
-        rank0_work,
-        rank1_work,
-        numel,
-        0,
-        dev0,
-        stream0,
-        rank0_ready,
-        rank1_ready,
-        collective_epoch,
-        config);
-
-    launch_ooverlap_rank_once(
-        collective,
-        rank1_work,
-        rank0_work,
-        numel,
-        1,
-        dev1,
-        stream1,
-        rank1_ready,
-        rank0_ready,
-        collective_epoch,
-        config);
-}
-
-void run_ooverlap_candidate_iters(
-    oo_group_t* group,
-    TestCollective collective,
-    half* rank0_work,
-    half* rank1_work,
-    size_t numel,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    int iters,
-    comm::LaunchConfig config) {
-    if (iters <= 0) {
-        return;
-    }
-
-    testing::reset_ready_signals(group);
-
-    int* rank0_ready =
-        testing::ready_signal_ptr(group, 0);
-
-    int* rank1_ready =
-        testing::ready_signal_ptr(group, 1);
-
-    for (int i = 0; i < iters; ++i) {
-        launch_ooverlap_candidate_once(
-            collective,
-            rank0_work,
-            rank1_work,
-            numel,
-            dev0,
-            dev1,
-            stream0,
-            stream1,
-            rank0_ready,
-            rank1_ready,
-            i + 1,
-            config);
-    }
-}
-
-double elapsed_ms_ooverlap_candidate(
-    oo_group_t* group,
-    TestCollective collective,
-    half* rank0_work,
-    half* rank1_work,
-    size_t numel,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    int iters,
-    comm::LaunchConfig config) {
-    testing::reset_ready_signals(group);
-
-    int epoch = 1;
-
-    int* rank0_ready =
-        testing::ready_signal_ptr(group, 0);
-
-    int* rank1_ready =
-        testing::ready_signal_ptr(group, 1);
-
-    return testing::elapsed_ms_two_stream_max(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        iters,
-        [&](int) {
-            launch_ooverlap_candidate_once(
-                collective,
-                rank0_work,
-                rank1_work,
-                numel,
-                dev0,
-                dev1,
-                stream0,
-                stream1,
-                rank0_ready,
-                rank1_ready,
-                epoch++,
-                config);
-        });
-}
-
-void launch_nccl_collective_once(
-    TestCollective collective,
-    half* rank0_work,
-    half* rank1_work,
-    size_t numel,
-    ncclComm_t* comms,
-    cudaStream_t stream0,
-    cudaStream_t stream1) {
-    OOVERLAP_TEST_NCCL_CHECK(ncclGroupStart());
-
-    testing::launch_nccl_collective_fp16(
-        collective,
-        comms[0],
-        rank0_work,
-        numel,
-        0,
-        2,
-        stream0);
-
-    testing::launch_nccl_collective_fp16(
-        collective,
-        comms[1],
-        rank1_work,
-        numel,
-        1,
-        2,
-        stream1);
-
-    OOVERLAP_TEST_NCCL_CHECK(ncclGroupEnd());
-}
-
-void run_nccl_iters(
-    TestCollective collective,
-    half* rank0_work,
-    half* rank1_work,
-    size_t numel,
-    ncclComm_t* comms,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    int iters) {
-    if (iters <= 0) {
-        return;
-    }
-
-    for (int i = 0; i < iters; ++i) {
-        launch_nccl_collective_once(
-            collective,
-            rank0_work,
-            rank1_work,
-            numel,
-            comms,
-            stream0,
-            stream1);
-    }
-}
-
-double elapsed_ms_nccl(
-    TestCollective collective,
-    half* rank0_work,
-    half* rank1_work,
-    size_t numel,
-    int dev0,
-    int dev1,
-    cudaStream_t stream0,
-    cudaStream_t stream1,
-    ncclComm_t* comms,
-    int iters) {
-    return testing::elapsed_ms_two_stream_max(
-        dev0,
-        stream0,
-        dev1,
-        stream1,
-        iters,
-        [&](int) {
-            launch_nccl_collective_once(
-                collective,
-                rank0_work,
-                rank1_work,
-                numel,
-                comms,
-                stream0,
-                stream1);
-        });
-}
-
-comm::LaunchConfig scenario_launch_config(
-    const json& scenario,
-    TestCollective collective,
-    SweepKernelKind kernel) {
-    comm::LaunchConfig config =
-        make_launch_config(collective, kernel);
-
-    config.threads =
-        scenario.value("threads", config.threads);
-
-    config.window_chunks =
-        scenario.value("window_chunks", config.window_chunks);
-
-    config.chunk_bytes =
-        scenario.value("chunk_bytes", config.chunk_bytes);
-
-    config.stage_depth =
-        scenario.value("stage_depth", config.stage_depth);
-
-    config.max_ctas =
-        scenario.value(
-            "max_ctas",
-            getenv_int_or("OOVERLAP_MAX_CTAS", config.max_ctas));
 
     return config;
 }
 
-json skipped_row(
-    const json& scenario,
-    int scenario_index,
-    const char* backend,
-    const char* collective,
-    const char* kernel,
-    const char* reason) {
-    json row;
-    row["id"] = scenario_id(scenario, scenario_index);
-    row["status"] = "skipped";
-    row["backend"] = backend;
-    row["collective"] = collective;
-    row["kernel"] = kernel;
-    row["reason"] = reason;
-    add_env_metadata(row);
-    return row;
+void validate_devices(const std::vector<int>& devices) {
+    if (devices.size() < 2) {
+        throw std::invalid_argument(
+            "CTA tuning sweep requires at least two CUDA devices");
+    }
+
+    if (devices.size() > static_cast<std::size_t>(kOoMaxLocalDevices)) {
+        throw std::invalid_argument(
+            "CTA tuning sweep exceeds Ooverlap's local-rank limit");
+    }
+
+    std::set<int> unique;
+    for (int device : devices) {
+        if (device < 0) {
+            throw std::invalid_argument("device ids must be non-negative");
+        }
+        if (!unique.insert(device).second) {
+            throw std::invalid_argument("device ids must be unique");
+        }
+    }
 }
 
-json run_ooverlap_scenario(
-    const json& root,
-    const json& scenario,
-    int scenario_index) {
-    const int iters =
-        get_with_fallback<int>(scenario, root, "iters", 100);
-
-    const int warmup =
-        get_with_fallback<int>(scenario, root, "warmup", 20);
-
-    const int dev0 =
-        get_with_fallback<int>(scenario, root, "dev0", 0);
-
-    const int dev1 =
-        get_with_fallback<int>(scenario, root, "dev1", 1);
-
-    if (iters <= 0 || warmup < 0) {
-        throw std::invalid_argument("iters must be > 0 and warmup must be >= 0");
+void validate_numels(
+    TestCollective collective,
+    const std::vector<int64_t>& numels,
+    int world_size) {
+    if (numels.empty()) {
+        throw std::invalid_argument("numels must be non-empty");
     }
 
-    if (dev0 == dev1) {
-        throw std::invalid_argument("dev0 and dev1 must differ");
-    }
-
-    const TestCollective collective =
-        testing::parse_collective(
-            scenario.value("collective", std::string("allreduce")));
-
-    const SweepKernelKind kernel =
-        parse_kernel_kind(
-            scenario.value("kernel", std::string("seq_fast_gmem")));
-
-    const size_t numel =
-        scenario_numel(scenario);
-
-    testing::validate_numel_for_collective(
-        collective,
-        static_cast<int64_t>(numel),
-        2);
-
-    const size_t bytes =
-        numel * sizeof(half);
-
-    const char* collective_name =
-        testing::collective_name(collective);
-
-    const char* kernel_name =
-        kernel_kind_name(kernel);
-
-    if (!kernel_supported_for_collective(collective, kernel)) {
-        return skipped_row(
-            scenario,
-            scenario_index,
-            "ooverlap",
-            collective_name,
-            kernel_name,
-            "kernel not supported for collective");
-    }
-
-    comm::LaunchConfig config =
-        scenario_launch_config(
-            scenario,
+    for (int64_t numel : numels) {
+        testing::validate_numel_for_collective(
             collective,
-            kernel);
+            numel,
+            world_size);
+    }
+}
 
-    json row;
-    row["id"] = scenario_id(scenario, scenario_index);
-    row["status"] = "ok";
-    row["backend"] = "ooverlap";
-    row["collective"] = collective_name;
-    row["kernel"] = kernel_name;
-    row["threads"] = config.threads;
-    row["max_ctas"] = config.max_ctas;
-    row["window_chunks"] = config.window_chunks;
-    row["chunk_bytes"] = config.chunk_bytes;
-    row["stage_depth"] = config.stage_depth;
-
-    if (!comm::launch_config_valid(config)) {
-        row["status"] = "skipped";
-        row["reason"] = "invalid launch config";
-        add_env_metadata(row);
-        return row;
+void sync_streams(
+    const std::vector<int>& devices,
+    const std::vector<cudaStream_t>& streams,
+    const char* label) {
+    if (devices.size() != streams.size()) {
+        throw std::invalid_argument("sync_streams: size mismatch");
     }
 
-    oo_group_t* group = nullptr;
-    oo_node_t* node0 = nullptr;
-    oo_node_t* node1 = nullptr;
-    oo_buffer_t* rank0_buf = nullptr;
-    oo_buffer_t* rank1_buf = nullptr;
+    for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+        system::runtime::sync_stream_on_device(
+            devices[rank],
+            streams[rank],
+            label);
+    }
+}
 
-    half* rank0_src = nullptr;
-    half* rank1_src = nullptr;
+void destroy_context_best_effort(SweepContext& context) {
+    for (oo_node_t*& node : context.nodes) {
+        testing::destroy_oo_node(node);
+    }
 
-    cudaStream_t stream0 = nullptr;
-    cudaStream_t stream1 = nullptr;
+    testing::destroy_oo_group(context.group);
 
-    int cleanup_dev0 = dev0;
-    int cleanup_dev1 = dev1;
+    const std::size_t stream_count =
+        std::min(context.devices.size(), context.streams.size());
+    for (std::size_t rank = 0; rank < stream_count; ++rank) {
+        if (context.streams[rank] != nullptr) {
+            system::runtime::destroy_stream_on_device(
+                context.devices[rank],
+                context.streams[rank]);
+            context.streams[rank] = nullptr;
+        }
+    }
+
+    context = SweepContext{};
+}
+
+SweepContext create_context(const std::vector<int>& devices) {
+    SweepContext context;
+    context.devices = devices;
+    context.nodes.assign(devices.size(), nullptr);
+    context.streams.assign(devices.size(), nullptr);
 
     try {
-        int devices[2] = {
-            dev0,
-            dev1,
-        };
-
         testing::check_oo(
-            oo_group_create(devices, 2, &group),
-            "oo_group_create");
+            oo_group_create_p2p(
+                context.devices.data(),
+                static_cast<int>(context.devices.size()),
+                &context.group),
+            "oo_group_create_p2p(CTA sweep)");
 
-        testing::check_oo(
-            oo_node_create(group, 0, &node0),
-            "oo_node_create(rank0)");
+        for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+            testing::check_oo(
+                oo_node_create(
+                    context.group,
+                    static_cast<int>(rank),
+                    &context.nodes[rank]),
+                "oo_node_create(CTA sweep)");
 
-        testing::check_oo(
-            oo_node_create(group, 1, &node1),
-            "oo_node_create(rank1)");
+            const int node_device = oo_node_device(context.nodes[rank]);
+            if (node_device != devices[rank]) {
+                throw std::runtime_error(
+                    "oo_node_device did not match requested device");
+            }
 
-        cleanup_dev0 = oo_node_device(node0);
-        cleanup_dev1 = oo_node_device(node1);
+            context.streams[rank] =
+                system::runtime::create_stream_on_device(node_device);
+        }
 
-        stream0 =
-            system::runtime::create_stream_on_device(cleanup_dev0);
+        return context;
+    } catch (...) {
+        destroy_context_best_effort(context);
+        throw;
+    }
+}
 
-        stream1 =
-            system::runtime::create_stream_on_device(cleanup_dev1);
+void destroy_timing_events_best_effort(
+    const std::vector<int>& devices,
+    TimingEvents& events) {
+    const std::size_t start_count =
+        std::min(devices.size(), events.starts.size());
+    for (std::size_t rank = 0; rank < start_count; ++rank) {
+        if (events.starts[rank] != nullptr) {
+            (void)cudaSetDevice(devices[rank]);
+            (void)cudaEventDestroy(events.starts[rank]);
+            events.starts[rank] = nullptr;
+        }
+    }
 
-        testing::cuda_malloc_half_on_device(
-            cleanup_dev0,
-            &rank0_src,
+    const std::size_t stop_count =
+        std::min(devices.size(), events.stops.size());
+    for (std::size_t rank = 0; rank < stop_count; ++rank) {
+        if (events.stops[rank] != nullptr) {
+            (void)cudaSetDevice(devices[rank]);
+            (void)cudaEventDestroy(events.stops[rank]);
+            events.stops[rank] = nullptr;
+        }
+    }
+}
+
+TimingEvents create_timing_events(const std::vector<int>& devices) {
+    TimingEvents events;
+    events.starts.assign(devices.size(), nullptr);
+    events.stops.assign(devices.size(), nullptr);
+
+    try {
+        for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+            system::runtime::set_device(devices[rank]);
+            testing::check_cuda(
+                cudaEventCreate(&events.starts[rank]),
+                "cudaEventCreate(CTA sweep start)");
+            testing::check_cuda(
+                cudaEventCreate(&events.stops[rank]),
+                "cudaEventCreate(CTA sweep stop)");
+        }
+
+        return events;
+    } catch (...) {
+        destroy_timing_events_best_effort(devices, events);
+        throw;
+    }
+}
+
+void destroy_size_buffers_best_effort(
+    const SweepContext& context,
+    SizeBuffers& buffers) {
+    for (oo_buffer_t*& buffer : buffers.buffers) {
+        testing::destroy_oo_buffer(buffer);
+    }
+
+    const std::size_t source_count =
+        std::min(context.devices.size(), buffers.sources.size());
+    for (std::size_t rank = 0; rank < source_count; ++rank) {
+        testing::cuda_free_on_device(
+            context.devices[rank],
+            buffers.sources[rank]);
+    }
+
+    buffers = SizeBuffers{};
+}
+
+SizeBuffers allocate_size_buffers(
+    const SweepContext& context,
+    int64_t numel,
+    std::size_t bytes) {
+    const std::size_t world_size = context.devices.size();
+
+    SizeBuffers buffers;
+    buffers.sources.assign(world_size, nullptr);
+    buffers.work.assign(world_size, nullptr);
+    buffers.buffers.assign(world_size, nullptr);
+
+    try {
+        for (std::size_t rank = 0; rank < world_size; ++rank) {
+            testing::cuda_malloc_half_on_device(
+                context.devices[rank],
+                &buffers.sources[rank],
+                bytes,
+                "cudaMalloc(CTA sweep source)");
+
+            testing::check_oo(
+                oo_buffer_alloc(
+                    context.nodes[rank],
+                    bytes,
+                    &buffers.buffers[rank]),
+                "oo_buffer_alloc(CTA sweep work)");
+
+            buffers.work[rank] = reinterpret_cast<half*>(
+                oo_buffer_ptr(buffers.buffers[rank]));
+
+            if (buffers.work[rank] == nullptr) {
+                throw std::runtime_error(
+                    "oo_buffer_ptr returned nullptr in CTA sweep");
+            }
+
+            testing::fill_rank_source_fp16(
+                buffers.sources[rank],
+                numel,
+                static_cast<int>(rank),
+                context.devices[rank],
+                context.streams[rank]);
+        }
+
+        return buffers;
+    } catch (...) {
+        destroy_size_buffers_best_effort(context, buffers);
+        throw;
+    }
+}
+
+void prepare_work_buffers(
+    const SweepContext& context,
+    const SizeBuffers& buffers,
+    std::size_t bytes) {
+    const std::size_t world_size = context.devices.size();
+
+    if (buffers.sources.size() != world_size ||
+        buffers.work.size() != world_size ||
+        context.streams.size() != world_size) {
+        throw std::invalid_argument(
+            "prepare_work_buffers: size mismatch");
+    }
+
+    for (std::size_t rank = 0; rank < world_size; ++rank) {
+        testing::reset_work_buffer_async(
+            buffers.work[rank],
+            buffers.sources[rank],
             bytes,
-            "cudaMalloc(rank0_src)");
+            context.devices[rank],
+            context.streams[rank]);
+    }
 
-        testing::cuda_malloc_half_on_device(
-            cleanup_dev1,
-            &rank1_src,
-            bytes,
-            "cudaMalloc(rank1_src)");
+    sync_streams(
+        context.devices,
+        context.streams,
+        "sync CTA sweep work reset");
+}
 
-        testing::check_oo(
-            oo_buffer_alloc(node0, bytes, &rank0_buf),
-            "oo_buffer_alloc(rank0)");
+void launch_rank_once(
+    TestCollective collective,
+    const SweepContext& context,
+    const SizeBuffers& buffers,
+    std::size_t numel,
+    std::size_t rank,
+    const comm::LaunchConfig& config) {
+    oo_node_t* node = context.nodes[rank];
+    oo_buffer_t* buffer = buffers.buffers[rank];
+    cudaStream_t stream = context.streams[rank];
 
-        testing::check_oo(
-            oo_buffer_alloc(node1, bytes, &rank1_buf),
-            "oo_buffer_alloc(rank1)");
-
-        half* rank0_work =
-            reinterpret_cast<half*>(oo_buffer_ptr(rank0_buf));
-
-        half* rank1_work =
-            reinterpret_cast<half*>(oo_buffer_ptr(rank1_buf));
-
-        testing::fill_two_rank_sources_fp16(
-            rank0_src,
-            rank1_src,
-            static_cast<int64_t>(numel),
-            cleanup_dev0,
-            cleanup_dev1,
-            stream0,
-            stream1);
-
-        testing::prepare_two_work_buffers(
-            rank0_src,
-            rank1_src,
-            rank0_work,
-            rank1_work,
-            bytes,
-            cleanup_dev0,
-            cleanup_dev1,
-            stream0,
-            stream1);
-
-        run_ooverlap_candidate_iters(
-            group,
-            collective,
-            rank0_work,
-            rank1_work,
+    comm::api::CollectiveLaunchState launch{};
+    testing::check_oo(
+        comm::api::prepare_collective_launch(
+            node,
+            buffer,
+            collective_plan_for(collective),
+            0,
             numel,
-            cleanup_dev0,
-            cleanup_dev1,
-            stream0,
-            stream1,
+            OO_DTYPE_FLOAT16,
+            &launch),
+        "prepare_collective_launch(CTA sweep)");
+
+    if (collective == TestCollective::AllReduce) {
+        comm::plan::AllreduceTransferPlan* transfer_plan = nullptr;
+        testing::check_oo(
+            context.group->transfer_plan_distribution->
+                get_allreduce_transfer_plan(
+                    node,
+                    launch,
+                    numel,
+                    OO_DTYPE_FLOAT16,
+                    OO_REDUCE_SUM,
+                    config,
+                    &transfer_plan),
+            "get_allreduce_transfer_plan(CTA sweep)");
+
+        testing::check_cuda(
+            enqueue_tma_multi_gpu_allreduce_rank_sm90(
+                launch,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                stream,
+                config,
+                *transfer_plan),
+            "enqueue allreduce CTA sweep");
+        return;
+    }
+
+    if (collective == TestCollective::ReduceScatter) {
+        comm::plan::ReduceScatterTransferPlan* transfer_plan = nullptr;
+        testing::check_oo(
+            context.group->transfer_plan_distribution->
+                get_reduce_scatter_transfer_plan(
+                    node,
+                    launch,
+                    numel,
+                    OO_DTYPE_FLOAT16,
+                    OO_REDUCE_SUM,
+                    config,
+                    &transfer_plan),
+            "get_reduce_scatter_transfer_plan(CTA sweep)");
+
+        testing::check_cuda(
+            enqueue_tma_multi_gpu_reduce_scatter_rank_sm90(
+                launch,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                stream,
+                config,
+                *transfer_plan),
+            "enqueue reduce-scatter CTA sweep");
+        return;
+    }
+
+    if (collective == TestCollective::AllGather) {
+        comm::plan::AllGatherTransferPlan* transfer_plan = nullptr;
+        testing::check_oo(
+            context.group->transfer_plan_distribution->
+                get_all_gather_transfer_plan(
+                    node,
+                    launch,
+                    numel,
+                    OO_DTYPE_FLOAT16,
+                    config,
+                    &transfer_plan),
+            "get_all_gather_transfer_plan(CTA sweep)");
+
+        testing::check_cuda(
+            enqueue_tma_multi_gpu_all_gather_rank_sm90(
+                launch,
+                OO_DTYPE_FLOAT16,
+                stream,
+                config,
+                *transfer_plan),
+            "enqueue all-gather CTA sweep");
+        return;
+    }
+
+    throw std::invalid_argument("unsupported collective");
+}
+
+void launch_collective_once(
+    TestCollective collective,
+    const SweepContext& context,
+    const SizeBuffers& buffers,
+    std::size_t numel,
+    const comm::LaunchConfig& config) {
+    for (std::size_t rank = 0; rank < context.devices.size(); ++rank) {
+        launch_rank_once(
+            collective,
+            context,
+            buffers,
+            numel,
+            rank,
+            config);
+    }
+}
+
+void run_warmup(
+    TestCollective collective,
+    const SweepContext& context,
+    const SizeBuffers& buffers,
+    std::size_t numel,
+    int warmup,
+    const comm::LaunchConfig& config) {
+    testing::reset_ready_signals(context.group);
+
+    for (int iteration = 0; iteration < warmup; ++iteration) {
+        launch_collective_once(
+            collective,
+            context,
+            buffers,
+            numel,
+            config);
+    }
+
+    sync_streams(
+        context.devices,
+        context.streams,
+        "sync CTA sweep warmup");
+}
+
+double elapsed_collective_ms(
+    TestCollective collective,
+    const SweepContext& context,
+    const SizeBuffers& buffers,
+    std::size_t numel,
+    int iters,
+    const comm::LaunchConfig& config,
+    TimingEvents& events) {
+    const std::size_t world_size = context.devices.size();
+
+    for (std::size_t rank = 0; rank < world_size; ++rank) {
+        system::runtime::set_device(context.devices[rank]);
+        testing::check_cuda(
+            cudaEventRecord(events.starts[rank], context.streams[rank]),
+            "cudaEventRecord(CTA sweep start)");
+    }
+
+    for (int iteration = 0; iteration < iters; ++iteration) {
+        launch_collective_once(
+            collective,
+            context,
+            buffers,
+            numel,
+            config);
+    }
+
+    for (std::size_t rank = 0; rank < world_size; ++rank) {
+        system::runtime::set_device(context.devices[rank]);
+        testing::check_cuda(
+            cudaEventRecord(events.stops[rank], context.streams[rank]),
+            "cudaEventRecord(CTA sweep stop)");
+    }
+
+    double max_ms = 0.0;
+    for (std::size_t rank = 0; rank < world_size; ++rank) {
+        system::runtime::set_device(context.devices[rank]);
+        testing::check_cuda(
+            cudaEventSynchronize(events.stops[rank]),
+            "cudaEventSynchronize(CTA sweep stop)");
+
+        float rank_ms = 0.0f;
+        testing::check_cuda(
+            cudaEventElapsedTime(
+                &rank_ms,
+                events.starts[rank],
+                events.stops[rank]),
+            "cudaEventElapsedTime(CTA sweep)");
+
+        max_ms = std::max(max_ms, static_cast<double>(rank_ms));
+    }
+
+    return max_ms;
+}
+
+void verify_result(
+    TestCollective collective,
+    const SweepContext& context,
+    const SizeBuffers& buffers,
+    int64_t numel,
+    const comm::LaunchConfig& config) {
+    prepare_work_buffers(
+        context,
+        buffers,
+        static_cast<std::size_t>(numel) * sizeof(half));
+
+    testing::reset_ready_signals(context.group);
+    launch_collective_once(
+        collective,
+        context,
+        buffers,
+        static_cast<std::size_t>(numel),
+        config);
+
+    sync_streams(
+        context.devices,
+        context.streams,
+        "sync CTA sweep verification");
+
+    for (std::size_t rank = 0; rank < context.devices.size(); ++rank) {
+        testing::verify_collective_fp16(
+            collective,
+            "TMA CTA sweep",
+            buffers.work[rank],
+            numel,
+            static_cast<int>(rank),
+            static_cast<int>(context.devices.size()),
+            context.devices[rank]);
+    }
+}
+
+std::map<std::string, double> benchmark_one_size(
+    TestCollective collective,
+    const SweepContext& context,
+    int64_t numel_arg,
+    int iters,
+    int warmup,
+    bool verify,
+    const comm::LaunchConfig& config,
+    TimingEvents& events) {
+    const std::size_t numel = static_cast<std::size_t>(numel_arg);
+    const std::size_t bytes = numel * sizeof(half);
+
+    SizeBuffers buffers = allocate_size_buffers(context, numel_arg, bytes);
+
+    try {
+        prepare_work_buffers(context, buffers, bytes);
+        run_warmup(
+            collective,
+            context,
+            buffers,
+            numel,
             warmup,
             config);
 
-        testing::sync_two_streams(
-            cleanup_dev0,
-            stream0,
-            cleanup_dev1,
-            stream1,
-            "sync ooverlap warmup");
-
-        testing::prepare_two_work_buffers(
-            rank0_src,
-            rank1_src,
-            rank0_work,
-            rank1_work,
-            bytes,
-            cleanup_dev0,
-            cleanup_dev1,
-            stream0,
-            stream1);
+        prepare_work_buffers(context, buffers, bytes);
+        testing::reset_ready_signals(context.group);
 
         const double total_ms =
-            elapsed_ms_ooverlap_candidate(
-                group,
+            elapsed_collective_ms(
                 collective,
-                rank0_work,
-                rank1_work,
+                context,
+                buffers,
                 numel,
-                cleanup_dev0,
-                cleanup_dev1,
-                stream0,
-                stream1,
                 iters,
+                config,
+                events);
+
+        if (verify) {
+            verify_result(
+                collective,
+                context,
+                buffers,
+                numel_arg,
                 config);
+        }
 
-        testing::sync_two_streams(
-            cleanup_dev0,
-            stream0,
-            cleanup_dev1,
-            stream1,
-            "sync ooverlap timed");
+        const double avg_ms =
+            total_ms / static_cast<double>(iters);
 
-        add_common_metrics(
-            row,
-            numel,
-            bytes,
-            iters,
-            warmup,
-            cleanup_dev0,
-            cleanup_dev1,
-            total_ms);
-
-        add_env_metadata(row);
-
-        testing::cuda_free_on_device(cleanup_dev0, rank0_src);
-        testing::cuda_free_on_device(cleanup_dev1, rank1_src);
-
-        testing::destroy_oo_buffer(rank0_buf);
-        testing::destroy_oo_buffer(rank1_buf);
-        testing::destroy_oo_node(node0);
-        testing::destroy_oo_node(node1);
-        testing::destroy_oo_group(group);
-
-        testing::destroy_stream_on_device(cleanup_dev0, stream0);
-        testing::destroy_stream_on_device(cleanup_dev1, stream1);
-
-        return row;
-    } catch (...) {
-        testing::cuda_free_on_device(cleanup_dev0, rank0_src);
-        testing::cuda_free_on_device(cleanup_dev1, rank1_src);
-
-        testing::destroy_oo_buffer(rank0_buf);
-        testing::destroy_oo_buffer(rank1_buf);
-        testing::destroy_oo_node(node0);
-        testing::destroy_oo_node(node1);
-        testing::destroy_oo_group(group);
-
-        testing::destroy_stream_on_device(cleanup_dev0, stream0);
-        testing::destroy_stream_on_device(cleanup_dev1, stream1);
-
-        throw;
-    }
-}
-
-json run_nccl_scenario(
-    const json& root,
-    const json& scenario,
-    int scenario_index) {
-    const int iters =
-        get_with_fallback<int>(scenario, root, "iters", 100);
-
-    const int warmup =
-        get_with_fallback<int>(scenario, root, "warmup", 20);
-
-    const int dev0 =
-        get_with_fallback<int>(scenario, root, "dev0", 0);
-
-    const int dev1 =
-        get_with_fallback<int>(scenario, root, "dev1", 1);
-
-    if (iters <= 0 || warmup < 0) {
-        throw std::invalid_argument("iters must be > 0 and warmup must be >= 0");
-    }
-
-    if (dev0 == dev1) {
-        throw std::invalid_argument("dev0 and dev1 must differ");
-    }
-
-    const TestCollective collective =
-        testing::parse_collective(
-            scenario.value("collective", std::string("allreduce")));
-
-    const size_t numel =
-        scenario_numel(scenario);
-
-    testing::validate_numel_for_collective(
-        collective,
-        static_cast<int64_t>(numel),
-        2);
-
-    const size_t bytes =
-        numel * sizeof(half);
-
-    half* rank0_work = nullptr;
-    half* rank1_work = nullptr;
-
-    cudaStream_t stream0 = nullptr;
-    cudaStream_t stream1 = nullptr;
-
-    ncclComm_t comms[2] = {
-        nullptr,
-        nullptr,
-    };
-
-    json row;
-    row["id"] = scenario_id(scenario, scenario_index);
-    row["status"] = "ok";
-    row["backend"] = "nccl";
-    row["collective"] = testing::collective_name(collective);
-    row["kernel"] = "nccl";
-
-    try {
-        system::runtime::ensure_context_on_device(dev0);
-        system::runtime::ensure_context_on_device(dev1);
-
-        stream0 =
-            system::runtime::create_stream_on_device(dev0);
-
-        stream1 =
-            system::runtime::create_stream_on_device(dev1);
-
-        testing::cuda_malloc_half_on_device(
-            dev0,
-            &rank0_work,
-            bytes,
-            "cudaMalloc(rank0_work)");
-
-        testing::cuda_malloc_half_on_device(
-            dev1,
-            &rank1_work,
-            bytes,
-            "cudaMalloc(rank1_work)");
-
-        testing::fill_two_rank_sources_fp16(
-            rank0_work,
-            rank1_work,
-            static_cast<int64_t>(numel),
-            dev0,
-            dev1,
-            stream0,
-            stream1);
-
-        int devices[2] = {
-            dev0,
-            dev1,
+        std::map<std::string, double> row = {
+            {"collective", testing::collective_code(collective)},
+            {"world_size", static_cast<double>(context.devices.size())},
+            {"numel", static_cast<double>(numel)},
+            {"bytes", static_cast<double>(bytes)},
+            {"iters", static_cast<double>(iters)},
+            {"warmup", static_cast<double>(warmup)},
+            {"max_ctas", static_cast<double>(config.max_ctas)},
+            {"max_ctas_per_reduce_task",
+             static_cast<double>(config.max_ctas_per_reduce_task)},
+            {"total_ms", total_ms},
+            {"avg_ms", avg_ms},
+            {"latency_us", avg_ms * 1000.0},
         };
 
-        OOVERLAP_TEST_NCCL_CHECK(
-            ncclCommInitAll(comms, 2, devices));
-
-        run_nccl_iters(
-            collective,
-            rank0_work,
-            rank1_work,
-            numel,
-            comms,
-            stream0,
-            stream1,
-            warmup);
-
-        testing::sync_two_streams(
-            dev0,
-            stream0,
-            dev1,
-            stream1,
-            "sync nccl warmup");
-
-        testing::fill_two_rank_sources_fp16(
-            rank0_work,
-            rank1_work,
-            static_cast<int64_t>(numel),
-            dev0,
-            dev1,
-            stream0,
-            stream1);
-
-        const double total_ms =
-            elapsed_ms_nccl(
-                collective,
-                rank0_work,
-                rank1_work,
-                numel,
-                dev0,
-                dev1,
-                stream0,
-                stream1,
-                comms,
-                iters);
-
-        testing::sync_two_streams(
-            dev0,
-            stream0,
-            dev1,
-            stream1,
-            "sync nccl timed");
-
-        add_common_metrics(
-            row,
-            numel,
-            bytes,
-            iters,
-            warmup,
-            dev0,
-            dev1,
-            total_ms);
-
-        add_env_metadata(row);
-
-        testing::destroy_nccl_comms(comms, 2);
-        testing::cuda_free_on_device(dev0, rank0_work);
-        testing::cuda_free_on_device(dev1, rank1_work);
-        testing::destroy_stream_on_device(dev0, stream0);
-        testing::destroy_stream_on_device(dev1, stream1);
-
+        destroy_size_buffers_best_effort(context, buffers);
         return row;
     } catch (...) {
-        testing::destroy_nccl_comms(comms, 2);
-        testing::cuda_free_on_device(dev0, rank0_work);
-        testing::cuda_free_on_device(dev1, rank1_work);
-        testing::destroy_stream_on_device(dev0, stream0);
-        testing::destroy_stream_on_device(dev1, stream1);
-
+        destroy_size_buffers_best_effort(context, buffers);
         throw;
     }
-}
-
-json run_one_scenario(
-    const json& root,
-    const json& scenario,
-    int scenario_index) {
-    const std::string backend =
-        scenario.value("backend", std::string("ooverlap"));
-
-    if (backend == "ooverlap" || backend == "oo") {
-        return run_ooverlap_scenario(root, scenario, scenario_index);
-    }
-
-    if (backend == "nccl") {
-        return run_nccl_scenario(root, scenario, scenario_index);
-    }
-
-    throw std::invalid_argument("unknown backend: " + backend);
 }
 
 } // namespace
 
-std::string benchmark_tma_two_gpu_collective_sweep_json(
-    const std::string& request_json) {
-    json response;
-    response["ok"] = true;
-    response["results"] = json::array();
-    response["errors"] = json::array();
-
-    try {
-        const json root =
-            json::parse(request_json);
-
-        if (!root.contains("scenarios") ||
-            !root.at("scenarios").is_array()) {
-            throw std::invalid_argument(
-                "request must contain scenarios array");
-        }
-
-        const json& scenarios =
-            root.at("scenarios");
-
-        for (size_t i = 0; i < scenarios.size(); ++i) {
-            const json& scenario =
-                scenarios.at(i);
-
-            try {
-                response["results"].push_back(
-                    run_one_scenario(
-                        root,
-                        scenario,
-                        static_cast<int>(i)));
-            } catch (const std::exception& exc) {
-                response["ok"] = false;
-
-                json err;
-                err["id"] =
-                    scenario_id(scenario, static_cast<int>(i));
-                err["index"] =
-                    i;
-                err["error"] =
-                    exc.what();
-
-                response["errors"].push_back(err);
-            }
-        }
-    } catch (const std::exception& exc) {
-        response["ok"] = false;
-
-        json err;
-        err["id"] = nullptr;
-        err["index"] = nullptr;
-        err["error"] = exc.what();
-
-        response["errors"].push_back(err);
+std::vector<std::map<std::string, double>>
+benchmark_tma_collective_cta_sweep_sm90(
+    const std::string& collective_name,
+    const std::vector<int64_t>& numels,
+    int iters,
+    int warmup,
+    const std::vector<int>& devices,
+    bool verify) {
+    if (iters <= 0) {
+        throw std::invalid_argument("iters must be > 0");
     }
 
-    return response.dump();
+    if (warmup < 0) {
+        throw std::invalid_argument("warmup must be >= 0");
+    }
+
+    validate_devices(devices);
+
+    const TestCollective collective =
+        testing::parse_collective(collective_name);
+
+    validate_numels(
+        collective,
+        numels,
+        static_cast<int>(devices.size()));
+
+    const comm::LaunchConfig config =
+        explicit_tma_launch_config(collective);
+
+    SweepContext context = create_context(devices);
+    TimingEvents events;
+
+    try {
+        events = create_timing_events(devices);
+
+        std::vector<std::map<std::string, double>> rows;
+        rows.reserve(numels.size());
+
+        for (int64_t numel : numels) {
+            rows.push_back(
+                benchmark_one_size(
+                    collective,
+                    context,
+                    numel,
+                    iters,
+                    warmup,
+                    verify,
+                    config,
+                    events));
+        }
+
+        destroy_timing_events_best_effort(devices, events);
+        destroy_context_best_effort(context);
+        return rows;
+    } catch (...) {
+        destroy_timing_events_best_effort(devices, events);
+        destroy_context_best_effort(context);
+        throw;
+    }
 }
 
 } // namespace ooverlap
-
