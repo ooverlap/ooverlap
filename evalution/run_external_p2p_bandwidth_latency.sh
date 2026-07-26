@@ -27,9 +27,9 @@ case "$WORLD_SIZE" in
     ;;
   4)
     DEVICES="0,1,2,3"
-    OOVERLAP_MAX_CTAS="12"
+    OOVERLAP_MAX_CTAS="18"
     NCCL_MAX_CTAS="-1"
-    MAX_CTAS_PER_REDUCE_TASK="4"
+    MAX_CTAS_PER_REDUCE_TASK="6"
     ;;
   *)
     echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
@@ -75,6 +75,12 @@ PLOT_PREFIX="$OUT_DIR/external_p2p_collective"
   exit 1
 }
 
+# OOVERLAP_EXTERNAL_P2P_TUNING_POLICY_CLI_V1
+[[ -f "$TUNING_POLICY" ]] || {
+  echo "error: tuning policy not found: $TUNING_POLICY" >&2
+  exit 1
+}
+
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
   echo "error: Python executable not found: $PYTHON_BIN" >&2
   exit 1
@@ -97,6 +103,7 @@ echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
 echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
 echo "[evalution] nccl_max_ctas=$NCCL_MAX_CTAS_LABEL"
 echo "[evalution] max_ctas_per_reduce_task=$MAX_CTAS_PER_REDUCE_TASK"
+echo "[evalution] tuning_policy=$TUNING_POLICY"
 echo "[evalution] latency_bytes=$LATENCY_BYTES"
 echo "[evalution] bandwidth_bytes=$BANDWIDTH_BYTES"
 echo "[evalution] iters=$ITERS warmup=$WARMUP"
@@ -111,6 +118,7 @@ echo "[evalution] output=${OUT_PREFIX}.txt"
   --ctas "$OOVERLAP_MAX_CTAS" \
   --nccl-ctas "$NCCL_MAX_CTAS" \
   --max-ctas-per-reduce-task "$MAX_CTAS_PER_REDUCE_TASK" \
+  --tuning-policy "$TUNING_POLICY" \
   --latency-bytes "$LATENCY_BYTES" \
   --bandwidth-bytes "$BANDWIDTH_BYTES" \
   --bytes "$BANDWIDTH_BYTES" \

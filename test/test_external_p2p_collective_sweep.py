@@ -20,6 +20,8 @@ FP16_BYTES = 2
 OOVERLAP_CTA_ENV_VAR = "OOVERLAP_MAX_CTAS"
 NCCL_CTA_ENV_VAR = "NCCL_MAX_CTAS"
 REDUCE_TASK_CTA_ENV_VAR = "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
+TUNING_POLICY_ENV_VAR = "OOVERLAP_TUNING_POLICY"
+# OOVERLAP_EXTERNAL_P2P_TUNING_POLICY_CLI_V1
 
 OUTPUT_COLUMNS = [
     "timestamp_utc",
@@ -387,11 +389,13 @@ def run_worker(request_path: Path, output_path: Path) -> None:
     cta_label = request.get("cta_limit")
     nccl_cta_limit = request.get("nccl_cta_limit")
     reduce_task_ctas = request.get("max_ctas_per_reduce_task")
+    tuning_policy = os.environ.get(TUNING_POLICY_ENV_VAR, "default")
     ring_size = os.environ.get("OOVERLAP_BENCH_RING_SIZE", "16")
     print(
         f"[worker] ooverlap_ctas={cta_label if cta_label is not None else 'default'} "
         f"nccl_ctas={nccl_cta_limit if nccl_cta_limit is not None else 'default'} "
         f"reduce_task_ctas={reduce_task_ctas if reduce_task_ctas is not None else 'default'} "
+        f"tuning_policy={tuning_policy} "
         f"bandwidth_ring_size={ring_size} "
         f"devices={devices} torch={torch.__version__}",
         flush=True,
@@ -446,6 +450,7 @@ def worker_environment(
     cta_limit: int | None,
     nccl_cta_limit: int | None,
     max_ctas_per_reduce_task: int | None,
+    tuning_policy: Path | None,
 ) -> dict[str, str]:
     env = os.environ.copy()
 
@@ -460,6 +465,8 @@ def worker_environment(
         env[NCCL_CTA_ENV_VAR] = str(nccl_cta_limit)
     if max_ctas_per_reduce_task is not None:
         env[REDUCE_TASK_CTA_ENV_VAR] = str(max_ctas_per_reduce_task)
+    if tuning_policy is not None:
+        env[TUNING_POLICY_ENV_VAR] = str(tuning_policy)
     return env
 
 
@@ -467,6 +474,7 @@ def run_cta_worker(
     cta_limit: int | None,
     nccl_cta_limit: int | None,
     max_ctas_per_reduce_task: int | None,
+    tuning_policy: Path | None,
     jobs: list[dict[str, Any]],
     devices: list[int],
     run_id: str,
@@ -474,7 +482,10 @@ def run_cta_worker(
 ) -> list[dict[str, Any]]:
     label = "default" if cta_limit is None else str(cta_limit)
     environment = worker_environment(
-        cta_limit, nccl_cta_limit, max_ctas_per_reduce_task
+        cta_limit,
+        nccl_cta_limit,
+        max_ctas_per_reduce_task,
+        tuning_policy,
     )
     rows: list[dict[str, Any]] = []
 
@@ -841,6 +852,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tuning-policy",
+        default=None,
+        help=(
+            "path to the OOverlap tuning-policy JSON file. The resolved "
+            "path is passed to each fresh worker as OOVERLAP_TUNING_POLICY"
+        ),
+    )
+    parser.add_argument(
         "--bytes",
         default="1M,2M,4M,8M,16M,32M,64M,128M,256M,512M",
         help="default byte-size list used when a metric-specific list is omitted",
@@ -903,6 +922,15 @@ def main() -> None:
         )
     except ValueError as exc:
         parser.error(str(exc))
+
+    tuning_policy: Path | None = None
+    if args.tuning_policy is not None:
+        tuning_policy = Path(args.tuning_policy).expanduser().resolve()
+        if not tuning_policy.is_file():
+            parser.error(
+                f"--tuning-policy does not name a file: {tuning_policy}"
+            )
+
     jobs = build_jobs(args, devices)
 
     timestamp_utc = datetime.now(timezone.utc).isoformat()
@@ -918,6 +946,10 @@ def main() -> None:
         "[info] max_ctas_per_reduce_task="
         f"{max_ctas_per_reduce_task if max_ctas_per_reduce_task is not None else 'default'}"
     )
+    print(
+        "[info] tuning_policy="
+        f"{tuning_policy if tuning_policy is not None else 'inherited/default'}"
+    )
     print(f"[info] jobs={len(jobs)} iters={args.iters} warmup={args.warmup}")
     print("[info] no plotting; saving CSV, JSONL, and tab-separated text")
 
@@ -928,6 +960,7 @@ def main() -> None:
                 cta_limit,
                 nccl_cta_limit,
                 max_ctas_per_reduce_task,
+                tuning_policy,
                 jobs,
                 devices,
                 run_id,
