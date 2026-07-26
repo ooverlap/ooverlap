@@ -1,4 +1,5 @@
 #include "comm/tuning/tuning_policy.h"
+// OOVERLAP_POLICY_WITHOUT_DTYPE_AND_TIMINGS_V1
 
 #include <nlohmann/json.hpp>
 
@@ -30,13 +31,11 @@ constexpr const char* kEnvMaxCtasPerReduceTask =
 struct RankedCtaCandidate {
     int max_ctas = 0;
     int max_ctas_per_reduce_task = 0;
-    double avg_ms = 0.0;
 };
 
 struct PolicyPoint {
     CollectivePlanFor collective = CollectivePlanFor::AllReduce;
     int world_size = 0;
-    oo_dtype_t dtype = OO_DTYPE_FLOAT16;
     size_t bytes = 0;
     std::vector<RankedCtaCandidate> ranked;
 };
@@ -50,7 +49,6 @@ struct LoadedPolicy {
 struct SelectionCacheKey {
     int collective = 0;
     int world_size = 0;
-    int dtype = 0;
     size_t bytes = 0;
     int preference = 0;
 
@@ -70,7 +68,6 @@ struct SelectionCacheKeyHash {
         };
 
         mix(std::hash<int>{}(key.world_size));
-        mix(std::hash<int>{}(key.dtype));
         mix(std::hash<size_t>{}(key.bytes));
         mix(std::hash<int>{}(key.preference));
         mix(std::hash<bool>{}(key.has_max_ctas));
@@ -87,7 +84,6 @@ struct SelectionCacheKeyEqual {
         const SelectionCacheKey& b) const {
         return a.collective == b.collective &&
                a.world_size == b.world_size &&
-               a.dtype == b.dtype &&
                a.bytes == b.bytes &&
                a.preference == b.preference &&
                a.has_max_ctas == b.has_max_ctas &&
@@ -300,31 +296,6 @@ bool collective_name_to_plan_for(
     return false;
 }
 
-bool dtype_name_to_public(
-    const std::string& name,
-    oo_dtype_t* out) {
-    if (out == nullptr) {
-        return false;
-    }
-
-    if (name == "float16" || name == "fp16" || name == "half" || name == "f16") {
-        *out = OO_DTYPE_FLOAT16;
-        return true;
-    }
-
-    if (name == "bfloat16" || name == "bf16") {
-        *out = OO_DTYPE_BFLOAT16;
-        return true;
-    }
-
-    if (name == "float32" || name == "fp32" || name == "float" || name == "f32") {
-        *out = OO_DTYPE_FLOAT32;
-        return true;
-    }
-
-    return false;
-}
-
 bool valid_candidate(
     const RankedCtaCandidate& candidate) {
     return candidate.max_ctas > 0 &&
@@ -338,47 +309,17 @@ bool valid_candidate(
 bool parse_ranked_candidate(
     const json& value,
     RankedCtaCandidate* out) {
-    if (out == nullptr) {
+    if (out == nullptr || !value.is_array() || value.size() != 2) {
         return false;
     }
 
     RankedCtaCandidate candidate{};
 
-    if (value.is_array()) {
-        if (value.size() < 2 ||
-            !json_value_as_int(value.at(0), &candidate.max_ctas) ||
-            !json_value_as_int(
-                value.at(1),
-                &candidate.max_ctas_per_reduce_task)) {
-            return false;
-        }
-
-        if (value.size() >= 3) {
-            if (!json_number_as_double(value.at(2), &candidate.avg_ms) ||
-                candidate.avg_ms < 0.0) {
-                return false;
-            }
-        }
-    } else if (value.is_object()) {
-        if (!json_get_int(value, "max_ctas", &candidate.max_ctas) ||
-            !json_get_int(
-                value,
-                "max_ctas_per_reduce_task",
-                &candidate.max_ctas_per_reduce_task)) {
-            return false;
-        }
-
-        if (value.contains("avg_ms")) {
-            if (!json_number_as_double(value.at("avg_ms"), &candidate.avg_ms) ||
-                candidate.avg_ms < 0.0) {
-                return false;
-            }
-        }
-    } else {
-        return false;
-    }
-
-    if (!valid_candidate(candidate)) {
+    if (!json_value_as_int(value.at(0), &candidate.max_ctas) ||
+        !json_value_as_int(
+            value.at(1),
+            &candidate.max_ctas_per_reduce_task) ||
+        !valid_candidate(candidate)) {
         return false;
     }
 
@@ -403,14 +344,11 @@ bool parse_policy_point(
 
     PolicyPoint point{};
     std::string collective_name;
-    std::string dtype_name;
 
     if (!json_get_int(value, "world_size", &point.world_size) ||
         point.world_size <= 0 ||
         !json_get_string(value, "collective", &collective_name) ||
         !collective_name_to_plan_for(collective_name, &point.collective) ||
-        !json_get_string(value, "dtype", &dtype_name) ||
-        !dtype_name_to_public(dtype_name, &point.dtype) ||
         (!json_get_size(value, "bytes", &point.bytes) &&
          !json_get_size(value, "bytes_per_rank", &point.bytes)) ||
         point.bytes == 0) {
@@ -547,10 +485,6 @@ void ensure_policy_loaded() {
                 return static_cast<int>(a.collective) <
                        static_cast<int>(b.collective);
             }
-            if (a.dtype != b.dtype) {
-                return static_cast<int>(a.dtype) <
-                       static_cast<int>(b.dtype);
-            }
             return a.bytes < b.bytes;
         });
 }
@@ -630,15 +564,13 @@ const PolicyPoint* select_nearest_policy_point(
     const std::vector<PolicyPoint>& points,
     CollectivePlanFor collective,
     int world_size,
-    size_t requested_bytes,
-    oo_dtype_t dtype) {
+    size_t requested_bytes) {
     const PolicyPoint* previous = nullptr;
     const PolicyPoint* next = nullptr;
 
     for (const PolicyPoint& point : points) {
         if (point.collective != collective ||
-            point.world_size != world_size ||
-            point.dtype != dtype) {
+            point.world_size != world_size) {
             continue;
         }
 
@@ -742,7 +674,6 @@ SelectionCacheKey make_selection_cache_key(
     CollectivePlanFor collective,
     int world_size,
     size_t bytes,
-    oo_dtype_t dtype,
     TuningPreference preference,
     bool has_max_ctas,
     int max_ctas,
@@ -751,7 +682,6 @@ SelectionCacheKey make_selection_cache_key(
     SelectionCacheKey key{};
     key.collective = static_cast<int>(collective);
     key.world_size = world_size;
-    key.dtype = static_cast<int>(dtype);
     key.bytes = bytes;
     key.preference = static_cast<int>(preference);
     key.has_max_ctas = has_max_ctas;
@@ -806,7 +736,6 @@ LaunchConfig select_launch_config_for_collective(
     CollectivePlanFor collective,
     int world_size,
     size_t bytes,
-    oo_dtype_t dtype,
     TuningPreference preference) {
     int env_max_ctas = 0;
     const bool has_max_ctas =
@@ -823,7 +752,6 @@ LaunchConfig select_launch_config_for_collective(
             collective,
             world_size,
             bytes,
-            dtype,
             preference,
             has_max_ctas,
             env_max_ctas,
@@ -855,8 +783,7 @@ LaunchConfig select_launch_config_for_collective(
                 policy.points,
                 collective,
                 world_size,
-                bytes,
-                dtype);
+                bytes);
 
         if (point != nullptr) {
             LaunchConfig candidate =
@@ -880,39 +807,33 @@ LaunchConfig select_launch_config_for_collective(
 LaunchConfig select_launch_config_for_allreduce(
     int world_size,
     size_t bytes,
-    oo_dtype_t dtype,
     TuningPreference preference) {
     return select_launch_config_for_collective(
         CollectivePlanFor::AllReduce,
         world_size,
         bytes,
-        dtype,
         preference);
 }
 
 LaunchConfig select_launch_config_for_reduce_scatter(
     int world_size,
     size_t bytes,
-    oo_dtype_t dtype,
     TuningPreference preference) {
     return select_launch_config_for_collective(
         CollectivePlanFor::ReduceScatter,
         world_size,
         bytes,
-        dtype,
         preference);
 }
 
 LaunchConfig select_launch_config_for_all_gather(
     int world_size,
     size_t bytes,
-    oo_dtype_t dtype,
     TuningPreference preference) {
     return select_launch_config_for_collective(
         CollectivePlanFor::AllGather,
         world_size,
         bytes,
-        dtype,
         preference);
 }
 
@@ -924,7 +845,6 @@ LaunchConfig select_launch_config_for_collective(
         collective,
         0,
         bytes,
-        OO_DTYPE_FLOAT16,
         preference);
 }
 

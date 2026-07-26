@@ -45,7 +45,6 @@ oo_status_t all_gather_impl(
             ooverlap::comm::CollectivePlanFor::AllGather,
             launch.world_size,
             launch.bytes,
-            dtype,
             ooverlap::comm::tuning_preference_from_public(
                 tuning_mode));
 

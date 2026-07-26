@@ -69,7 +69,6 @@ oo_status_t allreduce_impl(
             ooverlap::comm::CollectivePlanFor::AllReduce,
             launch.world_size,
             launch.bytes,
-            dtype,
             ooverlap::comm::tuning_preference_from_public(
                 tuning_mode));
 

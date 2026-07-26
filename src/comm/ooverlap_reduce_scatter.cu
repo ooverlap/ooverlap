@@ -61,7 +61,6 @@ oo_status_t reduce_scatter_impl(
             ooverlap::comm::CollectivePlanFor::ReduceScatter,
             launch.world_size,
             launch.bytes,
-            dtype,
             ooverlap::comm::tuning_preference_from_public(
                 tuning_mode));
 

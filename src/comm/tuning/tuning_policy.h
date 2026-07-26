@@ -20,38 +20,36 @@ TuningPreference tuning_preference_from_public(
 /*
  * Select a CTA-only launch policy for the nearest measured message size.
  *
- * The compact policy is keyed by:
+ * The compact policy is keyed only by:
  *   - collective
  *   - world_size
- *   - dtype
  *   - full logical message bytes
  *
- * Each point stores a performance-ranked list of:
- *   [max_ctas, max_ctas_per_reduce_task, optional_avg_ms]
+ * Each point stores a performance-ranked list of exact pairs:
+ *   [max_ctas, max_ctas_per_reduce_task]
+ *
+ * List order is the performance order; execution times are intentionally not
+ * stored or parsed by the runtime policy loader.
  */
 LaunchConfig select_launch_config_for_collective(
     CollectivePlanFor collective,
     int world_size,
     size_t bytes,
-    oo_dtype_t dtype,
     TuningPreference preference);
 
 LaunchConfig select_launch_config_for_allreduce(
     int world_size,
     size_t bytes,
-    oo_dtype_t dtype,
     TuningPreference preference);
 
 LaunchConfig select_launch_config_for_reduce_scatter(
     int world_size,
     size_t bytes,
-    oo_dtype_t dtype,
     TuningPreference preference);
 
 LaunchConfig select_launch_config_for_all_gather(
     int world_size,
     size_t bytes,
-    oo_dtype_t dtype,
     TuningPreference preference);
 
 /*
