@@ -1,397 +1,467 @@
 #!/usr/bin/env python3
 
+"""Tune Ooverlap CTA limits and generate tma_collective_policy.json.
+
+The parent process launches one fresh worker process for each
+(max_ctas, max_ctas_per_reduce_task) candidate. A worker loads the extension
+once and benchmarks every requested collective and message size in same-process
+multi-GPU mode.
+
+The final policy intentionally contains only:
+  world_size, collective, bytes, ranked CTA pairs.
+
+Detailed timing data is written separately for inspection.
+"""
+
+from __future__ import annotations
+
 import argparse
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
+from typing import Any, Iterable, Sequence
 
 
-# =============================================================================
-# Edit these arrays.
-# =============================================================================
+DEFAULT_NUMELS = sorted(
+    {
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+        623104,
+        741376,
+        881664,
+        1048576,
+        1246720,
+        1482752,
+        1763328,
+        2097152,
+        2493440,
+        2965504,
+        3526656,
+        4194304,
+        4987392,
+        5931520,
+        7053824,
+        8388608,
+        9975296,
+        11863040,
+        14107648,
+        16777216,
+        19951104,
+        23726080,
+        28215296,
+        33554432,
+        39902720,
+        47452672,
+        56431104,
+        67108864,
+        79805952,
+        94905856,
+        112862720,
+        134217728,
+        159612416,
+        189812224,
+        225725952,
+        268435456,
+        536870912,
+    }
+)
 
-NUMELS = [
-    32768,
-    65536,
-    131072,
-    262144,
-    524288,
-    1048576,
-    2097152,
-    4194304,
-    8388608,
-    16777216,
-    33554432,
-    67108864,
-    134217728,
-    268435456,
-    536870912,
-    623104,
-    741376,
-    881664,
-    1246720,
-    1482752,
-    1763328,
-    2493440,
-    2965504,
-    3526656,
-    4987392,
-    5931520,
-    7053824,
-    9975296,
-    11863040,
-    14107648,
-    19951104,
-    23726080,
-    28215296,
-    39902720,
-    47452672,
-    56431104,
-    79805952,
-    94905856,
-    112862720,
-    159612416,
-    189812224,
-    225725952,
-]
-
-COLLECTIVES = [
+DEFAULT_COLLECTIVES = (
     "allreduce",
     "reduce_scatter",
     "all_gather",
-]
+)
 
-# Kernel names can be different per collective.
-# These strings should match what your C++ launch config parser accepts.
-KERNELS_BY_COLLECTIVE = {
-    "allreduce": [
-        "tma_copy",
-        "seq_fast_gmem",
-        "overlap_fast_gmem",
-    ],
-    "reduce_scatter": [
-        "tma_copy",
-        "seq_fast_gmem",
-    ],
-    "all_gather": [
-        "tma_copy",
-        "seq_fast_gmem",
-    ],
-}
+# Edit this list or pass --cta-candidates. Each tuple gets a fresh process.
+DEFAULT_CTA_CANDIDATES = (
+    (3, 1),
+    (6, 2),
+    (9, 3),
+    (12, 4),
+    (15, 5),
+    (18, 6),
+    (24, 8),
+    (27, 9),
+)
 
-THREADS = [
-    128,
-    256,
-    512,
-    1024,
-]
-
-# Each value here runs in its own subprocess.
-# In that subprocess we set:
-#   OOVERLAP_MAX_CTAS=<ctas>
-#   NCCL_MAX_CTAS=<ctas>
-CTA_LIMITS = [
-    2,
-    4,
-    8,
-    16,
-]
-
-WINDOW_CHUNKS = [
-    16,
-    32,
-    64,
-    128,
-    256,
-    512,
-]
-
-# Each pair is:
-#   (chunk_bytes, stage_depth)
-CHUNK_STAGE_PAIRS = [
-    (2 * 1024, 64),
-    (4 * 1024, 32),
-    (8 * 1024, 16),
-    (16 * 1024, 8),
-    (32 * 1024, 4),
-    (64 * 1024, 2),
-]
-
-ITERS = 100
-WARMUP = 20
-DEV0 = 0
-DEV1 = 1
-
-INCLUDE_NCCL_BASELINE = True
-
-OUT_DIR = Path("results")
-REQUESTS_DIR = OUT_DIR / "tma_collective_sweep_requests"
-LOGS_DIR = OUT_DIR / "tma_collective_sweep_logs"
-
-MERGED_RESULT_JSON = OUT_DIR / "tma_collective_sweep_result.json"
-SKIPPED_JSON = OUT_DIR / "tma_collective_sweep_skipped.json"
-BEST_JSON = OUT_DIR / "tma_collective_sweep_best.json"
-
-# Extra NCCL knobs. Leave None to not set.
-NCCL_ALGO = None
-NCCL_PROTO = None
+ENV_MAX_CTAS = "OOVERLAP_MAX_CTAS"
+ENV_MAX_CTAS_PER_REDUCE_TASK = "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
+ENV_TUNING_POLICY = "OOVERLAP_TUNING_POLICY"
+MAX_CTAS = 32
+FP16_BYTES = 2
 
 
-# =============================================================================
-# Put your custom skip logic here.
-# Return None to run.
-# Return a string to skip.
-# =============================================================================
-
-def skip_scenario(s):
-    """
-    s example:
-
-    {
-        "backend": "ooverlap",
-        "collective": "allreduce",
-        "kernel": "seq_fast_gmem",
-        "numel": 1048576,
-        "threads": 1024,
-        "max_ctas": 4,
-        "window_chunks": 32,
-        "chunk_bytes": 32768,
-        "stage_depth": 4,
-    }
-    """
-
-    if s["collective"] in ("reduce_scatter", "all_gather"):
-        if s["numel"] % 2 != 0:
-            return "reduce_scatter/all_gather need even numel for 2 GPUs"
-
-    if s["backend"] == "nccl":
-        return None
-
-    if s["threads"] <= 0 or s["threads"] % 32 != 0:
-        return "threads must be positive and warp aligned"
-
-    if s["threads"] > 1024:
-        return "threads > 1024"
-
-    if s["max_ctas"] <= 0:
-        return "max_ctas must be positive"
-
-    if s["window_chunks"] <= 0:
-        return "window_chunks must be positive"
-
-    if s["chunk_bytes"] <= 0 or s["chunk_bytes"] % 16 != 0:
-        return "chunk_bytes must be positive and 16-byte aligned"
-
-    if s["stage_depth"] <= 0:
-        return "stage_depth must be positive"
-
-    if s["window_chunks"] < s["stage_depth"]:
-        return "window_chunks < stage_depth"
-
-    if s["kernel"] == "tma_copy" and s["threads"] > 32:
-        return "address is already 16-bit aligned we dont need tons of threads"
-
-    if s["numel"] > 67108864:
-        if (
-            s["kernel"] in ("seq_fast_gmem", "overlap_fast_gmem")
-            and s["threads"] < 512
-        ):
-            return "for huge numel numbers threads should be above 512"
-
-        if s["max_ctas"] < 8:
-            return "for these huge numel numbers lower cta does not give anything back"
-
-    if s["numel"] < 16777216:
-        if s["window_chunks"] > 64:
-            return "windows with huge chunks is not needed"
-
-        if (
-            s["kernel"] in ("seq_fast_gmem", "overlap_fast_gmem")
-            and s["threads"] > 512
-        ):
-            return "we dont need that much threads"
-
-    return None
-
-
-# =============================================================================
-# No need to edit below this line most of the time.
-# =============================================================================
-
-def repo_root():
+def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def extension_path():
+def default_extension_path() -> Path:
     return repo_root() / "build" / "lib" / "ooverlap_ext.so"
 
 
-def load_extension():
-    so = extension_path()
-
-    if not so.exists():
-        raise FileNotFoundError(f"Could not find {so}. Build first.")
-
-    spec = importlib.util.spec_from_file_location("ooverlap_ext", str(so))
-    mod = importlib.util.module_from_spec(spec)
-
-    if spec.loader is None:
-        raise RuntimeError(f"Could not load extension from {so}")
-
-    spec.loader.exec_module(mod)
-    return mod
+def default_work_dir() -> Path:
+    return repo_root() / "results" / "tma_collective_cta_tuning"
 
 
-def make_nccl_scenario(collective, numel, max_ctas):
-    return {
-        "id": f"nccl__{collective}__n{numel}__ctas{max_ctas}",
-        "backend": "nccl",
-        "collective": collective,
-        "kernel": "nccl",
-        "numel": numel,
-        "max_ctas": max_ctas,
+def default_policy_path() -> Path:
+    # This matches the runtime loader's default relative path.
+    return repo_root() / "tma_collective_policy.json"
+
+
+def load_extension(path: Path):
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"could not find extension: {path}")
+
+    spec = importlib.util.spec_from_file_location("ooverlap_ext", str(path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not create import spec for {path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    function_name = "benchmark_tma_collective_cta_sweep_sm90"
+    if not hasattr(module, function_name):
+        raise RuntimeError(
+            f"{path} does not export {function_name}; rebuild the new-policy branch"
+        )
+    return module
+
+
+def parse_csv_ints(text: str, name: str) -> list[int]:
+    values: list[int] = []
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{name} contains a non-integer value: {token!r}"
+            ) from exc
+        values.append(value)
+
+    if not values:
+        raise argparse.ArgumentTypeError(f"{name} must not be empty")
+    return values
+
+
+def parse_devices(text: str) -> list[int]:
+    devices = parse_csv_ints(text, "devices")
+    if len(devices) < 2:
+        raise argparse.ArgumentTypeError("at least two devices are required")
+    if any(device < 0 for device in devices):
+        raise argparse.ArgumentTypeError("device ids must be non-negative")
+    if len(set(devices)) != len(devices):
+        raise argparse.ArgumentTypeError("device ids must be unique")
+    return devices
+
+
+def parse_numels(text: str) -> list[int]:
+    numels = parse_csv_ints(text, "numels")
+    if any(numel <= 0 for numel in numels):
+        raise argparse.ArgumentTypeError("all numels must be positive")
+    return sorted(set(numels))
+
+
+def normalize_collective(value: str) -> str:
+    aliases = {
+        "allreduce": "allreduce",
+        "all_reduce": "allreduce",
+        "all-reduce": "allreduce",
+        "ar": "allreduce",
+        "reduce_scatter": "reduce_scatter",
+        "reduce-scatter": "reduce_scatter",
+        "reducescatter": "reduce_scatter",
+        "rs": "reduce_scatter",
+        "all_gather": "all_gather",
+        "all-gather": "all_gather",
+        "allgather": "all_gather",
+        "ag": "all_gather",
     }
+    try:
+        return aliases[value.strip().lower()]
+    except KeyError as exc:
+        raise argparse.ArgumentTypeError(
+            f"unknown collective {value!r}; expected allreduce, "
+            "reduce_scatter, or all_gather"
+        ) from exc
 
 
-def make_ooverlap_scenario(
-    collective,
-    kernel,
-    numel,
-    threads,
-    max_ctas,
-    window_chunks,
-    chunk_bytes,
-    stage_depth,
-):
-    return {
-        "id": (
-            f"oo__{collective}"
-            f"__{kernel}"
-            f"__n{numel}"
-            f"__thr{threads}"
-            f"__ctas{max_ctas}"
-            f"__win{window_chunks}"
-            f"__chunk{chunk_bytes}"
-            f"__stage{stage_depth}"
+def parse_collectives(text: str) -> list[str]:
+    collectives: list[str] = []
+    for token in text.split(","):
+        token = token.strip()
+        if token:
+            collective = normalize_collective(token)
+            if collective not in collectives:
+                collectives.append(collective)
+    if not collectives:
+        raise argparse.ArgumentTypeError("collectives must not be empty")
+    return collectives
+
+
+def validate_candidate(max_ctas: int, reduce_ctas: int) -> tuple[int, int]:
+    if max_ctas <= 0 or max_ctas > MAX_CTAS:
+        raise argparse.ArgumentTypeError(
+            f"max_ctas must be in [1, {MAX_CTAS}], got {max_ctas}"
+        )
+    if reduce_ctas <= 0 or reduce_ctas > max_ctas:
+        raise argparse.ArgumentTypeError(
+            "max_ctas_per_reduce_task must be positive and no greater than max_ctas"
+        )
+    return max_ctas, reduce_ctas
+
+
+def parse_candidates(text: str) -> list[tuple[int, int]]:
+    candidates: list[tuple[int, int]] = []
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        fields = token.split(":")
+        if len(fields) != 2:
+            raise argparse.ArgumentTypeError(
+                "CTA candidates must use MAX_CTAS:REDUCE_CTAS, for example 12:4"
+            )
+        try:
+            candidate = validate_candidate(int(fields[0]), int(fields[1]))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid CTA candidate: {token!r}"
+            ) from exc
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    if not candidates:
+        raise argparse.ArgumentTypeError("CTA candidates must not be empty")
+    return candidates
+
+
+def valid_numels_for_collective(
+    collective: str,
+    numels: Sequence[int],
+    world_size: int,
+) -> tuple[list[int], list[int]]:
+    if collective == "allreduce":
+        return list(numels), []
+
+    valid: list[int] = []
+    skipped: list[int] = []
+    for numel in numels:
+        if numel % world_size == 0:
+            valid.append(numel)
+        else:
+            skipped.append(numel)
+    return valid, skipped
+
+
+def write_json_atomic(path: Path, payload: Any, *, pretty: bool) -> None:
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+
+    if pretty:
+        text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    else:
+        text = json.dumps(payload, separators=(",", ":"), sort_keys=False) + "\n"
+
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
+def normalize_measurement(
+    raw: dict[str, Any],
+    collective: str,
+    candidate: tuple[int, int],
+    world_size: int,
+) -> dict[str, Any]:
+    max_ctas, reduce_ctas = candidate
+
+    required = (
+        "world_size",
+        "numel",
+        "bytes",
+        "iters",
+        "warmup",
+        "max_ctas",
+        "max_ctas_per_reduce_task",
+        "total_ms",
+        "avg_ms",
+        "latency_us",
+    )
+    missing = [field for field in required if field not in raw]
+    if missing:
+        raise RuntimeError(
+            f"C++ sweep row for {collective} is missing fields: {missing}"
+        )
+
+    row = {
+        "collective": collective,
+        "world_size": int(raw["world_size"]),
+        "numel": int(raw["numel"]),
+        "bytes": int(raw["bytes"]),
+        "iters": int(raw["iters"]),
+        "warmup": int(raw["warmup"]),
+        "max_ctas": int(raw["max_ctas"]),
+        "max_ctas_per_reduce_task": int(
+            raw["max_ctas_per_reduce_task"]
         ),
-        "backend": "ooverlap",
-        "collective": collective,
-        "kernel": kernel,
-        "numel": numel,
-        "threads": threads,
-        "max_ctas": max_ctas,
-        "window_chunks": window_chunks,
-        "chunk_bytes": chunk_bytes,
-        "stage_depth": stage_depth,
+        "total_ms": float(raw["total_ms"]),
+        "avg_ms": float(raw["avg_ms"]),
+        "latency_us": float(raw["latency_us"]),
     }
 
+    if row["world_size"] != world_size:
+        raise RuntimeError(
+            f"C++ sweep returned world_size={row['world_size']}, expected {world_size}"
+        )
+    if (row["max_ctas"], row["max_ctas_per_reduce_task"]) != candidate:
+        raise RuntimeError(
+            "C++ sweep did not use the requested CTA candidate: "
+            f"requested={candidate}, returned="
+            f"({row['max_ctas']}, {row['max_ctas_per_reduce_task']})"
+        )
+    if row["bytes"] != row["numel"] * FP16_BYTES:
+        raise RuntimeError("C++ sweep returned an unexpected fp16 byte count")
+    if not math.isfinite(row["avg_ms"]) or row["avg_ms"] <= 0.0:
+        raise RuntimeError(f"invalid avg_ms in C++ sweep row: {row['avg_ms']}")
 
-def generate_scenarios_for_cta(max_ctas):
-    scenarios = []
-    skipped = []
-
-    for collective in COLLECTIVES:
-        for numel in NUMELS:
-            if INCLUDE_NCCL_BASELINE:
-                s = make_nccl_scenario(collective, numel, max_ctas)
-                reason = skip_scenario(s)
-
-                if reason is None:
-                    scenarios.append(s)
-                else:
-                    skipped.append({**s, "reason": reason})
-
-            kernels = KERNELS_BY_COLLECTIVE.get(collective, [])
-
-            for kernel in kernels:
-                for threads in THREADS:
-                    for window_chunks in WINDOW_CHUNKS:
-                        for chunk_bytes, stage_depth in CHUNK_STAGE_PAIRS:
-                            s = make_ooverlap_scenario(
-                                collective=collective,
-                                kernel=kernel,
-                                numel=numel,
-                                threads=threads,
-                                max_ctas=max_ctas,
-                                window_chunks=window_chunks,
-                                chunk_bytes=chunk_bytes,
-                                stage_depth=stage_depth,
-                            )
-
-                            reason = skip_scenario(s)
-
-                            if reason is None:
-                                scenarios.append(s)
-                            else:
-                                skipped.append({**s, "reason": reason})
-
-    return scenarios, skipped
+    return row
 
 
-def make_request(scenarios):
-    return {
-        "iters": ITERS,
-        "warmup": WARMUP,
-        "dev0": DEV0,
-        "dev1": DEV1,
-        "scenarios": scenarios,
+def worker_main(request_path: Path, result_path: Path) -> int:
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+
+    candidate = (
+        int(os.environ[ENV_MAX_CTAS]),
+        int(os.environ[ENV_MAX_CTAS_PER_REDUCE_TASK]),
+    )
+    validate_candidate(*candidate)
+
+    extension = load_extension(Path(request["extension"]))
+    benchmark = extension.benchmark_tma_collective_cta_sweep_sm90
+
+    devices = [int(value) for value in request["devices"]]
+    numels = [int(value) for value in request["numels"]]
+    collectives = [normalize_collective(value) for value in request["collectives"]]
+    iters = int(request["iters"])
+    warmup = int(request["warmup"])
+    verify = bool(request["verify"])
+    world_size = len(devices)
+
+    response: dict[str, Any] = {
+        "ok": True,
+        "candidate": {
+            "max_ctas": candidate[0],
+            "max_ctas_per_reduce_task": candidate[1],
+        },
+        "devices": devices,
+        "results": [],
+        "skipped": [],
+        "errors": [],
     }
 
+    print(
+        "[worker] candidate="
+        f"({candidate[0]}, {candidate[1]}) devices={devices} "
+        f"collectives={collectives} sizes={len(numels)}"
+    )
 
-def worker_main(request_path, result_path):
-    request_path = Path(request_path)
-    result_path = Path(result_path)
+    for collective in collectives:
+        valid_numels, skipped_numels = valid_numels_for_collective(
+            collective,
+            numels,
+            world_size,
+        )
 
-    request = json.loads(request_path.read_text())
+        for numel in skipped_numels:
+            response["skipped"].append(
+                {
+                    "collective": collective,
+                    "world_size": world_size,
+                    "numel": numel,
+                    "bytes": numel * FP16_BYTES,
+                    "reason": "numel is not divisible by world_size",
+                }
+            )
 
-    print(f"[worker] request={request_path}")
-    print(f"[worker] result={result_path}")
-    print(f"[worker] OOVERLAP_MAX_CTAS={os.environ.get('OOVERLAP_MAX_CTAS')}")
-    print(f"[worker] NCCL_MAX_CTAS={os.environ.get('NCCL_MAX_CTAS')}")
+        if not valid_numels:
+            continue
 
-    ext = load_extension()
-    run_sweep = ext.benchmark_tma_two_gpu_collective_sweep_json
+        try:
+            raw_rows = benchmark(
+                collective,
+                valid_numels,
+                iters,
+                warmup,
+                devices,
+                verify,
+            )
 
-    response_text = run_sweep(json.dumps(request))
-    response = json.loads(response_text)
+            if len(raw_rows) != len(valid_numels):
+                raise RuntimeError(
+                    f"C++ sweep returned {len(raw_rows)} rows for "
+                    f"{len(valid_numels)} requested sizes"
+                )
 
-    response["env"] = {
-        "OOVERLAP_MAX_CTAS": os.environ.get("OOVERLAP_MAX_CTAS"),
-        "NCCL_MAX_CTAS": os.environ.get("NCCL_MAX_CTAS"),
-    }
+            normalized = [
+                normalize_measurement(
+                    dict(raw),
+                    collective,
+                    candidate,
+                    world_size,
+                )
+                for raw in raw_rows
+            ]
+            response["results"].extend(normalized)
+        except Exception as exc:  # Worker must preserve failures for the parent.
+            response["ok"] = False
+            response["errors"].append(
+                {
+                    "collective": collective,
+                    "candidate": list(candidate),
+                    "error": str(exc),
+                }
+            )
+            print(f"[worker] ERROR collective={collective}: {exc}", file=sys.stderr)
 
-    result_path.write_text(json.dumps(response, indent=2, sort_keys=True) + "\n")
-
-    if not response.get("ok", False):
-        return 1
-
-    return 0
+    write_json_atomic(result_path, response, pretty=True)
+    return 0 if response["ok"] else 1
 
 
-def run_one_cta_process(max_ctas, scenarios):
-    request_path = REQUESTS_DIR / f"request_ctas{max_ctas}.json"
-    result_path = REQUESTS_DIR / f"result_ctas{max_ctas}.json"
-    log_path = LOGS_DIR / f"log_ctas{max_ctas}.txt"
+def candidate_slug(candidate: tuple[int, int]) -> str:
+    return f"ctas_{candidate[0]}__reduce_{candidate[1]}"
 
-    request = make_request(scenarios)
-    request_path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n")
+
+def run_candidate_process(
+    candidate: tuple[int, int],
+    request_path: Path,
+    workers_dir: Path,
+    logs_dir: Path,
+) -> dict[str, Any]:
+    slug = candidate_slug(candidate)
+    result_path = workers_dir / f"{slug}.json"
+    log_path = logs_dir / f"{slug}.log"
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env[ENV_MAX_CTAS] = str(candidate[0])
+    env[ENV_MAX_CTAS_PER_REDUCE_TASK] = str(candidate[1])
+    # The C++ sweep bypasses policy selection, but clearing this avoids accidental
+    # interaction with other extension initialization paths.
+    env.pop(ENV_TUNING_POLICY, None)
 
-    env["OOVERLAP_MAX_CTAS"] = str(max_ctas)
-    env["NCCL_MAX_CTAS"] = str(max_ctas)
-
-    if NCCL_ALGO is not None:
-        env["NCCL_ALGO"] = str(NCCL_ALGO)
-
-    if NCCL_PROTO is not None:
-        env["NCCL_PROTO"] = str(NCCL_PROTO)
-
-    cmd = [
+    command = [
         sys.executable,
         str(Path(__file__).resolve()),
         "--worker",
@@ -402,272 +472,257 @@ def run_one_cta_process(max_ctas, scenarios):
     ]
 
     print(
-        f"[parent] run ctas={max_ctas} "
-        f"scenarios={len(scenarios)} "
-        f"OOVERLAP_MAX_CTAS={env['OOVERLAP_MAX_CTAS']} "
-        f"NCCL_MAX_CTAS={env['NCCL_MAX_CTAS']}"
+        f"[parent] run candidate={candidate} "
+        f"result={result_path.name} log={log_path.name}"
     )
 
-    proc = subprocess.run(
-        cmd,
+    process = subprocess.run(
+        command,
         cwd=str(repo_root()),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        check=False,
     )
+    log_path.write_text(process.stdout, encoding="utf-8")
 
-    log_path.write_text(proc.stdout)
-
-    print(f"[parent] ctas={max_ctas} returncode={proc.returncode}")
-    print(f"[parent] ctas={max_ctas} log={log_path}")
-
-    if proc.returncode != 0:
-        return {
+    if result_path.is_file():
+        try:
+            response = json.loads(result_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            response = {
+                "ok": False,
+                "candidate": {
+                    "max_ctas": candidate[0],
+                    "max_ctas_per_reduce_task": candidate[1],
+                },
+                "results": [],
+                "skipped": [],
+                "errors": [{"error": f"invalid worker JSON: {exc}"}],
+            }
+    else:
+        response = {
             "ok": False,
+            "candidate": {
+                "max_ctas": candidate[0],
+                "max_ctas_per_reduce_task": candidate[1],
+            },
             "results": [],
+            "skipped": [],
             "errors": [
                 {
-                    "id": None,
-                    "index": None,
-                    "max_ctas": max_ctas,
-                    "error": f"subprocess failed; see {log_path}",
+                    "error": (
+                        f"worker exited with code {process.returncode}; "
+                        f"see {log_path}"
+                    )
                 }
             ],
-            "env": {
-                "OOVERLAP_MAX_CTAS": str(max_ctas),
-                "NCCL_MAX_CTAS": str(max_ctas),
-            },
         }
 
-    return json.loads(result_path.read_text())
+    response["returncode"] = process.returncode
+    response["log"] = str(log_path)
+    if process.returncode != 0:
+        response["ok"] = False
 
-
-def tag_rows_with_cta(response, max_ctas):
-    for row in response.get("results", []):
-        row["process_max_ctas"] = max_ctas
-        row["ooverlap_max_ctas_env"] = max_ctas
-        row["nccl_max_ctas_env"] = max_ctas
-
-    for err in response.get("errors", []):
-        err["process_max_ctas"] = max_ctas
-
-
-def load_json_if_exists(path, default):
-    path = Path(path)
-
-    if not path.exists() or path.stat().st_size == 0:
-        return default
-
-    try:
-        return json.loads(path.read_text())
-    except json.JSONDecodeError:
-        backup = path.with_suffix(path.suffix + ".bad")
-        backup.write_text(path.read_text())
-        print(f"[warn] could not parse {path}; backed it up to {backup}")
-        return default
-
-
-def row_key(row, fallback_prefix, index):
-    row_id = row.get("id")
-    if row_id is not None:
-        return ("id", str(row_id))
-
-    return (
-        fallback_prefix,
-        row.get("backend"),
-        row.get("collective"),
-        row.get("kernel"),
-        row.get("numel"),
-        row.get("process_max_ctas"),
-        row.get("max_ctas"),
-        row.get("threads"),
-        row.get("window_chunks"),
-        row.get("chunk_bytes"),
-        row.get("stage_depth"),
-        index,
+    print(
+        f"[parent] candidate={candidate} returncode={process.returncode} "
+        f"rows={len(response.get('results', []))}"
     )
+    return response
 
 
-def merge_rows(old_rows, new_rows, fallback_prefix):
-    merged = {}
-    order = []
+def build_policy(measurements: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    # key -> candidate -> best measured avg_ms
+    grouped: dict[
+        tuple[int, str, int],
+        dict[tuple[int, int], float],
+    ] = defaultdict(dict)
 
-    for i, row in enumerate(old_rows or []):
-        key = row_key(row, fallback_prefix, i)
-        if key not in merged:
-            order.append(key)
-        merged[key] = row
-
-    for i, row in enumerate(new_rows or []):
-        key = row_key(row, fallback_prefix, i)
-        if key not in merged:
-            order.append(key)
-
-        # New run wins for the same scenario id/config.
-        merged[key] = row
-
-    return [merged[k] for k in order]
-
-
-def extract_result_rows(payload):
-    if isinstance(payload, list):
-        return payload
-
-    if isinstance(payload, dict):
-        rows = payload.get("results", [])
-        if isinstance(rows, list):
-            return rows
-
-    return []
-
-
-def extract_skipped_rows(payload):
-    if isinstance(payload, list):
-        return payload
-
-    if isinstance(payload, dict):
-        rows = payload.get("skipped", [])
-        if isinstance(rows, list):
-            return rows
-
-    return []
-
-
-def write_json_atomic(path, payload):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    tmp.replace(path)
-
-
-def best_rows(results):
-    best = {}
-
-    for row in results:
-        if row.get("status") != "ok":
-            continue
-
-        key = (
-            row.get("backend"),
-            row.get("collective"),
-            row.get("kernel"),
-            int(row.get("numel", 0)),
+    for row in measurements:
+        world_size = int(row["world_size"])
+        collective = normalize_collective(str(row["collective"]))
+        bytes_count = int(row["bytes"])
+        candidate = (
+            int(row["max_ctas"]),
+            int(row["max_ctas_per_reduce_task"]),
         )
+        avg_ms = float(row["avg_ms"])
 
-        old = best.get(key)
-
-        if old is None or float(row.get("avg_ms", 1e100)) < float(old.get("avg_ms", 1e100)):
-            best[key] = row
-
-    return [best[k] for k in sorted(best)]
-
-
-def parent_main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-    current_results = []
-    current_errors = []
-    current_skipped = []
-    current_ok = True
-
-    total_generated = 0
-    total_skipped = 0
-
-    for max_ctas in CTA_LIMITS:
-        scenarios, skipped = generate_scenarios_for_cta(max_ctas)
-
-        total_generated += len(scenarios)
-        total_skipped += len(skipped)
-
-        current_skipped.extend(skipped)
-
-        if not scenarios:
-            print(f"[parent] ctas={max_ctas} has no scenarios")
+        if world_size <= 0 or bytes_count <= 0:
+            continue
+        if not math.isfinite(avg_ms) or avg_ms <= 0.0:
             continue
 
-        response = run_one_cta_process(max_ctas, scenarios)
-        tag_rows_with_cta(response, max_ctas)
+        key = (world_size, collective, bytes_count)
+        previous = grouped[key].get(candidate)
+        if previous is None or avg_ms < previous:
+            grouped[key][candidate] = avg_ms
 
-        if not response.get("ok", False):
-            current_ok = False
-
-        current_results.extend(response.get("results", []))
-        current_errors.extend(response.get("errors", []))
-
-    old_result_payload = load_json_if_exists(
-        MERGED_RESULT_JSON,
-        {
-            "ok": True,
-            "results": [],
-        },
-    )
-
-    old_skipped_payload = load_json_if_exists(SKIPPED_JSON, [])
-
-    old_results = extract_result_rows(old_result_payload)
-    old_skipped = extract_skipped_rows(old_skipped_payload)
-
-    merged_results = merge_rows(old_results, current_results, "result")
-    merged_skipped = merge_rows(old_skipped, current_skipped, "skipped")
-
-    # Important: result JSON intentionally contains only measured result rows.
-    # Skipped rows stay in SKIPPED_JSON. Errors are printed and kept in per-CTA logs.
-    result_payload = {
-        "ok": bool(old_result_payload.get("ok", True)) and current_ok,
-        "results": merged_results,
+    collective_order = {
+        "allreduce": 0,
+        "reduce_scatter": 1,
+        "all_gather": 2,
     }
 
-    write_json_atomic(MERGED_RESULT_JSON, result_payload)
-    write_json_atomic(SKIPPED_JSON, merged_skipped)
+    entries: list[dict[str, Any]] = []
+    sorted_keys = sorted(
+        grouped,
+        key=lambda key: (
+            key[0],
+            collective_order[key[1]],
+            key[2],
+        ),
+    )
 
-    best = best_rows(merged_results)
-    write_json_atomic(BEST_JSON, best)
+    for world_size, collective, bytes_count in sorted_keys:
+        candidates = grouped[(world_size, collective, bytes_count)]
+        ranked = [
+            [candidate[0], candidate[1]]
+            for candidate, _ in sorted(
+                candidates.items(),
+                key=lambda item: (
+                    item[1],
+                    item[0][0],
+                    item[0][1],
+                ),
+            )
+        ]
+        if not ranked:
+            continue
 
-    ok_rows = [
-        r for r in merged_results
-        if r.get("status") == "ok"
+        entries.append(
+            {
+                "world_size": world_size,
+                "collective": collective,
+                "bytes": bytes_count,
+                "ranked": ranked,
+            }
+        )
+
+    return {
+        "version": 1,
+        "entries": entries,
+    }
+
+
+def requested_policy_keys(request: dict[str, Any]) -> set[tuple[int, str, int]]:
+    devices = [int(value) for value in request["devices"]]
+    world_size = len(devices)
+    numels = [int(value) for value in request["numels"]]
+
+    keys: set[tuple[int, str, int]] = set()
+    for collective_value in request["collectives"]:
+        collective = normalize_collective(collective_value)
+        valid_numels, _ = valid_numels_for_collective(
+            collective,
+            numels,
+            world_size,
+        )
+        for numel in valid_numels:
+            keys.add((world_size, collective, numel * FP16_BYTES))
+    return keys
+
+
+def produced_policy_keys(policy: dict[str, Any]) -> set[tuple[int, str, int]]:
+    return {
+        (
+            int(entry["world_size"]),
+            normalize_collective(str(entry["collective"])),
+            int(entry["bytes"]),
+        )
+        for entry in policy.get("entries", [])
+    }
+
+
+def parent_main(args: argparse.Namespace) -> int:
+    work_dir = args.work_dir.resolve()
+    workers_dir = work_dir / "workers"
+    logs_dir = work_dir / "logs"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    request = {
+        "extension": str(args.extension.resolve()),
+        "devices": args.devices,
+        "collectives": args.collectives,
+        "numels": args.numels,
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "verify": args.verify,
+    }
+    request_path = work_dir / "request.json"
+    write_json_atomic(request_path, request, pretty=True)
+
+    responses: list[dict[str, Any]] = []
+    for candidate in args.cta_candidates:
+        responses.append(
+            run_candidate_process(
+                candidate,
+                request_path,
+                workers_dir,
+                logs_dir,
+            )
+        )
+
+    measurements = [
+        row
+        for response in responses
+        for row in response.get("results", [])
+    ]
+    skipped = [
+        row
+        for response in responses
+        for row in response.get("skipped", [])
+    ]
+    errors = [
+        {
+            "candidate": response.get("candidate"),
+            **error,
+        }
+        for response in responses
+        for error in response.get("errors", [])
     ]
 
-    cpp_skipped = [
-        r for r in merged_results
-        if r.get("status") == "skipped"
-    ]
+    raw_payload = {
+        "version": 1,
+        "request": request,
+        "candidates": [list(candidate) for candidate in args.cta_candidates],
+        "measurements": measurements,
+        "skipped": skipped,
+        "errors": errors,
+        "workers": responses,
+    }
+    write_json_atomic(args.raw_out, raw_payload, pretty=True)
 
-    print(f"[result] generated scenarios this run: {total_generated}")
-    print(f"[result] python skipped this run:      {total_skipped}")
-    print(f"[result] merged result rows:           {len(merged_results)}")
-    print(f"[result] ok rows:                       {len(ok_rows)}")
-    print(f"[result] cpp skipped in results:        {len(cpp_skipped)}")
-    print(f"[result] merged python skipped rows:    {len(merged_skipped)}")
-    print(f"[result] errors this run:               {len(current_errors)}")
-    print(f"[result] merged:                        {MERGED_RESULT_JSON}")
-    print(f"[result] skipped:                       {SKIPPED_JSON}")
-    print(f"[result] best:                          {BEST_JSON}")
+    policy = build_policy(measurements)
+    write_json_atomic(args.policy_out, policy, pretty=args.pretty_policy)
 
-    if current_errors:
-        print("[errors]")
-        for err in current_errors[:20]:
-            print(json.dumps(err, sort_keys=True))
+    missing = requested_policy_keys(request) - produced_policy_keys(policy)
+    failed_workers = [response for response in responses if not response.get("ok", False)]
 
-    if best:
-        print("[best]")
-        for row in best[:80]:
+    print(f"[result] workers:       {len(responses)}")
+    print(f"[result] failed workers:{len(failed_workers):>8}")
+    print(f"[result] measurements:  {len(measurements)}")
+    print(f"[result] policy entries:{len(policy['entries']):>8}")
+    print(f"[result] missing points:{len(missing):>8}")
+    print(f"[result] raw:           {args.raw_out.resolve()}")
+    print(f"[result] policy:        {args.policy_out.resolve()}")
+
+    if missing:
+        print("[missing]")
+        for world_size, collective, bytes_count in sorted(missing)[:50]:
             print(
-                f"  backend={row.get('backend'):>8} "
-                f"collective={row.get('collective'):>14} "
-                f"kernel={row.get('kernel'):>18} "
-                f"numel={int(row.get('numel', 0)):>12} "
-                f"ctas={row.get('process_max_ctas')} "
-                f"avg_ms={float(row.get('avg_ms', 0.0)):.6f} "
-                f"id={row.get('id')}"
+                f"  world_size={world_size} collective={collective} "
+                f"bytes={bytes_count}"
             )
 
-    if current_errors or not current_ok:
+    if errors:
+        print("[errors]")
+        for error in errors[:50]:
+            print(json.dumps(error, sort_keys=True))
+
+    if failed_workers or missing:
         print("FAIL")
         return 1
 
@@ -675,26 +730,102 @@ def parent_main():
     return 0
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Benchmark CTA-limit candidates in fresh processes and generate "
+            "the simplified Ooverlap tuning policy"
+        )
+    )
 
-    parser.add_argument("--worker", action="store_true")
-    parser.add_argument("--request", type=str, default="")
-    parser.add_argument("--result", type=str, default="")
+    parser.add_argument(
+        "--devices",
+        type=parse_devices,
+        default=[0, 1],
+        help="comma-separated CUDA device ids (default: 0,1)",
+    )
+    parser.add_argument(
+        "--collectives",
+        type=parse_collectives,
+        default=list(DEFAULT_COLLECTIVES),
+        help="comma-separated collectives",
+    )
+    parser.add_argument(
+        "--numels",
+        type=parse_numels,
+        default=list(DEFAULT_NUMELS),
+        help="comma-separated full logical fp16 element counts",
+    )
+    parser.add_argument(
+        "--cta-candidates",
+        type=parse_candidates,
+        default=list(DEFAULT_CTA_CANDIDATES),
+        help=(
+            "comma-separated MAX_CTAS:REDUCE_CTAS pairs, for example "
+            "4:2,8:4,12:4,16:8"
+        ),
+    )
+    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument(
+        "--extension",
+        type=Path,
+        default=default_extension_path(),
+    )
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=default_work_dir(),
+    )
+    parser.add_argument(
+        "--raw-out",
+        type=Path,
+        default=default_work_dir() / "measurements.json",
+    )
+    parser.add_argument(
+        "--policy-out",
+        type=Path,
+        default=default_policy_path(),
+    )
+    parser.add_argument(
+        "--pretty-policy",
+        action="store_true",
+        help="pretty-print the runtime policy instead of compact JSON",
+    )
 
-    return parser.parse_args()
+    # Internal worker arguments.
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--request", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--result", type=Path, help=argparse.SUPPRESS)
+    return parser
 
 
-def main():
-    args = parse_args()
+def validate_cli(args: argparse.Namespace) -> None:
+    if args.iters <= 0:
+        raise SystemExit("--iters must be > 0")
+    if args.warmup < 0:
+        raise SystemExit("--warmup must be >= 0")
 
     if args.worker:
-        if not args.request or not args.result:
+        if args.request is None or args.result is None:
             raise SystemExit("--worker requires --request and --result")
+        return
 
+    if not args.extension.is_file():
+        raise SystemExit(
+            f"extension not found: {args.extension}; build ooverlap_ext first"
+        )
+
+
+def main() -> int:
+    parser = build_argument_parser()
+    args = parser.parse_args()
+    validate_cli(args)
+
+    if args.worker:
         return worker_main(args.request, args.result)
-
-    return parent_main()
+    return parent_main(args)
 
 
 if __name__ == "__main__":
