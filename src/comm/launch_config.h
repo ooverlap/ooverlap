@@ -51,6 +51,10 @@ union CollectivePlanKind {
 struct LaunchConfig {
     int threads = TMA_TWO_GPU_PEER_DEFAULT_THREADS;
     int max_ctas = TMA_TWO_GPU_PEER_DEFAULT_MAX_CTAS;
+
+    /* CTA group size used when independent reduction tasks are split. */
+    int max_ctas_per_reduce_task = 8;
+
     int window_chunks = TMA_TWO_GPU_PEER_DEFAULT_WINDOW_CHUNKS;
 
     int chunk_bytes = TMA_TWO_GPU_PEER_DEFAULT_CHUNK_BYTES;
@@ -148,6 +152,12 @@ __host__ __device__ __forceinline__ bool launch_config_valid_common(
 
     if (config.max_ctas <= 0 ||
         config.max_ctas > TMA_TWO_GPU_PEER_MAX_CTAS) {
+        return false;
+    }
+
+    if (config.max_ctas_per_reduce_task <= 0 ||
+        config.max_ctas_per_reduce_task >
+            TMA_TWO_GPU_PEER_MAX_CTAS) {
         return false;
     }
 
