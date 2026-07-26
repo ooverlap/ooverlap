@@ -855,8 +855,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--tuning-policy",
         default=None,
         help=(
-            "path to the OOverlap tuning-policy JSON file. The resolved "
-            "path is passed to each fresh worker as OOVERLAP_TUNING_POLICY"
+            "optional path to the OOverlap tuning-policy JSON file. If it "
+            "exists, the resolved path is passed to each fresh worker as "
+            "OOVERLAP_TUNING_POLICY; otherwise a warning is printed and the "
+            "runtime fallback is used"
         ),
     )
     parser.add_argument(
@@ -925,10 +927,15 @@ def main() -> None:
 
     tuning_policy: Path | None = None
     if args.tuning_policy is not None:
-        tuning_policy = Path(args.tuning_policy).expanduser().resolve()
-        if not tuning_policy.is_file():
-            parser.error(
-                f"--tuning-policy does not name a file: {tuning_policy}"
+        requested_tuning_policy = Path(args.tuning_policy).expanduser().resolve()
+        if requested_tuning_policy.is_file():
+            tuning_policy = requested_tuning_policy
+        else:
+            print(
+                "[warning] tuning policy not found: "
+                f"{requested_tuning_policy}; continuing without "
+                f"{TUNING_POLICY_ENV_VAR}",
+                file=sys.stderr,
             )
 
     jobs = build_jobs(args, devices)

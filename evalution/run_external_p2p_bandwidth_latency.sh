@@ -75,11 +75,15 @@ PLOT_PREFIX="$OUT_DIR/external_p2p_collective"
   exit 1
 }
 
-# OOVERLAP_EXTERNAL_P2P_TUNING_POLICY_CLI_V1
-[[ -f "$TUNING_POLICY" ]] || {
-  echo "error: tuning policy not found: $TUNING_POLICY" >&2
-  exit 1
-}
+# OOVERLAP_EXTERNAL_P2P_TUNING_POLICY_OPTIONAL_V1
+if [[ -f "$TUNING_POLICY" ]]; then
+  TUNING_POLICY_ARGS=(--tuning-policy "$TUNING_POLICY")
+  TUNING_POLICY_LABEL="$TUNING_POLICY"
+else
+  echo "[evalution] warning: tuning policy not found: $TUNING_POLICY; continuing without it" >&2
+  TUNING_POLICY_ARGS=()
+  TUNING_POLICY_LABEL="not found (runtime fallback)"
+fi
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
   echo "error: Python executable not found: $PYTHON_BIN" >&2
@@ -103,7 +107,7 @@ echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
 echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
 echo "[evalution] nccl_max_ctas=$NCCL_MAX_CTAS_LABEL"
 echo "[evalution] max_ctas_per_reduce_task=$MAX_CTAS_PER_REDUCE_TASK"
-echo "[evalution] tuning_policy=$TUNING_POLICY"
+echo "[evalution] tuning_policy=$TUNING_POLICY_LABEL"
 echo "[evalution] latency_bytes=$LATENCY_BYTES"
 echo "[evalution] bandwidth_bytes=$BANDWIDTH_BYTES"
 echo "[evalution] iters=$ITERS warmup=$WARMUP"
@@ -118,7 +122,7 @@ echo "[evalution] output=${OUT_PREFIX}.txt"
   --ctas "$OOVERLAP_MAX_CTAS" \
   --nccl-ctas "$NCCL_MAX_CTAS" \
   --max-ctas-per-reduce-task "$MAX_CTAS_PER_REDUCE_TASK" \
-  --tuning-policy "$TUNING_POLICY" \
+  "${TUNING_POLICY_ARGS[@]}" \
   --latency-bytes "$LATENCY_BYTES" \
   --bandwidth-bytes "$BANDWIDTH_BYTES" \
   --bytes "$BANDWIDTH_BYTES" \
