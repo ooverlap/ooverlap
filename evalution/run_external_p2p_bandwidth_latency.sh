@@ -58,6 +58,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DRIVER="$REPO_ROOT/test/test_external_p2p_collective_sweep.py"
 PLOTTER="$REPO_ROOT/test/plot_external_p2p_collective.py"
+TUNING_POLICY="$REPO_ROOT/results/policies/tp4_policy.json"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 OUT_DIR="$REPO_ROOT/results/evalution/external_p2p/tp${WORLD_SIZE}"

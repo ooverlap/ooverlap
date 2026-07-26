@@ -250,7 +250,7 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
     comm::plan::lowering_detail::LoweringPassOptions lowering_options{};
     lowering_options.enable_reduce_cta_groups = true;
     lowering_options.max_ctas_per_reduce_task =
-        max_ctas_per_reduce_task_from_env();
+        launch_config.max_ctas_per_reduce_task;
 
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<
