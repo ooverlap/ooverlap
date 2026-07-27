@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import matplotlib
+from matplotlib.ticker import MaxNLocator
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -603,6 +604,12 @@ def plot_paper_panel(
         axis.tick_params(axis="x", which="both", labelbottom=False)
 
     configure_paper_y_axis(axis, plotted_y_values)
+
+    if metric == "latency":
+        axis.yaxis.set_major_locator(
+            MaxNLocator(nbins=6, integer=True, min_n_ticks=2)
+        )
+
     axis.tick_params(
         axis="y",
         labelsize=PAPER_TICK_FONTSIZE,
@@ -744,7 +751,7 @@ def plot_paired_tp_3x4(
                     COLLECTIVE_TITLES[collective],
                     xy=(0.0, 0.5),
                     xycoords="axes fraction",
-                    xytext=(-72, 0),
+                    xytext=(-56, 0),
                     textcoords="offset points",
                     rotation=90,
                     ha="center",
