@@ -19,6 +19,10 @@ set -euo pipefail
 #   VLLM_PREFILL_NUM_PROMPTS=8
 #   VLLM_DECODE_NUM_PROMPTS=8
 #   VLLM_BATCH_PROMPT_MULTIPLIER=4
+#   VLLM_OOVERLAP_AG_DTYPE=bf16
+#   VLLM_OOVERLAP_AG_SLOTS=4
+#   VLLM_OOVERLAP_AG_CAPACITY_BYTES=67108864
+#   OOVERLAP_TUNING_POLICY=/path/to/tma_collective_policy.json
 
 usage() {
   echo "Usage: $0 {2|4} [all|prefill|decode|batch|plot]" >&2
@@ -77,6 +81,9 @@ OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="${OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:-$DEFAULT
 RR_DTYPE="${VLLM_OOVERLAP_RR_DTYPE:-bf16}"
 RR_SLOTS="${VLLM_OOVERLAP_RR_SLOTS:-$DEFAULT_RR_SLOTS}"
 RR_CAPACITY_BYTES="${VLLM_OOVERLAP_RR_CAPACITY_BYTES:-$DEFAULT_RR_CAPACITY_BYTES}"
+AG_DTYPE="${VLLM_OOVERLAP_AG_DTYPE:-$RR_DTYPE}"
+AG_SLOTS="${VLLM_OOVERLAP_AG_SLOTS:-4}"
+AG_CAPACITY_BYTES="${VLLM_OOVERLAP_AG_CAPACITY_BYTES:-67108864}"
 HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 NCCL_NET_PLUGIN="${OOVERLAP_NCCL_NET_PLUGIN:-none}"
@@ -89,7 +96,7 @@ NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
 
 BACKENDS="${VLLM_EVAL_BACKENDS:-pynccl,nccl_symm,ooverlap}"
 BASELINE_BACKEND="${VLLM_EVAL_BASELINE_BACKEND:-pynccl}"
-REPETITIONS="${VLLM_EVAL_REPETITIONS:-3}"
+REPETITIONS="${VLLM_EVAL_REPETITIONS:-1}"
 DATASET_NAME="random"
 RANDOM_RANGE_RATIO="0.0"
 SEED="0"
@@ -108,6 +115,8 @@ for pair in \
   "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
   "VLLM_OOVERLAP_RR_SLOTS:$RR_SLOTS" \
   "VLLM_OOVERLAP_RR_CAPACITY_BYTES:$RR_CAPACITY_BYTES" \
+  "VLLM_OOVERLAP_AG_SLOTS:$AG_SLOTS" \
+  "VLLM_OOVERLAP_AG_CAPACITY_BYTES:$AG_CAPACITY_BYTES" \
   "VLLM_EVAL_REPETITIONS:$REPETITIONS" \
   "VLLM_PREFILL_NUM_PROMPTS:$PREFILL_NUM_PROMPTS" \
   "VLLM_DECODE_NUM_PROMPTS:$DECODE_NUM_PROMPTS" \
@@ -125,12 +134,26 @@ case "$RR_DTYPE" in
   *) fail "VLLM_OOVERLAP_RR_DTYPE must be bf16, fp16, or fp32; got: $RR_DTYPE" ;;
 esac
 
+case "$AG_DTYPE" in
+  bf16|bfloat16|fp16|float16|fp32|float32) ;;
+  *) fail "VLLM_OOVERLAP_AG_DTYPE must be bf16, fp16, or fp32; got: $AG_DTYPE" ;;
+esac
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER="$REPO_ROOT/test/benchmark_vllm_paperlike.py"
 PLOTTER="$REPO_ROOT/test/plot_vllm_sweeps.py"
 OUT_ROOT="$REPO_ROOT/results/evalution/vllm/tp${WORLD_SIZE}"
+TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp4_policy.json}"
+
+if [[ "$MODE" != "plot" ]]; then
+  [[ -f "$TUNING_POLICY" ]] || fail "ooverlap tuning policy not found: $TUNING_POLICY"
+fi
+
+if [[ -f "$TUNING_POLICY" ]]; then
+  TUNING_POLICY="$(cd -- "$(dirname -- "$TUNING_POLICY")" && pwd)/$(basename -- "$TUNING_POLICY")"
+fi
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail "Python executable not found: $PYTHON_BIN"
 command -v bash >/dev/null 2>&1 || fail "bash was not found"
@@ -223,8 +246,12 @@ common_driver_args+=(--ooverlap-debug "$OOVERLAP_DEBUG")
 common_driver_args+=(--rr-dtype "$RR_DTYPE")
 common_driver_args+=(--rr-slots "$RR_SLOTS")
 common_driver_args+=(--rr-capacity-bytes "$RR_CAPACITY_BYTES")
+common_driver_args+=(--env "VLLM_OOVERLAP_AG_DTYPE=$AG_DTYPE")
+common_driver_args+=(--env "VLLM_OOVERLAP_AG_SLOTS=$AG_SLOTS")
+common_driver_args+=(--env "VLLM_OOVERLAP_AG_CAPACITY_BYTES=$AG_CAPACITY_BYTES")
 common_driver_args+=(--env "OOVERLAP_MAX_CTAS=$OOVERLAP_MAX_CTAS")
 common_driver_args+=(--env "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK")
+common_driver_args+=(--env "OOVERLAP_TUNING_POLICY=$TUNING_POLICY")
 common_driver_args+=(--env "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 common_driver_args+=(--env "TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE")
 common_driver_args+=(--env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN")
