@@ -424,6 +424,193 @@ def plot_paired_tp(
     save_figure(fig, output_path)
 
 
+# OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_V1
+def paper_tick_values(values: List[int], max_ticks: int = 6) -> List[int]:
+    """Return evenly distributed visible ticks while preserving both endpoints."""
+    ordered = list(dict.fromkeys(int(value) for value in values))
+    if len(ordered) <= max_ticks:
+        return ordered
+
+    indices = {
+        round(index * (len(ordered) - 1) / (max_ticks - 1))
+        for index in range(max_ticks)
+    }
+    return [ordered[index] for index in sorted(indices)]
+
+
+def plot_paper_metric_row(
+    rows: List[Dict[str, object]],
+    metric_spec,
+    axes_row,
+    legend_by_label: Dict[str, object],
+    *,
+    tp: int,
+    show_titles: bool,
+    show_xlabels: bool,
+) -> None:
+    """Plot one TP/metric combination across the three collective columns."""
+    grouped_by_metric, show_cta_in_legend = prepare_plot_data(rows)
+    metric, t_ccl_key, nccl_key, symmetric_key, ylabel = metric_spec
+    grouped = grouped_by_metric[metric]
+
+    for col_idx, collective in enumerate(COLLECTIVES):
+        axis = axes_row[col_idx]
+        collective_groups = grouped[collective]
+        first_rows = next(iter(collective_groups.values()))
+
+        for cta_limit, series in sorted(
+            collective_groups.items(),
+            key=lambda item: (-1 if item[0] is None else item[0]),
+        ):
+            x_values = [int(row["bytes"]) for row in series]
+            t_ccl_values = [float(row[t_ccl_key]) for row in series]
+            nccl_values = [float(row[nccl_key]) for row in series]
+            symmetric_values = [float(row[symmetric_key]) for row in series]
+            suffix = cta_suffix(cta_limit, show_cta_in_legend)
+
+            axis.plot(
+                x_values,
+                t_ccl_values,
+                marker="o",
+                linewidth=PLOT_LINEWIDTH,
+                markersize=PLOT_MARKERSIZE,
+                markeredgewidth=PLOT_MARKEREDGEWIDTH,
+                label=f"T-CCL{suffix}",
+            )
+            axis.plot(
+                x_values,
+                nccl_values,
+                marker="s",
+                linestyle="--",
+                linewidth=PLOT_LINEWIDTH,
+                markersize=PLOT_MARKERSIZE,
+                markeredgewidth=PLOT_MARKEREDGEWIDTH,
+                label=f"NCCL{suffix}",
+            )
+            if finite_positive(symmetric_values):
+                axis.plot(
+                    x_values,
+                    symmetric_values,
+                    marker="^",
+                    linestyle=":",
+                    linewidth=PLOT_LINEWIDTH,
+                    markersize=PLOT_MARKERSIZE,
+                    markeredgewidth=PLOT_MARKEREDGEWIDTH,
+                    label=f"Symmetric NCCL{suffix}",
+                )
+
+        for handle, label in zip(*axis.get_legend_handles_labels()):
+            legend_by_label.setdefault(label, handle)
+
+        all_x_ticks = [int(row["bytes"]) for row in first_rows]
+        visible_x_ticks = paper_tick_values(all_x_ticks)
+        axis.set_xscale("log", base=2)
+        axis.set_xticks(visible_x_ticks)
+        if show_xlabels:
+            axis.set_xticklabels(
+                [format_size_bytes(value) for value in visible_x_ticks],
+                rotation=0,
+                ha="center",
+            )
+        else:
+            axis.tick_params(axis="x", which="both", labelbottom=False)
+
+        axis.tick_params(axis="both", labelsize=7.5)
+        axis.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.35)
+
+        if show_titles:
+            axis.set_title(COLLECTIVE_TITLES[collective], fontsize=9.5)
+        if col_idx == 0:
+            axis.set_ylabel(f"TP={tp}\n{ylabel}", fontsize=8.5)
+
+
+def plot_paired_tp_4x3(
+    left_rows: List[Dict[str, object]],
+    left_tp: int,
+    right_rows: List[Dict[str, object]],
+    right_tp: int,
+    output_path: Path,
+) -> None:
+    """Plot two TP sweeps as three collective columns and four metric/TP rows.
+
+    Row order:
+      1. left TP bandwidth
+      2. right TP bandwidth
+      3. left TP latency
+      4. right TP latency
+    """
+    fig, axes = plt.subplots(
+        nrows=4,
+        ncols=3,
+        figsize=(7.2, 8.4),
+        squeeze=False,
+        sharex=False,
+    )
+    legend_by_label: Dict[str, object] = {}
+
+    bandwidth_spec = METRIC_SPECS[0]
+    latency_spec = METRIC_SPECS[1]
+
+    plot_paper_metric_row(
+        left_rows,
+        bandwidth_spec,
+        axes[0],
+        legend_by_label,
+        tp=left_tp,
+        show_titles=True,
+        show_xlabels=False,
+    )
+    plot_paper_metric_row(
+        right_rows,
+        bandwidth_spec,
+        axes[1],
+        legend_by_label,
+        tp=right_tp,
+        show_titles=False,
+        show_xlabels=True,
+    )
+    plot_paper_metric_row(
+        left_rows,
+        latency_spec,
+        axes[2],
+        legend_by_label,
+        tp=left_tp,
+        show_titles=False,
+        show_xlabels=False,
+    )
+    plot_paper_metric_row(
+        right_rows,
+        latency_spec,
+        axes[3],
+        legend_by_label,
+        tp=right_tp,
+        show_titles=False,
+        show_xlabels=True,
+    )
+
+    # Label each metric block once rather than repeating an x label on all panels.
+    axes[1][1].set_xlabel("Buffer size", fontsize=8.5, labelpad=5)
+    axes[3][1].set_xlabel("Buffer size", fontsize=8.5, labelpad=5)
+
+    add_figure_legend(fig, legend_by_label, 0.992)
+    fig.subplots_adjust(
+        left=0.105,
+        right=0.995,
+        bottom=0.065,
+        top=0.945,
+        wspace=0.24,
+        hspace=0.30,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    pdf_path = output_path.with_suffix(".pdf")
+    fig.savefig(pdf_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {output_path}")
+    print(f"[plot] wrote {pdf_path}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -462,6 +649,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Right TP-group size. If omitted, infer it from the path.",
+    )
+    parser.add_argument(
+        "--paired-layout",
+        choices=["side-by-side", "paper-4x3"],
+        default="side-by-side",
+        help=(
+            "Paired-TP layout. 'side-by-side' preserves the existing 2x6-style "
+            "figure; 'paper-4x3' uses three collective columns and four TP/metric rows."
+        ),
     )
     parser.add_argument(
         "--out-prefix",
@@ -532,15 +728,23 @@ def main() -> int:
     left_tp = resolve_tp(left_path, args.left_tp, "--left-tp")
     right_tp = resolve_tp(right_path, args.right_tp, "--right-tp")
 
+    default_layout_suffix = (
+        "paper_4x3" if args.paired_layout == "paper-4x3" else "combined"
+    )
     out_prefix = (
         Path(args.out_prefix).expanduser().resolve()
         if args.out_prefix
         else left_path.with_name(
-            f"{left_path.stem}_tp{left_tp}_tp{right_tp}_combined"
+            f"{left_path.stem}_tp{left_tp}_tp{right_tp}_{default_layout_suffix}"
         )
     )
 
-    plot_paired_tp(
+    plot_function = (
+        plot_paired_tp_4x3
+        if args.paired_layout == "paper-4x3"
+        else plot_paired_tp
+    )
+    plot_function(
         load_rows(left_path),
         left_tp,
         load_rows(right_path),
