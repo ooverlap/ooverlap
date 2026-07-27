@@ -30,8 +30,8 @@ PLOT_LINEWIDTH = 1.8
 PLOT_MARKERSIZE = 6.5
 PLOT_MARKEREDGEWIDTH = 0.8
 
-# OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_READABILITY_V4
-# These values are used only by the dense 4x3 paper layout. They are slightly
+# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_READABILITY_V1
+# These values are used only by the dense 3x4 paper layout. They are slightly
 # stronger than the standalone-figure defaults so curves remain distinguishable
 # after the figure is embedded at two-column paper width.
 PAPER_LINEWIDTH = 2.25
@@ -436,130 +436,100 @@ def plot_paired_tp(
     save_figure(fig, output_path)
 
 
-# OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_V1
+# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_V1
 def paper_tick_values(values: Iterable[int]) -> List[int]:
     """Return every distinct measured buffer size in increasing order."""
     return sorted({int(value) for value in values})
 
 
-def plot_paper_metric_row(
-    rows: List[Dict[str, object]],
+def plot_paper_panel(
+    grouped_by_metric,
+    show_cta_in_legend: bool,
     metric_spec,
-    axes_row,
+    collective: str,
+    axis,
     legend_by_label: Dict[str, object],
-    *,
-    tp: int,
-    show_titles: bool,
-    show_xlabels: bool,
 ) -> None:
-    """Plot one TP/metric combination across the three collective columns."""
-    grouped_by_metric, show_cta_in_legend = prepare_plot_data(rows)
-    metric, t_ccl_key, nccl_key, symmetric_key, ylabel = metric_spec
-    grouped = grouped_by_metric[metric]
+    """Plot one collective for one TP/metric column."""
+    metric, t_ccl_key, nccl_key, symmetric_key, _ylabel = metric_spec
+    collective_groups = grouped_by_metric[metric][collective]
 
-    for col_idx, collective in enumerate(COLLECTIVES):
-        axis = axes_row[col_idx]
-        collective_groups = grouped[collective]
-        for cta_limit, series in sorted(
-            collective_groups.items(),
-            key=lambda item: (-1 if item[0] is None else item[0]),
-        ):
-            x_values = [int(row["bytes"]) for row in series]
-            t_ccl_values = [float(row[t_ccl_key]) for row in series]
-            nccl_values = [float(row[nccl_key]) for row in series]
-            symmetric_values = [float(row[symmetric_key]) for row in series]
-            suffix = cta_suffix(cta_limit, show_cta_in_legend)
+    for cta_limit, series in sorted(
+        collective_groups.items(),
+        key=lambda item: (-1 if item[0] is None else item[0]),
+    ):
+        x_values = [int(row["bytes"]) for row in series]
+        t_ccl_values = [float(row[t_ccl_key]) for row in series]
+        nccl_values = [float(row[nccl_key]) for row in series]
+        symmetric_values = [float(row[symmetric_key]) for row in series]
+        suffix = cta_suffix(cta_limit, show_cta_in_legend)
 
+        axis.plot(
+            x_values,
+            t_ccl_values,
+            marker="o",
+            linewidth=PAPER_LINEWIDTH,
+            markersize=PAPER_MARKERSIZE,
+            markeredgewidth=PAPER_MARKEREDGEWIDTH,
+            label=f"T-CCL{suffix}",
+        )
+        axis.plot(
+            x_values,
+            nccl_values,
+            marker="s",
+            linestyle="--",
+            linewidth=PAPER_LINEWIDTH,
+            markersize=PAPER_MARKERSIZE,
+            markeredgewidth=PAPER_MARKEREDGEWIDTH,
+            label=f"NCCL{suffix}",
+        )
+        if finite_positive(symmetric_values):
             axis.plot(
                 x_values,
-                t_ccl_values,
-                marker="o",
+                symmetric_values,
+                marker="^",
+                linestyle=":",
                 linewidth=PAPER_LINEWIDTH,
                 markersize=PAPER_MARKERSIZE,
                 markeredgewidth=PAPER_MARKEREDGEWIDTH,
-                label=f"T-CCL{suffix}",
+                label=f"Symmetric NCCL{suffix}",
             )
-            axis.plot(
-                x_values,
-                nccl_values,
-                marker="s",
-                linestyle="--",
-                linewidth=PAPER_LINEWIDTH,
-                markersize=PAPER_MARKERSIZE,
-                markeredgewidth=PAPER_MARKEREDGEWIDTH,
-                label=f"NCCL{suffix}",
-            )
-            if finite_positive(symmetric_values):
-                axis.plot(
-                    x_values,
-                    symmetric_values,
-                    marker="^",
-                    linestyle=":",
-                    linewidth=PAPER_LINEWIDTH,
-                    markersize=PAPER_MARKERSIZE,
-                    markeredgewidth=PAPER_MARKEREDGEWIDTH,
-                    label=f"Symmetric NCCL{suffix}",
-                )
 
-        for handle, label in zip(*axis.get_legend_handles_labels()):
-            legend_by_label.setdefault(label, handle)
+    for handle, label in zip(*axis.get_legend_handles_labels()):
+        legend_by_label.setdefault(label, handle)
 
-        # Use the union across every CTA series. Looking only at ``first_rows``
-        # can hide measured sizes when another CTA configuration has extra points.
-        all_x_ticks = paper_tick_values(
-            int(row["bytes"])
-            for series in collective_groups.values()
-            for row in series
-        )
-        axis.set_xscale("log", base=2)
-        axis.set_xticks(all_x_ticks)
-        if show_xlabels:
-            axis.set_xticklabels(
-                [format_size_bytes(value) for value in all_x_ticks],
-                rotation=90,
-                ha="center",
-                va="top",
-            )
-            # Keep the vertical labels fully below the bottom spine.  The
-            # previous anchor rotation and 3-point pad pulled labels such as
-            # 1K/2K and 1M/2M into the plotting frame.
-            axis.tick_params(
-                axis="x",
-                which="major",
-                pad=8,
-                direction="out",
-            )
-        else:
-            axis.tick_params(axis="x", which="both", labelbottom=False)
-
-        axis.tick_params(axis="x", labelsize=PAPER_TICK_FONTSIZE)
-        # Keep y tick labels close to their own spine instead of allowing them
-        # to extend into the subplot immediately to the left.
-        axis.tick_params(
-            axis="y",
-            labelsize=PAPER_TICK_FONTSIZE,
-            pad=1,
-            direction="out",
-        )
-        axis.grid(True, which="both", linestyle="--", linewidth=0.65, alpha=0.32)
-        axis.margins(x=0.018)
-
-        if show_titles:
-            axis.set_title(
-                COLLECTIVE_TITLES[collective],
-                fontsize=PAPER_TITLE_FONTSIZE,
-                pad=7,
-            )
-        if col_idx == 0:
-            axis.set_ylabel(
-                f"TP={tp}\n{ylabel}",
-                fontsize=PAPER_LABEL_FONTSIZE,
-                labelpad=5,
-            )
+    all_x_ticks = paper_tick_values(
+        int(row["bytes"])
+        for series in collective_groups.values()
+        for row in series
+    )
+    axis.set_xscale("log", base=2)
+    axis.set_xticks(all_x_ticks)
+    axis.set_xticklabels(
+        [format_size_bytes(value) for value in all_x_ticks],
+        rotation=90,
+        ha="center",
+        va="top",
+    )
+    axis.tick_params(
+        axis="x",
+        which="major",
+        labelsize=PAPER_TICK_FONTSIZE,
+        pad=7,
+        direction="out",
+    )
+    axis.tick_params(
+        axis="y",
+        labelsize=PAPER_TICK_FONTSIZE,
+        pad=1,
+        direction="out",
+    )
+    axis.grid(True, which="both", linestyle="--", linewidth=0.65, alpha=0.32)
+    axis.margins(x=0.02)
 
 
 def add_paper_figure_legend(legend_axis, legend_by_label: Dict[str, object]) -> None:
-    """Draw the shared legend in its own row, isolated from subplot titles."""
+    """Draw the shared legend in its own row."""
     legend_axis.axis("off")
     legend_labels = list(legend_by_label)
     legend_handles = [legend_by_label[label] for label in legend_labels]
@@ -577,99 +547,129 @@ def add_paper_figure_legend(legend_axis, legend_by_label: Dict[str, object]) -> 
     )
 
 
-def plot_paired_tp_4x3(
+def plot_paired_tp_3x4(
     left_rows: List[Dict[str, object]],
     left_tp: int,
     right_rows: List[Dict[str, object]],
     right_tp: int,
     output_path: Path,
 ) -> None:
-    """Plot two TP sweeps as three collective columns and four metric/TP rows.
+    """Plot collective rows against TP/metric columns.
 
-    Row order:
-      1. left TP bandwidth
-      2. right TP bandwidth
-      3. left TP latency
-      4. right TP latency
+    Data rows:
+      1. All-Reduce
+      2. Reduce-Scatter
+      3. All-Gather
 
-    A separate top GridSpec row is reserved for the legend. This prevents long
-    entries such as ``Symmetric NCCL`` from colliding with the All-Gather title.
+    Data columns:
+      1. smaller TP bandwidth
+      2. smaller TP latency
+      3. larger TP bandwidth
+      4. larger TP latency
     """
-    # The visible data remains 4x3. Internally, one row is reserved for the
-    # legend and another narrow row separates the bandwidth and latency blocks.
-    # Tight horizontal margins and spacing recover width for every subplot.
-    fig = plt.figure(figsize=(8.8, 10.5))
-    grid = fig.add_gridspec(
-        nrows=6,
-        ncols=3,
-        height_ratios=(0.22, 1.0, 1.0, 0.15, 1.0, 1.0),
-        left=0.065,
-    right=0.999,
-    bottom=0.075,
-    top=0.995,
-    wspace=0.16,
-    hspace=0.24,
+    tp_groups = sorted(
+        ((int(left_tp), left_rows), (int(right_tp), right_rows)),
+        key=lambda item: item[0],
     )
+    (first_tp, first_rows), (second_tp, second_rows) = tp_groups
 
-    legend_axis = fig.add_subplot(grid[0, :])
-    spacer_axis = fig.add_subplot(grid[3, :])
-    spacer_axis.axis("off")
-    data_grid_rows = (1, 2, 4, 5)
-    axes = [
-        [fig.add_subplot(grid[grid_row, col_idx]) for col_idx in range(3)]
-        for grid_row in data_grid_rows
-    ]
-    legend_by_label: Dict[str, object] = {}
+    prepared_groups = []
+    for tp, rows in ((first_tp, first_rows), (second_tp, second_rows)):
+        grouped_by_metric, show_cta_in_legend = prepare_plot_data(rows)
+        prepared_groups.append((tp, grouped_by_metric, show_cta_in_legend))
 
     bandwidth_spec = METRIC_SPECS[0]
     latency_spec = METRIC_SPECS[1]
-
-    plot_paper_metric_row(
-        left_rows,
-        bandwidth_spec,
-        axes[0],
-        legend_by_label,
-        tp=left_tp,
-        show_titles=True,
-        show_xlabels=False,
-    )
-    plot_paper_metric_row(
-        right_rows,
-        bandwidth_spec,
-        axes[1],
-        legend_by_label,
-        tp=right_tp,
-        show_titles=False,
-        show_xlabels=True,
-    )
-    plot_paper_metric_row(
-        left_rows,
-        latency_spec,
-        axes[2],
-        legend_by_label,
-        tp=left_tp,
-        show_titles=False,
-        show_xlabels=False,
-    )
-    plot_paper_metric_row(
-        right_rows,
-        latency_spec,
-        axes[3],
-        legend_by_label,
-        tp=right_tp,
-        show_titles=False,
-        show_xlabels=True,
+    columns = (
+        (prepared_groups[0], bandwidth_spec, "Bandwidth\n(GB/s)"),
+        (prepared_groups[0], latency_spec, "Latency\n(\u00b5s)"),
+        (prepared_groups[1], bandwidth_spec, "Bandwidth\n(GB/s)"),
+        (prepared_groups[1], latency_spec, "Latency\n(\u00b5s)"),
     )
 
-    # Label each metric block once rather than repeating an x label on all panels.
-    axes[1][1].set_xlabel(
-        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=10
-    )
-    axes[3][1].set_xlabel(
-        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=10
+    # Internally the first column is a narrow row-label gutter. The visible data
+    # remains exactly three collective rows by four TP/metric columns.
+    fig = plt.figure(figsize=(12.8, 8.8))
+    grid = fig.add_gridspec(
+        nrows=5,
+        ncols=5,
+        height_ratios=(0.20, 0.18, 1.0, 1.0, 1.0),
+        width_ratios=(0.38, 1.0, 1.0, 1.0, 1.0),
+        left=0.018,
+        right=0.998,
+        bottom=0.11,
+        top=0.995,
+        wspace=0.24,
+        hspace=0.34,
     )
 
+    legend_axis = fig.add_subplot(grid[0, 1:])
+    first_tp_axis = fig.add_subplot(grid[1, 1:3])
+    second_tp_axis = fig.add_subplot(grid[1, 3:5])
+    for group_axis, tp in ((first_tp_axis, first_tp), (second_tp_axis, second_tp)):
+        group_axis.axis("off")
+        group_axis.text(
+            0.5,
+            0.5,
+            f"TP={tp}",
+            ha="center",
+            va="center",
+            fontsize=PAPER_TITLE_FONTSIZE + 1.5,
+            fontweight="semibold",
+        )
+
+    axes = []
+    for row_idx, collective in enumerate(COLLECTIVES):
+        grid_row = row_idx + 2
+        row_label_axis = fig.add_subplot(grid[grid_row, 0])
+        row_label_axis.axis("off")
+        row_label_axis.text(
+            1.0,
+            0.5,
+            COLLECTIVE_TITLES[collective],
+            ha="right",
+            va="center",
+            fontsize=PAPER_LABEL_FONTSIZE + 0.5,
+            fontweight="semibold",
+        )
+
+        axis_row = []
+        for col_idx, (prepared, metric_spec, column_title) in enumerate(columns):
+            _tp, grouped_by_metric, show_cta_in_legend = prepared
+            axis = fig.add_subplot(grid[grid_row, col_idx + 1])
+            plot_paper_panel(
+                grouped_by_metric,
+                show_cta_in_legend,
+                metric_spec,
+                collective,
+                axis,
+                legend_by_label={},
+            )
+            if row_idx == 0:
+                axis.set_title(
+                    column_title,
+                    fontsize=PAPER_TITLE_FONTSIZE,
+                    pad=8,
+                )
+            axis_row.append(axis)
+        axes.append(axis_row)
+
+    # Rebuild one shared legend from all axes. This avoids tying legend creation
+    # to a particular TP/metric panel.
+    legend_by_label: Dict[str, object] = {}
+    for axis_row in axes:
+        for axis in axis_row:
+            for handle, label in zip(*axis.get_legend_handles_labels()):
+                legend_by_label.setdefault(label, handle)
     add_paper_figure_legend(legend_axis, legend_by_label)
+
+    # A single x label per TP group keeps the four-column layout uncluttered.
+    axes[-1][0].set_xlabel(
+        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=22
+    )
+    axes[-1][2].set_xlabel(
+        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=22
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -678,7 +678,6 @@ def plot_paired_tp_4x3(
     plt.close(fig)
     print(f"[plot] wrote {output_path}")
     print(f"[plot] wrote {pdf_path}")
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -721,11 +720,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--paired-layout",
-        choices=["side-by-side", "paper-4x3"],
+        choices=["side-by-side", "paper-3x4", "paper-4x3"],
         default="side-by-side",
         help=(
             "Paired-TP layout. 'side-by-side' preserves the existing 2x6-style "
-            "figure; 'paper-4x3' uses three collective columns and four TP/metric rows."
+            "figure; 'paper-3x4' uses collective rows and TP/metric columns. "
+            "The old 'paper-4x3' spelling is accepted as a compatibility alias."
         ),
     )
     parser.add_argument(
@@ -797,9 +797,8 @@ def main() -> int:
     left_tp = resolve_tp(left_path, args.left_tp, "--left-tp")
     right_tp = resolve_tp(right_path, args.right_tp, "--right-tp")
 
-    default_layout_suffix = (
-        "paper_4x3" if args.paired_layout == "paper-4x3" else "combined"
-    )
+    paper_layout_requested = args.paired_layout in ("paper-3x4", "paper-4x3")
+    default_layout_suffix = "paper_3x4" if paper_layout_requested else "combined"
     out_prefix = (
         Path(args.out_prefix).expanduser().resolve()
         if args.out_prefix
@@ -808,11 +807,7 @@ def main() -> int:
         )
     )
 
-    plot_function = (
-        plot_paired_tp_4x3
-        if args.paired_layout == "paper-4x3"
-        else plot_paired_tp
-    )
+    plot_function = plot_paired_tp_3x4 if paper_layout_requested else plot_paired_tp
     plot_function(
         load_rows(left_path),
         left_tp,
