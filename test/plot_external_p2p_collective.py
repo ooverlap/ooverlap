@@ -443,6 +443,43 @@ def paper_tick_values(values: Iterable[int]) -> List[int]:
     return sorted({int(value) for value in values})
 
 
+# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_POLISH_V5
+# Keep every panel's upper limit on a labelled, human-readable tick.  Matplotlib's
+# default autoscaling can show a point above the final labelled tick (for example,
+# a 430 GB/s point while 400 is the highest visible tick).
+def paper_nice_y_step(max_value: float, target_intervals: int = 5) -> float:
+    """Return a readable major-tick step for a positive maximum value."""
+    if not math.isfinite(max_value) or max_value <= 0.0:
+        return 1.0
+
+    rough_step = max_value / max(1, target_intervals)
+    magnitude = 10.0 ** math.floor(math.log10(rough_step))
+    fraction = rough_step / magnitude
+    for nice_fraction in (1.0, 2.0, 2.5, 5.0, 10.0):
+        if fraction <= nice_fraction:
+            return nice_fraction * magnitude
+    return 10.0 * magnitude
+
+
+def configure_paper_y_axis(axis, values: Iterable[float]) -> None:
+    """Use zero as the baseline and include the data maximum on/below a labelled tick."""
+    finite_values = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite_values:
+        return
+
+    max_value = max(finite_values)
+    if max_value <= 0.0:
+        return
+
+    step = paper_nice_y_step(max_value)
+    upper = math.ceil(max_value / step - 1.0e-12) * step
+    upper = max(step, upper)
+    tick_count = int(round(upper / step))
+
+    axis.set_ylim(0.0, upper)
+    axis.set_yticks([index * step for index in range(tick_count + 1)])
+
+
 def plot_paper_panel(
     grouped_by_metric,
     show_cta_in_legend: bool,
@@ -456,6 +493,7 @@ def plot_paper_panel(
     """Plot one collective for one TP/metric column."""
     metric, t_ccl_key, nccl_key, symmetric_key, _ylabel = metric_spec
     collective_groups = grouped_by_metric[metric][collective]
+    plotted_y_values: List[float] = []
 
     for cta_limit, series in sorted(
         collective_groups.items(),
@@ -486,6 +524,9 @@ def plot_paper_panel(
             markeredgewidth=PAPER_MARKEREDGEWIDTH,
             label=f"NCCL{suffix}",
         )
+        plotted_y_values.extend(t_ccl_values)
+        plotted_y_values.extend(nccl_values)
+
         if finite_positive(symmetric_values):
             axis.plot(
                 x_values,
@@ -497,6 +538,7 @@ def plot_paper_panel(
                 markeredgewidth=PAPER_MARKEREDGEWIDTH,
                 label=f"Symmetric NCCL{suffix}",
             )
+            plotted_y_values.extend(symmetric_values)
 
     for handle, label in zip(*axis.get_legend_handles_labels()):
         legend_by_label.setdefault(label, handle)
@@ -523,9 +565,9 @@ def plot_paper_panel(
             direction="out",
         )
     else:
-        # The x values are identical within a column, so keep labels only on
-        # the final collective row while preserving the ticks/grid alignment.
         axis.tick_params(axis="x", which="both", labelbottom=False)
+
+    configure_paper_y_axis(axis, plotted_y_values)
     axis.tick_params(
         axis="y",
         labelsize=PAPER_TICK_FONTSIZE,
@@ -556,6 +598,7 @@ def add_paper_figure_legend(legend_axis, legend_by_label: Dict[str, object]) -> 
 
 
 # OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_SPACING_V4
+# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_POLISH_V5
 def plot_paired_tp_3x4(
     left_rows: List[Dict[str, object]],
     left_tp: int,
@@ -596,9 +639,6 @@ def plot_paired_tp_3x4(
         (prepared_groups[1], latency_spec, "Latency\n(µs)"),
     )
 
-    # Use a true four-column data grid. The collective name is attached directly
-    # to the first axis of each row instead of occupying a separate empty gutter.
-    # The small hspace is intentional because only the bottom row shows x labels.
     fig = plt.figure(figsize=(12.8, 8.0))
     grid = fig.add_gridspec(
         nrows=5,
@@ -606,9 +646,11 @@ def plot_paired_tp_3x4(
         height_ratios=(0.18, 0.15, 1.0, 1.0, 1.0),
         left=0.080,
         right=0.998,
-        bottom=0.115,
+        bottom=0.130,
         top=0.995,
-        wspace=0.24,
+        # Lower values bring the four columns closer together; increase this
+        # slightly if y tick labels ever become crowded.
+        wspace=0.20,
         hspace=0.10,
     )
 
@@ -644,15 +686,14 @@ def plot_paired_tp_3x4(
                 show_xlabels=(row_idx == len(COLLECTIVES) - 1),
             )
 
-            # Put the vertical collective label immediately beside column 1.
             if col_idx == 0:
                 axis.set_ylabel(
                     COLLECTIVE_TITLES[collective],
                     rotation=90,
                     ha="center",
                     va="center",
-                    fontsize=PAPER_LABEL_FONTSIZE + 0.5,
-                    fontweight="semibold",
+                    fontsize=PAPER_LABEL_FONTSIZE,
+                    fontweight="medium",
                     labelpad=8,
                 )
 
@@ -665,8 +706,6 @@ def plot_paired_tp_3x4(
             axis_row.append(axis)
         axes.append(axis_row)
 
-    # Rebuild one shared legend from all axes. This avoids tying legend creation
-    # to a particular TP/metric panel.
     legend_by_label: Dict[str, object] = {}
     for axis_row in axes:
         for axis in axis_row:
@@ -674,12 +713,12 @@ def plot_paired_tp_3x4(
                 legend_by_label.setdefault(label, handle)
     add_paper_figure_legend(legend_axis, legend_by_label)
 
-    # A single x label per TP group keeps the four-column layout uncluttered.
-    axes[-1][0].set_xlabel(
-        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=22
-    )
-    axes[-1][2].set_xlabel(
-        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=22
+    # One figure-wide label is sufficient because every column uses buffer size.
+    fig.supxlabel(
+        "Buffer size",
+        x=(0.080 + 0.998) / 2.0,
+        y=0.018,
+        fontsize=PAPER_LABEL_FONTSIZE,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -689,6 +728,7 @@ def plot_paired_tp_3x4(
     plt.close(fig)
     print(f"[plot] wrote {output_path}")
     print(f"[plot] wrote {pdf_path}")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
