@@ -30,7 +30,7 @@ PLOT_LINEWIDTH = 1.8
 PLOT_MARKERSIZE = 6.5
 PLOT_MARKEREDGEWIDTH = 0.8
 
-# OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_READABILITY_V3
+# OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_READABILITY_V4
 # These values are used only by the dense 4x3 paper layout. They are slightly
 # stronger than the standalone-figure defaults so curves remain distinguishable
 # after the figure is embedded at two-column paper width.
@@ -519,13 +519,28 @@ def plot_paper_metric_row(
                 rotation=90,
                 ha="center",
                 va="top",
-                rotation_mode="anchor",
             )
-            axis.tick_params(axis="x", which="major", pad=3)
+            # Keep the vertical labels fully below the bottom spine.  The
+            # previous anchor rotation and 3-point pad pulled labels such as
+            # 1K/2K and 1M/2M into the plotting frame.
+            axis.tick_params(
+                axis="x",
+                which="major",
+                pad=8,
+                direction="out",
+            )
         else:
             axis.tick_params(axis="x", which="both", labelbottom=False)
 
-        axis.tick_params(axis="both", labelsize=PAPER_TICK_FONTSIZE)
+        axis.tick_params(axis="x", labelsize=PAPER_TICK_FONTSIZE)
+        # Keep y tick labels close to their own spine instead of allowing them
+        # to extend into the subplot immediately to the left.
+        axis.tick_params(
+            axis="y",
+            labelsize=PAPER_TICK_FONTSIZE,
+            pad=1,
+            direction="out",
+        )
         axis.grid(True, which="both", linestyle="--", linewidth=0.65, alpha=0.32)
         axis.margins(x=0.018)
 
@@ -583,7 +598,7 @@ def plot_paired_tp_4x3(
     # The visible data remains 4x3. Internally, one row is reserved for the
     # legend and another narrow row separates the bandwidth and latency blocks.
     # Tight horizontal margins and spacing recover width for every subplot.
-    fig = plt.figure(figsize=(7.75, 10.5))
+    fig = plt.figure(figsize=(8.8, 10.5))
     grid = fig.add_gridspec(
         nrows=6,
         ncols=3,
@@ -592,7 +607,7 @@ def plot_paired_tp_4x3(
     right=0.999,
     bottom=0.075,
     top=0.995,
-    wspace=0.035,
+    wspace=0.16,
     hspace=0.24,
     )
 
