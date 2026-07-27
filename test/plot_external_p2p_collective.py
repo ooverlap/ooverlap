@@ -442,25 +442,26 @@ def paper_tick_values(values: Iterable[int]) -> List[int]:
     """Return every distinct measured buffer size in increasing order."""
     return sorted({int(value) for value in values})
 # OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_Y_AUTOSCALE_V6
+# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_Y_PADDING_V7
 def configure_paper_y_axis(axis, values: Iterable[float]) -> None:
-    """Keep the natural lower bound and show a labelled tick above the maximum.
+    """Add balanced space below the minimum and above the maximum.
 
-    Matplotlib's automatic y range is retained at the bottom, so panels whose
-    measurements start well above zero do not waste space down to zero.  At the
-    top, the next major tick above the largest plotted value is made visible so
-    the highest points can be interpreted against a labelled grid line.
+    Keep one labelled major tick outside the data range on each side, then add
+    a small fraction of one tick interval beyond those outer ticks. This keeps
+    extreme markers away from the top and bottom spines without forcing zero
+    into panels whose measurements live far above zero.
     """
     finite_values = [float(value) for value in values if math.isfinite(float(value))]
     if not finite_values:
         return
 
+    min_value = min(finite_values)
     max_value = max(finite_values)
 
-    # Recompute Matplotlib's normal data-driven y range after all curves have
-    # been added.  In particular, do not replace the lower bound with zero.
+    # Start from Matplotlib's normal data-driven scale so its locator chooses a
+    # sensible tick interval for this particular panel.
     axis.relim()
     axis.autoscale_view(scalex=False, scaley=True)
-    lower, _auto_upper = axis.get_ylim()
 
     major_ticks = sorted(
         {
@@ -481,29 +482,39 @@ def configure_paper_y_axis(axis, values: Iterable[float]) -> None:
         return
     step = min(positive_steps)
 
-    epsilon = 1.0e-10 * max(1.0, abs(max_value))
-    top_tick = next(
+    epsilon = 1.0e-10 * max(1.0, abs(min_value), abs(max_value))
+
+    lower_tick = next(
+        (tick for tick in reversed(major_ticks) if tick < min_value - epsilon),
+        None,
+    )
+    if lower_tick is None:
+        lower_tick = major_ticks[0]
+        while lower_tick >= min_value - epsilon:
+            lower_tick -= step
+        major_ticks.append(lower_tick)
+
+    upper_tick = next(
         (tick for tick in major_ticks if tick > max_value + epsilon),
         None,
     )
-    if top_tick is None:
-        top_tick = major_ticks[-1]
-        while top_tick <= max_value + epsilon:
-            top_tick += step
-        major_ticks.append(top_tick)
+    if upper_tick is None:
+        upper_tick = major_ticks[-1]
+        while upper_tick <= max_value + epsilon:
+            upper_tick += step
+        major_ticks.append(upper_tick)
 
-    visible_ticks = [
+    visible_ticks = sorted(
         tick
-        for tick in major_ticks
-        if tick >= lower - epsilon and tick <= top_tick + epsilon
-    ]
-    if not visible_ticks or abs(visible_ticks[-1] - top_tick) > epsilon:
-        visible_ticks.append(top_tick)
+        for tick in set(major_ticks)
+        if tick >= lower_tick - epsilon and tick <= upper_tick + epsilon
+    )
 
-    axis.set_ylim(lower, top_tick)
+    # Leave a little whitespace outside the outer labelled grid lines. Increase
+    # this value slightly (for example, to 0.20) for more padding.
+    edge_padding = 0.15 * step
+    axis.set_ylim(lower_tick - edge_padding, upper_tick + edge_padding)
     axis.set_yticks(visible_ticks)
-
-
 def plot_paper_panel(
     grouped_by_metric,
     show_cta_in_legend: bool,
