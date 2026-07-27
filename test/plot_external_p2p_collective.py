@@ -555,6 +555,7 @@ def add_paper_figure_legend(legend_axis, legend_by_label: Dict[str, object]) -> 
     )
 
 
+# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_SPACING_V4
 def plot_paired_tp_3x4(
     left_rows: List[Dict[str, object]],
     left_tp: int,
@@ -590,30 +591,30 @@ def plot_paired_tp_3x4(
     latency_spec = METRIC_SPECS[1]
     columns = (
         (prepared_groups[0], bandwidth_spec, "Bandwidth\n(GB/s)"),
-        (prepared_groups[0], latency_spec, "Latency\n(\u00b5s)"),
+        (prepared_groups[0], latency_spec, "Latency\n(µs)"),
         (prepared_groups[1], bandwidth_spec, "Bandwidth\n(GB/s)"),
-        (prepared_groups[1], latency_spec, "Latency\n(\u00b5s)"),
+        (prepared_groups[1], latency_spec, "Latency\n(µs)"),
     )
 
-    # Internally the first column is a narrow row-label gutter. The visible data
-    # remains exactly three collective rows by four TP/metric columns.
-    fig = plt.figure(figsize=(12.8, 8.8))
+    # Use a true four-column data grid. The collective name is attached directly
+    # to the first axis of each row instead of occupying a separate empty gutter.
+    # The small hspace is intentional because only the bottom row shows x labels.
+    fig = plt.figure(figsize=(12.8, 8.0))
     grid = fig.add_gridspec(
         nrows=5,
-        ncols=5,
-        height_ratios=(0.20, 0.18, 1.0, 1.0, 1.0),
-        width_ratios=(0.38, 1.0, 1.0, 1.0, 1.0),
-        left=0.018,
+        ncols=4,
+        height_ratios=(0.18, 0.15, 1.0, 1.0, 1.0),
+        left=0.080,
         right=0.998,
-        bottom=0.11,
+        bottom=0.115,
         top=0.995,
         wspace=0.24,
-        hspace=0.34,
+        hspace=0.10,
     )
 
-    legend_axis = fig.add_subplot(grid[0, 1:])
-    first_tp_axis = fig.add_subplot(grid[1, 1:3])
-    second_tp_axis = fig.add_subplot(grid[1, 3:5])
+    legend_axis = fig.add_subplot(grid[0, :])
+    first_tp_axis = fig.add_subplot(grid[1, 0:2])
+    second_tp_axis = fig.add_subplot(grid[1, 2:4])
     for group_axis, tp in ((first_tp_axis, first_tp), (second_tp_axis, second_tp)):
         group_axis.axis("off")
         group_axis.text(
@@ -629,24 +630,10 @@ def plot_paired_tp_3x4(
     axes = []
     for row_idx, collective in enumerate(COLLECTIVES):
         grid_row = row_idx + 2
-        row_label_axis = fig.add_subplot(grid[grid_row, 0])
-        row_label_axis.axis("off")
-        row_label_axis.text(
-            0.5,
-            0.5,
-            COLLECTIVE_TITLES[collective],
-            rotation=90,
-            ha="center",
-            va="center",
-            rotation_mode="anchor",
-            fontsize=PAPER_LABEL_FONTSIZE + 0.5,
-            fontweight="semibold",
-        )
-
         axis_row = []
         for col_idx, (prepared, metric_spec, column_title) in enumerate(columns):
             _tp, grouped_by_metric, show_cta_in_legend = prepared
-            axis = fig.add_subplot(grid[grid_row, col_idx + 1])
+            axis = fig.add_subplot(grid[grid_row, col_idx])
             plot_paper_panel(
                 grouped_by_metric,
                 show_cta_in_legend,
@@ -656,6 +643,19 @@ def plot_paired_tp_3x4(
                 legend_by_label={},
                 show_xlabels=(row_idx == len(COLLECTIVES) - 1),
             )
+
+            # Put the vertical collective label immediately beside column 1.
+            if col_idx == 0:
+                axis.set_ylabel(
+                    COLLECTIVE_TITLES[collective],
+                    rotation=90,
+                    ha="center",
+                    va="center",
+                    fontsize=PAPER_LABEL_FONTSIZE + 0.5,
+                    fontweight="semibold",
+                    labelpad=8,
+                )
+
             if row_idx == 0:
                 axis.set_title(
                     column_title,
