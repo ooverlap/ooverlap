@@ -129,6 +129,8 @@ COMM_RUN_CONFIGS_BY_TP: Dict[int, List[CommRunConfig]] = {
         CommRunConfig(comm_sm_slack=4, max_ctas_per_reduce_task=4),
         CommRunConfig(comm_sm_slack=6, max_ctas_per_reduce_task=6),
         CommRunConfig(comm_sm_slack=8, max_ctas_per_reduce_task=8),
+        CommRunConfig(comm_sm_slack=10, max_ctas_per_reduce_task=10),
+        CommRunConfig(comm_sm_slack=12, max_ctas_per_reduce_task=12),
         CommRunConfig(comm_sm_slack=16, max_ctas_per_reduce_task=16),
     ],
     4: [
