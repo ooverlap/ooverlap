@@ -634,6 +634,7 @@ def add_paper_figure_legend(legend_axis, legend_by_label: Dict[str, object]) -> 
 
 # OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_SPACING_V4
 # OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_POLISH_V5
+# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_METRIC_YLABELS_V8
 def plot_paired_tp_3x4(
     left_rows: List[Dict[str, object]],
     left_tp: int,
@@ -649,10 +650,10 @@ def plot_paired_tp_3x4(
       3. All-Gather
 
     Data columns:
-      1. smaller TP bandwidth
-      2. smaller TP latency
-      3. larger TP bandwidth
-      4. larger TP latency
+      1. smaller TP latency
+      2. smaller TP bandwidth
+      3. larger TP latency
+      4. larger TP bandwidth
     """
     tp_groups = sorted(
         ((int(left_tp), left_rows), (int(right_tp), right_rows)),
@@ -667,11 +668,14 @@ def plot_paired_tp_3x4(
 
     bandwidth_spec = METRIC_SPECS[0]
     latency_spec = METRIC_SPECS[1]
+
+    # Within each TP pair, latency comes first and bandwidth second. Metric names
+    # are rendered as vertical y-axis labels on every panel rather than as titles.
     columns = (
-        (prepared_groups[0], bandwidth_spec, "Bandwidth\n(GB/s)"),
-        (prepared_groups[0], latency_spec, "Latency\n(µs)"),
-        (prepared_groups[1], bandwidth_spec, "Bandwidth\n(GB/s)"),
-        (prepared_groups[1], latency_spec, "Latency\n(µs)"),
+        (prepared_groups[0], latency_spec),
+        (prepared_groups[0], bandwidth_spec),
+        (prepared_groups[1], latency_spec),
+        (prepared_groups[1], bandwidth_spec),
     )
 
     fig = plt.figure(figsize=(12.8, 8.0))
@@ -683,8 +687,8 @@ def plot_paired_tp_3x4(
         right=0.998,
         bottom=0.130,
         top=0.995,
-        # Lower values bring the four columns closer together; increase this
-        # slightly if y tick labels ever become crowded.
+        # The existing spacing is retained; compact label padding keeps the
+        # per-panel metric labels inside the available inter-column gutters.
         wspace=0.20,
         hspace=0.10,
     )
@@ -708,7 +712,7 @@ def plot_paired_tp_3x4(
     for row_idx, collective in enumerate(COLLECTIVES):
         grid_row = row_idx + 2
         axis_row = []
-        for col_idx, (prepared, metric_spec, column_title) in enumerate(columns):
+        for col_idx, (prepared, metric_spec) in enumerate(columns):
             _tp, grouped_by_metric, show_cta_in_legend = prepared
             axis = fig.add_subplot(grid[grid_row, col_idx])
             plot_paper_panel(
@@ -721,23 +725,35 @@ def plot_paired_tp_3x4(
                 show_xlabels=(row_idx == len(COLLECTIVES) - 1),
             )
 
+            metric_ylabel = metric_spec[4]
+            axis.set_ylabel(
+                metric_ylabel,
+                rotation=90,
+                ha="center",
+                va="center",
+                fontsize=PAPER_LABEL_FONTSIZE,
+                fontweight="normal",
+                labelpad=5,
+            )
+
+            # Column 1 needs both the metric label and the collective row label.
+            # Keep the metric label next to its axis and place the collective name
+            # farther left with a deliberate gap between the two vertical labels.
             if col_idx == 0:
-                axis.set_ylabel(
+                axis.annotate(
                     COLLECTIVE_TITLES[collective],
+                    xy=(0.0, 0.5),
+                    xycoords="axes fraction",
+                    xytext=(-72, 0),
+                    textcoords="offset points",
                     rotation=90,
                     ha="center",
                     va="center",
                     fontsize=PAPER_LABEL_FONTSIZE,
                     fontweight="medium",
-                    labelpad=8,
+                    annotation_clip=False,
                 )
 
-            if row_idx == 0:
-                axis.set_title(
-                    column_title,
-                    fontsize=PAPER_TITLE_FONTSIZE,
-                    pad=8,
-                )
             axis_row.append(axis)
         axes.append(axis_row)
 
