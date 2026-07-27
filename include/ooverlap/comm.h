@@ -344,6 +344,19 @@ oo_status_t oo_all_gather_tuned(
     oo_tuning_mode_t tuning_mode,
     cudaStream_t stream);
 
+/*
+ * Launch all-gather from a setup-time pre-registered slot. count is the total
+ * number of elements in the gathered output buffer.
+ */
+oo_status_t oo_all_gather_slot_tuned(
+    oo_node_t* node,
+    oo_ipc_slot_set_t* set,
+    int slot_index,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

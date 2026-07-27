@@ -13,7 +13,9 @@ oo_status_t all_gather_impl(
     size_t count,
     oo_dtype_t dtype,
     oo_tuning_mode_t tuning_mode,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    oo_buffer_t* const* prebound_rank_buffers = nullptr,
+    int prebound_rank_buffer_count = 0) {
     if (!oo_all_gather_supported(dtype)) {
         return OO_ERROR_UNSUPPORTED;
     }
@@ -26,15 +28,30 @@ oo_status_t all_gather_impl(
 
     ooverlap::comm::api::CollectiveLaunchState launch{};
 
-    oo_status_t status =
-        ooverlap::comm::api::prepare_collective_launch(
-            node,
-            local,
-            ooverlap::comm::CollectivePlanFor::AllGather,
-            element_offset,
-            count,
-            dtype,
-            &launch);
+    oo_status_t status = OO_SUCCESS;
+
+    if (prebound_rank_buffers != nullptr) {
+        status =
+            ooverlap::comm::api::prepare_collective_launch_prebound(
+                node,
+                prebound_rank_buffers,
+                prebound_rank_buffer_count,
+                ooverlap::comm::CollectivePlanFor::AllGather,
+                element_offset,
+                count,
+                dtype,
+                &launch);
+    } else {
+        status =
+            ooverlap::comm::api::prepare_collective_launch(
+                node,
+                local,
+                ooverlap::comm::CollectivePlanFor::AllGather,
+                element_offset,
+                count,
+                dtype,
+                &launch);
+    }
 
     if (status != OO_SUCCESS) {
         return status;
@@ -141,4 +158,47 @@ extern "C" oo_status_t oo_all_gather_tuned(
         dtype,
         tuning_mode,
         stream);
+}
+
+
+extern "C" oo_status_t oo_all_gather_slot_tuned(
+    oo_node_t* node,
+    oo_ipc_slot_set_t* set,
+    int slot_index,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    if (node == nullptr ||
+        node->group == nullptr ||
+        set == nullptr ||
+        set->group != node->group ||
+        set->world_size != node->group->num_devices ||
+        slot_index < 0 ||
+        slot_index >= set->slot_count ||
+        node->rank < 0 ||
+        node->rank >= set->world_size) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_buffer_t* const* rank_buffers =
+        set->rank_buffers.data() +
+        static_cast<size_t>(slot_index) *
+            static_cast<size_t>(set->world_size);
+
+    oo_buffer_t* local = rank_buffers[node->rank];
+    if (local == nullptr || local->ptr == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    return all_gather_impl(
+        node,
+        local,
+        0,
+        count,
+        dtype,
+        tuning_mode,
+        stream,
+        rank_buffers,
+        set->world_size);
 }
