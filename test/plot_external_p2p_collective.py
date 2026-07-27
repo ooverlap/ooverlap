@@ -583,17 +583,17 @@ def plot_paired_tp_4x3(
     # The visible data remains 4x3. Internally, one row is reserved for the
     # legend and another narrow row separates the bandwidth and latency blocks.
     # Tight horizontal margins and spacing recover width for every subplot.
-    fig = plt.figure(figsize=(7.75, 9.8))
+    fig = plt.figure(figsize=(7.75, 10.5))
     grid = fig.add_gridspec(
         nrows=6,
         ncols=3,
-        height_ratios=(0.22, 1.0, 1.0, 0.22, 1.0, 1.0),
-        left=0.078,
-        right=0.998,
-        bottom=0.050,
-        top=0.995,
-        wspace=0.085,
-        hspace=0.22,
+        height_ratios=(0.22, 1.0, 1.0, 0.15, 1.0, 1.0),
+        left=0.065,
+    right=0.999,
+    bottom=0.075,
+    top=0.995,
+    wspace=0.035,
+    hspace=0.24,
     )
 
     legend_axis = fig.add_subplot(grid[0, :])
