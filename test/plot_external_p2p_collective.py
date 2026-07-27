@@ -441,43 +441,67 @@ def plot_paired_tp(
 def paper_tick_values(values: Iterable[int]) -> List[int]:
     """Return every distinct measured buffer size in increasing order."""
     return sorted({int(value) for value in values})
-
-
-# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_POLISH_V5
-# Keep every panel's upper limit on a labelled, human-readable tick.  Matplotlib's
-# default autoscaling can show a point above the final labelled tick (for example,
-# a 430 GB/s point while 400 is the highest visible tick).
-def paper_nice_y_step(max_value: float, target_intervals: int = 5) -> float:
-    """Return a readable major-tick step for a positive maximum value."""
-    if not math.isfinite(max_value) or max_value <= 0.0:
-        return 1.0
-
-    rough_step = max_value / max(1, target_intervals)
-    magnitude = 10.0 ** math.floor(math.log10(rough_step))
-    fraction = rough_step / magnitude
-    for nice_fraction in (1.0, 2.0, 2.5, 5.0, 10.0):
-        if fraction <= nice_fraction:
-            return nice_fraction * magnitude
-    return 10.0 * magnitude
-
-
+# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_Y_AUTOSCALE_V6
 def configure_paper_y_axis(axis, values: Iterable[float]) -> None:
-    """Use zero as the baseline and include the data maximum on/below a labelled tick."""
+    """Keep the natural lower bound and show a labelled tick above the maximum.
+
+    Matplotlib's automatic y range is retained at the bottom, so panels whose
+    measurements start well above zero do not waste space down to zero.  At the
+    top, the next major tick above the largest plotted value is made visible so
+    the highest points can be interpreted against a labelled grid line.
+    """
     finite_values = [float(value) for value in values if math.isfinite(float(value))]
     if not finite_values:
         return
 
     max_value = max(finite_values)
-    if max_value <= 0.0:
+
+    # Recompute Matplotlib's normal data-driven y range after all curves have
+    # been added.  In particular, do not replace the lower bound with zero.
+    axis.relim()
+    axis.autoscale_view(scalex=False, scaley=True)
+    lower, _auto_upper = axis.get_ylim()
+
+    major_ticks = sorted(
+        {
+            float(tick)
+            for tick in axis.get_yticks()
+            if math.isfinite(float(tick))
+        }
+    )
+    if len(major_ticks) < 2:
         return
 
-    step = paper_nice_y_step(max_value)
-    upper = math.ceil(max_value / step - 1.0e-12) * step
-    upper = max(step, upper)
-    tick_count = int(round(upper / step))
+    positive_steps = [
+        right - left
+        for left, right in zip(major_ticks, major_ticks[1:])
+        if right - left > 0.0
+    ]
+    if not positive_steps:
+        return
+    step = min(positive_steps)
 
-    axis.set_ylim(0.0, upper)
-    axis.set_yticks([index * step for index in range(tick_count + 1)])
+    epsilon = 1.0e-10 * max(1.0, abs(max_value))
+    top_tick = next(
+        (tick for tick in major_ticks if tick > max_value + epsilon),
+        None,
+    )
+    if top_tick is None:
+        top_tick = major_ticks[-1]
+        while top_tick <= max_value + epsilon:
+            top_tick += step
+        major_ticks.append(top_tick)
+
+    visible_ticks = [
+        tick
+        for tick in major_ticks
+        if tick >= lower - epsilon and tick <= top_tick + epsilon
+    ]
+    if not visible_ticks or abs(visible_ticks[-1] - top_tick) > epsilon:
+        visible_ticks.append(top_tick)
+
+    axis.set_ylim(lower, top_tick)
+    axis.set_yticks(visible_ticks)
 
 
 def plot_paper_panel(
