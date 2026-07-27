@@ -437,6 +437,7 @@ def plot_paired_tp(
 
 
 # OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_V1
+# OOVERLAP_EXTERNAL_PLOT_PAPER_3X4_LABELS_V2
 def paper_tick_values(values: Iterable[int]) -> List[int]:
     """Return every distinct measured buffer size in increasing order."""
     return sorted({int(value) for value in values})
@@ -449,6 +450,8 @@ def plot_paper_panel(
     collective: str,
     axis,
     legend_by_label: Dict[str, object],
+    *,
+    show_xlabels: bool,
 ) -> None:
     """Plot one collective for one TP/metric column."""
     metric, t_ccl_key, nccl_key, symmetric_key, _ylabel = metric_spec
@@ -505,19 +508,24 @@ def plot_paper_panel(
     )
     axis.set_xscale("log", base=2)
     axis.set_xticks(all_x_ticks)
-    axis.set_xticklabels(
-        [format_size_bytes(value) for value in all_x_ticks],
-        rotation=90,
-        ha="center",
-        va="top",
-    )
-    axis.tick_params(
-        axis="x",
-        which="major",
-        labelsize=PAPER_TICK_FONTSIZE,
-        pad=7,
-        direction="out",
-    )
+    if show_xlabels:
+        axis.set_xticklabels(
+            [format_size_bytes(value) for value in all_x_ticks],
+            rotation=90,
+            ha="center",
+            va="top",
+        )
+        axis.tick_params(
+            axis="x",
+            which="major",
+            labelsize=PAPER_TICK_FONTSIZE,
+            pad=7,
+            direction="out",
+        )
+    else:
+        # The x values are identical within a column, so keep labels only on
+        # the final collective row while preserving the ticks/grid alignment.
+        axis.tick_params(axis="x", which="both", labelbottom=False)
     axis.tick_params(
         axis="y",
         labelsize=PAPER_TICK_FONTSIZE,
@@ -624,11 +632,13 @@ def plot_paired_tp_3x4(
         row_label_axis = fig.add_subplot(grid[grid_row, 0])
         row_label_axis.axis("off")
         row_label_axis.text(
-            1.0,
+            0.5,
             0.5,
             COLLECTIVE_TITLES[collective],
-            ha="right",
+            rotation=90,
+            ha="center",
             va="center",
+            rotation_mode="anchor",
             fontsize=PAPER_LABEL_FONTSIZE + 0.5,
             fontweight="semibold",
         )
@@ -644,6 +654,7 @@ def plot_paired_tp_3x4(
                 collective,
                 axis,
                 legend_by_label={},
+                show_xlabels=(row_idx == len(COLLECTIVES) - 1),
             )
             if row_idx == 0:
                 axis.set_title(
