@@ -1,6 +1,7 @@
 #include "comm/ooverlap_comm_private.h"
 
 #include "comm/plan/transfer_plan_distribution.h"
+#include "comm/tuning/tuning_policy.h"
 #include "comm/tma_multi_gpu_allreduce_sm90.h"
 #include "ooverlap/comm.h"
 
@@ -64,10 +65,12 @@ oo_status_t allreduce_impl(
     launch.plan_scratch_index = plan_scratch_index;
 
     ooverlap::comm::LaunchConfig config =
-        ooverlap::comm::api::select_public_launch_config(
+        ooverlap::comm::select_launch_config_for_collective(
             ooverlap::comm::CollectivePlanFor::AllReduce,
+            launch.world_size,
             launch.bytes,
-            tuning_mode);
+            ooverlap::comm::tuning_preference_from_public(
+                tuning_mode));
 
     ooverlap::comm::plan::AllreduceTransferPlan* transfer_plan = nullptr;
 

@@ -453,7 +453,7 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     comm::plan::lowering_detail::LoweringPassOptions lowering_options{};
     lowering_options.enable_reduce_cta_groups = true;
     lowering_options.max_ctas_per_reduce_task =
-        max_ctas_per_reduce_task_from_env();
+        launch_config.max_ctas_per_reduce_task;
     lowering_options.cta_barrier_start = cta_barrier_start;
 
     const bool plan_ok =

@@ -4,9 +4,8 @@ Automate SM90 ooverlap evaluation.
 
 Flow per shape:
   1. profile configs from CUTLASS CSV with tool/gen_config_sm90.py
-  2. for each comm_sm_slack:
-       - run tool/search.py with retry list of min-group trials
-       - run test/test.py without CTA caps
+  2. for each communication CTA configuration:
+       - run tool/search.py with matching backend-specific bandwidth curves
        - run test/test.py with CTA caps for both NCCL and ooverlap
        - save one scenario JSON
   3. save one merged evaluation JSON
@@ -128,13 +127,15 @@ COMM_BACKEND = "both"
 COMM_RUN_CONFIGS_BY_TP: Dict[int, List[CommRunConfig]] = {
     2: [
         CommRunConfig(comm_sm_slack=4, max_ctas_per_reduce_task=4),
+        CommRunConfig(comm_sm_slack=6, max_ctas_per_reduce_task=6),
         CommRunConfig(comm_sm_slack=8, max_ctas_per_reduce_task=8),
+        CommRunConfig(comm_sm_slack=16, max_ctas_per_reduce_task=16),
     ],
     4: [
+        CommRunConfig(comm_sm_slack=6, max_ctas_per_reduce_task=2),
         CommRunConfig(comm_sm_slack=9, max_ctas_per_reduce_task=3),
         CommRunConfig(comm_sm_slack=12, max_ctas_per_reduce_task=4),
-
-
+        CommRunConfig(comm_sm_slack=15, max_ctas_per_reduce_task=5),
         CommRunConfig(comm_sm_slack=18, max_ctas_per_reduce_task=6),
         CommRunConfig(comm_sm_slack=24, max_ctas_per_reduce_task=8),
     ],
@@ -238,6 +239,49 @@ def comm_run_config_to_dict(config: CommRunConfig) -> Dict[str, int]:
     }
 
 
+# OOVERLAP_CONFIG_SPECIFIC_BANDWIDTH_V2
+EVALUATION_SCHEMA_VERSION = 2
+
+
+def bandwidth_curve_path(config: CommRunConfig, backend: str) -> Path:
+    world_size = len(ACTIVE_DEVICES)
+    if world_size < 2:
+        raise RuntimeError("ACTIVE_DEVICES must contain at least two GPUs")
+
+    slack = int(config.comm_sm_slack)
+    reduce_ctas = int(config.max_ctas_per_reduce_task)
+    config_dir = repo_root() / "configs"
+
+    if backend == "nccl":
+        name = f"bandwidth_nccl_{COMM_OP}_tp{world_size}_c{slack}.pt"
+    elif backend == "ooverlap":
+        name = (
+            f"bandwidth_ooverlap_{COMM_OP}_tp{world_size}"
+            f"_c{slack}_r{reduce_ctas}.pt"
+        )
+    else:
+        raise ValueError(f"Unknown backend={backend}")
+
+    return config_dir / name
+
+
+def validate_bandwidth_curves(configs: List[CommRunConfig]) -> None:
+    missing = []
+    for config in configs:
+        for backend in ("nccl", "ooverlap"):
+            path = bandwidth_curve_path(config, backend)
+            if not path.is_file() or path.stat().st_size == 0:
+                missing.append(path)
+
+    if missing:
+        lines = [
+            "Missing configuration-specific bandwidth curves:",
+            *[f"  {path}" for path in missing],
+            "Run evalution/run_flashoverlap_sm90.sh first.",
+        ]
+        raise SystemExit("\n".join(lines))
+
+
 def active_comm_run_configs() -> List[CommRunConfig]:
     world_size = len(ACTIVE_DEVICES)
     configs = list(COMM_RUN_CONFIGS_BY_TP.get(world_size, []))
@@ -335,6 +379,11 @@ def load_existing_scenarios(run_dir: Path) -> Dict[str, Dict[str, Any]]:
         if not isinstance(data, dict):
             continue
 
+        # Do not carry legacy uncapped measurements into rebuilt output.
+        tests = data.get("tests")
+        if isinstance(tests, dict):
+            tests.pop("uncapped", None)
+
         sid = data.get("scenario_id")
         if not sid:
             sid = path.stem
@@ -384,9 +433,11 @@ def make_env(
             int(comm_config.max_ctas_per_reduce_task)
         )
         if set_ooverlap_max_ctas:
-            # search.py should model the same communication-SM reservation as
-            # the capped evaluation: total OOverlap CTAs equal comm_sm_slack.
-            env["OOVERLAP_MAX_CTAS"] = str(int(comm_config.comm_sm_slack))
+            # Search and validation use the same CTA reservation as the
+            # configuration-specific curves and final capped measurement.
+            comm_ctas = str(int(comm_config.comm_sm_slack))
+            env["OOVERLAP_MAX_CTAS"] = comm_ctas
+            env["NCCL_MAX_CTAS"] = comm_ctas
 
     if for_test and OOVERLAP_TUNING_POLICY:
         env["OOVERLAP_TUNING_POLICY"] = OOVERLAP_TUNING_POLICY
@@ -595,7 +646,13 @@ def existing_scenario_is_ok(
     sid: str,
 ) -> bool:
     old = scenarios_by_id.get(sid)
-    return isinstance(old, dict) and old.get("status") == "ok"
+    if not isinstance(old, dict) or old.get("status") != "ok":
+        return False
+    if int(old.get("evaluation_schema_version", 0) or 0) != EVALUATION_SCHEMA_VERSION:
+        return False
+
+    capped = old.get("tests", {}).get("capped")
+    return isinstance(capped, dict) and bool(capped.get("ok"))
 
 
 # =============================================================================
@@ -809,6 +866,10 @@ def run_search_trial(
         "--comm_sm_slack", str(slack),
         "--min_group_size", str(trial_cfg.min_group_size),
         "--min_effective_group_size", str(trial_cfg.min_effective_group_size),
+        "--nccl_bandwidth_path", str(bandwidth_curve_path(comm_config, "nccl")),
+        "--ooverlap_bandwidth_path", str(
+            bandwidth_curve_path(comm_config, "ooverlap")
+        ),
         *SEARCH_EXTRA_ARGS,
     ]
 
@@ -901,12 +962,10 @@ def run_search_with_retries(
 def run_test(
     shape: Shape,
     comm_config: CommRunConfig,
-    capped: bool,
     run_dir: Path,
 ) -> Dict[str, Any]:
     slack = int(comm_config.comm_sm_slack)
     reduce_ctas = int(comm_config.max_ctas_per_reduce_task)
-    label = "capped" if capped else "uncapped"
 
     cmd = [
         sys.executable,
@@ -916,20 +975,16 @@ def run_test(
         "--k", str(shape.k),
         "--comm_op", COMM_OP,
         "--comm_backend", COMM_BACKEND,
+        "--set_nccl_comm_ctas_to_comm_sms",
+        "--set_ooverlap_comm_ctas_to_comm_sms",
         *TEST_EXTRA_ARGS,
     ]
-
-    if capped:
-        cmd.extend([
-            "--set_nccl_comm_ctas_to_comm_sms",
-            "--set_ooverlap_comm_ctas_to_comm_sms",
-        ])
 
     res = run_cmd(
         cmd,
         run_dir / "logs" / (
             f"{shape_id(shape)}__slack{slack}__rcta{reduce_ctas}"
-            f"__test_{label}.log"
+            "__test_capped.log"
         ),
         env=make_env(for_test=True, comm_config=comm_config),
     )
@@ -942,7 +997,7 @@ def run_test(
 
     return {
         "ok": res["returncode"] == 0,
-        "capped": bool(capped),
+        "capped": True,
         "comm_config": comm_run_config_to_dict(comm_config),
         "run": res,
         "parsed": parsed,
@@ -975,6 +1030,11 @@ def run_scenario(
             comm_config.max_ctas_per_reduce_task
         ),
         "comm_config": comm_run_config_to_dict(comm_config),
+        "evaluation_schema_version": EVALUATION_SCHEMA_VERSION,
+        "bandwidth_paths": {
+            "nccl": str(bandwidth_curve_path(comm_config, "nccl")),
+            "ooverlap": str(bandwidth_curve_path(comm_config, "ooverlap")),
+        },
         "status": "running",
         "started_at": now_stamp(),
     }
@@ -997,29 +1057,16 @@ def run_scenario(
     }
     save_scenario(run_dir, scenario)
 
-    tests: Dict[str, Any] = {}
-
-    tests["uncapped"] = run_test(
-        shape,
-        comm_config,
-        capped=False,
-        run_dir=run_dir,
-    )
-    scenario["tests"] = tests
-    save_scenario(run_dir, scenario)
-
-    tests["capped"] = run_test(
-        shape,
-        comm_config,
-        capped=True,
-        run_dir=run_dir,
-    )
+    tests: Dict[str, Any] = {
+        "capped": run_test(
+            shape,
+            comm_config,
+            run_dir=run_dir,
+        )
+    }
     scenario["tests"] = tests
 
-    if not tests["uncapped"]["ok"]:
-        scenario["status"] = "failed"
-        scenario["failed_stage"] = "test_uncapped"
-    elif not tests["capped"]["ok"]:
+    if not tests["capped"]["ok"]:
         scenario["status"] = "failed"
         scenario["failed_stage"] = "test_capped"
     else:
@@ -1108,6 +1155,7 @@ def main() -> int:
     args = parse_args()
     ACTIVE_DEVICES = parse_devices(args.devices)
     comm_configs = active_comm_run_configs()
+    validate_bandwidth_curves(comm_configs)
 
     if not SHAPES:
         raise SystemExit("SHAPES is empty. Edit SHAPES near the top of this script first.")
@@ -1145,6 +1193,8 @@ def main() -> int:
         "test_script": TEST_SCRIPT,
         "comm_op": COMM_OP,
         "comm_backend": COMM_BACKEND,
+        "evaluation_schema_version": EVALUATION_SCHEMA_VERSION,
+        "measurement_mode": "capped_only",
         "comm_run_configs_by_tp": {
             str(tp): [comm_run_config_to_dict(config) for config in configs]
             for tp, configs in sorted(COMM_RUN_CONFIGS_BY_TP.items())

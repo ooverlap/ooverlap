@@ -1,9 +1,11 @@
 #include "comm/tuning/tuning_policy.h"
+// OOVERLAP_POLICY_WITHOUT_DTYPE_AND_TIMINGS_V1
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
@@ -22,50 +24,56 @@ using json = nlohmann::json;
 
 constexpr const char* kEnvPolicyPath = "OOVERLAP_TUNING_POLICY";
 constexpr const char* kDefaultPolicyPath = "./tma_collective_policy.json";
+constexpr const char* kEnvMaxCtas = "OOVERLAP_MAX_CTAS";
+constexpr const char* kEnvMaxCtasPerReduceTask =
+    "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK";
 
-struct PolicyEntry {
+struct RankedCtaCandidate {
+    int max_ctas = 0;
+    int max_ctas_per_reduce_task = 0;
+};
+
+struct PolicyPoint {
     CollectivePlanFor collective = CollectivePlanFor::AllReduce;
-    size_t bytes_per_rank = 0;
-    double avg_ms = 0.0;
-    LaunchConfig config{};
+    int world_size = 0;
+    size_t bytes = 0;
+    std::vector<RankedCtaCandidate> ranked;
 };
 
 struct LoadedPolicy {
     bool attempted = false;
     bool loaded = false;
-    std::vector<PolicyEntry> entries;
+    std::vector<PolicyPoint> points;
 };
 
 struct SelectionCacheKey {
     int collective = 0;
-    size_t bytes_per_rank = 0;
+    int world_size = 0;
+    size_t bytes = 0;
     int preference = 0;
 
     bool has_max_ctas = false;
     int max_ctas = 0;
 
-    bool has_max_threads = false;
-    int max_threads = 0;
-
-    long long tolerance_ppm = 50000;
+    bool has_max_ctas_per_reduce_task = false;
+    int max_ctas_per_reduce_task = 0;
 };
 
 struct SelectionCacheKeyHash {
     size_t operator()(const SelectionCacheKey& key) const {
         size_t h = std::hash<int>{}(key.collective);
 
-        auto mix = [&](size_t v) {
-            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        auto mix = [&](size_t value) {
+            h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
         };
 
-        mix(std::hash<size_t>{}(key.bytes_per_rank));
+        mix(std::hash<int>{}(key.world_size));
+        mix(std::hash<size_t>{}(key.bytes));
         mix(std::hash<int>{}(key.preference));
         mix(std::hash<bool>{}(key.has_max_ctas));
         mix(std::hash<int>{}(key.max_ctas));
-        mix(std::hash<bool>{}(key.has_max_threads));
-        mix(std::hash<int>{}(key.max_threads));
-        mix(std::hash<long long>{}(key.tolerance_ppm));
-
+        mix(std::hash<bool>{}(key.has_max_ctas_per_reduce_task));
+        mix(std::hash<int>{}(key.max_ctas_per_reduce_task));
         return h;
     }
 };
@@ -75,13 +83,15 @@ struct SelectionCacheKeyEqual {
         const SelectionCacheKey& a,
         const SelectionCacheKey& b) const {
         return a.collective == b.collective &&
-               a.bytes_per_rank == b.bytes_per_rank &&
+               a.world_size == b.world_size &&
+               a.bytes == b.bytes &&
                a.preference == b.preference &&
                a.has_max_ctas == b.has_max_ctas &&
                a.max_ctas == b.max_ctas &&
-               a.has_max_threads == b.has_max_threads &&
-               a.max_threads == b.max_threads &&
-               a.tolerance_ppm == b.tolerance_ppm;
+               a.has_max_ctas_per_reduce_task ==
+                   b.has_max_ctas_per_reduce_task &&
+               a.max_ctas_per_reduce_task ==
+                   b.max_ctas_per_reduce_task;
     }
 };
 
@@ -115,12 +125,11 @@ std::mutex& selection_cache_mutex() {
 bool parse_positive_int_env(
     const char* name,
     int* out) {
-    if (out == nullptr) {
+    if (name == nullptr || out == nullptr) {
         return false;
     }
 
     const char* text = std::getenv(name);
-
     if (text == nullptr || text[0] == '\0') {
         return false;
     }
@@ -129,11 +138,11 @@ bool parse_positive_int_env(
     char* end = nullptr;
     const long value = std::strtol(text, &end, 10);
 
-    if (errno != 0 || end == text || *end != '\0') {
-        return false;
-    }
-
-    if (value <= 0 || value > std::numeric_limits<int>::max()) {
+    if (errno != 0 ||
+        end == text ||
+        *end != '\0' ||
+        value <= 0 ||
+        value > std::numeric_limits<int>::max()) {
         return false;
     }
 
@@ -141,187 +150,116 @@ bool parse_positive_int_env(
     return true;
 }
 
-bool parse_double_env(
-    const char* name,
+bool json_number_as_double(
+    const json& value,
     double* out) {
     if (out == nullptr) {
         return false;
     }
 
-    const char* text = std::getenv(name);
-
-    if (text == nullptr || text[0] == '\0') {
-        return false;
+    if (value.is_number()) {
+        const double parsed = value.get<double>();
+        if (!std::isfinite(parsed)) {
+            return false;
+        }
+        *out = parsed;
+        return true;
     }
-
-    errno = 0;
-    char* end = nullptr;
-    const double value = std::strtod(text, &end);
-
-    if (errno != 0 || end == text || *end != '\0') {
-        return false;
-    }
-
-    if (!(value >= 0.0)) {
-        return false;
-    }
-
-    *out = value;
-    return true;
-}
-
-long long tolerance_ppm_from_fraction(double tolerance) {
-    if (!(tolerance >= 0.0)) {
-        tolerance = 0.05;
-    }
-
-    const double scaled = tolerance * 1000000.0;
-
-    if (scaled <= 0.0) {
-        return 0;
-    }
-
-    if (scaled >= static_cast<double>(std::numeric_limits<long long>::max())) {
-        return std::numeric_limits<long long>::max();
-    }
-
-    return static_cast<long long>(scaled + 0.5);
-}
-
-double tolerance_fraction_from_ppm(long long tolerance_ppm) {
-    if (tolerance_ppm <= 0) {
-        return 0.0;
-    }
-
-    return static_cast<double>(tolerance_ppm) / 1000000.0;
-}
-
-long long runtime_tolerance_ppm() {
-    double value = 0.10;
-    double env_value = 0.0;
-
-    if (parse_double_env("OOVERLAP_TUNING_TOLERANCE", &env_value)) {
-        value = env_value;
-    }
-
-    return tolerance_ppm_from_fraction(value);
-}
-
-bool json_get_string(
-    const json& obj,
-    const char* key,
-    std::string* out) {
-    if (out == nullptr || !obj.is_object() || !obj.contains(key)) {
-        return false;
-    }
-
-    const json& value = obj.at(key);
 
     if (!value.is_string()) {
         return false;
     }
 
-    *out = value.get<std::string>();
-    return true;
-}
-
-bool parse_string_double(
-    const std::string& text,
-    double* out) {
-    if (out == nullptr || text.empty()) {
+    const std::string text = value.get<std::string>();
+    if (text.empty()) {
         return false;
     }
 
     errno = 0;
     char* end = nullptr;
-    const double value = std::strtod(text.c_str(), &end);
+    const double parsed = std::strtod(text.c_str(), &end);
 
-    if (errno != 0 || end == text.c_str() || *end != '\0') {
+    if (errno != 0 ||
+        end == text.c_str() ||
+        *end != '\0' ||
+        !std::isfinite(parsed)) {
         return false;
     }
 
-    *out = value;
+    *out = parsed;
     return true;
 }
 
-bool json_get_double(
-    const json& obj,
-    const char* key,
-    double* out) {
-    if (out == nullptr || !obj.is_object() || !obj.contains(key)) {
+bool json_value_as_int(
+    const json& value,
+    int* out) {
+    double parsed = 0.0;
+    if (out == nullptr || !json_number_as_double(value, &parsed)) {
         return false;
     }
 
-    const json& value = obj.at(key);
-
-    if (value.is_number()) {
-        *out = value.get<double>();
-        return true;
+    if (parsed < static_cast<double>(std::numeric_limits<int>::min()) ||
+        parsed > static_cast<double>(std::numeric_limits<int>::max()) ||
+        std::floor(parsed) != parsed) {
+        return false;
     }
 
-    if (value.is_string()) {
-        return parse_string_double(value.get<std::string>(), out);
+    *out = static_cast<int>(parsed);
+    return true;
+}
+
+bool json_value_as_size(
+    const json& value,
+    size_t* out) {
+    double parsed = 0.0;
+    if (out == nullptr || !json_number_as_double(value, &parsed)) {
+        return false;
     }
 
-    return false;
+    if (parsed < 0.0 ||
+        parsed > static_cast<double>(std::numeric_limits<size_t>::max()) ||
+        std::floor(parsed) != parsed) {
+        return false;
+    }
+
+    *out = static_cast<size_t>(parsed);
+    return true;
 }
 
 bool json_get_int(
-    const json& obj,
+    const json& object,
     const char* key,
     int* out) {
-    double value = 0.0;
-
-    if (!json_get_double(obj, key, &value)) {
-        return false;
-    }
-
-    if (value < static_cast<double>(std::numeric_limits<int>::min()) ||
-        value > static_cast<double>(std::numeric_limits<int>::max())) {
-        return false;
-    }
-
-    *out = static_cast<int>(value);
-    return true;
+    return object.is_object() &&
+           key != nullptr &&
+           object.contains(key) &&
+           json_value_as_int(object.at(key), out);
 }
 
 bool json_get_size(
-    const json& obj,
+    const json& object,
     const char* key,
     size_t* out) {
-    double value = 0.0;
+    return object.is_object() &&
+           key != nullptr &&
+           object.contains(key) &&
+           json_value_as_size(object.at(key), out);
+}
 
-    if (!json_get_double(obj, key, &value)) {
+bool json_get_string(
+    const json& object,
+    const char* key,
+    std::string* out) {
+    if (out == nullptr ||
+        !object.is_object() ||
+        key == nullptr ||
+        !object.contains(key) ||
+        !object.at(key).is_string()) {
         return false;
     }
 
-    if (value < 0.0 ||
-        value > static_cast<double>(std::numeric_limits<size_t>::max())) {
-        return false;
-    }
-
-    *out = static_cast<size_t>(value);
+    *out = object.at(key).get<std::string>();
     return true;
-}
-
-bool row_status_ok(const json& row) {
-    std::string status;
-
-    if (!json_get_string(row, "status", &status)) {
-        return true;
-    }
-
-    return status == "ok";
-}
-
-bool row_backend_ok(const json& row) {
-    std::string backend;
-
-    if (!json_get_string(row, "backend", &backend)) {
-        return true;
-    }
-
-    return backend == "ooverlap" || backend == "oo";
 }
 
 bool collective_name_to_plan_for(
@@ -358,245 +296,160 @@ bool collective_name_to_plan_for(
     return false;
 }
 
-bool kernel_name_to_plan(
-    CollectivePlanFor collective,
-    const std::string& kernel,
-    LaunchConfig* config) {
-    if (config == nullptr || kernel == "nccl") {
-        return false;
-    }
-
-    if (collective == CollectivePlanFor::AllReduce) {
-        config->plan_for = CollectivePlanFor::AllReduce;
-
-        if (kernel == "tma_copy" ||
-            kernel == "normal" ||
-            kernel == "tma") {
-            config->plan = CollectivePlanKind(AllReducePlanKind::TmaCopy);
-            return true;
-        }
-
-        if (kernel == "seq_fast_copy_gmem" ||
-            kernel == "seq_fast_gmem" ||
-            kernel == "not_fused" ||
-            kernel == "fast_gmem_seq") {
-            config->plan =
-                CollectivePlanKind(AllReducePlanKind::SeqFastCopyGmem);
-            return true;
-        }
-
-        if (kernel == "overlap_fast_copy_gmem" ||
-            kernel == "overlap_fast_gmem" ||
-            kernel == "fused" ||
-            kernel == "fast_gmem_overlap") {
-            config->plan =
-                CollectivePlanKind(AllReducePlanKind::OverlapFastCopyGmem);
-            return true;
-        }
-    }
-
-    if (collective == CollectivePlanFor::ReduceScatter) {
-        config->plan_for = CollectivePlanFor::ReduceScatter;
-
-        if (kernel == "tma_reduce" ||
-            kernel == "normal" ||
-            kernel == "tma") {
-            config->plan =
-                CollectivePlanKind(ReduceScatterPlanKind::TmaReduce);
-            return true;
-        }
-
-        if (kernel == "seq_fast_add_gmem" ||
-            kernel == "fast_add_gmem" ||
-            kernel == "seq_fast_gmem" ||
-            kernel == "not_fused" ||
-            kernel == "fast_gmem_seq") {
-            config->plan =
-                CollectivePlanKind(ReduceScatterPlanKind::SeqFastAddGmem);
-            return true;
-        }
-    }
-
-    if (collective == CollectivePlanFor::AllGather) {
-        config->plan_for = CollectivePlanFor::AllGather;
-
-        if (kernel == "tma_copy" ||
-            kernel == "normal" ||
-            kernel == "tma") {
-            config->plan =
-                CollectivePlanKind(AllGatherPlanKind::TmaCopy);
-            return true;
-        }
-
-        if (kernel == "seq_fast_copy_gmem" ||
-            kernel == "seq_fast_gmem" ||
-            kernel == "not_fused" ||
-            kernel == "fast_gmem_seq") {
-            config->plan =
-                CollectivePlanKind(AllGatherPlanKind::SeqFastCopyGmem);
-            return true;
-        }
-    }
-
-    return false;
+bool valid_candidate(
+    const RankedCtaCandidate& candidate) {
+    return candidate.max_ctas > 0 &&
+           candidate.max_ctas <= TMA_TWO_GPU_PEER_MAX_CTAS &&
+           candidate.max_ctas_per_reduce_task > 0 &&
+           candidate.max_ctas_per_reduce_task <= candidate.max_ctas &&
+           candidate.max_ctas_per_reduce_task <=
+               TMA_TWO_GPU_PEER_MAX_CTAS;
 }
 
-bool row_avg_ms(
-    const json& row,
-    double* out) {
-    if (json_get_double(row, "avg_ms", out)) {
-        return *out > 0.0;
-    }
-
-    double total_ms = 0.0;
-    int iters = 0;
-
-    if (json_get_double(row, "total_ms", &total_ms) &&
-        json_get_int(row, "iters", &iters) &&
-        iters > 0) {
-        *out = total_ms / static_cast<double>(iters);
-        return *out > 0.0;
-    }
-
-    double latency_us = 0.0;
-
-    if (json_get_double(row, "latency_us", &latency_us)) {
-        *out = latency_us * 1.0e-3;
-        return *out > 0.0;
-    }
-
-    return false;
-}
-
-bool parse_policy_row(
-    const json& row,
-    PolicyEntry* out) {
-    if (out == nullptr || !row.is_object()) {
+bool parse_ranked_candidate(
+    const json& value,
+    RankedCtaCandidate* out) {
+    if (out == nullptr || !value.is_array() || value.size() != 2) {
         return false;
     }
 
-    if (!row_status_ok(row) || !row_backend_ok(row)) {
+    RankedCtaCandidate candidate{};
+
+    if (!json_value_as_int(value.at(0), &candidate.max_ctas) ||
+        !json_value_as_int(
+            value.at(1),
+            &candidate.max_ctas_per_reduce_task) ||
+        !valid_candidate(candidate)) {
         return false;
     }
 
-    std::string collective_name;
-    if (!json_get_string(row, "collective", &collective_name)) {
-        return false;
-    }
-
-    CollectivePlanFor collective{};
-    if (!collective_name_to_plan_for(collective_name, &collective)) {
-        return false;
-    }
-
-    std::string kernel;
-    if (!json_get_string(row, "kernel", &kernel)) {
-        return false;
-    }
-
-    PolicyEntry entry{};
-    entry.collective = collective;
-    entry.config = LaunchConfig{};
-
-    if (!kernel_name_to_plan(collective, kernel, &entry.config)) {
-        return false;
-    }
-
-    if (!json_get_size(row, "bytes_per_rank", &entry.bytes_per_rank) &&
-        !json_get_size(row, "bytes", &entry.bytes_per_rank)) {
-        return false;
-    }
-
-    if (!row_avg_ms(row, &entry.avg_ms)) {
-        return false;
-    }
-
-    json_get_int(row, "max_ctas", &entry.config.max_ctas);
-    json_get_int(row, "threads", &entry.config.threads);
-    json_get_int(row, "window_chunks", &entry.config.window_chunks);
-
-    if (!json_get_int(row, "chunk_bytes", &entry.config.chunk_bytes)) {
-        json_get_int(row, "compile_chunk_bytes", &entry.config.chunk_bytes);
-    }
-
-    if (!json_get_int(row, "stage_depth", &entry.config.stage_depth)) {
-        if (!json_get_int(row, "compile_stage_depth", &entry.config.stage_depth)) {
-            json_get_int(
-                row,
-                "compile_reduce_stage_depth",
-                &entry.config.stage_depth);
-        }
-    }
-
-    if (!launch_config_valid(entry.config)) {
-        return false;
-    }
-
-    *out = entry;
+    *out = candidate;
     return true;
 }
 
-void parse_policy_json_rows(
-    const json& rows,
-    std::vector<PolicyEntry>* entries) {
-    if (entries == nullptr) {
-        return;
+bool same_candidate(
+    const RankedCtaCandidate& a,
+    const RankedCtaCandidate& b) {
+    return a.max_ctas == b.max_ctas &&
+           a.max_ctas_per_reduce_task ==
+               b.max_ctas_per_reduce_task;
+}
+
+bool parse_policy_point(
+    const json& value,
+    PolicyPoint* out) {
+    if (out == nullptr || !value.is_object()) {
+        return false;
     }
 
-    if (rows.is_array()) {
-        for (const json& row : rows) {
-            PolicyEntry entry{};
+    PolicyPoint point{};
+    std::string collective_name;
 
-            if (parse_policy_row(row, &entry)) {
-                entries->push_back(entry);
+    if (!json_get_int(value, "world_size", &point.world_size) ||
+        point.world_size <= 0 ||
+        !json_get_string(value, "collective", &collective_name) ||
+        !collective_name_to_plan_for(collective_name, &point.collective) ||
+        (!json_get_size(value, "bytes", &point.bytes) &&
+         !json_get_size(value, "bytes_per_rank", &point.bytes)) ||
+        point.bytes == 0) {
+        return false;
+    }
+
+    const json* ranked = nullptr;
+    if (value.contains("ranked")) {
+        ranked = &value.at("ranked");
+    } else if (value.contains("candidates")) {
+        ranked = &value.at("candidates");
+    }
+
+    if (ranked == nullptr || !ranked->is_array()) {
+        return false;
+    }
+
+    for (const json& candidate_json : *ranked) {
+        RankedCtaCandidate candidate{};
+        if (!parse_ranked_candidate(candidate_json, &candidate)) {
+            continue;
+        }
+
+        bool duplicate = false;
+        for (const RankedCtaCandidate& existing : point.ranked) {
+            if (same_candidate(existing, candidate)) {
+                duplicate = true;
+                break;
             }
         }
 
+        if (!duplicate) {
+            point.ranked.push_back(candidate);
+        }
+    }
+
+    if (point.ranked.empty()) {
+        return false;
+    }
+
+    *out = std::move(point);
+    return true;
+}
+
+void parse_policy_points(
+    const json& values,
+    std::vector<PolicyPoint>* points) {
+    if (points == nullptr) {
         return;
     }
 
-    PolicyEntry entry{};
+    if (values.is_array()) {
+        for (const json& value : values) {
+            PolicyPoint point{};
+            if (parse_policy_point(value, &point)) {
+                points->push_back(std::move(point));
+            }
+        }
+        return;
+    }
 
-    if (parse_policy_row(rows, &entry)) {
-        entries->push_back(entry);
+    PolicyPoint point{};
+    if (parse_policy_point(values, &point)) {
+        points->push_back(std::move(point));
     }
 }
 
 bool load_policy_file(
     const char* path,
-    std::vector<PolicyEntry>* entries) {
-    if (path == nullptr || path[0] == '\0' || entries == nullptr) {
+    std::vector<PolicyPoint>* points) {
+    if (path == nullptr || path[0] == '\0' || points == nullptr) {
         return false;
     }
 
     std::ifstream file(path);
-
     if (!file) {
         return false;
     }
 
     json root;
-
     try {
         file >> root;
     } catch (...) {
         return false;
     }
 
-    const size_t before = entries->size();
+    const size_t before = points->size();
 
-    if (root.is_object() && root.contains("results")) {
-        parse_policy_json_rows(root.at("results"), entries);
+    if (root.is_object() && root.contains("entries")) {
+        parse_policy_points(root.at("entries"), points);
+    } else if (root.is_object() && root.contains("results")) {
+        parse_policy_points(root.at("results"), points);
     } else {
-        parse_policy_json_rows(root, entries);
+        parse_policy_points(root, points);
     }
 
-    return entries->size() > before;
+    return points->size() > before;
 }
 
 void ensure_policy_loaded() {
     LoadedPolicy& policy = global_policy();
-
     std::lock_guard<std::mutex> lock(global_policy_mutex());
 
     if (policy.attempted) {
@@ -604,15 +457,17 @@ void ensure_policy_loaded() {
     }
 
     policy.attempted = true;
-    policy.entries.clear();
+    policy.loaded = false;
+    policy.points.clear();
 
     const char* env_path = std::getenv(kEnvPolicyPath);
 
-    if (load_policy_file(env_path, &policy.entries)) {
+    if (load_policy_file(env_path, &policy.points)) {
         policy.loaded = true;
     } else {
-        policy.entries.clear();
-        policy.loaded = load_policy_file(kDefaultPolicyPath, &policy.entries);
+        policy.points.clear();
+        policy.loaded =
+            load_policy_file(kDefaultPolicyPath, &policy.points);
     }
 
     if (!policy.loaded) {
@@ -620,88 +475,18 @@ void ensure_policy_loaded() {
     }
 
     std::sort(
-        policy.entries.begin(),
-        policy.entries.end(),
-        [](const PolicyEntry& a, const PolicyEntry& b) {
+        policy.points.begin(),
+        policy.points.end(),
+        [](const PolicyPoint& a, const PolicyPoint& b) {
+            if (a.world_size != b.world_size) {
+                return a.world_size < b.world_size;
+            }
             if (a.collective != b.collective) {
                 return static_cast<int>(a.collective) <
                        static_cast<int>(b.collective);
             }
-
-            if (a.bytes_per_rank != b.bytes_per_rank) {
-                return a.bytes_per_rank < b.bytes_per_rank;
-            }
-
-            if (a.config.max_ctas != b.config.max_ctas) {
-                return a.config.max_ctas < b.config.max_ctas;
-            }
-
-            if (a.avg_ms != b.avg_ms) {
-                return a.avg_ms < b.avg_ms;
-            }
-
-            if (a.config.threads != b.config.threads) {
-                return a.config.threads < b.config.threads;
-            }
-
-            return static_cast<int>(a.config.plan_for) <
-                   static_cast<int>(b.config.plan_for);
+            return a.bytes < b.bytes;
         });
-}
-
-size_t select_policy_size(
-    const std::vector<PolicyEntry>& entries,
-    CollectivePlanFor collective,
-    size_t requested_bytes) {
-    bool has_prev = false;
-    bool has_next = false;
-
-    size_t prev = 0;
-    size_t next = 0;
-
-    for (const PolicyEntry& entry : entries) {
-        if (entry.collective != collective) {
-            continue;
-        }
-
-        const size_t b = entry.bytes_per_rank;
-
-        if (b == requested_bytes) {
-            return b;
-        }
-
-        if (b < requested_bytes) {
-            prev = b;
-            has_prev = true;
-            continue;
-        }
-
-        next = b;
-        has_next = true;
-        break;
-    }
-
-    if (!has_prev && !has_next) {
-        return requested_bytes;
-    }
-
-    if (!has_prev) {
-        return next;
-    }
-
-    if (!has_next) {
-        return prev;
-    }
-
-    const long double prev_ratio =
-        static_cast<long double>(requested_bytes) /
-        static_cast<long double>(prev);
-
-    const long double next_ratio =
-        static_cast<long double>(next) /
-        static_cast<long double>(requested_bytes);
-
-    return (prev_ratio <= next_ratio) ? prev : next;
 }
 
 LaunchConfig default_config_for_collective(
@@ -710,39 +495,63 @@ LaunchConfig default_config_for_collective(
         case CollectivePlanFor::AllReduce:
             return make_allreduce_launch_config(
                 AllReducePlanKind::TmaCopy);
-
         case CollectivePlanFor::ReduceScatter:
             return make_reduce_scatter_launch_config(
                 ReduceScatterPlanKind::TmaReduce);
-
         case CollectivePlanFor::AllGather:
             return make_all_gather_launch_config(
                 AllGatherPlanKind::TmaCopy);
-
         default:
             return LaunchConfig{};
     }
 }
 
+void apply_runtime_caps(
+    LaunchConfig* config,
+    bool has_max_ctas,
+    int max_ctas,
+    bool has_max_ctas_per_reduce_task,
+    int max_ctas_per_reduce_task) {
+    if (config == nullptr) {
+        return;
+    }
+
+    if (has_max_ctas) {
+        config->max_ctas =
+            std::min(
+                config->max_ctas,
+                std::min(max_ctas, TMA_TWO_GPU_PEER_MAX_CTAS));
+    }
+
+    if (has_max_ctas_per_reduce_task) {
+        config->max_ctas_per_reduce_task =
+            std::min(
+                config->max_ctas_per_reduce_task,
+                std::min(
+                    max_ctas_per_reduce_task,
+                    TMA_TWO_GPU_PEER_MAX_CTAS));
+    }
+
+    config->max_ctas_per_reduce_task =
+        std::min(
+            config->max_ctas_per_reduce_task,
+            config->max_ctas);
+}
+
 LaunchConfig fallback_config(
-    CollectivePlanFor collective) {
-    LaunchConfig config =
-        default_config_for_collective(collective);
+    CollectivePlanFor collective,
+    bool has_max_ctas,
+    int max_ctas,
+    bool has_max_ctas_per_reduce_task,
+    int max_ctas_per_reduce_task) {
+    LaunchConfig config = default_config_for_collective(collective);
 
-    int max_ctas = 0;
-    if (parse_positive_int_env("OOVERLAP_MAX_CTAS", &max_ctas)) {
-        config.max_ctas = std::min(config.max_ctas, max_ctas);
-    }
-
-    int max_threads = 0;
-    if (parse_positive_int_env("OOVERLAP_MAX_THREADS", &max_threads)) {
-        config.threads = std::min(config.threads, max_threads);
-        config.threads = (config.threads / 32) * 32;
-
-        if (config.threads < 32) {
-            config.threads = 32;
-        }
-    }
+    apply_runtime_caps(
+        &config,
+        has_max_ctas,
+        max_ctas,
+        has_max_ctas_per_reduce_task,
+        max_ctas_per_reduce_task);
 
     if (!launch_config_valid(config)) {
         return default_config_for_collective(collective);
@@ -751,121 +560,138 @@ LaunchConfig fallback_config(
     return config;
 }
 
-bool env_filter_accepts(
-    const PolicyEntry& entry,
-    bool has_max_ctas,
-    int env_max_ctas,
-    bool has_max_threads,
-    int env_max_threads) {
-    if (has_max_ctas && entry.config.max_ctas > env_max_ctas) {
-        return false;
-    }
+const PolicyPoint* select_nearest_policy_point(
+    const std::vector<PolicyPoint>& points,
+    CollectivePlanFor collective,
+    int world_size,
+    size_t requested_bytes) {
+    const PolicyPoint* previous = nullptr;
+    const PolicyPoint* next = nullptr;
 
-    if (has_max_threads && entry.config.threads > env_max_threads) {
-        return false;
-    }
-
-    return true;
-}
-
-int plan_index(LaunchConfig config) {
-    switch (config.plan_for) {
-        case CollectivePlanFor::AllReduce:
-            return static_cast<int>(config.plan.allreduce);
-
-        case CollectivePlanFor::ReduceScatter:
-            return static_cast<int>(config.plan.reduce_scatter);
-
-        case CollectivePlanFor::AllGather:
-            return static_cast<int>(config.plan.all_gather);
-
-        default:
-            return 0;
-    }
-}
-
-bool better_efficiency_choice(
-    const PolicyEntry& candidate,
-    const PolicyEntry& current) {
-    if (candidate.config.max_ctas != current.config.max_ctas) {
-        return candidate.config.max_ctas < current.config.max_ctas;
-    }
-
-    if (candidate.config.threads != current.config.threads) {
-        return candidate.config.threads < current.config.threads;
-    }
-
-    if (candidate.avg_ms != current.avg_ms) {
-        return candidate.avg_ms < current.avg_ms;
-    }
-
-    return plan_index(candidate.config) < plan_index(current.config);
-}
-
-bool select_from_candidates(
-    const std::vector<PolicyEntry>& candidates,
-    TuningPreference preference,
-    long long tolerance_ppm,
-    PolicyEntry* selected) {
-    if (selected == nullptr || candidates.empty()) {
-        return false;
-    }
-
-    const PolicyEntry* best = &candidates[0];
-
-    for (const PolicyEntry& entry : candidates) {
-        if (entry.avg_ms < best->avg_ms) {
-            best = &entry;
-        }
-    }
-
-    if (preference == TuningPreference::BestPerformance) {
-        *selected = *best;
-        return true;
-    }
-
-    const double tolerance =
-        tolerance_fraction_from_ppm(tolerance_ppm);
-
-    const double max_allowed =
-        best->avg_ms * (1.0 + tolerance);
-
-    const PolicyEntry* efficient = nullptr;
-
-    for (const PolicyEntry& entry : candidates) {
-        if (entry.avg_ms > max_allowed) {
+    for (const PolicyPoint& point : points) {
+        if (point.collective != collective ||
+            point.world_size != world_size) {
             continue;
         }
 
-        if (efficient == nullptr ||
-            better_efficiency_choice(entry, *efficient)) {
-            efficient = &entry;
+        if (point.bytes == requested_bytes) {
+            return &point;
+        }
+
+        if (point.bytes < requested_bytes) {
+            if (previous == nullptr || point.bytes > previous->bytes) {
+                previous = &point;
+            }
+        } else if (next == nullptr || point.bytes < next->bytes) {
+            next = &point;
         }
     }
 
-    *selected = efficient != nullptr ? *efficient : *best;
+    if (previous == nullptr) {
+        return next;
+    }
+    if (next == nullptr) {
+        return previous;
+    }
+
+    const long double previous_ratio =
+        static_cast<long double>(requested_bytes) /
+        static_cast<long double>(previous->bytes);
+    const long double next_ratio =
+        static_cast<long double>(next->bytes) /
+        static_cast<long double>(requested_bytes);
+
+    return previous_ratio <= next_ratio ? previous : next;
+}
+
+bool candidate_fits_caps(
+    const RankedCtaCandidate& candidate,
+    bool has_max_ctas,
+    int max_ctas,
+    bool has_max_ctas_per_reduce_task,
+    int max_ctas_per_reduce_task) {
+    if (has_max_ctas && candidate.max_ctas > max_ctas) {
+        return false;
+    }
+
+    if (has_max_ctas_per_reduce_task &&
+        candidate.max_ctas_per_reduce_task >
+            max_ctas_per_reduce_task) {
+        return false;
+    }
+
     return true;
+}
+
+LaunchConfig config_from_policy_point(
+    const PolicyPoint& point,
+    bool has_max_ctas,
+    int max_ctas,
+    bool has_max_ctas_per_reduce_task,
+    int max_ctas_per_reduce_task) {
+    const RankedCtaCandidate* selected = nullptr;
+
+    for (const RankedCtaCandidate& candidate : point.ranked) {
+        if (candidate_fits_caps(
+                candidate,
+                has_max_ctas,
+                max_ctas,
+                has_max_ctas_per_reduce_task,
+                max_ctas_per_reduce_task)) {
+            selected = &candidate;
+            break;
+        }
+    }
+
+    /*
+     * Prefer an actually measured tuple. If every measured tuple exceeds a
+     * runtime cap, clamp the best-ranked tuple as a deterministic fallback.
+     */
+    if (selected == nullptr && !point.ranked.empty()) {
+        selected = &point.ranked.front();
+    }
+
+    LaunchConfig config =
+        default_config_for_collective(point.collective);
+
+    if (selected != nullptr) {
+        config.max_ctas = selected->max_ctas;
+        config.max_ctas_per_reduce_task =
+            selected->max_ctas_per_reduce_task;
+    }
+
+    apply_runtime_caps(
+        &config,
+        has_max_ctas,
+        max_ctas,
+        has_max_ctas_per_reduce_task,
+        max_ctas_per_reduce_task);
+
+    return config;
 }
 
 SelectionCacheKey make_selection_cache_key(
     CollectivePlanFor collective,
-    size_t bytes_per_rank,
+    int world_size,
+    size_t bytes,
     TuningPreference preference,
     bool has_max_ctas,
-    int env_max_ctas,
-    bool has_max_threads,
-    int env_max_threads,
-    long long tolerance_ppm) {
+    int max_ctas,
+    bool has_max_ctas_per_reduce_task,
+    int max_ctas_per_reduce_task) {
     SelectionCacheKey key{};
     key.collective = static_cast<int>(collective);
-    key.bytes_per_rank = bytes_per_rank;
+    key.world_size = world_size;
+    key.bytes = bytes;
     key.preference = static_cast<int>(preference);
     key.has_max_ctas = has_max_ctas;
-    key.max_ctas = has_max_ctas ? env_max_ctas : 0;
-    key.has_max_threads = has_max_threads;
-    key.max_threads = has_max_threads ? env_max_threads : 0;
-    key.tolerance_ppm =
-        preference == TuningPreference::BestEfficiency ? tolerance_ppm : 0;
+    key.max_ctas = has_max_ctas ? max_ctas : 0;
+    key.has_max_ctas_per_reduce_task =
+        has_max_ctas_per_reduce_task;
+    key.max_ctas_per_reduce_task =
+        has_max_ctas_per_reduce_task
+            ? max_ctas_per_reduce_task
+            : 0;
     return key;
 }
 
@@ -877,9 +703,7 @@ bool selection_cache_lookup(
     }
 
     std::lock_guard<std::mutex> lock(selection_cache_mutex());
-
     const auto it = selection_cache().find(key);
-
     if (it == selection_cache().end()) {
         return false;
     }
@@ -892,7 +716,6 @@ void selection_cache_store(
     const SelectionCacheKey& key,
     LaunchConfig config) {
     std::lock_guard<std::mutex> lock(selection_cache_mutex());
-
     selection_cache()[key] = config;
 }
 
@@ -903,7 +726,6 @@ TuningPreference tuning_preference_from_public(
     switch (mode) {
         case OO_TUNING_BEST_EFFICIENCY:
             return TuningPreference::BestEfficiency;
-
         case OO_TUNING_BEST_PERFORMANCE:
         default:
             return TuningPreference::BestPerformance;
@@ -912,29 +734,29 @@ TuningPreference tuning_preference_from_public(
 
 LaunchConfig select_launch_config_for_collective(
     CollectivePlanFor collective,
-    size_t bytes_per_rank,
+    int world_size,
+    size_t bytes,
     TuningPreference preference) {
     int env_max_ctas = 0;
     const bool has_max_ctas =
-        parse_positive_int_env("OOVERLAP_MAX_CTAS", &env_max_ctas);
+        parse_positive_int_env(kEnvMaxCtas, &env_max_ctas);
 
-    int env_max_threads = 0;
-    const bool has_max_threads =
-        parse_positive_int_env("OOVERLAP_MAX_THREADS", &env_max_threads);
-
-    const long long tolerance_ppm =
-        runtime_tolerance_ppm();
+    int env_max_ctas_per_reduce_task = 0;
+    const bool has_max_ctas_per_reduce_task =
+        parse_positive_int_env(
+            kEnvMaxCtasPerReduceTask,
+            &env_max_ctas_per_reduce_task);
 
     const SelectionCacheKey cache_key =
         make_selection_cache_key(
             collective,
-            bytes_per_rank,
+            world_size,
+            bytes,
             preference,
             has_max_ctas,
             env_max_ctas,
-            has_max_threads,
-            env_max_threads,
-            tolerance_ppm);
+            has_max_ctas_per_reduce_task,
+            env_max_ctas_per_reduce_task);
 
     LaunchConfig cached{};
     if (selection_cache_lookup(cache_key, &cached)) {
@@ -942,88 +764,114 @@ LaunchConfig select_launch_config_for_collective(
     }
 
     ensure_policy_loaded();
+    LoadedPolicy& policy = global_policy();
 
-    LoadedPolicy& policy =
-        global_policy();
-
-    LaunchConfig selected_config{};
-
-    if (!policy.loaded || policy.entries.empty()) {
-        selected_config = fallback_config(collective);
-        selection_cache_store(cache_key, selected_config);
-        return selected_config;
-    }
-
-    const size_t selected_size =
-        select_policy_size(
-            policy.entries,
+    LaunchConfig selected =
+        fallback_config(
             collective,
-            bytes_per_rank);
+            has_max_ctas,
+            env_max_ctas,
+            has_max_ctas_per_reduce_task,
+            env_max_ctas_per_reduce_task);
 
-    std::vector<PolicyEntry> candidates;
-    candidates.reserve(64);
+    if (policy.loaded &&
+        !policy.points.empty() &&
+        world_size > 0 &&
+        bytes > 0) {
+        const PolicyPoint* point =
+            select_nearest_policy_point(
+                policy.points,
+                collective,
+                world_size,
+                bytes);
 
-    for (const PolicyEntry& entry : policy.entries) {
-        if (entry.collective != collective) {
-            continue;
+        if (point != nullptr) {
+            LaunchConfig candidate =
+                config_from_policy_point(
+                    *point,
+                    has_max_ctas,
+                    env_max_ctas,
+                    has_max_ctas_per_reduce_task,
+                    env_max_ctas_per_reduce_task);
+
+            if (launch_config_valid(candidate)) {
+                selected = candidate;
+            }
         }
-
-        if (entry.bytes_per_rank != selected_size) {
-            continue;
-        }
-
-        if (!env_filter_accepts(
-                entry,
-                has_max_ctas,
-                env_max_ctas,
-                has_max_threads,
-                env_max_threads)) {
-            continue;
-        }
-
-        candidates.push_back(entry);
     }
 
-    PolicyEntry selected{};
-
-    if (!select_from_candidates(
-            candidates,
-            preference,
-            tolerance_ppm,
-            &selected)) {
-        selected_config = fallback_config(collective);
-    } else {
-        selected_config = selected.config;
-    }
-
-    selection_cache_store(cache_key, selected_config);
-    return selected_config;
+    selection_cache_store(cache_key, selected);
+    return selected;
 }
 
 LaunchConfig select_launch_config_for_allreduce(
-    size_t bytes_per_rank,
+    int world_size,
+    size_t bytes,
     TuningPreference preference) {
     return select_launch_config_for_collective(
         CollectivePlanFor::AllReduce,
-        bytes_per_rank,
+        world_size,
+        bytes,
         preference);
 }
 
 LaunchConfig select_launch_config_for_reduce_scatter(
-    size_t bytes_per_rank,
+    int world_size,
+    size_t bytes,
     TuningPreference preference) {
     return select_launch_config_for_collective(
         CollectivePlanFor::ReduceScatter,
-        bytes_per_rank,
+        world_size,
+        bytes,
         preference);
 }
 
 LaunchConfig select_launch_config_for_all_gather(
-    size_t bytes_per_rank,
+    int world_size,
+    size_t bytes,
     TuningPreference preference) {
     return select_launch_config_for_collective(
         CollectivePlanFor::AllGather,
-        bytes_per_rank,
+        world_size,
+        bytes,
+        preference);
+}
+
+LaunchConfig select_launch_config_for_collective(
+    CollectivePlanFor collective,
+    size_t bytes,
+    TuningPreference preference) {
+    return select_launch_config_for_collective(
+        collective,
+        0,
+        bytes,
+        preference);
+}
+
+LaunchConfig select_launch_config_for_allreduce(
+    size_t bytes,
+    TuningPreference preference) {
+    return select_launch_config_for_collective(
+        CollectivePlanFor::AllReduce,
+        bytes,
+        preference);
+}
+
+LaunchConfig select_launch_config_for_reduce_scatter(
+    size_t bytes,
+    TuningPreference preference) {
+    return select_launch_config_for_collective(
+        CollectivePlanFor::ReduceScatter,
+        bytes,
+        preference);
+}
+
+LaunchConfig select_launch_config_for_all_gather(
+    size_t bytes,
+    TuningPreference preference) {
+    return select_launch_config_for_collective(
+        CollectivePlanFor::AllGather,
+        bytes,
         preference);
 }
 

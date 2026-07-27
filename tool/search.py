@@ -231,6 +231,30 @@ def load_comm_array(comm_backend: str, comm_op: str, world_size: int, bandwidth_
     print(f"Bandwidth curve captured from: {path}")
     return torch.load(path), path
 
+
+# OOVERLAP_CONFIG_SPECIFIC_BANDWIDTH_V2
+def requested_bandwidth_path(args, comm_backend: str) -> str:
+    if comm_backend == "nccl":
+        specific = args.nccl_bandwidth_path
+    elif comm_backend == "ooverlap":
+        specific = args.ooverlap_bandwidth_path
+    else:
+        raise ValueError(f"Unknown comm_backend={comm_backend}")
+
+    if specific:
+        return str(specific)
+
+    if args.bandwidth_path:
+        if args.comm_backend == "both":
+            raise ValueError(
+                "--bandwidth_path is ambiguous with --comm_backend both. Use "
+                "--nccl_bandwidth_path and --ooverlap_bandwidth_path."
+            )
+        return str(args.bandwidth_path)
+
+    return ""
+
+
 def load_shape_config(M: int, N: int, K: int):
     path = shape_json_path(M, N, K, "packed")
     if not path.exists():
@@ -1623,13 +1647,17 @@ def run_for_backend(args, comm_backend: str):
     print("########################################")
     print("")
 
-    if args.comm_backend == "both" and args.bandwidth_path:
-        raise ValueError("--bandwidth_path is ambiguous with --comm_backend both.")
+    bandwidth_path = requested_bandwidth_path(args, comm_backend)
 
     use_predictive = args.predictive_search or args.m * args.n > 33554432
 
     if use_predictive:
-        comm_array, used_path = load_comm_array(comm_backend, args.comm_op, world_size, args.bandwidth_path)
+        comm_array, used_path = load_comm_array(
+            comm_backend,
+            args.comm_op,
+            world_size,
+            bandwidth_path,
+        )
 
         fast_search(
             args.m,
@@ -1674,7 +1702,24 @@ def parse_args():
 
     p.add_argument("--comm_op", type=str, default="all_reduce", choices=["all_reduce", "reduce_scatter"])
     p.add_argument("--comm_backend", type=str, default="nccl", choices=["nccl", "ooverlap", "both"])
-    p.add_argument("--bandwidth_path", type=str, default="")
+    p.add_argument(
+        "--bandwidth_path",
+        type=str,
+        default="",
+        help="Legacy single-backend bandwidth path.",
+    )
+    p.add_argument(
+        "--nccl_bandwidth_path",
+        type=str,
+        default="",
+        help="NCCL curve used when --comm_backend is nccl or both.",
+    )
+    p.add_argument(
+        "--ooverlap_bandwidth_path",
+        type=str,
+        default="",
+        help="OOverlap curve used when --comm_backend is ooverlap or both.",
+    )
 
     p.add_argument("--predictive_search", action="store_true")
     p.add_argument("--comm_sm_slack", type=int, default=2)

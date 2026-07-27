@@ -57,9 +57,12 @@ DEFAULT_OUT_DIR = "results/eval_sm90/operator_speedup"
 DEFAULT_PLOT_NAME = "operator_overlap_speedup_by_shape"
 
 DEFAULT_BASELINE_SOURCE = "nccl_cublas"
+DEFAULT_BASELINE_AGGREGATION = "mean"
 DEFAULT_TEST_MODE = "both"
 
 
+
+# OOVERLAP_BASELINE_AGGREGATION_V1
 @dataclass
 class MetricPick:
     ms: float
@@ -198,6 +201,45 @@ def better_pick(old: Optional[MetricPick], new: Optional[MetricPick]) -> Optiona
     return old
 
 
+def aggregate_baseline_candidates(
+    candidates: List[MetricPick],
+    aggregation: str,
+    baseline_source: str,
+) -> Optional[MetricPick]:
+    """Aggregate repeated baseline measurements for one exact TP/M/N/K shape."""
+    if not candidates:
+        return None
+
+    ordered = sorted(candidates, key=lambda pick: float(pick.ms))
+    values = [float(pick.ms) for pick in ordered]
+
+    if aggregation == "fastest":
+        return ordered[0]
+    if aggregation == "slowest":
+        return ordered[-1]
+    if aggregation == "mean":
+        aggregate_ms = sum(values) / len(values)
+    elif aggregation == "median":
+        midpoint = len(values) // 2
+        if len(values) % 2:
+            aggregate_ms = values[midpoint]
+        else:
+            aggregate_ms = 0.5 * (values[midpoint - 1] + values[midpoint])
+    else:
+        raise ValueError(f"Unknown baseline_aggregation={aggregation}")
+
+    # Preserve the existing MetricPick-based JSON/CSV schema while making it
+    # explicit that this value is an aggregate rather than one scenario pick.
+    return MetricPick(
+        ms=float(aggregate_ms),
+        scenario_id=f"{aggregation}_of_{len(values)}_baseline_samples",
+        test_mode="aggregate",
+        backend=baseline_source,
+        comm_sm_slack=None,
+        cseg=None,
+    )
+
+
 def iter_test_modes(scenario: Dict[str, Any], test_mode_filter: str):
     tests = scenario.get("tests", {})
     if not isinstance(tests, dict):
@@ -309,9 +351,10 @@ def collect_best_for_shape_k(
     n: int,
     k: int,
     baseline_source: str,
+    baseline_aggregation: str,
     test_mode_filter: str,
 ) -> ShapeKResult:
-    baseline_pick: Optional[MetricPick] = None
+    baseline_samples: List[MetricPick] = []
     nccl_pick: Optional[MetricPick] = None
     ooverlap_pick: Optional[MetricPick] = None
 
@@ -331,8 +374,9 @@ def collect_best_for_shape_k(
             continue
 
         for mode, by_backend in iter_test_modes(scenario, test_mode_filter):
-            for cand in baseline_candidates(scenario, mode, by_backend, baseline_source):
-                baseline_pick = better_pick(baseline_pick, cand)
+            baseline_samples.extend(
+                baseline_candidates(scenario, mode, by_backend, baseline_source)
+            )
 
             nccl_ms = as_float(get_in(by_backend, ["nccl", "overlap_dur_ms"]))
             if nccl_ms is not None:
@@ -348,6 +392,11 @@ def collect_best_for_shape_k(
                     make_pick(scenario, mode, "ooverlap", oo_ms),
                 )
 
+    baseline_pick = aggregate_baseline_candidates(
+        baseline_samples,
+        aggregation=baseline_aggregation,
+        baseline_source=baseline_source,
+    )
     baseline_ms = baseline_pick.ms if baseline_pick else None
     nccl_ms = nccl_pick.ms if nccl_pick else None
     oo_ms = ooverlap_pick.ms if ooverlap_pick else None
@@ -424,6 +473,7 @@ def build_results(
     scenarios: List[Dict[str, Any]],
     shape_plots: List[ShapePlot],
     baseline_source: str,
+    baseline_aggregation: str,
     test_mode: str,
 ) -> Tuple[Dict[Tuple[int, int], List[ShapeKResult]], List[ShapeKResult]]:
     by_shape: Dict[Tuple[int, int], List[ShapeKResult]] = {}
@@ -440,6 +490,7 @@ def build_results(
                 n=sp.n,
                 k=k,
                 baseline_source=baseline_source,
+                baseline_aggregation=baseline_aggregation,
                 test_mode_filter=test_mode,
             )
             rows.append(r)
@@ -862,7 +913,8 @@ def write_summary_txt(path: Path, rows: List[ShapeKResult]) -> None:
     out = [
         "Operator-Level Communication-Computation Overlap Summary",
         "",
-        "Speedups are normalized to the no-overlap baseline for the same M, N, K shape.",
+        "Speedups are normalized to the aggregated no-overlap baseline for the same M, N, K shape.",
+        "The baseline aggregation policy is recorded in the companion JSON output.",
         "T-CCL vs NCCL is computed as NCCL overlap time divided by T-CCL overlap time.",
         "",
         line(headers),
@@ -954,6 +1006,16 @@ def parse_args() -> argparse.Namespace:
             "nccl_cublas",
             "best_cublas_any_backend",
         ],
+    )
+    p.add_argument(
+        "--baseline-aggregation",
+        type=str,
+        default=DEFAULT_BASELINE_AGGREGATION,
+        choices=["mean", "median", "fastest", "slowest"],
+        help=(
+            "How to combine repeated no-overlap baseline measurements for the "
+            "same TP/M/N/K. Default: mean."
+        ),
     )
     p.add_argument(
         "--test-mode",
@@ -1049,6 +1111,7 @@ def main() -> int:
             scenarios=scenarios,
             shape_plots=shape_plots,
             baseline_source=args.baseline_source,
+            baseline_aggregation=args.baseline_aggregation,
             test_mode=args.test_mode,
         )
 
@@ -1068,6 +1131,7 @@ def main() -> int:
             "input_json": str(in_path),
             "world_size": int(world_size),
             "baseline_source": args.baseline_source,
+            "baseline_aggregation": args.baseline_aggregation,
             "test_mode": args.test_mode,
             "plot_layout": "rows=M, columns=N, x-axis=K",
             "average_speedup": average,

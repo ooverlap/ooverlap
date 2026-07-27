@@ -27,9 +27,9 @@ case "$WORLD_SIZE" in
     ;;
   4)
     DEVICES="0,1,2,3"
-    OOVERLAP_MAX_CTAS="12"
+    OOVERLAP_MAX_CTAS="18"
     NCCL_MAX_CTAS="-1"
-    MAX_CTAS_PER_REDUCE_TASK="4"
+    MAX_CTAS_PER_REDUCE_TASK="6"
     ;;
   *)
     echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
@@ -58,6 +58,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DRIVER="$REPO_ROOT/test/test_external_p2p_collective_sweep.py"
 PLOTTER="$REPO_ROOT/test/plot_external_p2p_collective.py"
+TUNING_POLICY="$REPO_ROOT/results/policies/tp4_policy.json"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 OUT_DIR="$REPO_ROOT/results/evalution/external_p2p/tp${WORLD_SIZE}"
@@ -73,6 +74,16 @@ PLOT_PREFIX="$OUT_DIR/external_p2p_collective"
   echo "error: plotter not found: $PLOTTER" >&2
   exit 1
 }
+
+# OOVERLAP_EXTERNAL_P2P_TUNING_POLICY_OPTIONAL_V1
+if [[ -f "$TUNING_POLICY" ]]; then
+  TUNING_POLICY_ARGS=(--tuning-policy "$TUNING_POLICY")
+  TUNING_POLICY_LABEL="$TUNING_POLICY"
+else
+  echo "[evalution] warning: tuning policy not found: $TUNING_POLICY; continuing without it" >&2
+  TUNING_POLICY_ARGS=()
+  TUNING_POLICY_LABEL="not found (runtime fallback)"
+fi
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
   echo "error: Python executable not found: $PYTHON_BIN" >&2
@@ -96,6 +107,7 @@ echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
 echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
 echo "[evalution] nccl_max_ctas=$NCCL_MAX_CTAS_LABEL"
 echo "[evalution] max_ctas_per_reduce_task=$MAX_CTAS_PER_REDUCE_TASK"
+echo "[evalution] tuning_policy=$TUNING_POLICY_LABEL"
 echo "[evalution] latency_bytes=$LATENCY_BYTES"
 echo "[evalution] bandwidth_bytes=$BANDWIDTH_BYTES"
 echo "[evalution] iters=$ITERS warmup=$WARMUP"
@@ -110,6 +122,7 @@ echo "[evalution] output=${OUT_PREFIX}.txt"
   --ctas "$OOVERLAP_MAX_CTAS" \
   --nccl-ctas "$NCCL_MAX_CTAS" \
   --max-ctas-per-reduce-task "$MAX_CTAS_PER_REDUCE_TASK" \
+  "${TUNING_POLICY_ARGS[@]}" \
   --latency-bytes "$LATENCY_BYTES" \
   --bandwidth-bytes "$BANDWIDTH_BYTES" \
   --bytes "$BANDWIDTH_BYTES" \

@@ -1,106 +1,55 @@
 #pragma once
 
+#include <cstdint>
+#include <map>
 #include <string>
+#include <vector>
 
 namespace ooverlap {
 
 /*
- * JSON-driven SM90 two-GPU collective sweep executor.
+ * Rank-generic, same-process SM90 CTA tuning sweep.
  *
- * Python owns scenario generation. C++ only executes scenarios and returns
- * measured rows.
+ * The caller supplies one collective, a list of full logical fp16 element
+ * counts, and the CUDA devices representing the logical ranks. All ranks are
+ * created and launched inside this process with oo_group_create_p2p(); no CUDA
+ * IPC or external broker is involved.
  *
- * Input JSON shape:
+ * The candidate configuration is read once per process from:
  *
- * {
- *   "iters": 100,
- *   "warmup": 20,
- *   "dev0": 0,
- *   "dev1": 1,
- *   "scenarios": [
- *     {
- *       "id": "ar_tma_128m",
- *       "backend": "ooverlap",
- *       "collective": "allreduce",
- *       "kernel": "tma_copy",
- *       "numel": 67108864,
- *       "threads": 1024,
- *       "max_ctas": 8,
- *       "window_chunks": 32,
- *       "chunk_bytes": 16384,
- *       "stage_depth": 8
- *     },
- *     {
- *       "id": "nccl_rs_128m",
- *       "backend": "nccl",
- *       "collective": "reduce_scatter",
- *       "numel": 67108864
- *     }
- *   ]
- * }
+ *   OOVERLAP_MAX_CTAS
+ *   OOVERLAP_MAX_CTAS_PER_REDUCE_TASK
  *
- * Common fields:
+ * Both variables must be positive integers. The Python tuner is expected to
+ * spawn one fresh process for every candidate tuple, call this function with
+ * all desired message sizes, then rank the returned avg_ms values.
  *
- *   id:
- *     Any JSON value. Copied back to the output row.
+ * This benchmark deliberately bypasses the runtime tuning-policy selector and
+ * dispatches the explicit TMA LaunchConfig represented by those environment
+ * variables. dtype is intentionally fixed to fp16 because dtype is not part of
+ * the simplified policy key.
  *
- *   backend:
- *     "ooverlap" | "nccl"
+ * Returned numeric fields per size:
  *
- *   collective:
- *     "allreduce" | "all_reduce" | "ar"
- *     "reduce_scatter" | "reduce-scatter" | "rs"
- *     "all_gather" | "all-gather" | "ag"
- *
- *   numel:
- *     Full logical tensor element count per rank. dtype is currently fp16.
- *
- *   bytes_per_rank:
- *     Alternative to numel. Must be divisible by sizeof(half).
- *
- * Optional top-level fields can be overridden per scenario:
- *
+ *   collective
+ *   world_size
+ *   numel
+ *   bytes
  *   iters
  *   warmup
- *   dev0
- *   dev1
- *
- * Ooverlap-only fields:
- *
- *   kernel:
- *     "tma_copy" | "seq_fast_gmem" | "overlap_fast_gmem"
- *
- *   threads
  *   max_ctas
- *   window_chunks
- *   chunk_bytes
- *   stage_depth
- *
- * If max_ctas is omitted, OOVERLAP_MAX_CTAS is used when set.
- *
- * Output JSON shape:
- *
- * {
- *   "ok": true,
- *   "results": [
- *     {
- *       "id": "...",
- *       "status": "ok",
- *       "backend": "ooverlap",
- *       "collective": "allreduce",
- *       "kernel": "tma_copy",
- *       "numel": ...,
- *       "bytes_per_rank": ...,
- *       "total_ms": ...,
- *       "avg_ms": ...,
- *       "effective_gbps_per_rank": ...,
- *       "effective_gbps_aggregate_2gpu": ...
- *     }
- *   ],
- *   "errors": []
- * }
+ *   max_ctas_per_reduce_task
+ *   total_ms
+ *   avg_ms
+ *   latency_us
  */
-std::string benchmark_tma_two_gpu_collective_sweep_json(
-    const std::string& request_json);
+std::vector<std::map<std::string, double>>
+benchmark_tma_collective_cta_sweep_sm90(
+    const std::string& collective,
+    const std::vector<int64_t>& numels,
+    int iters,
+    int warmup,
+    const std::vector<int>& devices,
+    bool verify = false);
 
 } // namespace ooverlap

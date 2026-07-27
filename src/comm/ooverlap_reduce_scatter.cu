@@ -1,6 +1,7 @@
 #include "comm/ooverlap_comm_private.h"
 
 #include "comm/plan/transfer_plan_distribution.h"
+#include "comm/tuning/tuning_policy.h"
 #include "comm/tma_multi_gpu_reduce_scatter_sm90.h"
 
 namespace {
@@ -56,10 +57,12 @@ oo_status_t reduce_scatter_impl(
     }
 
     ooverlap::comm::LaunchConfig config =
-        ooverlap::comm::api::select_public_launch_config(
+        ooverlap::comm::select_launch_config_for_collective(
             ooverlap::comm::CollectivePlanFor::ReduceScatter,
+            launch.world_size,
             launch.bytes,
-            tuning_mode);
+            ooverlap::comm::tuning_preference_from_public(
+                tuning_mode));
 
     ooverlap::comm::plan::ReduceScatterTransferPlan* transfer_plan = nullptr;
 
