@@ -30,7 +30,7 @@ PLOT_LINEWIDTH = 1.8
 PLOT_MARKERSIZE = 6.5
 PLOT_MARKEREDGEWIDTH = 0.8
 
-# OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_READABILITY_V2
+# OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_READABILITY_V3
 # These values are used only by the dense 4x3 paper layout. They are slightly
 # stronger than the standalone-figure defaults so curves remain distinguishable
 # after the figure is embedded at two-column paper width.
@@ -437,17 +437,9 @@ def plot_paired_tp(
 
 
 # OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_V1
-def paper_tick_values(values: List[int], max_ticks: int = 5) -> List[int]:
-    """Return evenly distributed visible ticks while preserving both endpoints."""
-    ordered = list(dict.fromkeys(int(value) for value in values))
-    if len(ordered) <= max_ticks:
-        return ordered
-
-    indices = {
-        round(index * (len(ordered) - 1) / (max_ticks - 1))
-        for index in range(max_ticks)
-    }
-    return [ordered[index] for index in sorted(indices)]
+def paper_tick_values(values: Iterable[int]) -> List[int]:
+    """Return every distinct measured buffer size in increasing order."""
+    return sorted({int(value) for value in values})
 
 
 def plot_paper_metric_row(
@@ -468,8 +460,6 @@ def plot_paper_metric_row(
     for col_idx, collective in enumerate(COLLECTIVES):
         axis = axes_row[col_idx]
         collective_groups = grouped[collective]
-        first_rows = next(iter(collective_groups.values()))
-
         for cta_limit, series in sorted(
             collective_groups.items(),
             key=lambda item: (-1 if item[0] is None else item[0]),
@@ -514,22 +504,30 @@ def plot_paper_metric_row(
         for handle, label in zip(*axis.get_legend_handles_labels()):
             legend_by_label.setdefault(label, handle)
 
-        all_x_ticks = [int(row["bytes"]) for row in first_rows]
-        visible_x_ticks = paper_tick_values(all_x_ticks)
+        # Use the union across every CTA series. Looking only at ``first_rows``
+        # can hide measured sizes when another CTA configuration has extra points.
+        all_x_ticks = paper_tick_values(
+            int(row["bytes"])
+            for series in collective_groups.values()
+            for row in series
+        )
         axis.set_xscale("log", base=2)
-        axis.set_xticks(visible_x_ticks)
+        axis.set_xticks(all_x_ticks)
         if show_xlabels:
             axis.set_xticklabels(
-                [format_size_bytes(value) for value in visible_x_ticks],
-                rotation=0,
+                [format_size_bytes(value) for value in all_x_ticks],
+                rotation=90,
                 ha="center",
+                va="top",
+                rotation_mode="anchor",
             )
+            axis.tick_params(axis="x", which="major", pad=3)
         else:
             axis.tick_params(axis="x", which="both", labelbottom=False)
 
         axis.tick_params(axis="both", labelsize=PAPER_TICK_FONTSIZE)
         axis.grid(True, which="both", linestyle="--", linewidth=0.65, alpha=0.32)
-        axis.margins(x=0.035)
+        axis.margins(x=0.018)
 
         if show_titles:
             axis.set_title(
@@ -582,23 +580,29 @@ def plot_paired_tp_4x3(
     A separate top GridSpec row is reserved for the legend. This prevents long
     entries such as ``Symmetric NCCL`` from colliding with the All-Gather title.
     """
-    fig = plt.figure(figsize=(7.35, 8.9))
+    # The visible data remains 4x3. Internally, one row is reserved for the
+    # legend and another narrow row separates the bandwidth and latency blocks.
+    # Tight horizontal margins and spacing recover width for every subplot.
+    fig = plt.figure(figsize=(7.75, 9.8))
     grid = fig.add_gridspec(
-        nrows=5,
+        nrows=6,
         ncols=3,
-        height_ratios=(0.24, 1.0, 1.0, 1.0, 1.0),
-        left=0.092,
-        right=0.995,
-        bottom=0.063,
-        top=0.992,
-        wspace=0.13,
-        hspace=0.31,
+        height_ratios=(0.22, 1.0, 1.0, 0.22, 1.0, 1.0),
+        left=0.078,
+        right=0.998,
+        bottom=0.050,
+        top=0.995,
+        wspace=0.085,
+        hspace=0.22,
     )
 
     legend_axis = fig.add_subplot(grid[0, :])
+    spacer_axis = fig.add_subplot(grid[3, :])
+    spacer_axis.axis("off")
+    data_grid_rows = (1, 2, 4, 5)
     axes = [
-        [fig.add_subplot(grid[row_idx + 1, col_idx]) for col_idx in range(3)]
-        for row_idx in range(4)
+        [fig.add_subplot(grid[grid_row, col_idx]) for col_idx in range(3)]
+        for grid_row in data_grid_rows
     ]
     legend_by_label: Dict[str, object] = {}
 
@@ -644,10 +648,10 @@ def plot_paired_tp_4x3(
 
     # Label each metric block once rather than repeating an x label on all panels.
     axes[1][1].set_xlabel(
-        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=5
+        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=10
     )
     axes[3][1].set_xlabel(
-        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=5
+        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=10
     )
 
     add_paper_figure_legend(legend_axis, legend_by_label)
