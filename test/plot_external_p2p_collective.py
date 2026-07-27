@@ -30,6 +30,18 @@ PLOT_LINEWIDTH = 1.8
 PLOT_MARKERSIZE = 6.5
 PLOT_MARKEREDGEWIDTH = 0.8
 
+# OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_READABILITY_V2
+# These values are used only by the dense 4x3 paper layout. They are slightly
+# stronger than the standalone-figure defaults so curves remain distinguishable
+# after the figure is embedded at two-column paper width.
+PAPER_LINEWIDTH = 2.25
+PAPER_MARKERSIZE = 7.4
+PAPER_MARKEREDGEWIDTH = 1.0
+PAPER_TICK_FONTSIZE = 8.0
+PAPER_LABEL_FONTSIZE = 9.0
+PAPER_TITLE_FONTSIZE = 10.0
+PAPER_LEGEND_FONTSIZE = 8.5
+
 
 class PlotInputError(ValueError):
     pass
@@ -425,7 +437,7 @@ def plot_paired_tp(
 
 
 # OOVERLAP_EXTERNAL_PLOT_PAPER_4X3_V1
-def paper_tick_values(values: List[int], max_ticks: int = 6) -> List[int]:
+def paper_tick_values(values: List[int], max_ticks: int = 5) -> List[int]:
     """Return evenly distributed visible ticks while preserving both endpoints."""
     ordered = list(dict.fromkeys(int(value) for value in values))
     if len(ordered) <= max_ticks:
@@ -472,9 +484,9 @@ def plot_paper_metric_row(
                 x_values,
                 t_ccl_values,
                 marker="o",
-                linewidth=PLOT_LINEWIDTH,
-                markersize=PLOT_MARKERSIZE,
-                markeredgewidth=PLOT_MARKEREDGEWIDTH,
+                linewidth=PAPER_LINEWIDTH,
+                markersize=PAPER_MARKERSIZE,
+                markeredgewidth=PAPER_MARKEREDGEWIDTH,
                 label=f"T-CCL{suffix}",
             )
             axis.plot(
@@ -482,9 +494,9 @@ def plot_paper_metric_row(
                 nccl_values,
                 marker="s",
                 linestyle="--",
-                linewidth=PLOT_LINEWIDTH,
-                markersize=PLOT_MARKERSIZE,
-                markeredgewidth=PLOT_MARKEREDGEWIDTH,
+                linewidth=PAPER_LINEWIDTH,
+                markersize=PAPER_MARKERSIZE,
+                markeredgewidth=PAPER_MARKEREDGEWIDTH,
                 label=f"NCCL{suffix}",
             )
             if finite_positive(symmetric_values):
@@ -493,9 +505,9 @@ def plot_paper_metric_row(
                     symmetric_values,
                     marker="^",
                     linestyle=":",
-                    linewidth=PLOT_LINEWIDTH,
-                    markersize=PLOT_MARKERSIZE,
-                    markeredgewidth=PLOT_MARKEREDGEWIDTH,
+                    linewidth=PAPER_LINEWIDTH,
+                    markersize=PAPER_MARKERSIZE,
+                    markeredgewidth=PAPER_MARKEREDGEWIDTH,
                     label=f"Symmetric NCCL{suffix}",
                 )
 
@@ -515,13 +527,41 @@ def plot_paper_metric_row(
         else:
             axis.tick_params(axis="x", which="both", labelbottom=False)
 
-        axis.tick_params(axis="both", labelsize=7.5)
-        axis.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.35)
+        axis.tick_params(axis="both", labelsize=PAPER_TICK_FONTSIZE)
+        axis.grid(True, which="both", linestyle="--", linewidth=0.65, alpha=0.32)
+        axis.margins(x=0.035)
 
         if show_titles:
-            axis.set_title(COLLECTIVE_TITLES[collective], fontsize=9.5)
+            axis.set_title(
+                COLLECTIVE_TITLES[collective],
+                fontsize=PAPER_TITLE_FONTSIZE,
+                pad=7,
+            )
         if col_idx == 0:
-            axis.set_ylabel(f"TP={tp}\n{ylabel}", fontsize=8.5)
+            axis.set_ylabel(
+                f"TP={tp}\n{ylabel}",
+                fontsize=PAPER_LABEL_FONTSIZE,
+                labelpad=5,
+            )
+
+
+def add_paper_figure_legend(legend_axis, legend_by_label: Dict[str, object]) -> None:
+    """Draw the shared legend in its own row, isolated from subplot titles."""
+    legend_axis.axis("off")
+    legend_labels = list(legend_by_label)
+    legend_handles = [legend_by_label[label] for label in legend_labels]
+    legend_axis.legend(
+        legend_handles,
+        legend_labels,
+        loc="center",
+        ncol=min(3, len(legend_labels)),
+        frameon=False,
+        fontsize=PAPER_LEGEND_FONTSIZE,
+        handlelength=2.25,
+        handletextpad=0.55,
+        columnspacing=1.05,
+        borderaxespad=0.0,
+    )
 
 
 def plot_paired_tp_4x3(
@@ -538,14 +578,28 @@ def plot_paired_tp_4x3(
       2. right TP bandwidth
       3. left TP latency
       4. right TP latency
+
+    A separate top GridSpec row is reserved for the legend. This prevents long
+    entries such as ``Symmetric NCCL`` from colliding with the All-Gather title.
     """
-    fig, axes = plt.subplots(
-        nrows=4,
+    fig = plt.figure(figsize=(7.35, 8.9))
+    grid = fig.add_gridspec(
+        nrows=5,
         ncols=3,
-        figsize=(7.2, 8.4),
-        squeeze=False,
-        sharex=False,
+        height_ratios=(0.24, 1.0, 1.0, 1.0, 1.0),
+        left=0.092,
+        right=0.995,
+        bottom=0.063,
+        top=0.992,
+        wspace=0.13,
+        hspace=0.31,
     )
+
+    legend_axis = fig.add_subplot(grid[0, :])
+    axes = [
+        [fig.add_subplot(grid[row_idx + 1, col_idx]) for col_idx in range(3)]
+        for row_idx in range(4)
+    ]
     legend_by_label: Dict[str, object] = {}
 
     bandwidth_spec = METRIC_SPECS[0]
@@ -589,18 +643,14 @@ def plot_paired_tp_4x3(
     )
 
     # Label each metric block once rather than repeating an x label on all panels.
-    axes[1][1].set_xlabel("Buffer size", fontsize=8.5, labelpad=5)
-    axes[3][1].set_xlabel("Buffer size", fontsize=8.5, labelpad=5)
-
-    add_figure_legend(fig, legend_by_label, 0.992)
-    fig.subplots_adjust(
-        left=0.105,
-        right=0.995,
-        bottom=0.065,
-        top=0.945,
-        wspace=0.24,
-        hspace=0.30,
+    axes[1][1].set_xlabel(
+        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=5
     )
+    axes[3][1].set_xlabel(
+        "Buffer size", fontsize=PAPER_LABEL_FONTSIZE, labelpad=5
+    )
+
+    add_paper_figure_legend(legend_axis, legend_by_label)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
