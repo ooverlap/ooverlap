@@ -7,10 +7,9 @@ set -euo pipefail
 #   ./evalution/run_flashoverlap_sm90.sh 2
 #   ./evalution/run_flashoverlap_sm90.sh 4
 #
-# Optional OOverlap-only overrides:
-#   OOVERLAP_MAX_CTAS=8 \
-#   OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=4 \
-#     ./evalution/run_flashoverlap_sm90.sh 4
+# Communication CTA configurations are read from COMM_RUN_CONFIGS_BY_TP in
+# tool/evaluate_sm90.py. Each pair receives matching bandwidth curves.
+# An optional TP-specific tuning policy is applied to every OOverlap process.
 #
 # The only accepted argument is the tensor-parallel/world size. Devices,
 # bandwidth settings, evaluation settings, and plotting settings are fixed here.
@@ -25,14 +24,6 @@ fail() {
   exit 1
 }
 
-require_positive_integer() {
-  local name="$1"
-  local value="$2"
-
-  if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
-    fail "$name must be a positive integer; got: $value"
-  fi
-}
 
 [[ $# -eq 1 ]] || usage
 WORLD_SIZE="$1"
@@ -40,13 +31,9 @@ WORLD_SIZE="$1"
 case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
-    DEFAULT_OOVERLAP_MAX_CTAS="8"
-    DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="8"
     ;;
   4)
     DEVICES="0,1,2,3"
-    DEFAULT_OOVERLAP_MAX_CTAS="12"
-    DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="4"
     ;;
   *)
     echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
@@ -54,15 +41,6 @@ case "$WORLD_SIZE" in
     ;;
 esac
 
-# These variables are passed only to OOverlap commands. They are deliberately
-# removed from the NCCL bandwidth command's environment.
-OOVERLAP_MAX_CTAS="${OOVERLAP_MAX_CTAS:-$DEFAULT_OOVERLAP_MAX_CTAS}"
-OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="${OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:-$DEFAULT_OOVERLAP_MAX_CTAS_PER_REDUCE_TASK}"
-
-require_positive_integer "OOVERLAP_MAX_CTAS" "$OOVERLAP_MAX_CTAS"
-require_positive_integer \
-  "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
-  "$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
 
 # Fixed bandwidth-curve settings. The curve uses the mean latency because
 # neither --use-median nor --use-p90 is passed to tool/bandwidth.py.
@@ -79,6 +57,7 @@ EVALUATE_SCRIPT="$REPO_ROOT/tool/evaluate_sm90.py"
 PLOT_SCRIPT="$REPO_ROOT/test/plot_eval_sm90.py"
 EXTENSION="$REPO_ROOT/build/lib/ooverlap_ext.so"
 ALGO_DICT="$REPO_ROOT/configs/AlgoDictSm90.json"
+TUNING_POLICY="${TUNING_POLICY:-${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp${WORLD_SIZE}_policy.json}}"
 
 CONFIG_DIR="$REPO_ROOT/configs"
 EVAL_OUT_DIR="$REPO_ROOT/results/eval_sm90"
@@ -86,8 +65,6 @@ PLOT_OUT_DIR="$EVAL_OUT_DIR/operator_speedup"
 PIPELINE_LOG_DIR="$EVAL_OUT_DIR/pipeline_logs"
 EVAL_JSON="$EVAL_OUT_DIR/evaluation_result.json"
 
-NCCL_BANDWIDTH_PT="$CONFIG_DIR/bandwidth_nccl_all_reduce_tp${WORLD_SIZE}.pt"
-OOVERLAP_BANDWIDTH_PT="$CONFIG_DIR/bandwidth_ooverlap_all_reduce_tp${WORLD_SIZE}.pt"
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail "Python executable not found: $PYTHON_BIN"
 command -v tee >/dev/null 2>&1 || fail "tee was not found"
@@ -97,6 +74,16 @@ for required in "$BANDWIDTH_SCRIPT" "$EVALUATE_SCRIPT" "$PLOT_SCRIPT" "$ALGO_DIC
 done
 
 [[ -f "$EXTENSION" ]] || fail "extension not found: $EXTENSION; build the repository first"
+
+# OOVERLAP_FLASHOVERLAP_OPTIONAL_TUNING_POLICY_V1
+if [[ -f "$TUNING_POLICY" ]]; then
+  export OOVERLAP_TUNING_POLICY="$TUNING_POLICY"
+  TUNING_POLICY_LABEL="$TUNING_POLICY"
+else
+  echo "[evalution] warning: tuning policy not found: $TUNING_POLICY; continuing without it" >&2
+  unset OOVERLAP_TUNING_POLICY
+  TUNING_POLICY_LABEL="not found (runtime fallback)"
+fi
 
 mkdir -p "$CONFIG_DIR" "$EVAL_OUT_DIR" "$PLOT_OUT_DIR" "$PIPELINE_LOG_DIR"
 cd "$REPO_ROOT"
@@ -133,6 +120,36 @@ for index in range(count):
             f"cuda:{index} has capability {major}.{minor}; eval_sm90 requires SM90 or newer"
         )
 PY
+
+# OOVERLAP_CONFIG_SPECIFIC_BANDWIDTH_V2
+COMM_CONFIGS=()
+while IFS= read -r pair; do
+  [[ -n "$pair" ]] && COMM_CONFIGS+=("$pair")
+done < <(
+  "$PYTHON_BIN" - "$EVALUATE_SCRIPT" "$WORLD_SIZE" <<'PY_CONFIG'
+import importlib.util
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).resolve()
+world_size = int(sys.argv[2])
+spec = importlib.util.spec_from_file_location("ooverlap_eval_sm90_comm_configs", path)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"could not import {path}")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+configs = list(module.COMM_RUN_CONFIGS_BY_TP.get(world_size, []))
+if not configs:
+    raise SystemExit(f"no COMM_RUN_CONFIGS_BY_TP entry for TP={world_size}")
+
+for config in configs:
+    print(f"{int(config.comm_sm_slack)}:{int(config.max_ctas_per_reduce_task)}")
+PY_CONFIG
+)
+
+[[ ${#COMM_CONFIGS[@]} -gt 0 ]] || fail "no communication configurations found for TP=$WORLD_SIZE"
 
 # With --skip-existing-profile, a CUTLASS CSV is needed only when the matching
 # GPU-specific packed config is absent or contains no Algo entries.
@@ -176,39 +193,47 @@ PY
 
 run_bandwidth_if_missing() {
   local backend="$1"
-  local output_pt="$2"
-  local log_path="$3"
+  local max_ctas="$2"
+  local reduce_ctas="$3"
+  local output_pt="$4"
+  local log_path="$5"
 
   if [[ -s "$output_pt" ]]; then
     echo "[evalution] bandwidth curve exists; skipping $backend: $output_pt"
     return
   fi
 
-  echo "[evalution] generating $backend all-reduce bandwidth curve for TP=$WORLD_SIZE"
+  echo "[evalution] generating $backend all-reduce bandwidth curve " \
+       "for TP=$WORLD_SIZE max_ctas=$max_ctas reduce_ctas=$reduce_ctas"
 
   if [[ "$backend" == "ooverlap" ]]; then
-    OOVERLAP_MAX_CTAS="$OOVERLAP_MAX_CTAS" \
-    OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
-      "$PYTHON_BIN" "$BANDWIDTH_SCRIPT" \
-        --comm_backend "$backend" \
-        --comm_op all_reduce \
-        --devices "$DEVICES" \
-        --warmup "$BANDWIDTH_WARMUP" \
-        --iters "$BANDWIDTH_ITERS" \
-        --sleep-seconds "$BANDWIDTH_SLEEP_SECONDS"
+    (
+      unset NCCL_MAX_CTAS
+      OOVERLAP_MAX_CTAS="$max_ctas" \
+      OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="$reduce_ctas" \
+        "$PYTHON_BIN" "$BANDWIDTH_SCRIPT" \
+          --comm_backend "$backend" \
+          --comm_op all_reduce \
+          --devices "$DEVICES" \
+          --warmup "$BANDWIDTH_WARMUP" \
+          --iters "$BANDWIDTH_ITERS" \
+          --sleep-seconds "$BANDWIDTH_SLEEP_SECONDS" \
+          --output-path "$output_pt"
+    )
   else
-    # Prevent caller-exported OOverlap controls from leaking into the NCCL run.
     (
       unset OOVERLAP_MAX_CTAS
       unset OOVERLAP_MAX_CTAS_PER_REDUCE_TASK
-
-      "$PYTHON_BIN" "$BANDWIDTH_SCRIPT" \
-        --comm_backend "$backend" \
-        --comm_op all_reduce \
-        --devices "$DEVICES" \
-        --warmup "$BANDWIDTH_WARMUP" \
-        --iters "$BANDWIDTH_ITERS" \
-        --sleep-seconds "$BANDWIDTH_SLEEP_SECONDS"
+      unset OOVERLAP_TUNING_POLICY
+      NCCL_MAX_CTAS="$max_ctas" \
+        "$PYTHON_BIN" "$BANDWIDTH_SCRIPT" \
+          --comm_backend "$backend" \
+          --comm_op all_reduce \
+          --devices "$DEVICES" \
+          --warmup "$BANDWIDTH_WARMUP" \
+          --iters "$BANDWIDTH_ITERS" \
+          --sleep-seconds "$BANDWIDTH_SLEEP_SECONDS" \
+          --output-path "$output_pt"
     )
   fi 2>&1 | tee "$log_path"
 
@@ -217,28 +242,37 @@ run_bandwidth_if_missing() {
 
 echo "[evalution] SM90 FlashOverlap paper pipeline"
 echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
-echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
-echo "[evalution] ooverlap_max_ctas_per_reduce_task=$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK"
+echo "[evalution] tuning_policy=$TUNING_POLICY_LABEL"
+echo "[evalution] comm_configs=${COMM_CONFIGS[*]}"
 echo "[evalution] bandwidth_warmup=$BANDWIDTH_WARMUP"
 echo "[evalution] bandwidth_iters=$BANDWIDTH_ITERS"
 echo "[evalution] bandwidth_sleep_seconds=$BANDWIDTH_SLEEP_SECONDS"
 echo "[evalution] evaluation_output=$EVAL_OUT_DIR"
 echo "[evalution] plot_output=$PLOT_OUT_DIR"
 
-run_bandwidth_if_missing \
-  "nccl" \
-  "$NCCL_BANDWIDTH_PT" \
-  "$PIPELINE_LOG_DIR/tp${WORLD_SIZE}_bandwidth_nccl.log"
+for pair in "${COMM_CONFIGS[@]}"; do
+  IFS=: read -r max_ctas reduce_ctas <<< "$pair"
 
-run_bandwidth_if_missing \
-  "ooverlap" \
-  "$OOVERLAP_BANDWIDTH_PT" \
-  "$PIPELINE_LOG_DIR/tp${WORLD_SIZE}_bandwidth_ooverlap.log"
+  nccl_pt="$CONFIG_DIR/bandwidth_nccl_all_reduce_tp${WORLD_SIZE}_c${max_ctas}.pt"
+  ooverlap_pt="$CONFIG_DIR/bandwidth_ooverlap_all_reduce_tp${WORLD_SIZE}_c${max_ctas}_r${reduce_ctas}.pt"
 
-echo "[evalution] running SM90 search and overlap evaluation"
-OOVERLAP_MAX_CTAS="$OOVERLAP_MAX_CTAS" \
-OOVERLAP_MAX_CTAS_PER_REDUCE_TASK="$OOVERLAP_MAX_CTAS_PER_REDUCE_TASK" \
-  "$PYTHON_BIN" "$EVALUATE_SCRIPT" \
+  run_bandwidth_if_missing \
+    "nccl" \
+    "$max_ctas" \
+    "$reduce_ctas" \
+    "$nccl_pt" \
+    "$PIPELINE_LOG_DIR/tp${WORLD_SIZE}_c${max_ctas}_bandwidth_nccl.log"
+
+  run_bandwidth_if_missing \
+    "ooverlap" \
+    "$max_ctas" \
+    "$reduce_ctas" \
+    "$ooverlap_pt" \
+    "$PIPELINE_LOG_DIR/tp${WORLD_SIZE}_c${max_ctas}_r${reduce_ctas}_bandwidth_ooverlap.log"
+done
+
+echo "[evalution] running SM90 search and capped overlap evaluation"
+"$PYTHON_BIN" "$EVALUATE_SCRIPT" \
     --devices "$DEVICES" \
     --out-dir "$EVAL_OUT_DIR" \
     --skip-existing-profile \
@@ -252,7 +286,7 @@ echo "[evalution] generating operator-level plots and summaries"
   --out-dir "$PLOT_OUT_DIR" \
   --name "operator_overlap_speedup_by_shape" \
   --baseline-source "nccl_cublas" \
-  --test-mode "both" \
+  --test-mode "capped" \
   --all-shapes \
   --tps "2,4" \
   --annotate \

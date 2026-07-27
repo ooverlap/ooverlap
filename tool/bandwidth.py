@@ -353,16 +353,28 @@ def summarize_results(
     return comm_array, bandwidths
 
 
-def save_outputs(comm_backend, comm_op, world_size, sizes, comm_array, bandwidths):
+# OOVERLAP_CONFIG_SPECIFIC_BANDWIDTH_V2
+def save_outputs(
+    comm_backend,
+    comm_op,
+    world_size,
+    sizes,
+    comm_array,
+    bandwidths,
+    output_path="",
+):
     backend = backend_label(comm_backend)
 
-    out_dir = repo_root() / "configs"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if output_path:
+        out_pt = Path(output_path).expanduser().resolve()
+        out_pt.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = repo_root() / "configs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_pt = out_dir / f"bandwidth_{backend}_{comm_op}_tp{world_size}.pt"
 
-    out_pt = out_dir / f"bandwidth_{backend}_{comm_op}_tp{world_size}.pt"
     torch.save(comm_array, out_pt)
-
-    out_png = out_dir / f"bandwidth_{backend}_{comm_op}_tp{world_size}.png"
+    out_png = out_pt.with_suffix(".png")
 
     plt.figure()
     plt.plot(sizes, bandwidths, marker="o")
@@ -413,6 +425,7 @@ def run_backend(args, comm_backend):
         sizes=sizes,
         comm_array=comm_array,
         bandwidths=bandwidths,
+        output_path=args.output_path,
     )
 
 
@@ -444,6 +457,15 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--sleep-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        default="",
+        help=(
+            "Optional exact .pt output path. The plot is written beside it with "
+            "a .png suffix. Required for configuration-specific curves."
+        ),
+    )
     parser.add_argument("--use-median", action="store_true")
     parser.add_argument("--use-p90", action="store_true")
     parser.add_argument("--sizes", action="store_true")
@@ -461,6 +483,12 @@ def main():
 
     if args.comm_backend in ("ooverlap", "both") and args.comm_op != "all_reduce":
         raise RuntimeError("ooverlap backend currently supports only --comm_op all_reduce")
+
+    if args.comm_backend == "both" and args.output_path:
+        raise ValueError(
+            "--output-path is ambiguous with --comm_backend both; run each "
+            "backend separately or omit --output-path"
+        )
 
     if args.comm_backend == "both":
         run_backend(args, "nccl")
