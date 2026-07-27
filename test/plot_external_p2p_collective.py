@@ -696,7 +696,7 @@ def plot_paired_tp_3x4(
         top=0.995,
         # The existing spacing is retained; compact label padding keeps the
         # per-panel metric labels inside the available inter-column gutters.
-        wspace=0.20,
+        wspace=0.22,
         hspace=0.10,
     )
 
@@ -757,7 +757,7 @@ def plot_paired_tp_3x4(
                     ha="center",
                     va="center",
                     fontsize=PAPER_LABEL_FONTSIZE,
-                    fontweight="medium",
+                    fontweight="bold",
                     annotation_clip=False,
                 )
 
