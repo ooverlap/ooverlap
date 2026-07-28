@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Plot the three vLLM paper-evaluation sweeps.
+"""Plot the vLLM decode batch-scaling benchmark.
 
 Inputs are the per-run summary.csv files emitted by benchmark_vllm_paperlike.py.
-The script creates PDF and PNG versions of:
+The script creates PDF and PNG versions of batch_throughput.
 
-* prefill_latency.{pdf,png}
-* decode_latency.{pdf,png}
-* batch_throughput.{pdf,png}
+OOVERLAP_VLLM_BATCH_ONLY_PLOT_V1
 """
 from __future__ import annotations
 
@@ -251,8 +249,8 @@ def retain_order(series: dict[str, list[tuple[int, float, float]]], order: list[
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot the three vLLM evaluation sweeps")
-    parser.add_argument("--root", required=True, help="TP result root containing the three sweep directories")
+    parser = argparse.ArgumentParser(description="Plot the vLLM decode batch-scaling benchmark")
+    parser.add_argument("--root", required=True, help="TP result root containing batch_scaling")
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--include-backends", default=None, help="Comma-separated backend allow-list")
     parser.add_argument("--exclude-backends", default=None, help="Comma-separated backend deny-list")
@@ -266,27 +264,9 @@ def main() -> int:
     include = set(csv_list(args.include_backends))
     exclude = set(csv_list(args.exclude_backends))
 
-    prefill = select_backends(load_runs(root / "prefill_length" / "summary.csv"), include, exclude)
-    decode = select_backends(load_runs(root / "decode_length" / "summary.csv"), include, exclude)
     batch = select_backends(load_runs(root / "batch_scaling" / "summary.csv"), include, exclude)
-    order = ordered_backends(prefill + decode + batch)
+    order = ordered_backends(batch)
 
-    plot_series(
-        out_dir / "prefill_latency",
-        retain_order(prefill_series(prefill), order),
-        "Prompt length (tokens)",
-        "Prefill latency (ms/request)",
-        xlog2=True,
-        lower_is_better=True,
-    )
-    plot_series(
-        out_dir / "decode_latency",
-        retain_order(decode_series(decode), order),
-        "Output length (tokens)",
-        "Incremental decode latency (ms/output token)",
-        xlog2=True,
-        lower_is_better=True,
-    )
     plot_series(
         out_dir / "batch_throughput",
         retain_order(batch_series(batch), order),

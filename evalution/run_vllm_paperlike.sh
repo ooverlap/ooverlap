@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Three paper-evaluation sweeps for vLLM:
-#   1. prefill latency versus prompt length
-#   2. incremental decode latency versus output length
-#   3. decode throughput versus active-sequence limit
+# OOVERLAP_VLLM_BATCH_ONLY_BENCHMARK_V1
+# One paper-evaluation benchmark for vLLM:
+#   decode throughput versus the maximum number of active sequences
+#
+# Workload:
+#   input=16, output=256, max_num_seqs=1,2,4,8,16,32,64
 #
 # Usage:
-#   ./evalution/run_vllm_paperlike.sh 2 [all|prefill|decode|batch|plot]
-#   ./evalution/run_vllm_paperlike.sh 4 [all|prefill|decode|batch|plot]
+#   ./evalution/run_vllm_paperlike.sh 2 [run|plot]
+#   ./evalution/run_vllm_paperlike.sh 4 [run|plot]
 #
 # Useful overrides:
 #   VLLM_MODEL_DIR=/scratch/local/models/Qwen2.5-72B-Instruct
 #   VLLM_EVAL_BACKENDS=pynccl,nccl_symm,ooverlap
-#   VLLM_PLOT_INCLUDE_BACKENDS=nccl_symm,ooverlap
-#   VLLM_PLOT_EXCLUDE_BACKENDS=pynccl
-#   VLLM_EVAL_REPETITIONS=3
-#   VLLM_PREFILL_NUM_PROMPTS=8
-#   VLLM_DECODE_NUM_PROMPTS=8
+#   VLLM_PLOT_INCLUDE_BACKENDS=pynccl,nccl_symm,ooverlap
+#   VLLM_PLOT_EXCLUDE_BACKENDS=
+#   VLLM_EVAL_REPETITIONS=5
 #   VLLM_BATCH_PROMPT_MULTIPLIER=4
 #   VLLM_OOVERLAP_AG_DTYPE=bf16
 #   VLLM_OOVERLAP_AG_SLOTS=4
@@ -25,7 +25,7 @@ set -euo pipefail
 #   OOVERLAP_TUNING_POLICY=/path/to/tma_collective_policy.json
 
 usage() {
-  echo "Usage: $0 {2|4} [all|prefill|decode|batch|plot]" >&2
+  echo "Usage: $0 {2|4} [run|plot]" >&2
   exit 2
 }
 
@@ -44,9 +44,9 @@ require_positive_integer() {
 
 [[ $# -ge 1 && $# -le 2 ]] || usage
 WORLD_SIZE="$1"
-MODE="${2:-all}"
+MODE="${2:-run}"
 case "$MODE" in
-  all|prefill|decode|batch|plot) ;;
+  run|plot) ;;
   *) usage ;;
 esac
 
@@ -88,8 +88,8 @@ NCCL_WIN_ENABLE="${NCCL_WIN_ENABLE:-1}"
 NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
 
-BACKENDS="${VLLM_EVAL_BACKENDS:-pynccl,nccl_symm,ooverlap}"
-BASELINE_BACKEND="${VLLM_EVAL_BASELINE_BACKEND:-pynccl}"
+BACKENDS="${VLLM_EVAL_BACKENDS:-pynccl,nccl_symm,ooverlap,auto}"
+BASELINE_BACKEND="${VLLM_EVAL_BASELINE_BACKEND:-auto}"
 REPETITIONS="${VLLM_EVAL_REPETITIONS:-1}"
 DATASET_NAME="random"
 RANDOM_RANGE_RATIO="0.0"
@@ -97,11 +97,6 @@ SEED="0"
 FLASHINFER_SAMPLER="0"
 OOVERLAP_DEBUG="0"
 MAX_BATCHED_TOKENS="4096"
-
-PREFILL_NUM_PROMPTS="${VLLM_PREFILL_NUM_PROMPTS:-8}"
-PREFILL_NUM_WARMUPS="${VLLM_PREFILL_NUM_WARMUPS:-2}"
-DECODE_NUM_PROMPTS="${VLLM_DECODE_NUM_PROMPTS:-8}"
-DECODE_NUM_WARMUPS="${VLLM_DECODE_NUM_WARMUPS:-2}"
 BATCH_PROMPT_MULTIPLIER="${VLLM_BATCH_PROMPT_MULTIPLIER:-4}"
 
 for pair in \
@@ -110,8 +105,6 @@ for pair in \
   "VLLM_OOVERLAP_AG_SLOTS:$AG_SLOTS" \
   "VLLM_OOVERLAP_AG_CAPACITY_BYTES:$AG_CAPACITY_BYTES" \
   "VLLM_EVAL_REPETITIONS:$REPETITIONS" \
-  "VLLM_PREFILL_NUM_PROMPTS:$PREFILL_NUM_PROMPTS" \
-  "VLLM_DECODE_NUM_PROMPTS:$DECODE_NUM_PROMPTS" \
   "VLLM_BATCH_PROMPT_MULTIPLIER:$BATCH_PROMPT_MULTIPLIER"; do
   require_positive_integer "${pair%%:*}" "${pair#*:}"
 done
@@ -184,8 +177,7 @@ MODEL="$(cd -- "$MODEL_DIR" && pwd)"
 mkdir -p "$OUT_ROOT"
 cd "$REPO_ROOT"
 
-# Validate all three backends before a long run. This intentionally retains the
-# existing symmetric-memory and ooverlap checks even when plotting only.
+# Validate all three configured backends before the benchmark run.
 preflight() {
   local check_code
   check_code='import os, sys, torch
@@ -246,43 +238,12 @@ common_driver_args+=(--env "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 common_driver_args+=(--env "TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE")
 common_driver_args+=(--env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN")
 common_driver_args+=(--env "NCCL_NET=$NCCL_NET")
-common_driver_args+=(--env "VLLM_USE_NCCL_SYMM_MEM=$VLLM_USE_NCCL_SYMM_MEM")
+#common_driver_args+=(--env "VLLM_USE_NCCL_SYMM_MEM=$VLLM_USE_NCCL_SYMM_MEM")
 common_driver_args+=(--env "NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE")
 common_driver_args+=(--env "NCCL_WIN_ENABLE=$NCCL_WIN_ENABLE")
 common_driver_args+=(--env "NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE")
 common_driver_args+=(--env "NCCL_MNNVL_ENABLE=$NCCL_MNNVL_ENABLE")
 common_driver_args+=(--fail-fast)
-
-run_prefill() {
-  local out_dir="$OUT_ROOT/prefill_length"
-  mkdir -p "$out_dir"
-  "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
-    --out-dir "$out_dir" --workloads "" --batch-sizes "1" \
-    --num-prompts "$PREFILL_NUM_PROMPTS" --num-warmups "$PREFILL_NUM_WARMUPS" \
-    --workload prefill-128:128:1 \
-    --workload prefill-256:256:1 \
-    --workload prefill-512:512:1 \
-    --workload prefill-1024:1024:1 \
-    --workload prefill-2048:2048:1 \
-    --workload prefill-4096:4096:1 \
-    2>&1 | tee "$out_dir/pipeline.log"
-}
-
-run_decode() {
-  local out_dir="$OUT_ROOT/decode_length"
-  mkdir -p "$out_dir"
-  "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
-    --out-dir "$out_dir" --workloads "" --batch-sizes "1" \
-    --num-prompts "$DECODE_NUM_PROMPTS" --num-warmups "$DECODE_NUM_WARMUPS" \
-    --workload decode-1:512:1 \
-    --workload decode-4:512:4 \
-    --workload decode-16:512:16 \
-    --workload decode-64:512:64 \
-    --workload decode-128:512:128 \
-    --workload decode-256:512:256 \
-    --workload decode-512:512:512 \
-    2>&1 | tee "$out_dir/pipeline.log"
-}
 
 run_batch() {
   local out_dir="$OUT_ROOT/batch_scaling"
@@ -290,7 +251,7 @@ run_batch() {
   "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
     --out-dir "$out_dir" --workloads "" \
     --workload batch-decode:16:256 \
-    --batch-sizes "1,2,4,8,16,32,64,128,256" \
+    --batch-sizes "1,2,4,8,16,32,64" \
     --prompt-multiplier "$BATCH_PROMPT_MULTIPLIER" \
     2>&1 | tee "$out_dir/pipeline.log"
 }
@@ -306,14 +267,8 @@ run_plot() {
   "$PYTHON_BIN" "$PLOTTER" "${args[@]}"
 }
 
-if [[ "$MODE" != "plot" ]]; then
-  preflight
-fi
 case "$MODE" in
-  all) run_prefill; run_decode; run_batch; run_plot ;;
-  prefill) run_prefill; run_plot ;;
-  decode) run_decode; run_plot ;;
-  batch) run_batch; run_plot ;;
+  run) preflight; run_batch; run_plot ;;
   plot) run_plot ;;
 esac
 
