@@ -21,13 +21,17 @@ COLLECTIVE_TITLES = {'allreduce': 'All-Reduce', 'reduce_scatter': 'Reduce-Scatte
 PLOT_LINEWIDTH = 1.8
 PLOT_MARKERSIZE = 6.5
 PLOT_MARKEREDGEWIDTH = 0.8
+PLOT_TICK_FONTSIZE = 13
+PLOT_LABEL_FONTSIZE = 14
+PLOT_TITLE_FONTSIZE = 15
+PLOT_LEGEND_FONTSIZE = 13
 PAPER_LINEWIDTH = 2.25
 PAPER_MARKERSIZE = 7.4
 PAPER_MARKEREDGEWIDTH = 1.0
-PAPER_TICK_FONTSIZE = 8.0
-PAPER_LABEL_FONTSIZE = 9.0
-PAPER_TITLE_FONTSIZE = 10.0
-PAPER_LEGEND_FONTSIZE = 8.5
+PAPER_TICK_FONTSIZE = 13
+PAPER_LABEL_FONTSIZE = 14
+PAPER_TITLE_FONTSIZE = 15
+PAPER_LEGEND_FONTSIZE = 15
 
 class PlotInputError(ValueError):
     pass
@@ -246,11 +250,22 @@ def plot_tp_group(
                 rotation=90,
                 ha='center',
             )
+            axis.tick_params(
+                axis='x',
+                which='major',
+                labelsize=PLOT_TICK_FONTSIZE,
+                pad=5,
+            )
+            axis.tick_params(
+                axis='y',
+                which='major',
+                labelsize=PLOT_TICK_FONTSIZE,
+            )
             axis.grid(True, which='both', linestyle='--', alpha=0.35)
             if row_idx == 0:
-                axis.set_title(COLLECTIVE_TITLES[collective], fontsize=12)
+                axis.set_title(COLLECTIVE_TITLES[collective], fontsize=PLOT_TITLE_FONTSIZE)
             if show_ylabels and col_idx == 0:
-                axis.set_ylabel(ylabel)
+                axis.set_ylabel(ylabel, fontsize=PLOT_LABEL_FONTSIZE)
 
 def add_figure_legend(fig, legend_by_label: Dict[str, object], y: float) -> None:
     legend_labels = list(legend_by_label)
@@ -262,6 +277,7 @@ def add_figure_legend(fig, legend_by_label: Dict[str, object], y: float) -> None
         ncol=min(len(legend_labels), 6),
         bbox_to_anchor=(0.5, y),
         frameon=False,
+        fontsize=PLOT_LEGEND_FONTSIZE,
         handlelength=2.0,
         columnspacing=1.25,
     )
@@ -277,7 +293,7 @@ def plot_combined(rows: List[Dict[str, object]], tp: int, output_path: Path) -> 
     fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(15, 7.6), sharex=False)
     legend_by_label: Dict[str, object] = {}
     plot_tp_group(rows, axes, legend_by_label, show_ylabels=True)
-    fig.supxlabel('Buffer size', y=0.022)
+    fig.supxlabel('Buffer size', y=0.022, fontsize=PLOT_LABEL_FONTSIZE)
     add_figure_legend(fig, legend_by_label, 0.988)
     fig.subplots_adjust(left=0.06, right=0.995, bottom=0.12, top=0.9, wspace=0.18, hspace=0.22)
     save_figure(fig, output_path)
@@ -308,12 +324,28 @@ def plot_paired_tp(
             f'TP={tp}',
             ha='center',
             va='center',
-            fontsize=13,
+            fontsize=PLOT_TITLE_FONTSIZE + 1.0,
             fontweight='semibold',
         )
-    fig.text(0.012, 0.64, 'AlgoBW (GB/s)', rotation=90, ha='center', va='center')
-    fig.text(0.012, 0.315, 'Latency (µs)', rotation=90, ha='center', va='center')
-    fig.supxlabel('Buffer size', y=0.025)
+    fig.text(
+        0.012,
+        0.64,
+        'AlgoBW (GB/s)',
+        rotation=90,
+        ha='center',
+        va='center',
+        fontsize=PLOT_LABEL_FONTSIZE,
+    )
+    fig.text(
+        0.012,
+        0.315,
+        'Latency (µs)',
+        rotation=90,
+        ha='center',
+        va='center',
+        fontsize=PLOT_LABEL_FONTSIZE,
+    )
+    fig.supxlabel('Buffer size', y=0.025, fontsize=PLOT_LABEL_FONTSIZE)
     add_figure_legend(fig, legend_by_label, 0.995)
     save_figure(fig, output_path)
 
@@ -512,17 +544,24 @@ def plot_paired_tp_3x4(
         (prepared_groups[1], latency_spec),
         (prepared_groups[1], bandwidth_spec),
     )
-    fig = plt.figure(figsize=(12.8, 8.0))
+    fig = plt.figure(figsize=(16, 10.0)) # whole figure size
     grid = fig.add_gridspec(
         nrows=5,
         ncols=4,
-        height_ratios=(0.18, 0.15, 1.0, 1.0, 1.0),
-        left=0.08,
-        right=0.998,
-        bottom=0.13,
+        height_ratios=(0.12, 0.09, 1.0, 1.0, 1.0),
+        # height_ratios=(0.18, 0.15, 1.0, 1.0, 1.0),
+        # left=0.07,
+        # right=0.995,
+        # bottom=0.13,
+        # top=0.995,
+
+        left=0.065,
+        right=0.995,
+        bottom=0.10,
         top=0.995,
-        wspace=0.22,
-        hspace=0.1,
+
+        wspace=0.22, # column spaces
+        hspace=0.07,
     )
     legend_axis = fig.add_subplot(grid[0, :])
     first_tp_axis = fig.add_subplot(grid[1, 0:2])
@@ -562,14 +601,14 @@ def plot_paired_tp_3x4(
                 va='center',
                 fontsize=PAPER_LABEL_FONTSIZE,
                 fontweight='normal',
-                labelpad=5,
+                labelpad=7,
             )
             if col_idx == 0:
                 axis.annotate(
                     COLLECTIVE_TITLES[collective],
                     xy=(0.0, 0.5),
                     xycoords='axes fraction',
-                    xytext=(-56, 0),
+                    xytext=(-48, 0),
                     textcoords='offset points',
                     rotation=90,
                     ha='center',
