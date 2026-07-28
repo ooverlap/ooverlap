@@ -61,6 +61,13 @@ DEFAULT_BASELINE_AGGREGATION = "mean"
 DEFAULT_TEST_MODE = "both"
 
 
+# OOVERLAP_FLASHOVERLAP_PLOT_FONTS_V1
+AXIS_LABEL_FONTSIZE = 15
+TICK_LABEL_FONTSIZE = 13
+LEGEND_FONTSIZE = 13
+PANEL_LABEL_FONTSIZE = 12
+SPEEDUP_LABEL_FONTSIZE = 10
+
 
 # OOVERLAP_BASELINE_AGGREGATION_V1
 @dataclass
@@ -646,6 +653,7 @@ def plot_results_grid(
             ax.set_ylim(0.0, ymax)
             ax.set_xticks(xs)
             ax.set_xticklabels(k_labels, rotation=0)
+            ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
             ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.45)
 
             # Keep the panel name inside the axes so it cannot be clipped outside.
@@ -656,13 +664,13 @@ def plot_results_grid(
                 transform=ax.transAxes,
                 ha="left",
                 va="top",
-                fontsize=10,
+                fontsize=PANEL_LABEL_FONTSIZE,
             )
 
             if row_idx == nrows - 1:
-                ax.set_xlabel("K dimension")
+                ax.set_xlabel("K dimension", fontsize=AXIS_LABEL_FONTSIZE)
             if col_idx == 0:
-                ax.set_ylabel("Speedup")
+                ax.set_ylabel("Speedup", fontsize=AXIS_LABEL_FONTSIZE)
 
             if annotate:
                 for bars in (bars0, bars1, bars2):
@@ -674,7 +682,7 @@ def plot_results_grid(
                             f"{height:.2f}",
                             ha="center",
                             va="top",
-                            fontsize=7,
+                            fontsize=SPEEDUP_LABEL_FONTSIZE,
                             rotation=90,
                         )
 
@@ -686,7 +694,7 @@ def plot_results_grid(
             bbox_to_anchor=(0.5, 0.985),
             ncols=3,
             frameon=False,
-            fontsize=10,
+            fontsize=LEGEND_FONTSIZE,
         )
 
     fig.tight_layout(rect=(0.02, 0.02, 0.98, 0.94))
@@ -726,7 +734,8 @@ def plot_tp_average_speedups(
         + t_ccl_min_values
         + t_ccl_max_values
     )
-    ymax = max(1.2, max(all_values) * 1.18)
+    # Leave room above the maximum endpoint for the mean-speedup label.
+    ymax = max(1.2, max(all_values) * 1.32)
 
     fig_width = max(7.0, 2.4 * len(rows) + 2.5)
     fig, ax = plt.subplots(figsize=(fig_width, 4.8))
@@ -775,24 +784,42 @@ def plot_tp_average_speedups(
     ax.axhline(1.0, linewidth=1.0, linestyle="--", alpha=0.75)
     ax.set_xticks(xs)
     ax.set_xticklabels([f"TP={int(row['world_size'])}" for row in rows])
-    ax.set_xlabel("Tensor parallel size")
-    ax.set_ylabel("Speedup")
+    ax.set_xlabel("Tensor parallel size", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Speedup", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
     ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.45)
-    ax.legend(loc="upper center", ncols=3, frameon=False)
+    ax.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncols=3,
+        frameon=False,
+        fontsize=LEGEND_FONTSIZE,
+    )
 
-    for bars in (bars0, bars1, bars2):
-        for bar in bars:
+    # Put the mean label above the larger of the mean bar and the observed
+    # maximum. This avoids collisions with both hollow-min and filled-max
+    # endpoint markers.
+    label_groups = (
+        (bars0, baseline_values),
+        (bars1, nccl_max_values),
+        (bars2, t_ccl_max_values),
+    )
+    label_pad = 0.025 * ymax
+    for bars, upper_values in label_groups:
+        for bar, upper in zip(bars, upper_values):
             height = bar.get_height()
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                max(0.02 * ymax, height - 0.035 * ymax),
+                max(height, upper) + label_pad,
                 f"{height:.2f}x",
                 ha="center",
-                va="top",
-                fontsize=8,
+                va="bottom",
+                fontsize=SPEEDUP_LABEL_FONTSIZE,
+                fontweight="bold",
+                clip_on=False,
             )
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=240, bbox_inches="tight")
     if out_pdf is not None:
