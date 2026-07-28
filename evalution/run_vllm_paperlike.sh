@@ -146,8 +146,8 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER="$REPO_ROOT/test/benchmark_vllm_paperlike.py"
 PLOTTER="$REPO_ROOT/test/plot_vllm_sweeps.py"
-#OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_1024_128/tp${WORLD_SIZE}"
-OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_512_1024/tp${WORLD_SIZE}"
+OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_1024_128/tp${WORLD_SIZE}"
+#OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_512_1024/tp${WORLD_SIZE}"
 TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp4_policy.json}"
 
 if [[ "$MODE" != "plot" ]]; then

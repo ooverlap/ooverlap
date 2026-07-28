@@ -21,16 +21,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# OOVERLAP_VLLM_AUTO_BASELINE_SPEEDUP_V1
 BACKEND_LABELS = {
+    "auto": "vLLM Auto",
     "pynccl": "NCCL",
+    "ooverlap": "T-CCL",
     "nccl_symm": "NCCL symmetric",
-    "ooverlap": "Ooverlap",
 }
 # OOVERLAP_VLLM_GROUPED_HATCHED_BAR_PLOTS_V1
 BACKEND_HATCHES = {
+    "auto": "",
     "pynccl": "///",
-    "nccl_symm": r"\\",
     "ooverlap": "xxx",
+    "nccl_symm": r"\\",
 }
 
 
@@ -128,7 +131,7 @@ def aggregate(values: Iterable[float]) -> tuple[float, float]:
 
 def ordered_backends(runs: Iterable[Run]) -> list[str]:
     present = {run.backend for run in runs}
-    preferred = ["pynccl", "nccl_symm", "ooverlap"]
+    preferred = ["auto", "pynccl", "ooverlap", "nccl_symm"]
     return [name for name in preferred if name in present] + sorted(present - set(preferred))
 
 
@@ -158,6 +161,10 @@ def plot_series(
     )
     centers = list(range(len(all_xs)))
     center_by_x = {value: center for value, center in zip(all_xs, centers)}
+    baseline_by_x = {
+        point[0]: point[1]
+        for point in series.get("auto", [])
+    }
 
     group_width = 0.82
     bar_width = group_width / max(1, len(backends))
@@ -169,7 +176,7 @@ def plot_series(
         bar_positions = [center_by_x[value] + offset for value in present_xs]
         bar_values = [mean_by_x[value] for value in present_xs]
 
-        axis.bar(
+        bars = axis.bar(
             bar_positions,
             bar_values,
             width=bar_width * 0.9,
@@ -179,10 +186,36 @@ def plot_series(
             label=label_for(backend),
         )
 
+        if backend == "ooverlap":
+            for bar, batch_size, throughput in zip(
+                bars,
+                present_xs,
+                bar_values,
+            ):
+                baseline = baseline_by_x.get(batch_size)
+                if baseline is None or baseline <= 0.0:
+                    continue
+
+                speedup = throughput / baseline
+                axis.annotate(
+                    f"{speedup:.2f}×",
+                    xy=(
+                        bar.get_x() + bar.get_width() / 2.0,
+                        bar.get_height(),
+                    ),
+                    xytext=(0, 4),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    fontweight="bold",
+                )
+
     axis.set_xticks(centers)
     axis.set_xticklabels([str(value) for value in all_xs])
     axis.set_xlabel(xlabel)
     axis.set_ylabel(ylabel)
+    axis.margins(y=0.12)
     axis.grid(True, axis="y", linestyle="--", alpha=0.35)
     axis.legend(frameon=False)
     direction = "Lower is better" if lower_is_better else "Higher is better"
@@ -271,7 +304,7 @@ def main() -> int:
         out_dir / "batch_throughput",
         retain_order(batch_series(batch), order),
         "Maximum active sequences",
-        "Output throughput (tokens/s)",
+        "End-to-end output throughput (tokens/s)",
         xlog2=True,
         lower_is_better=False,
     )
