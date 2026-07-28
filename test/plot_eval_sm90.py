@@ -66,7 +66,7 @@ AXIS_LABEL_FONTSIZE = 15
 TICK_LABEL_FONTSIZE = 13
 LEGEND_FONTSIZE = 13
 PANEL_LABEL_FONTSIZE = 12
-SPEEDUP_LABEL_FONTSIZE = 10
+SPEEDUP_LABEL_FONTSIZE = 9
 
 
 # OOVERLAP_BASELINE_AGGREGATION_V1
@@ -734,8 +734,8 @@ def plot_tp_average_speedups(
         + t_ccl_min_values
         + t_ccl_max_values
     )
-    # Leave room above the maximum endpoint for the mean-speedup label.
-    ymax = max(1.2, max(all_values) * 1.32)
+    # Leave modest headroom above the observed endpoint range.
+    ymax = max(1.2, max(all_values) * 1.20)
 
     fig_width = max(7.0, 2.4 * len(rows) + 2.5)
     fig, ax = plt.subplots(figsize=(fig_width, 4.8))
@@ -784,7 +784,7 @@ def plot_tp_average_speedups(
     ax.axhline(1.0, linewidth=1.0, linestyle="--", alpha=0.75)
     ax.set_xticks(xs)
     ax.set_xticklabels([f"TP={int(row['world_size'])}" for row in rows])
-    ax.set_xlabel("Tensor parallel size", fontsize=AXIS_LABEL_FONTSIZE)
+    # ax.set_xlabel("Tensor parallel size", fontsize=AXIS_LABEL_FONTSIZE)
     ax.set_ylabel("Speedup", fontsize=AXIS_LABEL_FONTSIZE)
     ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
     ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.45)
@@ -796,27 +796,26 @@ def plot_tp_average_speedups(
         fontsize=LEGEND_FONTSIZE,
     )
 
-    # Put the mean label above the larger of the mean bar and the observed
-    # maximum. This avoids collisions with both hollow-min and filled-max
-    # endpoint markers.
-    label_groups = (
-        (bars0, baseline_values),
-        (bars1, nccl_max_values),
-        (bars2, t_ccl_max_values),
-    )
-    label_pad = 0.025 * ymax
-    for bars, upper_values in label_groups:
-        for bar, upper in zip(bars, upper_values):
+    # OOVERLAP_FLASHOVERLAP_AVERAGE_LABELS_ON_MEAN_V1
+    # Baseline is definitionally 1.00x, so annotate only measured overlap
+    # backends. Keep each mean label tied to the top of its mean bar rather
+    # than moving it above the observed maximum endpoint.
+    for bars in (bars1, bars2):
+        for bar in bars:
             height = bar.get_height()
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                max(height, upper) + label_pad,
+            ax.annotate(
                 f"{height:.2f}x",
+                xy=(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    height,
+                ),
+                xytext=(0, 0),
+                textcoords="offset points",
                 ha="center",
                 va="bottom",
                 fontsize=SPEEDUP_LABEL_FONTSIZE,
                 fontweight="bold",
-                clip_on=False,
+                zorder=6,
             )
 
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
