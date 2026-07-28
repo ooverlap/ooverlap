@@ -21,6 +21,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# OOVERLAP_VLLM_PAPER_FONT_SIZES_V1
+AXIS_LABEL_FONTSIZE = 15
+TICK_LABEL_FONTSIZE = 13
+LEGEND_FONTSIZE = 13
+SPEEDUP_LABEL_FONTSIZE = 10
+
 # OOVERLAP_VLLM_AUTO_BASELINE_SPEEDUP_V1
 BACKEND_LABELS = {
     "auto": "vLLM Auto",
@@ -146,7 +152,6 @@ def plot_series(
     ylabel: str,
     *,
     xlog2: bool,
-    lower_is_better: bool,
 ) -> None:
     # OOVERLAP_VLLM_GROUPED_HATCHED_BAR_PLOTS_V1
     # Use categorical spacing so every sweep is a grouped bar chart. The third
@@ -203,23 +208,24 @@ def plot_series(
                         bar.get_x() + bar.get_width() / 2.0,
                         bar.get_height(),
                     ),
-                    xytext=(0, 4),
+                    xytext=(2, 5),
                     textcoords="offset points",
                     ha="center",
                     va="bottom",
-                    fontsize=8,
+                    rotation=90,
+                    # rotation_mode="anchor",
+                    fontsize=SPEEDUP_LABEL_FONTSIZE,
                     fontweight="bold",
                 )
 
     axis.set_xticks(centers)
     axis.set_xticklabels([str(value) for value in all_xs])
-    axis.set_xlabel(xlabel)
-    axis.set_ylabel(ylabel)
-    axis.margins(y=0.12)
+    axis.set_xlabel(xlabel, fontsize=AXIS_LABEL_FONTSIZE)
+    axis.set_ylabel(ylabel, fontsize=AXIS_LABEL_FONTSIZE)
+    axis.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
+    axis.margins(y=0.20)
     axis.grid(True, axis="y", linestyle="--", alpha=0.35)
-    axis.legend(frameon=False)
-    direction = "Lower is better" if lower_is_better else "Higher is better"
-    axis.text(0.99, 0.02, direction, transform=axis.transAxes, ha="right", va="bottom", fontsize=9)
+    axis.legend(frameon=False, fontsize=LEGEND_FONTSIZE)
     fig.tight_layout()
     output_base.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_base.with_suffix(".png"), dpi=220, bbox_inches="tight")
@@ -303,10 +309,9 @@ def main() -> int:
     plot_series(
         out_dir / "batch_throughput",
         retain_order(batch_series(batch), order),
-        "Maximum active sequences",
-        "End-to-end output throughput (tokens/s)",
+        "Batch Size",
+        "Tokens per Second",
         xlog2=True,
-        lower_is_better=False,
     )
     return 0
 
