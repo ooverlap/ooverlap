@@ -449,9 +449,6 @@ class OoTorchCommunicator {
           {static_cast<int64_t>(capacity_elems)},
           options,
           torch::MemoryFormat::Contiguous);
-      // OOVERLAP_VLLM_NO_COPY_UPPER_BOUND_V2: initialize only AllReduce slots once.
-      // Performance-only mode: generated model values are numerically invalid.
-      slot.tensor.zero_();
       TORCH_CHECK(slot.tensor.defined() &&
                       slot.tensor.is_cuda() &&
                       slot.tensor.is_contiguous() &&
@@ -482,10 +479,72 @@ class OoTorchCommunicator {
     round_robin_index_ = 0;
   }
 
-  torch::Tensor all_reduce_round_robin(torch::Tensor input) {
-    validate(input);
+  // OOVERLAP_QWEN_DIRECT_SLOT_API_V1
+  torch::Tensor acquire_all_reduce_slot(
+      const std::vector<int64_t>& shape) {
     TORCH_CHECK(round_robin_set_ != nullptr && !round_robin_slots_.empty(),
                 "round-robin pool is not initialized");
+
+    const int64_t numel = checked_round_robin_numel(shape);
+    const size_t elem_size = round_robin_dtype_size(round_robin_dtype_);
+    const size_t capacity_elems = round_robin_capacity_bytes_ / elem_size;
+    TORCH_CHECK(
+        static_cast<size_t>(numel) <= capacity_elems,
+        "requested all-reduce slot view exceeds capacity: requested_numel=",
+        numel,
+        " capacity_numel=",
+        capacity_elems);
+
+    c10::cuda::CUDAGuard guard(
+        torch::Device(torch::kCUDA, devices_[local_rank_]));
+
+    RoundRobinSlot& slot = round_robin_slots_[round_robin_index_];
+    return slot.tensor.narrow(0, 0, numel).view(shape);
+  }
+
+  torch::Tensor all_reduce_preloaded_slot(torch::Tensor slot_view) {
+    validate(slot_view);
+    TORCH_CHECK(round_robin_set_ != nullptr && !round_robin_slots_.empty(),
+                "round-robin pool is not initialized");
+    TORCH_CHECK(slot_view.scalar_type() == round_robin_dtype_,
+                "preloaded slot dtype does not match round-robin pool dtype");
+    TORCH_CHECK(slot_view.nbytes() <= round_robin_capacity_bytes_,
+                "preloaded slot exceeds round-robin capacity: slot_bytes=",
+                slot_view.nbytes(),
+                " capacity_bytes=",
+                round_robin_capacity_bytes_);
+
+    c10::cuda::CUDAGuard guard(slot_view.device());
+
+    const size_t slot_index = round_robin_index_;
+    RoundRobinSlot& slot = round_robin_slots_[slot_index];
+    TORCH_CHECK(
+        slot_view.data_ptr() == slot.tensor.data_ptr(),
+        "preloaded tensor is not a view of the current all-reduce slot: slot_index=",
+        slot_index);
+
+    check_status(
+        oo_allreduce_slot_tuned(
+            node_,
+            round_robin_set_,
+            static_cast<int>(slot_index),
+            static_cast<size_t>(slot_view.numel()),
+            to_oo_dtype(slot_view.scalar_type()),
+            OO_REDUCE_SUM,
+            OO_TUNING_BEST_PERFORMANCE,
+            current_stream_for(slot_view)),
+        "oo_allreduce_slot_tuned(preloaded)");
+
+    round_robin_index_ =
+        (round_robin_index_ + 1) % round_robin_slots_.size();
+
+    // This tensor aliases pool storage and is overwritten when the round-robin
+    // index wraps after N later collective calls.
+    return slot_view;
+  }
+
+  torch::Tensor all_reduce_round_robin(torch::Tensor input) {
+    validate(input);
     TORCH_CHECK(input.scalar_type() == round_robin_dtype_,
                 "input dtype does not match round-robin pool dtype");
     TORCH_CHECK(input.nbytes() <= round_robin_capacity_bytes_,
@@ -494,36 +553,10 @@ class OoTorchCommunicator {
                 " capacity_bytes=",
                 round_robin_capacity_bytes_);
 
-    c10::cuda::CUDAGuard guard(input.device());
-
-    const size_t slot_index = round_robin_index_;
-    RoundRobinSlot& slot = round_robin_slots_[slot_index];
     torch::Tensor view =
-        slot.tensor
-            .narrow(0, 0, input.numel())
-            .view(input.sizes());
-
-    // OOVERLAP_VLLM_NO_COPY_UPPER_BOUND_V2: deliberately skip view.copy_(input).
-    // The zero-initialized slot stays zero after SUM AllReduce and slot reuse.
-
-    check_status(
-        oo_allreduce_slot_tuned(
-            node_,
-            round_robin_set_,
-            static_cast<int>(slot_index),
-            static_cast<size_t>(input.numel()),
-            to_oo_dtype(input.scalar_type()),
-            OO_REDUCE_SUM,
-            OO_TUNING_BEST_PERFORMANCE,
-            current_stream_for(view)),
-        "oo_allreduce_slot_tuned");
-
-    round_robin_index_ =
-        (round_robin_index_ + 1) % round_robin_slots_.size();
-
-    // Intentionally unsafe: this view aliases pool storage and is overwritten
-    // when the round-robin index wraps after N later collective calls.
-    return view;
+        acquire_all_reduce_slot(input.sizes().vec());
+    view.copy_(input);
+    return all_reduce_preloaded_slot(view);
   }
 
   size_t round_robin_slot_count() const {
@@ -714,6 +747,23 @@ class OoTorchCommunicator {
   }
 
  private:
+  int64_t checked_round_robin_numel(
+      const std::vector<int64_t>& shape) const {
+    TORCH_CHECK(!shape.empty(),
+                "all-reduce slot shape must have at least one dimension");
+
+    int64_t numel = 1;
+    for (int64_t dim : shape) {
+      TORCH_CHECK(dim > 0,
+                  "all-reduce slot dimensions must be positive, got ", dim);
+      TORCH_CHECK(
+          numel <= std::numeric_limits<int64_t>::max() / dim,
+          "all-reduce slot element count overflow");
+      numel *= dim;
+    }
+    return numel;
+  }
+
   void validate(const torch::Tensor& t) {
     TORCH_CHECK(t.defined(), "tensor must be defined");
     TORCH_CHECK(t.is_cuda(), "tensor must be CUDA");
@@ -896,6 +946,12 @@ PYBIND11_MODULE(ooverlap_torch_ext, m) {
       .def("all_reduce_inplace_cached", &OoTorchCommunicator::all_reduce_inplace_cached)
       .def("init_round_robin_slots", &OoTorchCommunicator::init_round_robin_slots,
            py::arg("dtype"), py::arg("capacity_bytes"), py::arg("slot_count"))
+      .def("acquire_all_reduce_slot",
+           &OoTorchCommunicator::acquire_all_reduce_slot,
+           py::arg("shape"))
+      .def("all_reduce_preloaded_slot",
+           &OoTorchCommunicator::all_reduce_preloaded_slot,
+           py::arg("slot"))
       .def("all_reduce_round_robin", &OoTorchCommunicator::all_reduce_round_robin,
            py::arg("input"))
       .def("round_robin_slot_count", &OoTorchCommunicator::round_robin_slot_count)
