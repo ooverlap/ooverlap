@@ -2,11 +2,15 @@
 set -euo pipefail
 
 # OOVERLAP_VLLM_BATCH_ONLY_BENCHMARK_V1
+# OOVERLAP_VLLM_1024X128_ISOLATED_RUNS_V1
 # One paper-evaluation benchmark for vLLM:
-#   decode throughput versus the maximum number of active sequences
+#   output throughput versus the maximum number of active sequences
 #
 # Workload:
-#   input=16, output=256, max_num_seqs=1,2,4,8,16,32,64
+#   input=1024, output=128, max_num_seqs=1,2,4,8,16,32,64
+#
+# Isolation:
+#   fixed backend order, process-group cleanup, and a short inter-run cooldown
 #
 # Usage:
 #   ./evalution/run_vllm_paperlike.sh 2 [run|plot]
@@ -17,8 +21,9 @@ set -euo pipefail
 #   VLLM_EVAL_BACKENDS=pynccl,nccl_symm,ooverlap
 #   VLLM_PLOT_INCLUDE_BACKENDS=pynccl,nccl_symm,ooverlap
 #   VLLM_PLOT_EXCLUDE_BACKENDS=
-#   VLLM_EVAL_REPETITIONS=5
-#   VLLM_BATCH_PROMPT_MULTIPLIER=4
+#   VLLM_EVAL_REPETITIONS=1
+#   VLLM_BATCH_PROMPT_MULTIPLIER=2
+#   VLLM_EVAL_COOLDOWN_SECONDS=10
 #   VLLM_OOVERLAP_AG_DTYPE=bf16
 #   VLLM_OOVERLAP_AG_SLOTS=4
 #   VLLM_OOVERLAP_AG_CAPACITY_BYTES=67108864
@@ -39,6 +44,14 @@ require_positive_integer() {
   local value="$2"
   if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
     fail "$name must be a positive integer; got: $value"
+  fi
+}
+
+require_nonnegative_number() {
+  local name="$1"
+  local value="$2"
+  if ! [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    fail "$name must be a non-negative number; got: $value"
   fi
 }
 
@@ -88,6 +101,7 @@ NCCL_WIN_ENABLE="${NCCL_WIN_ENABLE:-1}"
 NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
 
+# Keep a fixed, conservative order. Ooverlap runs last by default.
 BACKENDS="${VLLM_EVAL_BACKENDS:-ooverlap,auto,pynccl}"
 BASELINE_BACKEND="${VLLM_EVAL_BASELINE_BACKEND:-pynccl}"
 REPETITIONS="${VLLM_EVAL_REPETITIONS:-1}"
@@ -98,6 +112,7 @@ FLASHINFER_SAMPLER="0"
 OOVERLAP_DEBUG="0"
 MAX_BATCHED_TOKENS="4096"
 BATCH_PROMPT_MULTIPLIER="${VLLM_BATCH_PROMPT_MULTIPLIER:-4}"
+COOLDOWN_SECONDS="${VLLM_EVAL_COOLDOWN_SECONDS:-10}"
 
 for pair in \
   "VLLM_OOVERLAP_RR_SLOTS:$RR_SLOTS" \
@@ -108,6 +123,8 @@ for pair in \
   "VLLM_BATCH_PROMPT_MULTIPLIER:$BATCH_PROMPT_MULTIPLIER"; do
   require_positive_integer "${pair%%:*}" "${pair#*:}"
 done
+
+require_nonnegative_number "VLLM_EVAL_COOLDOWN_SECONDS" "$COOLDOWN_SECONDS"
 
 MAX_SUPPORTED_RR_SLOTS="257"
 if (( RR_SLOTS > MAX_SUPPORTED_RR_SLOTS )); then
@@ -129,7 +146,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER="$REPO_ROOT/test/benchmark_vllm_paperlike.py"
 PLOTTER="$REPO_ROOT/test/plot_vllm_sweeps.py"
-OUT_ROOT="$REPO_ROOT/results/evalution/vllm/tp${WORLD_SIZE}"
+OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_1024_128/tp${WORLD_SIZE}"
 TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp4_policy.json}"
 
 if [[ "$MODE" != "plot" ]]; then
@@ -221,6 +238,7 @@ common_driver_args+=(--baseline-backend "$BASELINE_BACKEND")
 common_driver_args+=(--device-groups "$DEVICES")
 common_driver_args+=(--max-batched-tokens "$MAX_BATCHED_TOKENS")
 common_driver_args+=(--repetitions "$REPETITIONS")
+common_driver_args+=(--cooldown-seconds "$COOLDOWN_SECONDS")
 common_driver_args+=(--dataset-name "$DATASET_NAME")
 common_driver_args+=(--random-range-ratio "$RANDOM_RANGE_RATIO")
 common_driver_args+=(--seed "$SEED")
@@ -250,7 +268,7 @@ run_batch() {
   mkdir -p "$out_dir"
   "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
     --out-dir "$out_dir" --workloads "" \
-    --workload low-concurrency-long-generation:256:512 \
+    --workload realistic-conversation:1024:128 \
     --batch-sizes "1,2,4,8,16,32,64" \
     --prompt-multiplier "$BATCH_PROMPT_MULTIPLIER" \
     2>&1 | tee "$out_dir/pipeline.log"

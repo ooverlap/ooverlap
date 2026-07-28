@@ -808,6 +808,55 @@ def print_command(command: Sequence[str]) -> str:
     return shlex.join(list(command))
 
 
+# OOVERLAP_VLLM_PROCESS_GROUP_ISOLATION_V2
+# Each benchmark starts a new session, so the child PID is also its process-group
+# ID. Normal completion waits for descendants, and stale descendants are removed
+# before the next backend starts.
+def process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_for_process_group_exit(
+    process_group_id: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not process_group_exists(process_group_id):
+            return True
+        time.sleep(0.25)
+    return not process_group_exists(process_group_id)
+
+
+def terminate_process_group(
+    process_group_id: int,
+    term_timeout_seconds: float = 10.0,
+) -> None:
+    if not process_group_exists(process_group_id):
+        return
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    if wait_for_process_group_exit(process_group_id, term_timeout_seconds):
+        return
+
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+    wait_for_process_group_exit(process_group_id, 5.0)
+
+
 def execute_streaming(
     command: Sequence[str],
     environment: Mapping[str, str],
@@ -816,6 +865,7 @@ def execute_streaming(
 ) -> tuple[int, float]:
     start = time.monotonic()
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
     with log_path.open("w", encoding="utf-8", buffering=1) as log_handle:
         process = subprocess.Popen(
             list(command),
@@ -827,39 +877,56 @@ def execute_streaming(
             bufsize=1,
             start_new_session=True,
         )
+        process_group_id = process.pid
+
         try:
             assert process.stdout is not None
             for line in process.stdout:
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 log_handle.write(line)
+
             return_code = process.wait()
+
+            # Give engine/worker descendants a chance to shut down normally.
+            if not wait_for_process_group_exit(process_group_id, 20.0):
+                message = (
+                    "vLLM descendants remained after the CLI exited; "
+                    "terminating the benchmark process group\n"
+                )
+                sys.stderr.write(message)
+                sys.stderr.flush()
+                log_handle.write(message)
+                terminate_process_group(process_group_id)
+
         except KeyboardInterrupt:
-            # OOVERLAP_VLLM_PROCESS_GROUP_CLEANUP_V1
-            # vLLM launches an engine process and multiple workers. Signalling
-            # only the CLI parent can leave GPU-owning workers alive. Because
-            # the child starts a new session, its PID is also its process-group
-            # ID; signal the whole group and escalate only after timeouts.
             try:
-                os.killpg(process.pid, signal.SIGINT)
+                os.killpg(process_group_id, signal.SIGINT)
             except ProcessLookupError:
                 pass
+
             try:
-                return_code = process.wait(timeout=20)
+                process.wait(timeout=20)
             except subprocess.TimeoutExpired:
+                terminate_process_group(process_group_id)
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    return_code = process.wait(timeout=10)
+                    process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    return_code = process.wait()
+                    pass
             raise
+
+        finally:
+            # Covers abnormal exits while consuming stdout as well as failed CLI
+            # runs that leave GPU-owning descendants behind.
+            if process_group_exists(process_group_id):
+                terminate_process_group(process_group_id)
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
     return return_code, time.monotonic() - start
 
 
@@ -1303,6 +1370,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--repetitions", type=int, default=None)
     parser.add_argument("--prompt-multiplier", type=int, default=None)
+    parser.add_argument(
+        "--cooldown-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Seconds to wait after a benchmark process group exits and before "
+            "starting the next run"
+        ),
+    )
     parser.add_argument("--num-prompts", type=int, default=None)
     parser.add_argument("--num-warmups", type=int, default=None)
 
@@ -1456,12 +1532,17 @@ def main() -> int:
     prompt_multiplier = int(
         selected(args.prompt_multiplier, config, "prompt_multiplier", 4)
     )
+    cooldown_seconds = float(
+        selected(args.cooldown_seconds, config, "cooldown_seconds", 0.0)
+    )
     exact_num_prompts = selected(args.num_prompts, config, "num_prompts", None)
     exact_num_warmups = selected(args.num_warmups, config, "num_warmups", None)
     if repetitions <= 0:
         raise ConfigurationError("repetitions must be positive")
     if prompt_multiplier <= 0:
         raise ConfigurationError("prompt_multiplier must be positive")
+    if cooldown_seconds < 0.0:
+        raise ConfigurationError("cooldown_seconds must be non-negative")
     if exact_num_prompts is not None and int(exact_num_prompts) <= 0:
         raise ConfigurationError("num_prompts must be positive")
     if exact_num_warmups is not None and int(exact_num_warmups) < 0:
@@ -1560,6 +1641,7 @@ def main() -> int:
         "max_batched_tokens": token_limits,
         "repetitions": repetitions,
         "prompt_multiplier": prompt_multiplier,
+        "cooldown_seconds": cooldown_seconds,
         "num_prompts_override": exact_num_prompts,
         "num_warmups_override": exact_num_warmups,
         "extra_vllm_args": extra_vllm_args,
@@ -1699,6 +1781,13 @@ def main() -> int:
                 break
         else:
             print(f"OK: elapsed={float(result['elapsed_time']):.4f}s")
+
+        if index < len(specs) and cooldown_seconds > 0.0:
+            print(
+                "Benchmark process group exited. "
+                f"Cooling down for {cooldown_seconds:.1f} seconds..."
+            )
+            time.sleep(cooldown_seconds)
 
     if args.dry_run:
         print(f"Prepared {len(specs)} commands under {out_dir}; no benchmarks were run.")
