@@ -146,8 +146,8 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER="$REPO_ROOT/test/benchmark_vllm_paperlike.py"
 PLOTTER="$REPO_ROOT/test/plot_vllm_sweeps.py"
-OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_1024_128/tp${WORLD_SIZE}"
-#OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_512_1024/tp${WORLD_SIZE}"
+#OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_1024_128/tp${WORLD_SIZE}"
+OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_512_1024/tp${WORLD_SIZE}"
 TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp4_policy.json}"
 
 if [[ "$MODE" != "plot" ]]; then
@@ -277,6 +277,16 @@ run_batch() {
 
 #--workload realistic-conversation:1024:128 \
 
+# OOVERLAP_VLLM_PLOT_REBUILDS_SUMMARIES_V1
+run_summary() {
+  local out_dir="$OUT_ROOT/batch_scaling"
+
+  "$PYTHON_BIN" "$DRIVER" \
+    --out-dir "$out_dir" \
+    --summarize-only \
+    --baseline-backend "$BASELINE_BACKEND"
+}
+
 run_plot() {
   local args=(--root "$OUT_ROOT" --out-dir "$OUT_ROOT/plots")
   if [[ -n "${VLLM_PLOT_INCLUDE_BACKENDS:-}" ]]; then
@@ -290,7 +300,7 @@ run_plot() {
 
 case "$MODE" in
   run) preflight; run_batch; run_plot ;;
-  plot) run_plot ;;
+  plot) run_summary; run_plot ;;
 esac
 
 echo "[evalution] complete"

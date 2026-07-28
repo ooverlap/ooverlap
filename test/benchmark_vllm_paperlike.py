@@ -1150,6 +1150,189 @@ def format_optional(value: Any, format_spec: str) -> str:
     return format(float(value), format_spec)
 
 
+# OOVERLAP_VLLM_CROSS_BATCH_SPEEDUP_SUMMARY_V1
+# Cross-batch paper numbers use the geometric mean of per-batch output-throughput
+# ratios. The arithmetic mean and observed range are reported for transparency.
+def cross_batch_speedup_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("model"),
+        tuple(row.get("devices", [])),
+        row.get("tensor_parallel_size"),
+        row.get("workload"),
+        row.get("input_len"),
+        row.get("output_len"),
+        row.get("max_num_batched_tokens"),
+        row.get("max_model_len"),
+        row.get("gpu_memory_utilization"),
+    )
+
+
+def build_cross_batch_speedup_rows(
+    aggregates: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    throughput_by_group: dict[
+        tuple[Any, ...], dict[str, dict[int, float]]
+    ] = {}
+
+    for row in aggregates:
+        throughput = row.get("output_tokens_per_s_mean")
+        batch = row.get("max_num_seqs")
+        backend = str(row.get("backend", ""))
+        if throughput is None or batch is None or not backend:
+            continue
+
+        throughput_value = float(throughput)
+        batch_value = int(batch)
+        if throughput_value <= 0.0 or batch_value <= 0:
+            continue
+
+        group = throughput_by_group.setdefault(
+            cross_batch_speedup_key(row),
+            {},
+        )
+        group.setdefault(backend, {})[batch_value] = throughput_value
+
+    comparisons = (
+        ("auto", "vLLM Auto"),
+        ("pynccl", "NCCL"),
+    )
+    target_backend = "ooverlap"
+    target_label = "T-CCL"
+    summary_rows: list[dict[str, Any]] = []
+
+    for key, backend_values in throughput_by_group.items():
+        target_by_batch = backend_values.get(target_backend, {})
+        if not target_by_batch:
+            continue
+
+        (
+            model,
+            devices,
+            tensor_parallel_size,
+            workload,
+            input_len,
+            output_len,
+            max_num_batched_tokens,
+            max_model_len,
+            gpu_memory_utilization,
+        ) = key
+
+        for baseline_backend, baseline_label in comparisons:
+            baseline_by_batch = backend_values.get(baseline_backend, {})
+            batches = sorted(set(target_by_batch) & set(baseline_by_batch))
+            ratios = [
+                target_by_batch[batch] / baseline_by_batch[batch]
+                for batch in batches
+                if baseline_by_batch[batch] > 0.0
+            ]
+            if not ratios:
+                continue
+
+            geometric_mean_speedup = statistics.geometric_mean(ratios)
+            arithmetic_mean_speedup = statistics.mean(ratios)
+            summary_rows.append(
+                {
+                    "model": model,
+                    "devices": devices,
+                    "tensor_parallel_size": tensor_parallel_size,
+                    "workload": workload,
+                    "input_len": input_len,
+                    "output_len": output_len,
+                    "max_num_batched_tokens": max_num_batched_tokens,
+                    "max_model_len": max_model_len,
+                    "gpu_memory_utilization": gpu_memory_utilization,
+                    "target_backend": target_backend,
+                    "target_label": target_label,
+                    "baseline_backend": baseline_backend,
+                    "baseline_label": baseline_label,
+                    "batch_sizes": batches,
+                    "points": len(ratios),
+                    "geometric_mean_speedup": geometric_mean_speedup,
+                    "geometric_mean_change_pct": (
+                        geometric_mean_speedup - 1.0
+                    )
+                    * 100.0,
+                    "arithmetic_mean_speedup": arithmetic_mean_speedup,
+                    "minimum_speedup": min(ratios),
+                    "maximum_speedup": max(ratios),
+                }
+            )
+
+    summary_rows.sort(
+        key=lambda row: (
+            str(row.get("model")),
+            int(row.get("tensor_parallel_size") or 0),
+            str(row.get("workload")),
+            int(row.get("input_len") or 0),
+            int(row.get("output_len") or 0),
+            int(row.get("max_num_batched_tokens") or 0),
+            str(row.get("baseline_backend")),
+        )
+    )
+    return summary_rows
+
+
+def make_cross_batch_speedup_text(
+    speedup_rows: Sequence[dict[str, Any]],
+) -> str:
+    lines = [
+        "Cross-batch T-CCL speedup summary",
+        "Headline metric: geometric mean of per-batch output-throughput ratios",
+        "Arithmetic mean and range are included for transparency.",
+        "",
+    ]
+
+    if not speedup_rows:
+        lines.append(
+            "No complete T-CCL comparisons against vLLM Auto or NCCL were found."
+        )
+        return "\n".join(lines).rstrip() + "\n"
+
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in speedup_rows:
+        key = (
+            row.get("model"),
+            tuple(row.get("devices", [])),
+            row.get("tensor_parallel_size"),
+            row.get("workload"),
+            row.get("input_len"),
+            row.get("output_len"),
+            row.get("max_num_batched_tokens"),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    for key in sorted(grouped, key=lambda value: tuple(str(item) for item in value)):
+        model, devices, tp, workload, input_len, output_len, token_limit = key
+        lines.extend(
+            [
+                "=" * 88,
+                f"Model: {model}",
+                f"Devices: {','.join(str(device) for device in devices)}  TP: {tp}",
+                f"Workload: {workload}  input={input_len}  output={output_len}",
+                f"max_num_batched_tokens={token_limit}",
+                "-" * 88,
+            ]
+        )
+
+        for row in sorted(
+            grouped[key],
+            key=lambda item: str(item.get("baseline_backend")),
+        ):
+            batches = ",".join(str(value) for value in row.get("batch_sizes", []))
+            lines.append(
+                f"T-CCL vs {row.get('baseline_label')}: "
+                f"geomean={float(row['geometric_mean_speedup']):.4f}x "
+                f"({float(row['geometric_mean_change_pct']):+.2f}%), "
+                f"arithmetic_mean={float(row['arithmetic_mean_speedup']):.4f}x, "
+                f"range={float(row['minimum_speedup']):.4f}x-"
+                f"{float(row['maximum_speedup']):.4f}x, "
+                f"points={int(row['points'])}, batches={batches}"
+            )
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def make_summary_text(
     rows: Sequence[dict[str, Any]],
     aggregates: Sequence[dict[str, Any]],
@@ -1247,10 +1430,15 @@ def rebuild_summaries(out_dir: Path, baseline_backend: str) -> tuple[int, int]:
 
     aggregates = aggregate_rows(rows)
     write_csv(out_dir / "summary_aggregate.csv", aggregates)
-    atomic_write_text(
-        out_dir / "summary.txt",
-        make_summary_text(rows, aggregates, baseline_backend),
-    )
+
+    speedup_rows = build_cross_batch_speedup_rows(aggregates)
+    write_csv(out_dir / "speedup_summary.csv", speedup_rows)
+    speedup_text = make_cross_batch_speedup_text(speedup_rows)
+    atomic_write_text(out_dir / "speedup_summary.txt", speedup_text)
+
+    detailed_text = make_summary_text(rows, aggregates, baseline_backend)
+    combined_text = detailed_text.rstrip() + "\n\n" + speedup_text
+    atomic_write_text(out_dir / "summary.txt", combined_text)
     return len(rows), len(aggregates)
 
 
