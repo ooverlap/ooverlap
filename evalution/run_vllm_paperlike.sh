@@ -111,7 +111,7 @@ SEED="0"
 FLASHINFER_SAMPLER="0"
 OOVERLAP_DEBUG="0"
 MAX_BATCHED_TOKENS="4096"
-BATCH_PROMPT_MULTIPLIER="${VLLM_BATCH_PROMPT_MULTIPLIER:-4}"
+BATCH_PROMPT_MULTIPLIER="${VLLM_BATCH_PROMPT_MULTIPLIER:-2}"
 COOLDOWN_SECONDS="${VLLM_EVAL_COOLDOWN_SECONDS:-10}"
 
 for pair in \
@@ -146,7 +146,8 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER="$REPO_ROOT/test/benchmark_vllm_paperlike.py"
 PLOTTER="$REPO_ROOT/test/plot_vllm_sweeps.py"
-OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_1024_128/tp${WORLD_SIZE}"
+#OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_1024_128/tp${WORLD_SIZE}"
+OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_512_1024/tp${WORLD_SIZE}"
 TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp4_policy.json}"
 
 if [[ "$MODE" != "plot" ]]; then
@@ -268,11 +269,13 @@ run_batch() {
   mkdir -p "$out_dir"
   "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
     --out-dir "$out_dir" --workloads "" \
-    --workload realistic-conversation:1024:128 \
+    --workload long-decode:512:1024 \
     --batch-sizes "1,2,4,8,16,32,64" \
     --prompt-multiplier "$BATCH_PROMPT_MULTIPLIER" \
     2>&1 | tee "$out_dir/pipeline.log"
 }
+
+#--workload realistic-conversation:1024:128 \
 
 run_plot() {
   local args=(--root "$OUT_ROOT" --out-dir "$OUT_ROOT/plots")
