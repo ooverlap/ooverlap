@@ -88,7 +88,7 @@ NCCL_WIN_ENABLE="${NCCL_WIN_ENABLE:-1}"
 NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
 
-BACKENDS="${VLLM_EVAL_BACKENDS:-pynccl,ooverlap,auto}"
+BACKENDS="${VLLM_EVAL_BACKENDS:-ooverlap,auto}"
 BASELINE_BACKEND="${VLLM_EVAL_BASELINE_BACKEND:-auto}"
 REPETITIONS="${VLLM_EVAL_REPETITIONS:-1}"
 DATASET_NAME="random"
@@ -239,10 +239,10 @@ common_driver_args+=(--env "TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE")
 common_driver_args+=(--env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN")
 common_driver_args+=(--env "NCCL_NET=$NCCL_NET")
 #common_driver_args+=(--env "VLLM_USE_NCCL_SYMM_MEM=$VLLM_USE_NCCL_SYMM_MEM")
-common_driver_args+=(--env "NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE")
-common_driver_args+=(--env "NCCL_WIN_ENABLE=$NCCL_WIN_ENABLE")
-common_driver_args+=(--env "NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE")
-common_driver_args+=(--env "NCCL_MNNVL_ENABLE=$NCCL_MNNVL_ENABLE")
+#common_driver_args+=(--env "NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE")
+#common_driver_args+=(--env "NCCL_WIN_ENABLE=$NCCL_WIN_ENABLE")
+#common_driver_args+=(--env "NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE")
+#common_driver_args+=(--env "NCCL_MNNVL_ENABLE=$NCCL_MNNVL_ENABLE")
 common_driver_args+=(--fail-fast)
 
 run_batch() {
@@ -250,8 +250,7 @@ run_batch() {
   mkdir -p "$out_dir"
   "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
     --out-dir "$out_dir" --workloads "" \
-    --workload batch-decode:16:256 \
-    --workload moderate-context-decode:512:256 \
+    --workload low-concurrency-long-generation:256:512 \
     --batch-sizes "1,2,4,8,16,32,64" \
     --prompt-multiplier "$BATCH_PROMPT_MULTIPLIER" \
     2>&1 | tee "$out_dir/pipeline.log"

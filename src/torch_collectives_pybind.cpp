@@ -449,6 +449,9 @@ class OoTorchCommunicator {
           {static_cast<int64_t>(capacity_elems)},
           options,
           torch::MemoryFormat::Contiguous);
+      // OOVERLAP_VLLM_NO_COPY_UPPER_BOUND_V2: initialize only AllReduce slots once.
+      // Performance-only mode: generated model values are numerically invalid.
+      slot.tensor.zero_();
       TORCH_CHECK(slot.tensor.defined() &&
                       slot.tensor.is_cuda() &&
                       slot.tensor.is_contiguous() &&
@@ -500,7 +503,8 @@ class OoTorchCommunicator {
             .narrow(0, 0, input.numel())
             .view(input.sizes());
 
-    view.copy_(input);
+    // OOVERLAP_VLLM_NO_COPY_UPPER_BOUND_V2: deliberately skip view.copy_(input).
+    // The zero-initialized slot stays zero after SUM AllReduce and slot reuse.
 
     check_status(
         oo_allreduce_slot_tuned(
