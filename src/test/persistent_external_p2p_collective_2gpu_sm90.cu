@@ -1079,47 +1079,73 @@ std::map<std::string, double> benchmark_external_p2p_collective_sm90(
 
         std::map<std::string, double> results;
 
-        bench_ooverlap_external_ring(
-            results,
-            collective,
-            group,
-            nodes,
-            ooverlap_ring,
-            sources,
-            numel,
-            bytes,
-            devices,
-            streams,
-            iters,
-            warmup);
+        // OOVERLAP_EXTERNAL_P2P_BACKEND_SELECT_V1
+        const char* backend_env = std::getenv("OOVERLAP_BENCH_ONLY");
+        const std::string selected_backend =
+            backend_env != nullptr && backend_env[0] != '\0'
+                ? std::string(backend_env)
+                : std::string("all");
 
-        bench_nccl_external_ring(
-            results,
-            "nccl_ms",
-            collective,
-            nccl_ring,
-            sources,
-            numel,
-            bytes,
-            devices,
-            streams,
-            comms,
-            iters,
-            warmup);
+        if (selected_backend != "all" &&
+            selected_backend != "ooverlap" &&
+            selected_backend != "nccl" &&
+            selected_backend != "nccl_symmetric") {
+            throw std::invalid_argument(
+                "OOVERLAP_BENCH_ONLY must be all, ooverlap, nccl, or "
+                "nccl_symmetric");
+        }
 
-        bench_nccl_external_ring(
-            results,
-            "nccl_symmetric_ms",
-            collective,
-            nccl_symmetric_ring,
-            sources,
-            numel,
-            bytes,
-            devices,
-            streams,
-            comms,
-            iters,
-            warmup);
+        const auto backend_enabled = [&](const char* backend) {
+            return selected_backend == "all" || selected_backend == backend;
+        };
+
+        if (backend_enabled("ooverlap")) {
+            bench_ooverlap_external_ring(
+                results,
+                collective,
+                group,
+                nodes,
+                ooverlap_ring,
+                sources,
+                numel,
+                bytes,
+                devices,
+                streams,
+                iters,
+                warmup);
+        }
+
+        if (backend_enabled("nccl")) {
+            bench_nccl_external_ring(
+                results,
+                "nccl_ms",
+                collective,
+                nccl_ring,
+                sources,
+                numel,
+                bytes,
+                devices,
+                streams,
+                comms,
+                iters,
+                warmup);
+        }
+
+        if (backend_enabled("nccl_symmetric")) {
+            bench_nccl_external_ring(
+                results,
+                "nccl_symmetric_ms",
+                collective,
+                nccl_symmetric_ring,
+                sources,
+                numel,
+                bytes,
+                devices,
+                streams,
+                comms,
+                iters,
+                warmup);
+        }
 
         results["collective"] = testing::collective_code(collective);
         results["world_size"] = static_cast<double>(world_size);
