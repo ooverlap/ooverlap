@@ -717,7 +717,6 @@ def plot_tp_average_speedups(
 
     xs = list(range(len(rows)))
     bar_width = 0.25
-    baseline_values = [1.0 for _ in rows]
     nccl_values = [float(row["mean_nccl_speedup"]) for row in rows]
     t_ccl_values = [float(row["mean_ooverlap_speedup"]) for row in rows]
     nccl_min_values = [float(row["min_nccl_speedup"]) for row in rows]
@@ -726,8 +725,7 @@ def plot_tp_average_speedups(
     t_ccl_max_values = [float(row["max_ooverlap_speedup"]) for row in rows]
 
     all_values = (
-        baseline_values
-        + nccl_values
+        nccl_values
         + t_ccl_values
         + nccl_min_values
         + nccl_max_values
@@ -737,30 +735,25 @@ def plot_tp_average_speedups(
     # Leave modest headroom above the observed endpoint range.
     ymax = max(1.2, max(all_values) * 1.20)
 
-    fig_width = max(7.0, 2.4 * len(rows) + 2.5)
+    # fig_width = max(7.0, 2.4 * len(rows) + 2.5)
+    fig_width = max(4.5, 1.5 * len(rows) + 1.5)
     fig, ax = plt.subplots(figsize=(fig_width, 4.8))
 
-    bars0 = ax.bar(
-        [x - bar_width for x in xs],
-        baseline_values,
-        width=bar_width,
-        label="Baseline",
-        edgecolor="none",
-        linewidth=0,
-    )
     bars1 = ax.bar(
-        xs,
+        [x - bar_width / 2.0 for x in xs],
         nccl_values,
         width=bar_width,
         label="NCCL",
+        color="tab:orange",
         edgecolor="none",
         linewidth=0,
     )
     bars2 = ax.bar(
-        [x + bar_width for x in xs],
+        [x + bar_width / 2.0 for x in xs],
         t_ccl_values,
         width=bar_width,
         label="T-CCL",
+        color="tab:green",
         edgecolor="none",
         linewidth=0,
     )
@@ -768,11 +761,12 @@ def plot_tp_average_speedups(
     # A hollow endpoint is the minimum; a filled endpoint is the maximum.
     # NCCL uses circles and T-CCL uses diamonds.
     for x, low, high in zip(xs, nccl_min_values, nccl_max_values):
-        ax.scatter([x], [low], marker="o", facecolors="none", edgecolors="black", zorder=5)
-        ax.scatter([x], [high], marker="o", facecolors="black", edgecolors="black", zorder=5)
+        marker_x = x - bar_width / 2.0
+        ax.scatter([marker_x], [low], marker="o", facecolors="none", edgecolors="black", zorder=5)
+        ax.scatter([marker_x], [high], marker="o", facecolors="black", edgecolors="black", zorder=5)
 
     for x, low, high in zip(xs, t_ccl_min_values, t_ccl_max_values):
-        marker_x = x + bar_width
+        marker_x = x + bar_width / 2.0
         ax.scatter(
             [marker_x], [low], marker="D", facecolors="none", edgecolors="black", zorder=5
         )
@@ -791,14 +785,14 @@ def plot_tp_average_speedups(
     ax.legend(
         loc="lower center",
         bbox_to_anchor=(0.5, 1.02),
-        ncols=3,
+        ncols=2,
         frameon=False,
         fontsize=LEGEND_FONTSIZE,
     )
 
     # OOVERLAP_FLASHOVERLAP_AVERAGE_LABELS_ON_MEAN_V1
-    # Baseline is definitionally 1.00x, so annotate only measured overlap
-    # backends. Keep each mean label tied to the top of its mean bar rather
+    # The dashed y=1 line represents the baseline. Annotate only measured
+    # overlap backends, keeping each mean label tied to its mean bar rather
     # than moving it above the observed maximum endpoint.
     for bars in (bars1, bars2):
         for bar in bars:
