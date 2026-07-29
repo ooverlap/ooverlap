@@ -2,27 +2,43 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 {2|4} NUMEL [NUMEL ...]" >&2
-  echo "Example: $0 2 1048576 4194304 16777216 33554432" >&2
+  echo "Usage: $0 {2|4} {AR|RS|AG} NUMEL [NUMEL ...]" >&2
+  echo "Example: $0 2 AR 1048576 4194304 16777216 33554432" >&2
   exit 2
 }
 
-[[ $# -ge 2 ]] || usage
+[[ $# -ge 3 ]] || usage
 WORLD_SIZE="$1"
-shift
+COLLECTIVE_ARG="${2^^}"
+shift 2
 NUMELS=("$@")
+
+case "$COLLECTIVE_ARG" in
+  AR)
+    COLLECTIVE="allreduce"
+    ;;
+  RS)
+    COLLECTIVE="reduce_scatter"
+    ;;
+  AG)
+    COLLECTIVE="all_gather"
+    ;;
+  *)
+    usage
+    ;;
+esac
 
 # Match the unrestricted settings in run_external_p2p_bandwidth_latency.sh.
 case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
-    OOVERLAP_CTAS="16"
-    MAX_CTAS_PER_REDUCE_TASK="16"
+    OOVERLAP_CTAS="8"
+    MAX_CTAS_PER_REDUCE_TASK="8"
     ;;
   4)
     DEVICES="0,1,2,3"
-    OOVERLAP_CTAS="18"
-    MAX_CTAS_PER_REDUCE_TASK="6"
+    OOVERLAP_CTAS="9"
+    MAX_CTAS_PER_REDUCE_TASK="3"
     ;;
   *)
     usage
@@ -34,6 +50,10 @@ for numel in "${NUMELS[@]}"; do
     echo "error: NUMEL must be a positive integer; got: $numel" >&2
     exit 2
   }
+  if [[ "$COLLECTIVE" != "allreduce" ]] && ((numel % WORLD_SIZE != 0)); then
+    echo "error: $COLLECTIVE requires NUMEL divisible by world size $WORLD_SIZE; got: $numel" >&2
+    exit 2
+  fi
 done
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,7 +65,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 ITERS="${ITERS:-1000}"
 WARMUP="${WARMUP:-100}"
 
-OUT_DIR="$REPO_ROOT/results/evalution/external_p2p/sm_usage/tp${WORLD_SIZE}/unres"
+OUT_DIR="$REPO_ROOT/results/evalution/external_p2p/sm_usage/tp${WORLD_SIZE}/unres/${COLLECTIVE}"
 OUT_FILE="$OUT_DIR/sm_usage.txt"
 
 [[ -f "$DRIVER" ]] || {
@@ -105,7 +125,8 @@ PY
 
 mkdir -p "$OUT_DIR"
 {
-  echo "# collective=allreduce"
+  echo "# collective=$COLLECTIVE"
+  echo "# collective_argument=$COLLECTIVE_ARG"
   echo "# world_size=$WORLD_SIZE"
   echo "# devices=$DEVICES"
   echo "# ooverlap_max_ctas=$OOVERLAP_CTAS"
@@ -124,7 +145,7 @@ for numel in "${NUMELS[@]}"; do
 
   for backend in ooverlap nccl nccl_symmetric; do
     REPORT="$OUT_DIR/${backend}_numel${numel}"
-    echo "[evalution] backend=$backend numel=$numel report=$REPORT"
+    echo "[evalution] collective=$COLLECTIVE backend=$backend numel=$numel report=$REPORT"
 
     if [[ "$backend" == "ooverlap" ]]; then
       OOVERLAP_BENCH_ONLY="$backend" \
@@ -138,7 +159,7 @@ for numel in "${NUMELS[@]}"; do
         --output="$REPORT" \
         "$PYTHON_BIN" "$DRIVER" \
           --mode bench \
-          --collective allreduce \
+          --collective "$COLLECTIVE" \
           --numel "$numel" \
           --iters "$ITERS" \
           --warmup "$WARMUP" \
@@ -153,7 +174,7 @@ for numel in "${NUMELS[@]}"; do
         --output="$REPORT" \
         "$PYTHON_BIN" "$DRIVER" \
           --mode bench \
-          --collective allreduce \
+          --collective "$COLLECTIVE" \
           --numel "$numel" \
           --iters "$ITERS" \
           --warmup "$WARMUP" \
