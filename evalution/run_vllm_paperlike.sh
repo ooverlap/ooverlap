@@ -146,8 +146,8 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER="$REPO_ROOT/test/benchmark_vllm_paperlike.py"
 PLOTTER="$REPO_ROOT/test/plot_vllm_sweeps.py"
-OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_1024_128/tp${WORLD_SIZE}"
-#OUT_ROOT="$REPO_ROOT/results/evalution/vllm/qwen_512_1024/tp${WORLD_SIZE}"
+OUT_ROOT=""
+WORKLOAD=""
 TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp4_policy.json}"
 
 if [[ "$MODE" != "plot" ]]; then
@@ -192,7 +192,6 @@ MODEL_DIR="${VLLM_MODEL_DIR:-$DEFAULT_MODEL_DIR}"
 [[ -d "$MODEL_DIR" ]] || fail "model directory does not exist: $MODEL_DIR"
 [[ -f "$MODEL_DIR/config.json" ]] || fail "model directory is missing config.json: $MODEL_DIR"
 MODEL="$(cd -- "$MODEL_DIR" && pwd)"
-mkdir -p "$OUT_ROOT"
 cd "$REPO_ROOT"
 
 # Validate all three configured backends before the benchmark run.
@@ -269,13 +268,13 @@ run_batch() {
   mkdir -p "$out_dir"
   "$PYTHON_BIN" "$DRIVER" "${common_driver_args[@]}" \
     --out-dir "$out_dir" --workloads "" \
-    --workload long-decode:512:1024 \
+    --workload "$WORKLOAD" \
     --batch-sizes "1,2,4,8,16,32,64" \
     --prompt-multiplier "$BATCH_PROMPT_MULTIPLIER" \
     2>&1 | tee "$out_dir/pipeline.log"
 }
 
-#--workload realistic-conversation:1024:128 \
+# Both paper workloads are dispatched below by run_workload().
 
 # OOVERLAP_VLLM_PLOT_REBUILDS_SUMMARIES_V1
 run_summary() {
@@ -298,11 +297,34 @@ run_plot() {
   "$PYTHON_BIN" "$PLOTTER" "${args[@]}"
 }
 
+run_workload() {
+  local result_name="$1"
+  WORKLOAD="$2"
+  OUT_ROOT="$REPO_ROOT/results/evalution/vllm/${result_name}/tp${WORLD_SIZE}"
+  mkdir -p "$OUT_ROOT"
+
+  echo "[evalution] workload=$WORKLOAD"
+  echo "[evalution] root=$OUT_ROOT"
+
+  if [[ "$MODE" == "run" ]]; then
+    run_batch
+    run_plot
+  else
+    run_summary
+    run_plot
+  fi
+}
+
 case "$MODE" in
-  run) preflight; run_batch; run_plot ;;
-  plot) run_summary; run_plot ;;
+  run)
+    preflight
+    run_workload "qwen_1024_128" "realistic-conversation:1024:128"
+    run_workload "qwen_512_1024" "long-decode:512:1024"
+    ;;
+  plot)
+    run_workload "qwen_1024_128" "realistic-conversation:1024:128"
+    run_workload "qwen_512_1024" "long-decode:512:1024"
+    ;;
 esac
 
 echo "[evalution] complete"
-echo "[evalution] root=$OUT_ROOT"
-echo "[evalution] plots=$OUT_ROOT/plots"

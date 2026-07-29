@@ -4,35 +4,53 @@ set -euo pipefail
 # Fixed paper-evaluation wrapper for external-P2P collective latency/bandwidth.
 #
 # Usage:
-#   ./evalution/run_external_p2p_bandwidth_latency.sh 2
-#   ./evalution/run_external_p2p_bandwidth_latency.sh 4
+#   ./evalution/run_external_p2p_bandwidth_latency.sh 2 unres
+#   ./evalution/run_external_p2p_bandwidth_latency.sh 2 res
+#   ./evalution/run_external_p2p_bandwidth_latency.sh 4 unres
+#   ./evalution/run_external_p2p_bandwidth_latency.sh 4 res
 #
-# The only accepted argument is the tensor-parallel/world size. All benchmark
-# parameters are fixed here so paper runs are reproducible.
+# The first argument is the tensor-parallel/world size. The second selects the
+# unrestricted or restricted CTA configuration.
+# OOVERLAP_EXTERNAL_P2P_TP_CTA_MODE_V1
 
 usage() {
-  echo "Usage: $0 {2|4}" >&2
+  echo "Usage: $0 {2|4} {unres|res}" >&2
   exit 2
 }
 
-[[ $# -eq 1 ]] || usage
+[[ $# -eq 2 ]] || usage
 WORLD_SIZE="$1"
+CTA_MODE="$2"
 
-case "$WORLD_SIZE" in
-  2)
+# Edit only the CTA values in these four branches for the paper scenarios.
+# "default" leaves the OOverlap setting unset; -1 leaves NCCL_MAX_CTAS unset.
+case "$WORLD_SIZE:$CTA_MODE" in
+  2:unres)
     DEVICES="0,1"
-    OOVERLAP_MAX_CTAS="8"
+    OOVERLAP_MAX_CTAS="16"
     NCCL_MAX_CTAS="-1"
-    MAX_CTAS_PER_REDUCE_TASK="8"
+    MAX_CTAS_PER_REDUCE_TASK="16"
     ;;
-  4)
+  2:res)
+    DEVICES="0,1"
+    OOVERLAP_MAX_CTAS="4"
+    NCCL_MAX_CTAS="4"
+    MAX_CTAS_PER_REDUCE_TASK="4"
+    ;;
+  4:unres)
+    DEVICES="0,1,2,3"
+    OOVERLAP_MAX_CTAS="18"
+    NCCL_MAX_CTAS="-1"
+    MAX_CTAS_PER_REDUCE_TASK="6"
+    ;;
+  4:res)
     DEVICES="0,1,2,3"
     OOVERLAP_MAX_CTAS="9"
     NCCL_MAX_CTAS="9"
     MAX_CTAS_PER_REDUCE_TASK="3"
     ;;
   *)
-    echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
+    echo "error: expected world size 2 or 4 and CTA mode unres or res; got: $WORLD_SIZE $CTA_MODE" >&2
     usage
     ;;
 esac
@@ -61,7 +79,7 @@ PLOTTER="$REPO_ROOT/test/plot_external_p2p_collective.py"
 TUNING_POLICY="$REPO_ROOT/results/policies/tp4_policy.json"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-OUT_DIR="$REPO_ROOT/results/evalution/external_p2p/tp${WORLD_SIZE}"
+OUT_DIR="$REPO_ROOT/results/evalution/external_p2p/tp${WORLD_SIZE}/${CTA_MODE}"
 OUT_PREFIX="$OUT_DIR/external_p2p_bandwidth_latency"
 PLOT_PREFIX="$OUT_DIR/external_p2p_collective"
 
@@ -104,6 +122,7 @@ cd "$REPO_ROOT"
 
 echo "[evalution] external-P2P latency and bandwidth"
 echo "[evalution] world_size=$WORLD_SIZE devices=$DEVICES"
+echo "[evalution] cta_mode=$CTA_MODE"
 echo "[evalution] ooverlap_max_ctas=$OOVERLAP_MAX_CTAS"
 echo "[evalution] nccl_max_ctas=$NCCL_MAX_CTAS_LABEL"
 echo "[evalution] max_ctas_per_reduce_task=$MAX_CTAS_PER_REDUCE_TASK"
