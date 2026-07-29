@@ -13,6 +13,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from time import sleep
 
 
 COLLECTIVES = ("allreduce", "reduce_scatter", "all_gather")
@@ -405,6 +406,7 @@ def run_worker(request_path: Path, output_path: Path) -> None:
     cache: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
 
     for job in request["jobs"]:
+        sleep(5)
         sizes_bytes = [int(value) for value in job["sizes_bytes"]]
         numels = [bytes_to_numel(value) for value in sizes_bytes]
         use_ring = job["metric_set"] == "bandwidth"
@@ -545,6 +547,7 @@ def run_cta_worker(
                     "non-list result"
                 )
             rows.extend(job_rows)
+            sleep(5)
 
     return rows
 

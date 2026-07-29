@@ -27,9 +27,9 @@ case "$WORLD_SIZE" in
     ;;
   4)
     DEVICES="0,1,2,3"
-    OOVERLAP_MAX_CTAS="18"
-    NCCL_MAX_CTAS="-1"
-    MAX_CTAS_PER_REDUCE_TASK="6"
+    OOVERLAP_MAX_CTAS="9"
+    NCCL_MAX_CTAS="9"
+    MAX_CTAS_PER_REDUCE_TASK="3"
     ;;
   *)
     echo "error: world size must be exactly 2 or 4; got: $WORLD_SIZE" >&2
@@ -51,7 +51,7 @@ fi
 # while this range is known to complete on the same installation.
 LATENCY_BYTES="1K,2K,4K,8K,16K,32K,64K,128K,256K,512K"
 BANDWIDTH_BYTES="1M,2M,4M,8M,16M,32M,64M,128M,256M,512M"
-ITERS="100"
+ITERS="150"
 WARMUP="20"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
