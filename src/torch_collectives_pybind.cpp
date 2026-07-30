@@ -28,10 +28,7 @@
 namespace py = pybind11;
 
 static cudaStream_t current_stream_for(const torch::Tensor& t) {
-  TORCH_CHECK(t.is_cuda(), "tensor must be CUDA");
-  const int dev = t.get_device();
-  c10::cuda::CUDAGuard guard(t.device());
-  return at::cuda::getCurrentCUDAStream(dev).stream();
+  return at::cuda::getCurrentCUDAStream(t.get_device()).stream();
 }
 
 static oo_dtype_t to_oo_dtype(torch::ScalarType t) {
@@ -482,46 +479,18 @@ class OoTorchCommunicator {
   // OOVERLAP_QWEN_DIRECT_SLOT_API_V1
   torch::Tensor acquire_all_reduce_slot(
       const std::vector<int64_t>& shape) {
-    TORCH_CHECK(round_robin_set_ != nullptr && !round_robin_slots_.empty(),
-                "round-robin pool is not initialized");
-
-    const int64_t numel = checked_round_robin_numel(shape);
-    const size_t elem_size = round_robin_dtype_size(round_robin_dtype_);
-    const size_t capacity_elems = round_robin_capacity_bytes_ / elem_size;
-    TORCH_CHECK(
-        static_cast<size_t>(numel) <= capacity_elems,
-        "requested all-reduce slot view exceeds capacity: requested_numel=",
-        numel,
-        " capacity_numel=",
-        capacity_elems);
-
-    c10::cuda::CUDAGuard guard(
-        torch::Device(torch::kCUDA, devices_[local_rank_]));
+    int64_t numel = 1;
+    for (int64_t dim : shape) {
+      numel *= dim;
+    }
 
     RoundRobinSlot& slot = round_robin_slots_[round_robin_index_];
     return slot.tensor.narrow(0, 0, numel).view(shape);
   }
 
-  torch::Tensor all_reduce_preloaded_slot(torch::Tensor slot_view) {
-    validate(slot_view);
-    TORCH_CHECK(round_robin_set_ != nullptr && !round_robin_slots_.empty(),
-                "round-robin pool is not initialized");
-    TORCH_CHECK(slot_view.scalar_type() == round_robin_dtype_,
-                "preloaded slot dtype does not match round-robin pool dtype");
-    TORCH_CHECK(slot_view.nbytes() <= round_robin_capacity_bytes_,
-                "preloaded slot exceeds round-robin capacity: slot_bytes=",
-                slot_view.nbytes(),
-                " capacity_bytes=",
-                round_robin_capacity_bytes_);
-
-    c10::cuda::CUDAGuard guard(slot_view.device());
-
+  torch::Tensor all_reduce_preloaded_slot(
+      const torch::Tensor& slot_view) {
     const size_t slot_index = round_robin_index_;
-    RoundRobinSlot& slot = round_robin_slots_[slot_index];
-    TORCH_CHECK(
-        slot_view.data_ptr() == slot.tensor.data_ptr(),
-        "preloaded tensor is not a view of the current all-reduce slot: slot_index=",
-        slot_index);
 
     check_status(
         oo_allreduce_slot_tuned(
@@ -529,7 +498,7 @@ class OoTorchCommunicator {
             round_robin_set_,
             static_cast<int>(slot_index),
             static_cast<size_t>(slot_view.numel()),
-            to_oo_dtype(slot_view.scalar_type()),
+            to_oo_dtype(round_robin_dtype_),
             OO_REDUCE_SUM,
             OO_TUNING_BEST_PERFORMANCE,
             current_stream_for(slot_view)),
@@ -543,16 +512,8 @@ class OoTorchCommunicator {
     return slot_view;
   }
 
-  torch::Tensor all_reduce_round_robin(torch::Tensor input) {
-    validate(input);
-    TORCH_CHECK(input.scalar_type() == round_robin_dtype_,
-                "input dtype does not match round-robin pool dtype");
-    TORCH_CHECK(input.nbytes() <= round_robin_capacity_bytes_,
-                "input exceeds round-robin slot capacity: input_bytes=",
-                input.nbytes(),
-                " capacity_bytes=",
-                round_robin_capacity_bytes_);
-
+  torch::Tensor all_reduce_round_robin(
+      const torch::Tensor& input) {
     torch::Tensor view =
         acquire_all_reduce_slot(input.sizes().vec());
     view.copy_(input);
@@ -643,70 +604,13 @@ class OoTorchCommunicator {
   // OOVERLAP_DIRECT_ALL_GATHER_SLOT_API_V1
   torch::Tensor acquire_all_gather_slot(
       const std::vector<int64_t>& input_shape) {
-    TORCH_CHECK(!input_shape.empty(),
-                "all-gather slot shape must have at least one dimension");
-    TORCH_CHECK(
-        all_gather_round_robin_set_ != nullptr &&
-            !all_gather_round_robin_slots_.empty(),
-        "all-gather round-robin pool is not initialized");
-
-    int64_t input_numel_i64 = 1;
+    size_t input_numel = 1;
     for (int64_t dim : input_shape) {
-      TORCH_CHECK(dim > 0,
-                  "all-gather slot dimensions must be positive, got ", dim);
-      TORCH_CHECK(
-          input_numel_i64 <= std::numeric_limits<int64_t>::max() / dim,
-          "all-gather slot element count overflow");
-      input_numel_i64 *= dim;
+      input_numel *= static_cast<size_t>(dim);
     }
 
-    const size_t world_size = devices_.size();
-    const size_t input_numel = static_cast<size_t>(input_numel_i64);
-    const size_t elem_size =
-        round_robin_dtype_size(all_gather_round_robin_dtype_);
-
-    TORCH_CHECK(world_size > 0, "all-gather communicator has no devices");
-    TORCH_CHECK(
-        input_numel <= std::numeric_limits<size_t>::max() / world_size,
-        "all-gather element count overflow");
-
-    const size_t output_numel = input_numel * world_size;
-    TORCH_CHECK(
-        output_numel <=
-            static_cast<size_t>(std::numeric_limits<int64_t>::max()),
-        "all-gather output element count is too large");
-    TORCH_CHECK(
-        output_numel <= std::numeric_limits<size_t>::max() / elem_size,
-        "all-gather output byte count overflow");
-
-    const size_t output_bytes = output_numel * elem_size;
-    TORCH_CHECK(
-        output_bytes <= all_gather_round_robin_capacity_bytes_,
-        "all-gather output exceeds round-robin slot capacity: output_bytes=",
-        output_bytes,
-        " capacity_bytes=",
-        all_gather_round_robin_capacity_bytes_);
-    TORCH_CHECK(
-        input_shape[0] <=
-            std::numeric_limits<int64_t>::max() /
-                static_cast<int64_t>(world_size),
-        "all-gather output dimension overflow");
-
-    size_t local_offset = 0;
-    size_t local_count = 0;
-    check_status(
-        oo_rank_partition(
-            local_rank_,
-            static_cast<int>(world_size),
-            output_numel,
-            &local_offset,
-            &local_count),
-        "oo_rank_partition(acquire_all_gather_slot)");
-    TORCH_CHECK(local_count == input_numel,
-                "all-gather local partition does not match requested input size");
-
-    c10::cuda::CUDAGuard guard(
-        torch::Device(torch::kCUDA, devices_[local_rank_]));
+    const size_t local_offset =
+        static_cast<size_t>(local_rank_) * input_numel;
 
     RoundRobinSlot& slot =
         all_gather_round_robin_slots_[all_gather_round_robin_index_];
@@ -714,86 +618,17 @@ class OoTorchCommunicator {
         .narrow(
             0,
             static_cast<int64_t>(local_offset),
-            static_cast<int64_t>(local_count))
+            static_cast<int64_t>(input_numel))
         .view(input_shape);
   }
 
-  torch::Tensor all_gather_preloaded_slot(torch::Tensor local_view) {
-    validate(local_view);
-    TORCH_CHECK(local_view.dim() > 0,
-                "all_gather_preloaded_slot requires at least one dimension");
-    TORCH_CHECK(
-        all_gather_round_robin_set_ != nullptr &&
-            !all_gather_round_robin_slots_.empty(),
-        "all-gather round-robin pool is not initialized");
-    TORCH_CHECK(
-        local_view.scalar_type() == all_gather_round_robin_dtype_,
-        "preloaded all-gather slot dtype does not match the slot-pool dtype");
-
+  torch::Tensor all_gather_preloaded_slot(
+      const torch::Tensor& local_view) {
     const size_t world_size = devices_.size();
     const size_t input_numel = static_cast<size_t>(local_view.numel());
-    const size_t elem_size =
-        round_robin_dtype_size(all_gather_round_robin_dtype_);
-
-    TORCH_CHECK(world_size > 0, "all-gather communicator has no devices");
-    TORCH_CHECK(
-        input_numel <= std::numeric_limits<size_t>::max() / world_size,
-        "all-gather element count overflow");
-
     const size_t output_numel = input_numel * world_size;
-    TORCH_CHECK(
-        output_numel <=
-            static_cast<size_t>(std::numeric_limits<int64_t>::max()),
-        "all-gather output element count is too large");
-    TORCH_CHECK(
-        output_numel <= std::numeric_limits<size_t>::max() / elem_size,
-        "all-gather output byte count overflow");
-
-    const size_t output_bytes = output_numel * elem_size;
-    TORCH_CHECK(
-        output_bytes <= all_gather_round_robin_capacity_bytes_,
-        "all-gather output exceeds round-robin slot capacity: output_bytes=",
-        output_bytes,
-        " capacity_bytes=",
-        all_gather_round_robin_capacity_bytes_);
-    TORCH_CHECK(
-        local_view.size(0) <=
-            std::numeric_limits<int64_t>::max() /
-                static_cast<int64_t>(world_size),
-        "all-gather output dimension overflow");
-
-    size_t local_offset = 0;
-    size_t local_count = 0;
-    check_status(
-        oo_rank_partition(
-            local_rank_,
-            static_cast<int>(world_size),
-            output_numel,
-            &local_offset,
-            &local_count),
-        "oo_rank_partition(all_gather_preloaded_slot)");
-    TORCH_CHECK(local_count == input_numel,
-                "all-gather local partition does not match preloaded input size");
-
-    c10::cuda::CUDAGuard guard(local_view.device());
-
     const size_t slot_index = all_gather_round_robin_index_;
     RoundRobinSlot& slot = all_gather_round_robin_slots_[slot_index];
-
-    const std::uintptr_t expected_address =
-        reinterpret_cast<std::uintptr_t>(slot.tensor.data_ptr()) +
-        local_offset * elem_size;
-    const std::uintptr_t actual_address =
-        reinterpret_cast<std::uintptr_t>(local_view.data_ptr());
-    TORCH_CHECK(
-        actual_address == expected_address,
-        "preloaded tensor is not the local partition of the current all-gather "
-        "slot: slot_index=",
-        slot_index,
-        " expected_address=",
-        expected_address,
-        " actual_address=",
-        actual_address);
 
     std::vector<int64_t> output_sizes = local_view.sizes().vec();
     output_sizes[0] *= static_cast<int64_t>(world_size);
@@ -812,7 +647,7 @@ class OoTorchCommunicator {
             all_gather_round_robin_set_,
             static_cast<int>(slot_index),
             output_numel,
-            to_oo_dtype(local_view.scalar_type()),
+            to_oo_dtype(all_gather_round_robin_dtype_),
             OO_TUNING_BEST_PERFORMANCE,
             current_stream_for(output)),
         "oo_all_gather_slot_tuned(preloaded)");
@@ -826,13 +661,8 @@ class OoTorchCommunicator {
     return output;
   }
 
-  torch::Tensor all_gather_round_robin(torch::Tensor input) {
-    validate(input);
-    TORCH_CHECK(input.dim() > 0,
-                "all_gather_round_robin requires at least one dimension");
-    TORCH_CHECK(input.scalar_type() == all_gather_round_robin_dtype_,
-                "input dtype does not match all-gather round-robin pool dtype");
-
+  torch::Tensor all_gather_round_robin(
+      const torch::Tensor& input) {
     torch::Tensor local_view =
         acquire_all_gather_slot(input.sizes().vec());
     local_view.copy_(input);

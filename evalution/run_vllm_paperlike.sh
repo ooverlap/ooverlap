@@ -102,7 +102,7 @@ NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
 
 # Keep a fixed, conservative order. Ooverlap runs last by default.
-BACKENDS="${VLLM_EVAL_BACKENDS:-ooverlap,auto,pynccl}"
+BACKENDS="${VLLM_EVAL_BACKENDS:-auto,pynccl,ooverlap}"
 BASELINE_BACKEND="${VLLM_EVAL_BASELINE_BACKEND:-pynccl}"
 REPETITIONS="${VLLM_EVAL_REPETITIONS:-1}"
 DATASET_NAME="random"
@@ -112,7 +112,7 @@ FLASHINFER_SAMPLER="0"
 OOVERLAP_DEBUG="0"
 MAX_BATCHED_TOKENS="4096"
 BATCH_PROMPT_MULTIPLIER="${VLLM_BATCH_PROMPT_MULTIPLIER:-2}"
-COOLDOWN_SECONDS="${VLLM_EVAL_COOLDOWN_SECONDS:-10}"
+COOLDOWN_SECONDS="${VLLM_EVAL_COOLDOWN_SECONDS:-17}"
 
 for pair in \
   "VLLM_OOVERLAP_RR_SLOTS:$RR_SLOTS" \
@@ -257,10 +257,6 @@ common_driver_args+=(--env "TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE")
 common_driver_args+=(--env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN")
 common_driver_args+=(--env "NCCL_NET=$NCCL_NET")
 #common_driver_args+=(--env "VLLM_USE_NCCL_SYMM_MEM=$VLLM_USE_NCCL_SYMM_MEM")
-#common_driver_args+=(--env "NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE")
-#common_driver_args+=(--env "NCCL_WIN_ENABLE=$NCCL_WIN_ENABLE")
-#common_driver_args+=(--env "NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE")
-#common_driver_args+=(--env "NCCL_MNNVL_ENABLE=$NCCL_MNNVL_ENABLE")
 common_driver_args+=(--fail-fast)
 
 run_batch() {
