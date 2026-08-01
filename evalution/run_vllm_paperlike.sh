@@ -102,7 +102,7 @@ NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
 
 # Keep a fixed, conservative order. Ooverlap runs last by default.
-BACKENDS="${VLLM_EVAL_BACKENDS:-auto,pynccl,ooverlap}"
+BACKENDS="${VLLM_EVAL_BACKENDS:-ooverlap,auto,pynccl}"
 BASELINE_BACKEND="${VLLM_EVAL_BASELINE_BACKEND:-pynccl}"
 REPETITIONS="${VLLM_EVAL_REPETITIONS:-1}"
 DATASET_NAME="random"
@@ -314,11 +314,11 @@ run_workload() {
 case "$MODE" in
   run)
     preflight
-    run_workload "qwen_1024_128" "realistic-conversation:1024:128"
+    #run_workload "qwen_1024_128" "realistic-conversation:1024:128"
     run_workload "qwen_512_1024" "long-decode:512:1024"
     ;;
   plot)
-    run_workload "qwen_1024_128" "realistic-conversation:1024:128"
+    #run_workload "qwen_1024_128" "realistic-conversation:1024:128"
     run_workload "qwen_512_1024" "long-decode:512:1024"
     ;;
 esac
