@@ -10,9 +10,12 @@
 
 namespace ooverlap {
 
-constexpr size_t kFastReduceScatterMaxBytes =
-    static_cast<size_t>(TMA_TWO_GPU_PEER_SMALL_TASK_BYTES) *
-    static_cast<size_t>(6);
+/*
+ * Match the fast all-reduce work budget, but count only work this rank
+ * actually sends. Reduce-scatter skips its locally owned shard, so the
+ * full input can be larger than ChunkBytes * MaxCtas.
+ */
+constexpr int kFastReduceScatterMaxCtas = 6;
 
 static_assert(
     TMA_TWO_GPU_PEER_SMALL_TASK_BYTES > 0,
@@ -23,6 +26,12 @@ static_assert(
 static_assert(
     TMA_TWO_GPU_PEER_MAX_CTAS > 0,
     "fast reduce-scatter must allow at least one CTA");
+static_assert(
+    kFastReduceScatterMaxCtas > 0,
+    "fast reduce-scatter CTA budget must be positive");
+static_assert(
+    kFastReduceScatterMaxCtas <= TMA_TWO_GPU_PEER_MAX_CTAS,
+    "fast reduce-scatter CTA budget exceeds the global limit");
 
 inline bool fast_reduce_scatter_eligible(
     const oo_group_t* group,
@@ -39,7 +48,6 @@ inline bool fast_reduce_scatter_eligible(
         launch.peer_count > TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS ||
         launch.dtype_size == 0 ||
         launch.bytes == 0 ||
-        launch.bytes > kFastReduceScatterMaxBytes ||
         count == 0 ||
         count > static_cast<size_t>(-1) / launch.dtype_size ||
         count * launch.dtype_size != launch.bytes ||
@@ -124,8 +132,8 @@ inline bool fast_reduce_scatter_eligible(
             static_cast<size_t>(TMA_TWO_GPU_PEER_SMALL_TASK_BYTES);
 
         if (ctas == 0 ||
-            ctas > static_cast<size_t>(TMA_TWO_GPU_PEER_MAX_CTAS) ||
-            total_ctas > TMA_TWO_GPU_PEER_MAX_CTAS -
+            ctas > static_cast<size_t>(kFastReduceScatterMaxCtas) ||
+            total_ctas > kFastReduceScatterMaxCtas -
                 static_cast<int>(ctas)) {
             return false;
         }
@@ -134,7 +142,7 @@ inline bool fast_reduce_scatter_eligible(
     }
 
     return total_ctas > 0 &&
-           total_ctas <= TMA_TWO_GPU_PEER_MAX_CTAS;
+           total_ctas <= kFastReduceScatterMaxCtas;
 }
 
 cudaError_t enqueue_fast_multi_gpu_reduce_scatter_rank_sm90(

@@ -404,7 +404,6 @@ cudaError_t launch_fast_multi_gpu_reduce_scatter_typed(
         launch.peer_count > kFastReduceScatterMaxPeers ||
         launch.dtype_size == 0 ||
         launch.bytes == 0 ||
-        launch.bytes > kFastReduceScatterMaxBytes ||
         count == 0 ||
         count > static_cast<size_t>(-1) / launch.dtype_size ||
         count * launch.dtype_size != launch.bytes ||
@@ -498,8 +497,8 @@ cudaError_t launch_fast_multi_gpu_reduce_scatter_typed(
                 static_cast<size_t>(TMA_TWO_GPU_PEER_SMALL_TASK_BYTES));
 
         if (peer_ctas <= 0 ||
-            peer_ctas > TMA_TWO_GPU_PEER_MAX_CTAS ||
-            num_ctas > TMA_TWO_GPU_PEER_MAX_CTAS - peer_ctas) {
+            peer_ctas > kFastReduceScatterMaxCtas ||
+            num_ctas > kFastReduceScatterMaxCtas - peer_ctas) {
             return cudaErrorInvalidConfiguration;
         }
 
@@ -513,7 +512,7 @@ cudaError_t launch_fast_multi_gpu_reduce_scatter_typed(
         num_ctas += peer_ctas;
     }
 
-    if (num_ctas <= 0 || num_ctas > TMA_TWO_GPU_PEER_MAX_CTAS) {
+    if (num_ctas <= 0 || num_ctas > kFastReduceScatterMaxCtas) {
         return cudaErrorInvalidConfiguration;
     }
 
