@@ -257,6 +257,69 @@ __global__ void fast_multi_gpu_allreduce_kernel_sm90(
 }
 
 template <typename ReduceOp>
+cudaError_t configure_fast_allreduce_kernel_once(int device) {
+    if (device < 0 || device >= 32) {
+        return cudaErrorInvalidDevice;
+    }
+
+    static std::mutex mutex;
+    static std::atomic<unsigned int> configured_mask{0u};
+
+    const unsigned int bit =
+        1u << static_cast<unsigned int>(device);
+
+    if ((configured_mask.load(std::memory_order_acquire) & bit) != 0u) {
+        return cudaSuccess;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if ((configured_mask.load(std::memory_order_relaxed) & bit) != 0u) {
+        return cudaSuccess;
+    }
+
+    cudaDeviceProp prop{};
+    cudaError_t error = cudaGetDeviceProperties(&prop, device);
+    if (error != cudaSuccess) {
+        return error;
+    }
+
+    constexpr size_t dynamic_smem_bytes =
+        static_cast<size_t>(TMA_TWO_GPU_PEER_SMALL_TASK_BYTES);
+    constexpr size_t total_smem_bytes =
+        dynamic_smem_bytes + sizeof(sync::semaphore);
+
+    if (total_smem_bytes >
+        static_cast<size_t>(prop.sharedMemPerBlockOptin)) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    if (total_smem_bytes >
+        static_cast<size_t>(prop.sharedMemPerBlock)) {
+        error = cudaFuncSetAttribute(
+            fast_multi_gpu_allreduce_kernel_sm90<ReduceOp>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(dynamic_smem_bytes));
+
+        if (error != cudaSuccess) {
+            return error;
+        }
+    }
+
+    error = cudaFuncSetAttribute(
+        fast_multi_gpu_allreduce_kernel_sm90<ReduceOp>,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        100);
+
+    if (error != cudaSuccess) {
+        return error;
+    }
+
+    configured_mask.fetch_or(bit, std::memory_order_release);
+    return cudaSuccess;
+}
+
+template <typename ReduceOp>
 cudaError_t launch_fast_multi_gpu_allreduce_typed(
     const comm::api::FastAllreduceLaunchState& launch,
     cudaStream_t stream,
@@ -311,6 +374,13 @@ cudaError_t launch_fast_multi_gpu_allreduce_typed(
     }
 
     cudaError_t error = cudaSetDevice(launch.local_device);
+    if (error != cudaSuccess) {
+        return error;
+    }
+
+    error =
+        configure_fast_allreduce_kernel_once<ReduceOp>(
+            launch.local_device);
     if (error != cudaSuccess) {
         return error;
     }
