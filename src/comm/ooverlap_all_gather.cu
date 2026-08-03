@@ -1,5 +1,6 @@
 #include "comm/ooverlap_comm_private.h"
 
+#include "comm/fast_multi_gpu_all_gather_sm90.h"
 #include "comm/plan/transfer_plan_distribution.h"
 #include "comm/tuning/tuning_policy.h"
 #include "comm/tma_multi_gpu_all_gather_sm90.h"
@@ -15,7 +16,8 @@ oo_status_t all_gather_impl(
     oo_tuning_mode_t tuning_mode,
     cudaStream_t stream,
     oo_buffer_t* const* prebound_rank_buffers = nullptr,
-    int prebound_rank_buffer_count = 0) {
+    int prebound_rank_buffer_count = 0,
+    int plan_scratch_index = 0) {
     if (!oo_all_gather_supported(dtype)) {
         return OO_ERROR_UNSUPPORTED;
     }
@@ -55,6 +57,23 @@ oo_status_t all_gather_impl(
 
     if (status != OO_SUCCESS) {
         return status;
+    }
+
+    launch.plan_scratch_index = plan_scratch_index;
+
+    if (ooverlap::fast_all_gather_eligible(
+            node->group,
+            launch,
+            count)) {
+        const cudaError_t error =
+            ooverlap::enqueue_fast_multi_gpu_all_gather_rank_sm90(
+                launch,
+                count,
+                dtype,
+                stream,
+                plan_scratch_index);
+
+        return ooverlap::comm::api::cuda_to_status(error);
     }
 
     ooverlap::comm::LaunchConfig config =
@@ -128,7 +147,8 @@ oo_status_t all_gather_prebound_tuned(
         tuning_mode,
         stream,
         rank_buffers,
-        rank_buffer_count);
+        rank_buffer_count,
+        0);
 }
 
 } // namespace api
@@ -242,5 +262,6 @@ extern "C" oo_status_t oo_all_gather_slot_tuned(
         tuning_mode,
         stream,
         rank_buffers,
-        set->world_size);
+        set->world_size,
+        slot_index);
 }
