@@ -1,5 +1,6 @@
 #include "comm/ooverlap_comm_private.h"
 
+#include "comm/fast_multi_gpu_reduce_scatter_sm90.h"
 #include "comm/plan/transfer_plan_distribution.h"
 #include "comm/tuning/tuning_policy.h"
 #include "comm/tma_multi_gpu_reduce_scatter_sm90.h"
@@ -23,9 +24,7 @@ oo_status_t reduce_scatter_impl(
         return OO_ERROR_UNSUPPORTED;
     }
 
-    if (node == nullptr ||
-        node->group == nullptr ||
-        node->group->transfer_plan_distribution == nullptr) {
+    if (node == nullptr || node->group == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
@@ -74,6 +73,26 @@ oo_status_t reduce_scatter_impl(
 
     if (status != OO_SUCCESS) {
         return status;
+    }
+
+    if (ooverlap::fast_reduce_scatter_eligible(
+            node->group,
+            launch,
+            count)) {
+        const cudaError_t error =
+            ooverlap::enqueue_fast_multi_gpu_reduce_scatter_rank_sm90(
+                launch,
+                count,
+                dtype,
+                op,
+                stream,
+                plan_scratch_index);
+
+        return ooverlap::comm::api::cuda_to_status(error);
+    }
+
+    if (node->group->transfer_plan_distribution == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
     }
 
     ooverlap::comm::LaunchConfig config =
