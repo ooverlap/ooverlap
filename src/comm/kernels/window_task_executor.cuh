@@ -3,6 +3,7 @@
 #include "comm/params.h"
 #include "comm/task/window_task.cuh"
 #include "comm/pipeline/window_pipeline.cuh"
+#include "comm/plan/transfer_plan.h"
 #include "comm/plan/window_plan.cuh"
 #include "comm/tma_variant_config.h"
 #include "comm/kernels/multi_gpu_ready_signal.cuh"
@@ -70,6 +71,7 @@ template <
     int FillDepth,
     size_t ChunkBytes,
     typename ReduceApply,
+    int MaxPeers,
     typename FastCopyVecT = uint4,
     int FastCopyUnroll = TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
     int LoadFillDepth = FillDepth,
@@ -78,6 +80,9 @@ __device__ __forceinline__ void execute_window_task(
     const task::WindowTask& task,
     unsigned char* shared_raw,
     sync::semaphore* barriers,
+    int* local_ready_signal,
+    MultiGpuReadySignalPlan<MaxPeers> ready_plan,
+    int collective_epoch,
     unsigned int* cta_barrier_counter) {
     static_assert(StageDepth > 0, "StageDepth must be > 0");
     static_assert(FillDepth > 0, "FillDepth must be > 0");
@@ -198,6 +203,29 @@ __device__ __forceinline__ void execute_window_task(
             }
             return;
 
+        case task::WindowTaskOp::FinalPeerRendezvous:
+            if (threadIdx.x == 0 && blockIdx.x == 0) {
+                const int ready_value =
+                    collective_epoch *
+                        comm::plan::kReadySignalPhaseStride +
+                    static_cast<int>(task.payload.ready_phase);
+
+                publish_ready_signal(
+                    local_ready_signal,
+                    ready_value,
+                    ready_plan.protocol);
+
+                for (int peer_idx = 0;
+                     peer_idx < ready_plan.peer_count;
+                     ++peer_idx) {
+                    wait_until_ready_signal_at_least(
+                        ready_plan.peer_ready_signals[peer_idx],
+                        ready_value,
+                        ready_plan.poll_sleep_cycles);
+                }
+            }
+            return;
+
         case task::WindowTaskOp::Barrier:
             arrive_and_wait_cta_barrier(
                 cta_barrier_counter,
@@ -232,6 +260,7 @@ template <
     int FillDepth,
     size_t ChunkBytes,
     typename ReduceApply,
+    int MaxPeers,
     typename FastCopyVecT = uint4,
     int FastCopyUnroll = TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
     int LoadFillDepth = FillDepth,
@@ -243,6 +272,9 @@ __device__ __forceinline__ void execute_window_task_stripe(
     int cta_idx,
     unsigned char* shared_raw,
     sync::semaphore* barriers,
+    int* local_ready_signal,
+    MultiGpuReadySignalPlan<MaxPeers> ready_plan,
+    int collective_epoch,
     unsigned int* cta_barrier_counter) {
     static_assert(StageDepth > 0, "StageDepth must be > 0");
     static_assert(FillDepth > 0, "FillDepth must be > 0");
@@ -284,6 +316,7 @@ __device__ __forceinline__ void execute_window_task_stripe(
             FillDepth,
             ChunkBytes,
             ReduceApply,
+            MaxPeers,
             FastCopyVecT,
             FastCopyUnroll,
             LoadFillDepth,
@@ -291,6 +324,9 @@ __device__ __forceinline__ void execute_window_task_stripe(
                 task,
                 shared_raw,
                 barriers,
+                local_ready_signal,
+                ready_plan,
+                collective_epoch,
                 cta_barrier_counter);
 
         if (task.terminal) {

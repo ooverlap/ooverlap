@@ -269,6 +269,35 @@ __global__ void fast_multi_gpu_allreduce_kernel_sm90(
 
     tma::reduce_commit_group();
     tma::reduce_async_wait<0>();
+
+    const unsigned int fanout_done_target =
+        peers_loaded_target + cta_count;
+
+    arrive_and_wait_fast_allreduce_counter(
+        grid_counter,
+        fanout_done_target);
+
+    if (blockIdx.x == 0) {
+        const int ready_value =
+            fast_allreduce_ready_value(
+                params.collective_epoch,
+                kFanoutDoneReadyPhase);
+
+        comm::kernels::publish_ready_signal(
+            params.local_ready_signal,
+            ready_value,
+            comm::kernels::MultiGpuReadySignalProtocol::
+                DeviceMemoryStoreRelease);
+
+        for (int peer_idx = 0;
+             peer_idx < params.peer_count;
+             ++peer_idx) {
+            comm::kernels::wait_until_ready_signal_at_least(
+                params.peer_ready_signals[peer_idx],
+                ready_value,
+                64);
+        }
+    }
 }
 
 template <typename ReduceOp>
@@ -342,7 +371,7 @@ cudaError_t launch_fast_multi_gpu_allreduce_typed(
         *scratch.last_value;
     const unsigned int counter_final =
         counter_base +
-        static_cast<unsigned int>(num_ctas + 1);
+        static_cast<unsigned int>(2 * num_ctas + 1);
 
     fast_multi_gpu_allreduce_kernel_sm90<ReduceOp><<<
         num_ctas,

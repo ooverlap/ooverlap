@@ -43,6 +43,7 @@ enum class WindowTaskOp : std::uint8_t {
     CopyTMAFanout = 11,
     ReduceTMAFanout = 12,
     Barrier = 13,
+    FinalPeerRendezvous = 14,
 };
 
 struct WindowTaskWindowPayload {
@@ -80,6 +81,7 @@ union WindowTaskPayload {
     WindowTaskFanoutPayload fanout;
     WindowTaskReadyPayload ready;
     std::uint32_t barrier_target;
+    std::uint32_t ready_phase;
 
     __host__ __device__ constexpr WindowTaskPayload()
         : window{} {}
@@ -125,6 +127,17 @@ __host__ __device__ __forceinline__ WindowTask make_barrier_task(
     WindowTask task{};
     task.op = WindowTaskOp::Barrier;
     task.payload.barrier_target = barrier_target;
+    return task;
+}
+
+__host__ __device__ __forceinline__ WindowTask
+make_final_peer_rendezvous_task(
+    std::uint32_t ready_phase,
+    bool terminal = false) {
+    WindowTask task{};
+    task.op = WindowTaskOp::FinalPeerRendezvous;
+    task.terminal = terminal;
+    task.payload.ready_phase = ready_phase;
     return task;
 }
 
@@ -399,6 +412,9 @@ __host__ __device__ __forceinline__ bool window_task_has_work(
                    task.payload.window.window_chunks > 0 &&
                    task.payload.window.begin_window <
                        task.payload.window.end_window;
+
+        case WindowTaskOp::FinalPeerRendezvous:
+            return task.payload.ready_phase > 0;
 
         case WindowTaskOp::Barrier:
             return task.payload.barrier_target > 0;

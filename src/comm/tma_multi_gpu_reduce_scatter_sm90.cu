@@ -245,12 +245,36 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
     static thread_local
         comm::plan::WindowTaskExecutorPlan<MaxLoweringTasks> window_plan;
 
+    comm::kernels::CtaBarrierScratch cta_barrier_scratch{};
+
+    const cudaError_t cta_barrier_scratch_error =
+        comm::kernels::get_cached_cta_barrier_scratch(
+            launch.local_device,
+            launch.plan_scratch_index,
+            &cta_barrier_scratch);
+
+    if (cta_barrier_scratch_error != cudaSuccess ||
+        cta_barrier_scratch.counter == nullptr ||
+        cta_barrier_scratch.last_value == nullptr) {
+        return cta_barrier_scratch_error != cudaSuccess
+            ? cta_barrier_scratch_error
+            : cudaErrorInvalidValue;
+    }
+
     int num_blocks = 0;
+
+    const unsigned int cta_barrier_start =
+        *cta_barrier_scratch.last_value + 1u;
 
     comm::plan::lowering_detail::LoweringPassOptions lowering_options{};
     lowering_options.enable_reduce_cta_groups = true;
     lowering_options.max_ctas_per_reduce_task =
         launch_config.max_ctas_per_reduce_task;
+    lowering_options.cta_barrier_start = cta_barrier_start;
+    lowering_options.enable_final_peer_rendezvous =
+        use_ready_binding && ready_plan.peer_count > 0;
+    lowering_options.final_ready_phase =
+        comm::plan::kReadySignalPhaseStride - 1;
 
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<
@@ -275,9 +299,24 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
         return cudaSuccess;
     }
 
+    unsigned int cta_barrier_final_value = cta_barrier_start;
+    const int first_stripe_tasks =
+        window_plan.tasks_per_cta < window_plan.total_tasks
+            ? window_plan.tasks_per_cta
+            : window_plan.total_tasks;
+
+    for (int i = 0; i < first_stripe_tasks; ++i) {
+        if (window_plan.tasks[i].op ==
+            comm::task::WindowTaskOp::Barrier) {
+            cta_barrier_final_value =
+                window_plan.tasks[i].payload.barrier_target;
+        }
+    }
+
     system::runtime::set_device(launch.local_device);
 
-    return comm::kernels::dispatch_multi_gpu_window_task_executor_by_value_sm90<
+    const cudaError_t launch_error =
+        comm::kernels::dispatch_multi_gpu_window_task_executor_by_value_sm90<
         ReduceApply,
         ChunkBytes,
         StageDepth,
@@ -294,7 +333,18 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
             launch.local_ready_signal,
             ready_plan,
             launch.collective_epoch,
-            "tma_multi_gpu_reduce_scatter(by-value): requested shared memory exceeds opt-in limit");
+            "tma_multi_gpu_reduce_scatter(by-value): requested shared memory exceeds opt-in limit",
+            cta_barrier_scratch.counter,
+            cta_barrier_start);
+
+    if (launch_error != cudaSuccess) {
+        return launch_error;
+    }
+
+    *cta_barrier_scratch.last_value =
+        cta_barrier_final_value;
+
+    return cudaSuccess;
 }
 
 template <

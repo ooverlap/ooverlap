@@ -620,6 +620,13 @@ struct LoweringPassOptions {
     unsigned int cta_barrier_start = 1u;
 
     /*
+     * Append a full-CTA completion barrier followed by a CTA-0-only
+     * peer publish/wait task. The all-reduce launcher enables this.
+     */
+    bool enable_final_peer_rendezvous = false;
+    int final_ready_phase = kReadySignalPhaseStride - 1;
+
+    /*
      * The current executor has historically had a temporary local-task limit in
      * execute_window_task_stripe(). Keep this disabled by default so the skeleton
      * preserves old lowering behavior. Enable while debugging if needed.
@@ -660,7 +667,9 @@ inline bool make_lowering_context(
         reserved_prefix_tasks_per_cta < 0 ||
         (options.enable_reduce_cta_groups &&
          (options.max_ctas_per_reduce_task <= 0 ||
-          options.max_ctas_per_reduce_task > task::kWindowTaskMaxCtas))) {
+          options.max_ctas_per_reduce_task > task::kWindowTaskMaxCtas)) ||
+        (options.enable_final_peer_rendezvous &&
+         !valid_ready_signal_phase(options.final_ready_phase))) {
         return false;
     }
 
@@ -1175,7 +1184,8 @@ inline bool compute_lowering_shape(
 
     if (tasks.ready_count == 0 &&
         tasks.barrier_count == 0 &&
-        tasks.window_count == 0) {
+        tasks.window_count == 0 &&
+        !ctx.options.enable_final_peer_rendezvous) {
         *out = shape;
         return true;
     }
@@ -1185,11 +1195,15 @@ inline bool compute_lowering_shape(
             ? tasks.ready_pair_count
             : 0;
 
+    const int final_rendezvous_tasks =
+        ctx.options.enable_final_peer_rendezvous ? 2 : 0;
+
     shape.tasks_per_cta =
         tasks.ready_count +
         tasks.barrier_count +
         tasks.window_count -
-        merged_ready_task_savings;
+        merged_ready_task_savings +
+        final_rendezvous_tasks;
 
     if (shape.tasks_per_cta <= 0 || shape.tasks_per_cta > MaxWindowTasks) {
         return false;
@@ -1361,6 +1375,10 @@ inline bool emit_window_plan_from_rank_tasks(
                         }
                     }
                 
+                    if (ctx.options.enable_final_peer_rendezvous) {
+                        ready_task.terminal = false;
+                    }
+
                     out_window_plan->tasks[task_idx++] = ready_task;
                     ++ready_pair_index;
                     ++i;
@@ -1377,6 +1395,10 @@ inline bool emit_window_plan_from_rank_tasks(
                     out_window_plan->tasks_per_cta = 0;
                     *out_num_blocks = 0;
                     return false;
+                }
+
+                if (ctx.options.enable_final_peer_rendezvous) {
+                    ready_task.terminal = false;
                 }
 
                 out_window_plan->tasks[task_idx++] = ready_task;
@@ -1490,6 +1512,9 @@ inline bool emit_window_plan_from_rank_tasks(
                 }
 
                 window_task.cta_mask = cta_mask;
+                if (ctx.options.enable_final_peer_rendezvous) {
+                    window_task.terminal = false;
+                }
                 out_window_plan->tasks[task_idx++] = window_task;
                 continue;
             }
@@ -1515,7 +1540,36 @@ inline bool emit_window_plan_from_rank_tasks(
             }
 
             window_task.cta_mask = cta_mask;
+            if (ctx.options.enable_final_peer_rendezvous) {
+                window_task.terminal = false;
+            }
             out_window_plan->tasks[task_idx++] = window_task;
+        }
+
+        if (ctx.options.enable_final_peer_rendezvous) {
+            const unsigned int final_barrier_target =
+                ctx.options.cta_barrier_start +
+                static_cast<unsigned int>(
+                    (active_barrier_index + 1) * shape.cta_count);
+
+            out_window_plan->tasks[task_idx++] =
+                task::make_barrier_task(final_barrier_target);
+
+            task::WindowTask final_ready_task =
+                task::make_final_peer_rendezvous_task(
+                    static_cast<std::uint32_t>(
+                        ctx.options.final_ready_phase),
+                    true);
+
+            final_ready_task.cta_mask = task::WindowTaskCtaMask{1};
+            out_window_plan->tasks[task_idx++] = final_ready_task;
+        }
+
+        if (task_idx != (cta_idx + 1) * shape.tasks_per_cta) {
+            out_window_plan->total_tasks = 0;
+            out_window_plan->tasks_per_cta = 0;
+            *out_num_blocks = 0;
+            return false;
         }
     }
 

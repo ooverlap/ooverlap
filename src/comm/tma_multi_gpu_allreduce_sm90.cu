@@ -122,6 +122,8 @@ const char* debug_window_task_op_name(
             return "ReadyPublishWait";
         case comm::task::WindowTaskOp::Barrier:
             return "Barrier";
+        case comm::task::WindowTaskOp::FinalPeerRendezvous:
+            return "FinalPeerRendezvous";
         default:
             return "Unknown";
     }
@@ -223,6 +225,14 @@ void debug_print_window_task_plan(
                         " barrier_target=%u",
                         static_cast<unsigned int>(
                             task.payload.barrier_target));
+                    break;
+
+                case comm::task::WindowTaskOp::FinalPeerRendezvous:
+                    std::fprintf(
+                        stderr,
+                        " ready_phase=%u",
+                        static_cast<unsigned int>(
+                            task.payload.ready_phase));
                     break;
 
                 case comm::task::WindowTaskOp::None:
@@ -455,6 +465,10 @@ cudaError_t launch_allreduce_rank_variant_sm90(
     lowering_options.max_ctas_per_reduce_task =
         launch_config.max_ctas_per_reduce_task;
     lowering_options.cta_barrier_start = cta_barrier_start;
+    lowering_options.enable_final_peer_rendezvous =
+        use_ready_binding && ready_plan.peer_count > 0;
+    lowering_options.final_ready_phase =
+        comm::plan::kReadySignalPhaseStride - 1;
 
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<

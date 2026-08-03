@@ -102,6 +102,7 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         FillDepth,
         Variant::chunk_bytes,
         ReduceApply,
+        MaxPeers,
         uint4,
         TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
         LoadFillDepth,
@@ -112,6 +113,9 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
             static_cast<int>(blockIdx.x),
             shared_raw,
             barriers,
+            local_ready_signal,
+            ready_plan,
+            collective_epoch,
             cta_barrier_counter);
 }
 
