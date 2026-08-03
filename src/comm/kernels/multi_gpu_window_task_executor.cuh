@@ -103,11 +103,7 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
             cta_barrier_counter);
 
     if (cta_barrier_counter != nullptr) {
-
-        arrive_and_wait_cta_barrier(
-            cta_barrier_counter,
-            cta_barrier_final_target);
-
+        
         const int final_ready_value =
             collective_epoch * comm::plan::kReadySignalPhaseStride +
             (comm::plan::kReadySignalPhaseStride - 1);
