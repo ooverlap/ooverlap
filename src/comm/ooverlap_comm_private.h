@@ -200,6 +200,41 @@ oo_status_t prepare_collective_launch_prebound(
     oo_dtype_t dtype,
     CollectiveLaunchState* out);
 
+/*
+ * Internal benchmark launchers. Each call receives one immutable, complete
+ * rank-indexed buffer row, avoiding mutation of group->collective_buffers while
+ * ranks for the same logical collective are being enqueued.
+ */
+oo_status_t allreduce_prebound_tuned(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream);
+
+oo_status_t reduce_scatter_prebound_tuned(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    oo_tensor_slice_t* out_slice,
+    cudaStream_t stream);
+
+oo_status_t all_gather_prebound_tuned(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream);
+
 } // namespace api
 } // namespace comm
 } // namespace ooverlap

@@ -159,6 +159,51 @@ oo_status_t allreduce_impl(
 
 } // namespace
 
+namespace ooverlap {
+namespace comm {
+namespace api {
+
+oo_status_t allreduce_prebound_tuned(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    if (node == nullptr ||
+        node->group == nullptr ||
+        rank_buffers == nullptr ||
+        rank_buffer_count != node->group->num_devices ||
+        node->rank < 0 ||
+        node->rank >= rank_buffer_count) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_buffer_t* local = rank_buffers[node->rank];
+    if (local == nullptr || local->ptr == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    return allreduce_impl(
+        node,
+        local,
+        0,
+        count,
+        dtype,
+        op,
+        tuning_mode,
+        stream,
+        rank_buffers,
+        rank_buffer_count,
+        0);
+}
+
+} // namespace api
+} // namespace comm
+} // namespace ooverlap
+
 extern "C" oo_status_t oo_allreduce_offset(
     oo_node_t* node,
     oo_buffer_t* local,

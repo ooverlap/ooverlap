@@ -93,6 +93,48 @@ oo_status_t all_gather_impl(
 
 } // namespace
 
+namespace ooverlap {
+namespace comm {
+namespace api {
+
+oo_status_t all_gather_prebound_tuned(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream) {
+    if (node == nullptr ||
+        node->group == nullptr ||
+        rank_buffers == nullptr ||
+        rank_buffer_count != node->group->num_devices ||
+        node->rank < 0 ||
+        node->rank >= rank_buffer_count) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_buffer_t* local = rank_buffers[node->rank];
+    if (local == nullptr || local->ptr == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    return all_gather_impl(
+        node,
+        local,
+        0,
+        count,
+        dtype,
+        tuning_mode,
+        stream,
+        rank_buffers,
+        rank_buffer_count);
+}
+
+} // namespace api
+} // namespace comm
+} // namespace ooverlap
+
 extern "C" oo_status_t oo_all_gather_offset(
     oo_node_t* node,
     oo_buffer_t* local,

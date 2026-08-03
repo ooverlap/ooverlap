@@ -1,5 +1,6 @@
 #include "test/external_p2p_collective_sweep_sm90.h"
 
+#include "comm/ooverlap_comm_private.h"
 #include "ooverlap/comm.h"
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/checks.cuh"
@@ -363,6 +364,93 @@ void launch_ooverlap_once(
             collective,
             ctx.nodes[rank],
             buffers.ooverlap_buffers[rank],
+            numel,
+            ctx.streams[rank],
+            label.c_str());
+    }
+}
+
+void launch_ooverlap_prebound_once_for_rank(
+    TestCollective collective,
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    std::size_t numel,
+    cudaStream_t stream,
+    const char* label) {
+    if (collective == TestCollective::AllReduce) {
+        testing::check_oo(
+            comm::api::allreduce_prebound_tuned(
+                node,
+                rank_buffers,
+                rank_buffer_count,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                OO_TUNING_BEST_PERFORMANCE,
+                stream),
+            label);
+        return;
+    }
+
+    if (collective == TestCollective::ReduceScatter) {
+        oo_tensor_slice_t slice{};
+        testing::check_oo(
+            comm::api::reduce_scatter_prebound_tuned(
+                node,
+                rank_buffers,
+                rank_buffer_count,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                OO_TUNING_BEST_PERFORMANCE,
+                &slice,
+                stream),
+            label);
+        return;
+    }
+
+    if (collective == TestCollective::AllGather) {
+        testing::check_oo(
+            comm::api::all_gather_prebound_tuned(
+                node,
+                rank_buffers,
+                rank_buffer_count,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_TUNING_BEST_PERFORMANCE,
+                stream),
+            label);
+        return;
+    }
+
+    throw std::invalid_argument("unsupported collective");
+}
+
+void launch_ooverlap_prebound_once(
+    TestCollective collective,
+    const SweepContext& ctx,
+    const SizeBuffers& buffers,
+    std::size_t numel) {
+    if (ctx.nodes.size() != buffers.ooverlap_buffers.size() ||
+        ctx.nodes.size() != ctx.streams.size()) {
+        throw std::invalid_argument(
+            "launch_ooverlap_prebound_once: size mismatch");
+    }
+
+    oo_buffer_t* const* rank_buffers =
+        buffers.ooverlap_buffers.data();
+    const int rank_buffer_count =
+        static_cast<int>(buffers.ooverlap_buffers.size());
+
+    for (std::size_t rank = 0; rank < ctx.nodes.size(); ++rank) {
+        const std::string label =
+            "external ring ooverlap rank" + std::to_string(rank);
+        launch_ooverlap_prebound_once_for_rank(
+            collective,
+            ctx.nodes[rank],
+            rank_buffers,
+            rank_buffer_count,
             numel,
             ctx.streams[rank],
             label.c_str());
@@ -770,7 +858,7 @@ std::map<std::string, double> run_one_size_ring(
             for (int i = 0; i < count; ++i) {
                 const SizeBuffers& slot =
                     ring[static_cast<std::size_t>(i) % ring.size()];
-                launch_ooverlap_once(
+                launch_ooverlap_prebound_once(
                     collective,
                     ctx,
                     slot,
@@ -803,7 +891,7 @@ std::map<std::string, double> run_one_size_ring(
                 bytes,
                 "sync external ring ooverlap verification reset");
             testing::reset_ready_signals(ctx.group);
-            launch_ooverlap_once(collective, ctx, slot, numel);
+            launch_ooverlap_prebound_once(collective, ctx, slot, numel);
             sync_streams(
                 ctx.devices,
                 ctx.streams,

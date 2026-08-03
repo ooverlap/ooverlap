@@ -17,7 +17,8 @@ namespace kernels {
 __device__ __forceinline__ void wait_until_cta_barrier_counter_at_least(
     unsigned int* counter,
     unsigned int target) {
-    if (counter == nullptr || target == 0) {
+
+    if (threadIdx.x != 0) {
         return;
     }
 
@@ -31,6 +32,10 @@ __device__ __forceinline__ void wait_until_cta_barrier_counter_at_least(
 __device__ __forceinline__ void advance_cta_barrier_counter(
     unsigned int* counter,
     unsigned int increment) {
+
+    if (threadIdx.x != 0) {
+        return;
+    }
 
     cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
     state.fetch_add(increment, cuda::memory_order_release);
