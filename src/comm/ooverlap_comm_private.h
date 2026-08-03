@@ -79,6 +79,28 @@ struct CollectiveLaunchState {
     size_t bytes = 0;
 };
 
+/*
+ * Minimal launch state for the small direct all-reduce path. This contains
+ * only the local/peer data pointers and the existing device ready signals.
+ * It intentionally has no topology plan, logical task, window, chunk,
+ * staging, or lowering state.
+ */
+struct FastAllreduceLaunchState {
+    void* local_ptr = nullptr;
+    void* peer_ptrs[kMaxPublicPeers] = {};
+
+    int* local_ready_signal = nullptr;
+    const int* peer_ready_signals[kMaxPublicPeers] = {};
+
+    int peer_count = 0;
+    int rank = -1;
+    int world_size = 0;
+    int local_device = -1;
+    int collective_epoch = 0;
+
+    size_t bytes = 0;
+};
+
 oo_status_t exception_to_status();
 
 oo_status_t cuda_to_status(cudaError_t error);
@@ -121,6 +143,19 @@ LaunchConfig select_public_launch_config(
 oo_status_t register_ipc_collective_buffers(
     oo_node_t* node,
     oo_buffer_t* local);
+
+/*
+ * Resolve only the direct local/peer pointers and the device ready signals
+ * needed by the small all-reduce kernel.
+ */
+oo_status_t prepare_fast_allreduce_launch(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* prebound_rank_buffers,
+    int prebound_rank_buffer_count,
+    size_t offset_bytes,
+    size_t bytes,
+    FastAllreduceLaunchState* out);
 
 /*
  * Build a rank-local collective launch state from the group-owned current

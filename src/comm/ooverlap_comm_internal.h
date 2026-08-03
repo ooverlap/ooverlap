@@ -282,6 +282,14 @@ struct oo_group {
      * + logical transfer planning.
      */
     bool topology_valid = false;
+
+    /*
+     * True only when every directed GPU pair supports validated direct
+     * peer load/store access and direct TMA reduction. The small all-reduce
+     * kernel requires this all-to-all property and never uses SHM staging.
+     */
+    bool is_all_peer_to_peer = false;
+
     ooverlap::topology::Topology topology{};
 
     /*

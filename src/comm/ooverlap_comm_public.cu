@@ -302,6 +302,37 @@ oo_status_t enable_group_peer_access_all_to_all(oo_group_t* group) {
     return OO_SUCCESS;
 }
 
+bool topology_is_all_peer_to_peer(
+    const ooverlap::topology::Topology& topology,
+    int world_size) {
+    if (world_size <= 0 ||
+        topology.nodes.size() != static_cast<size_t>(world_size)) {
+        return false;
+    }
+
+    for (int src_rank = 0; src_rank < world_size; ++src_rank) {
+        for (int dst_rank = 0; dst_rank < world_size; ++dst_rank) {
+            if (src_rank == dst_rank) {
+                continue;
+            }
+
+            const ooverlap::topology::Link* link =
+                topology.link_by_ordinals(
+                    src_rank,
+                    dst_rank);
+
+            if (link == nullptr ||
+                !link->cuda_peer_access_supported ||
+                !link->safe_for_direct_copy ||
+                !link->safe_for_tma_reduce) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 oo_status_t initialize_group_topology(
     oo_group_t* group,
     bool enable_peer_access_in_discovery,
@@ -330,9 +361,14 @@ oo_status_t initialize_group_topology(
                 options);
 
         group->topology_valid = true;
+        group->is_all_peer_to_peer =
+            topology_is_all_peer_to_peer(
+                group->topology,
+                group->num_devices);
         return OO_SUCCESS;
     } catch (...) {
         group->topology_valid = false;
+        group->is_all_peer_to_peer = false;
         group->topology = ooverlap::topology::Topology{};
         return ooverlap::comm::api::exception_to_status();
     }

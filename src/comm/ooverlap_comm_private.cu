@@ -657,6 +657,129 @@ oo_status_t register_ipc_collective_buffers(
 }
 
 
+oo_status_t prepare_fast_allreduce_launch(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* prebound_rank_buffers,
+    int prebound_rank_buffer_count,
+    size_t offset_bytes,
+    size_t bytes,
+    FastAllreduceLaunchState* out) {
+    if (out == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out = FastAllreduceLaunchState{};
+
+    if (node == nullptr ||
+        node->group == nullptr ||
+        local == nullptr ||
+        local->ptr == nullptr ||
+        bytes == 0) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_group_t* group = node->group;
+
+    if (node->rank < 0 ||
+        node->rank >= group->num_devices ||
+        group->num_devices < 2 ||
+        group->num_devices - 1 > kMaxPublicPeers) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (prebound_rank_buffers != nullptr) {
+        if (prebound_rank_buffer_count != group->num_devices ||
+            prebound_rank_buffers[node->rank] != local) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+    } else if (
+        group->bootstrap_kind ==
+            oo_group_bootstrap_kind::multiprocess_ipc) {
+        const oo_status_t status =
+            ensure_ipc_legacy_collective_buffers_registered(
+                node,
+                local);
+
+        if (status != OO_SUCCESS) {
+            return status;
+        }
+    } else {
+        group->collective_buffers[node->rank] = local;
+    }
+
+    const cudaError_t set_device_error =
+        cudaSetDevice(node->device);
+
+    if (set_device_error != cudaSuccess) {
+        return cuda_to_status(set_device_error);
+    }
+
+    int peer_idx = 0;
+
+    for (int rank = 0; rank < group->num_devices; ++rank) {
+        oo_buffer_t* buffer =
+            prebound_rank_buffers != nullptr
+                ? prebound_rank_buffers[rank]
+                : group->collective_buffers[rank];
+
+        if (buffer == nullptr ||
+            buffer->ptr == nullptr ||
+            buffer->group != group ||
+            buffer->owner_rank != rank ||
+            buffer->owner_device != group->devices[rank] ||
+            offset_bytes > buffer->bytes ||
+            bytes > buffer->bytes - offset_bytes) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        void* logical_ptr =
+            reinterpret_cast<void*>(
+                reinterpret_cast<std::uint8_t*>(buffer->ptr) +
+                offset_bytes);
+
+        if ((reinterpret_cast<std::uintptr_t>(logical_ptr) &
+             static_cast<std::uintptr_t>(15)) != 0) {
+            return OO_ERROR_UNSUPPORTED;
+        }
+
+        oo_ready_signal& ready_signal =
+            group->ready_signal_slots[rank];
+
+        if (ready_signal.ptr == nullptr) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (rank == node->rank) {
+            out->local_ptr = logical_ptr;
+            out->local_ready_signal =
+                reinterpret_cast<int*>(ready_signal.ptr);
+            continue;
+        }
+
+        out->peer_ptrs[peer_idx] = logical_ptr;
+        out->peer_ready_signals[peer_idx] =
+            reinterpret_cast<const int*>(ready_signal.ptr);
+        ++peer_idx;
+    }
+
+    if (out->local_ptr == nullptr ||
+        out->local_ready_signal == nullptr ||
+        peer_idx != group->num_devices - 1) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    out->peer_count = peer_idx;
+    out->rank = node->rank;
+    out->world_size = group->num_devices;
+    out->local_device = node->device;
+    out->collective_epoch = ++node->collective_epoch;
+    out->bytes = bytes;
+
+    return OO_SUCCESS;
+}
+
+
 /* OOVERLAP_ROUND_ROBIN_SLOT_POOL_PATCH_V1 */
 oo_status_t prepare_collective_launch_impl(
     oo_node_t* node,

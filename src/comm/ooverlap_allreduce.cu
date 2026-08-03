@@ -1,5 +1,6 @@
 #include "comm/ooverlap_comm_private.h"
 
+#include "comm/fast_multi_gpu_allreduce_sm90.h"
 #include "comm/plan/transfer_plan_distribution.h"
 #include "comm/tuning/tuning_policy.h"
 #include "comm/tma_multi_gpu_allreduce_sm90.h"
@@ -25,15 +26,71 @@ oo_status_t allreduce_impl(
         return OO_ERROR_UNSUPPORTED;
     }
 
-    if (node == nullptr ||
-        node->group == nullptr ||
-        node->group->transfer_plan_distribution == nullptr) {
+    if (node == nullptr || node->group == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    size_t offset_bytes = 0;
+    size_t bytes = 0;
+
+    oo_status_t status =
+        ooverlap::comm::api::checked_element_offset_bytes(
+            element_offset,
+            dtype,
+            &offset_bytes);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
+    status =
+        ooverlap::comm::api::checked_element_bytes(
+            count,
+            dtype,
+            &bytes);
+
+    if (status != OO_SUCCESS) {
+        return status;
+    }
+
+    if (ooverlap::fast_allreduce_eligible(
+            node->group,
+            offset_bytes,
+            bytes)) {
+        ooverlap::comm::api::FastAllreduceLaunchState fast_launch{};
+
+        status =
+            ooverlap::comm::api::prepare_fast_allreduce_launch(
+                node,
+                local,
+                prebound_rank_buffers,
+                prebound_rank_buffer_count,
+                offset_bytes,
+                bytes,
+                &fast_launch);
+
+        if (status == OO_SUCCESS) {
+            const cudaError_t error =
+                ooverlap::enqueue_fast_multi_gpu_allreduce_rank_sm90(
+                    fast_launch,
+                    dtype,
+                    op,
+                    stream,
+                    plan_scratch_index);
+
+            return ooverlap::comm::api::cuda_to_status(error);
+        }
+
+        if (status != OO_ERROR_UNSUPPORTED) {
+            return status;
+        }
+    }
+
+    if (node->group->transfer_plan_distribution == nullptr) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
     ooverlap::comm::api::CollectiveLaunchState launch{};
-
-    oo_status_t status = OO_SUCCESS;
 
     if (prebound_rank_buffers != nullptr) {
         status =
@@ -88,7 +145,7 @@ oo_status_t allreduce_impl(
         return status;
     }
 
-    cudaError_t error =
+    const cudaError_t error =
         ooverlap::enqueue_tma_multi_gpu_allreduce_rank_sm90(
             launch,
             dtype,
