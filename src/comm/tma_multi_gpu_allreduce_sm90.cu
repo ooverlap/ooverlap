@@ -99,7 +99,7 @@ bool validate_allreduce_launch(
 }
 
 #ifndef OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
-#define OOVERLAP_DEBUG_PRINT_WINDOW_TASKS 0
+#define OOVERLAP_DEBUG_PRINT_WINDOW_TASKS 1
 #endif
 
 #if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
@@ -290,7 +290,7 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         ReduceOp>;
 
     constexpr int MaxLoweringTasks =
-        comm::plan::kTmaMultiGpuAllReduceMaxWindowTasks;
+        comm::plan::kTmaMultiGpuByValueMaxWindowTasks;
     constexpr int MaxPeers =
         comm::plan::kTmaMultiGpuAllReduceMaxPeers;
     constexpr int MaxRanks =

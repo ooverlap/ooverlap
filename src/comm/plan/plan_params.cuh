@@ -16,7 +16,7 @@ constexpr int kTmaMultiGpuAllGatherMaxWindowTasks = 256;
 constexpr int kTmaMultiGpuByValueCapacity16 = 16;
 constexpr int kTmaMultiGpuByValueCapacity32 = 32;
 constexpr int kTmaMultiGpuByValueCapacity64 = 64;
-constexpr int kTmaMultiGpuByValueCapacity128 = 96;
+constexpr int kTmaMultiGpuByValueCapacity128 = 112;
 constexpr int kTmaMultiGpuByValueMaxWindowTasks =
     kTmaMultiGpuByValueCapacity128;
 

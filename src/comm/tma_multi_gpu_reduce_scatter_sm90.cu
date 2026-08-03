@@ -115,7 +115,7 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
         ReduceOp>;
 
     constexpr int MaxLoweringTasks =
-        comm::plan::kTmaMultiGpuReduceScatterMaxWindowTasks;
+        comm::plan::kTmaMultiGpuByValueMaxWindowTasks;
     constexpr int MaxPeers =
         comm::plan::kTmaMultiGpuReduceScatterMaxPeers;
 

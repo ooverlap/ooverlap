@@ -91,7 +91,7 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         DummyReduceOp>;
 
     constexpr int MaxLoweringTasks =
-        comm::plan::kTmaMultiGpuAllGatherMaxWindowTasks;
+        comm::plan::kTmaMultiGpuByValueMaxWindowTasks;
     constexpr int MaxPeers =
         comm::plan::kTmaMultiGpuAllGatherMaxPeers;
 
