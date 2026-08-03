@@ -24,16 +24,13 @@ __device__ __forceinline__ void wait_until_cta_barrier_counter_at_least(
     cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
 
     while (state.load(cuda::memory_order_acquire) < target) {
-        __nanosleep(64);
+        __nanosleep(16);
     }
 }
 
 __device__ __forceinline__ void advance_cta_barrier_counter(
     unsigned int* counter,
     unsigned int increment) {
-    if (counter == nullptr || increment == 0) {
-        return;
-    }
 
     cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
     state.fetch_add(increment, cuda::memory_order_release);
@@ -42,16 +39,13 @@ __device__ __forceinline__ void advance_cta_barrier_counter(
 __device__ __forceinline__ void arrive_and_wait_cta_barrier(
     unsigned int* counter,
     unsigned int target) {
-    if (counter == nullptr || target == 0) {
-        return;
-    }
 
     if (threadIdx.x == 0) {
         cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
         state.fetch_add(1u, cuda::memory_order_acq_rel);
 
         while (state.load(cuda::memory_order_acquire) < target) {
-            __nanosleep(64);
+            __nanosleep(16);
         }
     }
 }

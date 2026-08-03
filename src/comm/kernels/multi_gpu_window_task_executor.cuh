@@ -78,9 +78,8 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         arrive_and_wait_cta_barrier(
             cta_barrier_counter,
             cta_barrier_entry_target);
-
-        __syncthreads();
     }
+
 
     execute_window_task_stripe<
         Variant::stage_depth,
@@ -104,13 +103,10 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
             cta_barrier_counter);
 
     if (cta_barrier_counter != nullptr) {
-        __syncthreads();
 
         arrive_and_wait_cta_barrier(
             cta_barrier_counter,
             cta_barrier_final_target);
-
-        __syncthreads();
 
         const int final_ready_value =
             collective_epoch * comm::plan::kReadySignalPhaseStride +
@@ -445,6 +441,8 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
     }
 
     static thread_local ByValuePlan by_value_plan;
+
+    printf("the size is %d\n", window_plan.total_tasks);
 
     if (!comm::plan::window_task_executor_plan_pack(
             window_plan,

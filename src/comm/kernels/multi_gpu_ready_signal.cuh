@@ -202,12 +202,6 @@ template <int MaxPeers>
 __device__ __forceinline__ void distributed_ready_rendezvous_for_cta(
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int ready_value) {
-    if (threadIdx.x != 0 ||
-        ready_value <= 0 ||
-        ready_plan.protocol == MultiGpuReadySignalProtocol::Disabled ||
-        ready_plan.peer_count <= 0) {
-        return;
-    }
 
     const int first_peer = static_cast<int>(blockIdx.x);
     const int peer_stride = static_cast<int>(gridDim.x);

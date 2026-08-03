@@ -324,6 +324,7 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
         }
     }
 
+
     cta_barrier_final_value +=
         static_cast<unsigned int>(num_blocks);
 
