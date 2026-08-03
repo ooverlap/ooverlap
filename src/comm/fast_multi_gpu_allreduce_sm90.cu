@@ -342,7 +342,7 @@ cudaError_t launch_fast_multi_gpu_allreduce_typed(
         *scratch.last_value;
     const unsigned int counter_final =
         counter_base +
-        static_cast<unsigned int>(2 * num_ctas + 1);
+        static_cast<unsigned int>(num_ctas + 1);
 
     fast_multi_gpu_allreduce_kernel_sm90<ReduceOp><<<
         num_ctas,
