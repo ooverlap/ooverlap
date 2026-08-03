@@ -442,8 +442,6 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
 
     static thread_local ByValuePlan by_value_plan;
 
-    printf("the size is %d\n", window_plan.total_tasks);
-
     if (!comm::plan::window_task_executor_plan_pack(
             window_plan,
             &by_value_plan)) {
