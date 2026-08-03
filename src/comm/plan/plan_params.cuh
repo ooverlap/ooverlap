@@ -4,9 +4,9 @@ namespace ooverlap {
 namespace comm {
 namespace plan {
 
-constexpr int kTmaMultiGpuAllReduceMaxPeers = 15;
-constexpr int kTmaMultiGpuReduceScatterMaxPeers = 15;
-constexpr int kTmaMultiGpuAllGatherMaxPeers = 15;
+constexpr int kTmaMultiGpuAllReduceMaxPeers = 4;
+constexpr int kTmaMultiGpuReduceScatterMaxPeers = 4;
+constexpr int kTmaMultiGpuAllGatherMaxPeers = 4;
 
 constexpr int kTmaMultiGpuAllReduceMaxWindowTasks = 256;
 constexpr int kTmaMultiGpuReduceScatterMaxWindowTasks = 256;
