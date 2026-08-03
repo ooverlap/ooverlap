@@ -715,6 +715,17 @@ oo_status_t prepare_fast_allreduce_launch(
         return cuda_to_status(set_device_error);
     }
 
+    oo_ready_signal& local_ready_slot =
+        group->ready_signal_slots[node->rank];
+
+    if (local_ready_slot.ptr == nullptr ||
+        local_ready_slot.bytes < kOoReadySignalBytes) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    int* local_ready_base =
+        reinterpret_cast<int*>(local_ready_slot.ptr);
+
     int peer_idx = 0;
 
     for (int rank = 0; rank < group->num_devices; ++rank) {
@@ -746,25 +757,32 @@ oo_status_t prepare_fast_allreduce_launch(
         oo_ready_signal& ready_signal =
             group->ready_signal_slots[rank];
 
-        if (ready_signal.ptr == nullptr) {
+        if (ready_signal.ptr == nullptr ||
+            ready_signal.bytes < kOoReadySignalBytes) {
             return OO_ERROR_INVALID_ARGUMENT;
         }
 
         if (rank == node->rank) {
             out->local_ptr = logical_ptr;
-            out->local_ready_signal =
-                reinterpret_cast<int*>(ready_signal.ptr);
             continue;
         }
 
+        int* peer_ready_base =
+            reinterpret_cast<int*>(ready_signal.ptr);
+
         out->peer_ptrs[peer_idx] = logical_ptr;
-        out->peer_ready_signals[peer_idx] =
-            reinterpret_cast<const int*>(ready_signal.ptr);
+        out->peer_publish_signals[peer_idx] =
+            peer_ready_base +
+            kOoReadySignalInboxBaseSlot +
+            node->rank;
+        out->local_wait_signals[peer_idx] =
+            local_ready_base +
+            kOoReadySignalInboxBaseSlot +
+            rank;
         ++peer_idx;
     }
 
     if (out->local_ptr == nullptr ||
-        out->local_ready_signal == nullptr ||
         peer_idx != group->num_devices - 1) {
         return OO_ERROR_INVALID_ARGUMENT;
     }
@@ -893,6 +911,14 @@ oo_status_t prepare_collective_launch_impl(
     oo_ready_signal& local_host_signal =
         group->host_ready_signal_slots[node->rank];
 
+    if (local_signal.ptr == nullptr ||
+        local_signal.bytes < kOoReadySignalBytes) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    int* local_device_ready_base =
+        reinterpret_cast<int*>(local_signal.ptr);
+
     {
         const cudaError_t err =
             cudaSetDevice(node->device);
@@ -936,11 +962,13 @@ oo_status_t prepare_collective_launch_impl(
     out->bytes = bytes;
     out->collective_epoch = ++node->collective_epoch;
     out->local_ready_signal =
-        reinterpret_cast<int*>(local_signal.ptr);
+        local_device_ready_base + kOoReadySignalLegacySlot;
     out->local_ready_signal_by_channel[kOoReadySignalChannelDeviceMemory] =
-        reinterpret_cast<int*>(local_signal.ptr);
+        local_device_ready_base + kOoReadySignalLegacySlot;
     out->local_ready_signal_by_channel[kOoReadySignalChannelHostMapped] =
-        local_host_ready_signal;
+        local_host_ready_signal != nullptr
+            ? local_host_ready_signal + kOoReadySignalLegacySlot
+            : nullptr;
     out->ready_signal_protocol_by_channel[kOoReadySignalChannelDeviceMemory] = 0;
     out->ready_signal_protocol_by_channel[kOoReadySignalChannelHostMapped] = 2;
     out->ready_signal_poll_sleep_cycles_by_channel
@@ -1001,11 +1029,27 @@ oo_status_t prepare_collective_launch_impl(
         oo_ready_signal& peer_host_signal =
             group->host_ready_signal_slots[rank];
 
+        if (peer_signal.ptr == nullptr ||
+            peer_signal.bytes < kOoReadySignalBytes) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        int* peer_device_ready_base =
+            reinterpret_cast<int*>(peer_signal.ptr);
+
         out->peer_ready_signals[peer_idx] =
-            reinterpret_cast<const int*>(peer_signal.ptr);
+            peer_device_ready_base + kOoReadySignalLegacySlot;
+        out->peer_publish_signals[peer_idx] =
+            peer_device_ready_base +
+            kOoReadySignalInboxBaseSlot +
+            node->rank;
+        out->local_wait_signals[peer_idx] =
+            local_device_ready_base +
+            kOoReadySignalInboxBaseSlot +
+            rank;
         out->peer_ready_signals_by_channel
             [peer_idx][kOoReadySignalChannelDeviceMemory] =
-                reinterpret_cast<const int*>(peer_signal.ptr);
+                peer_device_ready_base + kOoReadySignalLegacySlot;
         int* peer_host_ready_signal = nullptr;
 
         status =
@@ -1019,7 +1063,9 @@ oo_status_t prepare_collective_launch_impl(
 
         out->peer_ready_signals_by_channel
             [peer_idx][kOoReadySignalChannelHostMapped] =
-                reinterpret_cast<const int*>(peer_host_ready_signal);
+                peer_host_ready_signal != nullptr
+                    ? peer_host_ready_signal + kOoReadySignalLegacySlot
+                    : nullptr;
 
         peer_idx += 1;
     }

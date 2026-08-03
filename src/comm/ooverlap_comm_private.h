@@ -36,10 +36,21 @@ struct CollectiveLaunchState {
     int peer_count = 0;
 
     /*
-     * Legacy single-channel fields.  These mirror the DeviceMemory channel.
+     * Legacy single-channel fields. These keep slot 0 for planner-generated
+     * ReadyPublish/ReadyWait tasks.
      */
     int* local_ready_signal = nullptr;
     const int* peer_ready_signals[kMaxPublicPeers] = {};
+
+    /*
+     * Fixed prologue/epilogue rendezvous pointers.
+     *
+     * peer_publish_signals[i] is a receiver-local inbox slot on peer i and is
+     * written remotely exactly once per phase by this rank.
+     * local_wait_signals[i] is this rank's local inbox slot for peer i.
+     */
+    int* peer_publish_signals[kMaxPublicPeers] = {};
+    const int* local_wait_signals[kMaxPublicPeers] = {};
 
     /*
      * Channel-aware ready pointers/protocols.  The planner chooses a logical
@@ -89,8 +100,8 @@ struct FastAllreduceLaunchState {
     void* local_ptr = nullptr;
     void* peer_ptrs[kMaxPublicPeers] = {};
 
-    int* local_ready_signal = nullptr;
-    const int* peer_ready_signals[kMaxPublicPeers] = {};
+    int* peer_publish_signals[kMaxPublicPeers] = {};
+    const int* local_wait_signals[kMaxPublicPeers] = {};
 
     int peer_count = 0;
     int rank = -1;

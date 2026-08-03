@@ -79,6 +79,8 @@ bool validate_allreduce_launch(
              (launch.out_of_place &&
               (launch.peer_input_ptrs[peer_idx] == nullptr ||
                launch.peer_output_ptrs[peer_idx] == nullptr))) ||
+            launch.peer_publish_signals[peer_idx] == nullptr ||
+            launch.local_wait_signals[peer_idx] == nullptr ||
             peer_rank < 0 ||
             peer_rank >= launch.world_size ||
             peer_rank == launch.rank ||
@@ -99,7 +101,7 @@ bool validate_allreduce_launch(
 }
 
 #ifndef OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
-#define OOVERLAP_DEBUG_PRINT_WINDOW_TASKS 1
+#define OOVERLAP_DEBUG_PRINT_WINDOW_TASKS 0
 #endif
 
 #if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
@@ -367,6 +369,8 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         comm::kernels::make_multi_gpu_ready_signal_plan<MaxPeers>(
             launch.peer_count,
             launch.peer_ready_signals,
+            launch.peer_publish_signals,
+            launch.local_wait_signals,
             static_cast<comm::kernels::MultiGpuReadySignalProtocol>(
                 launch.ready_signal_protocol_by_channel[device_ready_channel]),
             launch.ready_signal_poll_sleep_cycles_by_channel[device_ready_channel]);
@@ -457,18 +461,15 @@ cudaError_t launch_allreduce_rank_variant_sm90(
 
     int num_blocks = 0;
 
-    const unsigned int cta_barrier_start =
-        *cta_barrier_scratch.last_value + 1u;
+    const unsigned int cta_barrier_base =
+        *cta_barrier_scratch.last_value;
 
     comm::plan::lowering_detail::LoweringPassOptions lowering_options{};
     lowering_options.enable_reduce_cta_groups = true;
     lowering_options.max_ctas_per_reduce_task =
         launch_config.max_ctas_per_reduce_task;
-    lowering_options.cta_barrier_start = cta_barrier_start;
-    lowering_options.enable_final_peer_rendezvous =
-        use_ready_binding && ready_plan.peer_count > 0;
-    lowering_options.final_ready_phase =
-        comm::plan::kReadySignalPhaseStride - 1;
+    /* Lower relative barrier targets; rebase after CTA count is known. */
+    lowering_options.cta_barrier_start = 0u;
 
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<
@@ -493,10 +494,20 @@ cudaError_t launch_allreduce_rank_variant_sm90(
         return cudaSuccess;
     }
 
+    const unsigned int cta_barrier_entry_target =
+        cta_barrier_base + static_cast<unsigned int>(num_blocks);
+
+    if (!comm::kernels::rebase_cta_barrier_targets(
+            &window_plan,
+            cta_barrier_entry_target)) {
+        return cudaErrorInvalidValue;
+    }
+
     const unsigned int cta_barrier_final_value =
         final_cta_barrier_counter_value(
             window_plan,
-            cta_barrier_start);
+            cta_barrier_entry_target) +
+        static_cast<unsigned int>(num_blocks);
 
     #if OOVERLAP_DEBUG_PRINT_WINDOW_TASKS
         debug_print_window_task_plan<MaxLoweringTasks>(
@@ -528,7 +539,8 @@ cudaError_t launch_allreduce_rank_variant_sm90(
                 launch.collective_epoch,
                 "tma_multi_gpu_allreduce(by-value): requested shared memory exceeds opt-in limit",
                 cta_barrier_scratch.counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_value);
 
     if (launch_error != cudaSuccess) {
         return launch_error;

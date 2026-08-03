@@ -29,8 +29,8 @@ struct FastAllreduceKernelParams {
     const void* local_ptr = nullptr;
     void* peer_ptrs[kFastAllreduceMaxPeers] = {};
 
-    int* local_ready_signal = nullptr;
-    const int* peer_ready_signals[kFastAllreduceMaxPeers] = {};
+    comm::kernels::MultiGpuReadySignalPlan<kFastAllreduceMaxPeers>
+        ready_plan{};
 
     size_t bytes = 0;
     int peer_count = 0;
@@ -135,16 +135,6 @@ cudaError_t get_fast_allreduce_barrier_scratch(
     return cudaSuccess;
 }
 
-__device__ __forceinline__ void wait_fast_allreduce_counter(
-    unsigned int* counter,
-    unsigned int target) {
-    cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
-
-    while (state.load(cuda::memory_order_acquire) < target) {
-        __nanosleep(64);
-    }
-}
-
 __device__ __forceinline__ void arrive_and_wait_fast_allreduce_counter(
     unsigned int* counter,
     unsigned int target) {
@@ -154,12 +144,6 @@ __device__ __forceinline__ void arrive_and_wait_fast_allreduce_counter(
     while (state.load(cuda::memory_order_acquire) < target) {
         __nanosleep(64);
     }
-}
-
-__device__ __forceinline__ void advance_fast_allreduce_counter(
-    unsigned int* counter) {
-    cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
-    state.fetch_add(1u, cuda::memory_order_release);
 }
 
 __device__ __forceinline__ int fast_allreduce_ready_value(
@@ -220,34 +204,19 @@ __global__ void fast_multi_gpu_allreduce_kernel_sm90(
         grid_counter,
         loaded_target);
 
+    const int loaded_ready_value =
+        fast_allreduce_ready_value(
+            params.collective_epoch,
+            kLoadedReadyPhase);
+
+    comm::kernels::distributed_ready_rendezvous_for_cta(
+        params.ready_plan,
+        loaded_ready_value);
+
     const unsigned int peers_loaded_target =
-        loaded_target + 1u;
+        loaded_target + cta_count;
 
-    if (blockIdx.x == 0) {
-        const int ready_value =
-            fast_allreduce_ready_value(
-                params.collective_epoch,
-                kLoadedReadyPhase);
-
-        comm::kernels::publish_ready_signal(
-            params.local_ready_signal,
-            ready_value,
-            comm::kernels::MultiGpuReadySignalProtocol::
-                DeviceMemoryStoreRelease);
-
-        for (int peer_idx = 0;
-             peer_idx < params.peer_count;
-             ++peer_idx) {
-            comm::kernels::wait_until_ready_signal_at_least(
-                params.peer_ready_signals[peer_idx],
-                ready_value,
-                64);
-        }
-
-        advance_fast_allreduce_counter(grid_counter);
-    }
-
-    wait_fast_allreduce_counter(
+    arrive_and_wait_fast_allreduce_counter(
         grid_counter,
         peers_loaded_target);
 
@@ -277,27 +246,14 @@ __global__ void fast_multi_gpu_allreduce_kernel_sm90(
         grid_counter,
         fanout_done_target);
 
-    if (blockIdx.x == 0) {
-        const int ready_value =
-            fast_allreduce_ready_value(
-                params.collective_epoch,
-                kFanoutDoneReadyPhase);
+    const int fanout_done_ready_value =
+        fast_allreduce_ready_value(
+            params.collective_epoch,
+            kFanoutDoneReadyPhase);
 
-        comm::kernels::publish_ready_signal(
-            params.local_ready_signal,
-            ready_value,
-            comm::kernels::MultiGpuReadySignalProtocol::
-                DeviceMemoryStoreRelease);
-
-        for (int peer_idx = 0;
-             peer_idx < params.peer_count;
-             ++peer_idx) {
-            comm::kernels::wait_until_ready_signal_at_least(
-                params.peer_ready_signals[peer_idx],
-                ready_value,
-                64);
-        }
-    }
+    comm::kernels::distributed_ready_rendezvous_for_cta(
+        params.ready_plan,
+        fanout_done_ready_value);
 }
 
 template <typename ReduceOp>
@@ -306,7 +262,6 @@ cudaError_t launch_fast_multi_gpu_allreduce_typed(
     cudaStream_t stream,
     int scratch_index) {
     if (launch.local_ptr == nullptr ||
-        launch.local_ready_signal == nullptr ||
         launch.peer_count <= 0 ||
         launch.peer_count > kFastAllreduceMaxPeers ||
         launch.bytes == 0 ||
@@ -318,23 +273,31 @@ cudaError_t launch_fast_multi_gpu_allreduce_typed(
 
     FastAllreduceKernelParams params{};
     params.local_ptr = launch.local_ptr;
-    params.local_ready_signal = launch.local_ready_signal;
     params.bytes = launch.bytes;
     params.peer_count = launch.peer_count;
     params.collective_epoch = launch.collective_epoch;
+    params.ready_plan =
+        comm::kernels::make_multi_gpu_ready_signal_plan<
+            kFastAllreduceMaxPeers>(
+                launch.peer_count,
+                nullptr,
+                launch.peer_publish_signals,
+                launch.local_wait_signals,
+                comm::kernels::MultiGpuReadySignalProtocol::
+                    DeviceMemoryStoreRelease,
+                64);
 
     for (int peer_idx = 0;
          peer_idx < launch.peer_count;
          ++peer_idx) {
         if (launch.peer_ptrs[peer_idx] == nullptr ||
-            launch.peer_ready_signals[peer_idx] == nullptr) {
+            launch.peer_publish_signals[peer_idx] == nullptr ||
+            launch.local_wait_signals[peer_idx] == nullptr) {
             return cudaErrorInvalidValue;
         }
 
         params.peer_ptrs[peer_idx] =
             launch.peer_ptrs[peer_idx];
-        params.peer_ready_signals[peer_idx] =
-            launch.peer_ready_signals[peer_idx];
     }
 
     const int num_ctas =
@@ -371,7 +334,7 @@ cudaError_t launch_fast_multi_gpu_allreduce_typed(
         *scratch.last_value;
     const unsigned int counter_final =
         counter_base +
-        static_cast<unsigned int>(2 * num_ctas + 1);
+        static_cast<unsigned int>(3 * num_ctas);
 
     fast_multi_gpu_allreduce_kernel_sm90<ReduceOp><<<
         num_ctas,

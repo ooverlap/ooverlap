@@ -10,8 +10,9 @@ namespace kernels {
  * Ready-signal protocols.
  *
  * DeviceMemoryStoreRelease:
- *   Fast path for one-writer-per-rank ready slots in peer-visible device
- *   memory.  The owner GPU stores its epoch into its own slot; peers poll.
+ *   Fast path for one-writer ready slots in peer-visible device memory.
+ *   Fixed prologue/epilogue rendezvous uses receiver-local inbox slots:
+ *   senders write remotely once, receivers poll local memory.
  *
  * DeviceMemoryAtomicMax:
  *   Compatibility/debug path.  More robust if the same rank can publish epochs
@@ -48,7 +49,13 @@ __host__ __device__ __forceinline__ int default_ready_signal_poll_sleep_cycles(
 template <int MaxPeers>
 struct MultiGpuReadySignalPlan {
     int peer_count = 0;
+
+    /* Slot-0 pointers retained for planner-generated ready tasks. */
     const int* peer_ready_signals[MaxPeers] = {};
+
+    /* Fixed prologue/epilogue directional inbox pointers. */
+    int* peer_publish_signals[MaxPeers] = {};
+    const int* local_wait_signals[MaxPeers] = {};
 
     MultiGpuReadySignalProtocol protocol =
         MultiGpuReadySignalProtocol::DeviceMemoryStoreRelease;
@@ -60,6 +67,8 @@ template <int MaxPeers>
 inline MultiGpuReadySignalPlan<MaxPeers> make_multi_gpu_ready_signal_plan(
     int peer_count,
     const int* const* peer_ready_signals,
+    int* const* peer_publish_signals,
+    const int* const* local_wait_signals,
     MultiGpuReadySignalProtocol protocol =
         MultiGpuReadySignalProtocol::DeviceMemoryStoreRelease,
     int poll_sleep_cycles = 0) {
@@ -83,6 +92,10 @@ inline MultiGpuReadySignalPlan<MaxPeers> make_multi_gpu_ready_signal_plan(
     for (int i = 0; i < peer_count; ++i) {
         plan.peer_ready_signals[i] =
             peer_ready_signals != nullptr ? peer_ready_signals[i] : nullptr;
+        plan.peer_publish_signals[i] =
+            peer_publish_signals != nullptr ? peer_publish_signals[i] : nullptr;
+        plan.local_wait_signals[i] =
+            local_wait_signals != nullptr ? local_wait_signals[i] : nullptr;
     }
 
     return plan;
@@ -103,14 +116,14 @@ __device__ __forceinline__ void publish_ready_signal_store_release(
      * This avoids atomic RMW on the fast path.  The system fence after the
      * volatile store keeps the published epoch visible outside the writer GPU.
      */
+#if defined(__CUDA_ARCH__)
+    __threadfence_system();
+#endif
+
     volatile int* ready =
         reinterpret_cast<volatile int*>(ready_signal);
 
     ready[0] = collective_epoch;
-
-#if defined(__CUDA_ARCH__)
-    __threadfence_system();
-#endif
 }
 
 __device__ __forceinline__ void publish_ready_signal_atomic_max(
@@ -171,8 +184,50 @@ __device__ __forceinline__ void wait_until_ready_signal_at_least(
 
     while (load_ready_signal(ready_signal) < collective_epoch) {
 #if defined(__CUDA_ARCH__)
-        __nanosleep(16);
+        __nanosleep(
+            poll_sleep_cycles > 0 ?
+                static_cast<unsigned int>(poll_sleep_cycles) :
+                16u);
 #endif
+    }
+}
+
+/*
+ * Distribute fixed rank rendezvous edges over CTAs. Each CTA first publishes
+ * every peer inbox assigned to it, then polls the matching receiver-local
+ * inboxes. Publishing all assigned edges before waiting avoids ordering cycles
+ * when one CTA owns multiple peers.
+ */
+template <int MaxPeers>
+__device__ __forceinline__ void distributed_ready_rendezvous_for_cta(
+    MultiGpuReadySignalPlan<MaxPeers> ready_plan,
+    int ready_value) {
+    if (threadIdx.x != 0 ||
+        ready_value <= 0 ||
+        ready_plan.protocol == MultiGpuReadySignalProtocol::Disabled ||
+        ready_plan.peer_count <= 0) {
+        return;
+    }
+
+    const int first_peer = static_cast<int>(blockIdx.x);
+    const int peer_stride = static_cast<int>(gridDim.x);
+
+    for (int peer_idx = first_peer;
+         peer_idx < ready_plan.peer_count;
+         peer_idx += peer_stride) {
+        publish_ready_signal(
+            ready_plan.peer_publish_signals[peer_idx],
+            ready_value,
+            ready_plan.protocol);
+    }
+
+    for (int peer_idx = first_peer;
+         peer_idx < ready_plan.peer_count;
+         peer_idx += peer_stride) {
+        wait_until_ready_signal_at_least(
+            ready_plan.local_wait_signals[peer_idx],
+            ready_value,
+            ready_plan.poll_sleep_cycles);
     }
 }
 

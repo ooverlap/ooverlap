@@ -25,6 +25,20 @@ enum class oo_ready_signal_channel : int {
 };
 
 constexpr int kOoReadySignalChannelCount = 2;
+
+/*
+ * Slot 0 preserves the existing planner ReadyPublish/ReadyWait protocol.
+ * Slots [1, 1 + kOoMaxLocalDevices) are receiver-local inboxes indexed by
+ * sender rank. Fixed kernel prologues/epilogues remotely write those inboxes
+ * and poll only local memory.
+ */
+constexpr int kOoReadySignalLegacySlot = 0;
+constexpr int kOoReadySignalInboxBaseSlot = 1;
+constexpr int kOoReadySignalSlotsPerRank =
+    kOoReadySignalInboxBaseSlot + kOoMaxLocalDevices;
+constexpr size_t kOoReadySignalBytes =
+    static_cast<size_t>(kOoReadySignalSlotsPerRank) * sizeof(int);
+
 constexpr int kOoReadySignalChannelDeviceMemory =
     static_cast<int>(oo_ready_signal_channel::device_memory);
 constexpr int kOoReadySignalChannelHostMapped =

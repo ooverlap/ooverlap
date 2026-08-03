@@ -45,7 +45,8 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     unsigned int* cta_barrier_counter,
-    unsigned int cta_barrier_start) {
+    unsigned int cta_barrier_entry_target,
+    unsigned int cta_barrier_final_target) {
 
     using Variant = comm::TmaPipelineVariant<
         ChunkBytes,
@@ -67,32 +68,16 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
     __shared__ sync::semaphore barriers[Variant::barrier_count];
 
     if (cta_barrier_counter != nullptr) {
-        if (threadIdx.x == 0) {
-            if (blockIdx.x == 0) {
-                const int entry_ready_value =
-                    collective_epoch * comm::plan::kReadySignalPhaseStride;
+        const int entry_ready_value =
+            collective_epoch * comm::plan::kReadySignalPhaseStride;
 
-                publish_ready_signal(
-                    local_ready_signal,
-                    entry_ready_value,
-                    ready_plan.protocol);
+        distributed_ready_rendezvous_for_cta(
+            ready_plan,
+            entry_ready_value);
 
-                for (int peer_idx = 0;
-                     peer_idx < ready_plan.peer_count;
-                     ++peer_idx) {
-                    wait_until_ready_signal_at_least(
-                        ready_plan.peer_ready_signals[peer_idx],
-                        entry_ready_value,
-                        ready_plan.poll_sleep_cycles);
-                }
-
-                advance_cta_barrier_counter(cta_barrier_counter, 1u);
-            } else {
-                wait_until_cta_barrier_counter_at_least(
-                    cta_barrier_counter,
-                    cta_barrier_start);
-            }
-        }
+        arrive_and_wait_cta_barrier(
+            cta_barrier_counter,
+            cta_barrier_entry_target);
 
         __syncthreads();
     }
@@ -117,6 +102,24 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
             ready_plan,
             collective_epoch,
             cta_barrier_counter);
+
+    if (cta_barrier_counter != nullptr) {
+        __syncthreads();
+
+        arrive_and_wait_cta_barrier(
+            cta_barrier_counter,
+            cta_barrier_final_target);
+
+        __syncthreads();
+
+        const int final_ready_value =
+            collective_epoch * comm::plan::kReadySignalPhaseStride +
+            (comm::plan::kReadySignalPhaseStride - 1);
+
+        distributed_ready_rendezvous_for_cta(
+            ready_plan,
+            final_ready_value);
+    }
 }
 
 
@@ -163,6 +166,34 @@ struct CtaBarrierScratch {
     unsigned int* counter = nullptr;
     unsigned int* last_value = nullptr;
 };
+
+template <int MaxTasks>
+inline bool rebase_cta_barrier_targets(
+    comm::plan::WindowTaskExecutorPlan<MaxTasks>* plan,
+    unsigned int offset) {
+    if (plan == nullptr ||
+        plan->total_tasks < 0 ||
+        plan->total_tasks > MaxTasks) {
+        return false;
+    }
+
+    for (int i = 0; i < plan->total_tasks; ++i) {
+        if (plan->tasks[i].op != comm::task::WindowTaskOp::Barrier) {
+            continue;
+        }
+
+        const unsigned int target =
+            plan->tasks[i].payload.barrier_target;
+
+        if (target > ~0u - offset) {
+            return false;
+        }
+
+        plan->tasks[i].payload.barrier_target = target + offset;
+    }
+
+    return true;
+}
 
 inline cudaError_t get_cached_cta_barrier_scratch(
     int device,
@@ -239,7 +270,8 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     unsigned int* cta_barrier_counter = nullptr,
-    unsigned int cta_barrier_start = 0u) {
+    unsigned int cta_barrier_entry_target = 0u,
+    unsigned int cta_barrier_final_target = 0u) {
     if (num_blocks <= 0 || threads <= 0) {
         return cudaSuccess;
     }
@@ -262,7 +294,8 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
                 ready_plan,
                 collective_epoch,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
 
     return cudaGetLastError();
 }
@@ -394,7 +427,8 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
     int collective_epoch,
     const char* error_prefix,
     unsigned int* cta_barrier_counter = nullptr,
-    unsigned int cta_barrier_start = 0u) {
+    unsigned int cta_barrier_entry_target = 0u,
+    unsigned int cta_barrier_final_target = 0u) {
     using ByValuePlan =
         comm::plan::WindowTaskExecutorPlan<ByValueMaxTasks>;
 
@@ -448,7 +482,8 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
             ready_plan,
             collective_epoch,
             cta_barrier_counter,
-            cta_barrier_start);
+            cta_barrier_entry_target,
+            cta_barrier_final_target);
 }
 
 
@@ -473,7 +508,8 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
     int collective_epoch,
     const char* error_prefix,
     unsigned int* cta_barrier_counter = nullptr,
-    unsigned int cta_barrier_start = 0u) {
+    unsigned int cta_barrier_entry_target = 0u,
+    unsigned int cta_barrier_final_target = 0u) {
     if (window_plan.total_tasks < 0 ||
         window_plan.total_tasks > MaxSourceTasks) {
         return cudaErrorInvalidConfiguration;
@@ -502,7 +538,8 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
                 collective_epoch,
                 error_prefix,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
     }
 
     if (window_plan.total_tasks <=
@@ -528,7 +565,8 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
                 collective_epoch,
                 error_prefix,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
     }
 
     if (window_plan.total_tasks <=
@@ -554,7 +592,8 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
                 collective_epoch,
                 error_prefix,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
     }
 
     if (window_plan.total_tasks <=
@@ -580,7 +619,8 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
                 collective_epoch,
                 error_prefix,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
     }
 
     return cudaErrorInvalidConfiguration;
