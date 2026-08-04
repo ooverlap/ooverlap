@@ -7,6 +7,7 @@ set(OOVERLAP_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 set(OOVERLAP_SM90A_GENCODE "--generate-code=arch=compute_90a,code=sm_90a")
 set(OOVERLAP_SM90A_PTX     "--generate-code=arch=compute_90a,code=compute_90a")
+set(OOVERLAP_SM90A_LTO     "--generate-code=arch=compute_90a,code=lto_90a")
 
 # -------------------------
 # Small build helpers
@@ -246,8 +247,22 @@ if(OOVERLAP_NEED_CORE)
   ooverlap_enable_pic(ooverlap_comm)
 
   ooverlap_enable_release_opts(ooverlap_comm)
+  target_compile_definitions(ooverlap_comm PRIVATE
+    $<$<CONFIG:Debug>:OOVERLAP_DEBUG_CUDA_LAUNCH_CHECKS>
+  )
   set_property(TARGET ooverlap_comm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
   set_property(TARGET ooverlap_comm PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+if(OOVERLAP_ENABLE_CUDA_LTO)
+  # LTO IR requires RDC. Keep it on the core communication library, whose
+  # separable-compilation/device-link properties are enabled above. In
+  # particular, do not apply it to ooverlap_gemm, which intentionally
+  # compiles CUTLASS SM90 kernels with RDC disabled.
+  target_compile_options(ooverlap_comm PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_LTO}>
+  )
+endif()
+
 
   target_include_directories(ooverlap_comm
     PUBLIC

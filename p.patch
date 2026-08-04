@@ -1,0 +1,32 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index a674fa1..7b8de9b 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -20,11 +20,6 @@ function(ooverlap_force_sm90a target)
+       $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_GENCODE}>
+       $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_PTX}>
+     )
+-    if(OOVERLAP_ENABLE_CUDA_LTO)
+-      target_compile_options(${target} PRIVATE
+-        $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_LTO}>
+-      )
+-    endif()
+   endif()
+ endfunction()
+ 
+@@ -254,6 +249,15 @@ if(OOVERLAP_NEED_CORE)
+   ooverlap_enable_release_opts(ooverlap_comm)
+   set_property(TARGET ooverlap_comm PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+   set_property(TARGET ooverlap_comm PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
++  if(OOVERLAP_ENABLE_CUDA_LTO)
++    # LTO IR requires RDC. Keep it on the core communication library, whose
++    # separable-compilation/device-link properties are enabled above. In
++    # particular, do not apply it to ooverlap_gemm, which intentionally
++    # compiles CUTLASS SM90 kernels with RDC disabled.
++    target_compile_options(ooverlap_comm PRIVATE
++      $<$<COMPILE_LANGUAGE:CUDA>:${OOVERLAP_SM90A_LTO}>
++    )
++  endif()
+ 
+   target_include_directories(ooverlap_comm
+     PUBLIC

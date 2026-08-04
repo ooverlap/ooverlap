@@ -1,7 +1,5 @@
 #include "comm/tma_multi_gpu_reduce_scatter_sm90.h"
 
-#include "ooverlap/system/runtime_utils.cuh"
-
 #include "comm/kernels/multi_gpu_ready_signal.cuh"
 #include "comm/kernels/multi_gpu_window_task_executor.cuh"
 #include "comm/params.h"
@@ -241,8 +239,6 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
 
     cta_barrier_final_value +=
         static_cast<unsigned int>(num_blocks);
-
-    system::runtime::set_device(launch.local_device);
 
     const cudaError_t launch_error =
         comm::kernels::dispatch_multi_gpu_window_task_executor_by_value_sm90<

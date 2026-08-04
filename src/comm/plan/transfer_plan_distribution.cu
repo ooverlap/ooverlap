@@ -3,6 +3,7 @@
 #include "comm/plan/transfer_planner.h"
 #include "ooverlap/comm.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -144,11 +145,25 @@ struct CachedPlanEntry {
     TransferPlan<MaxTransferTasks> plan{};
 };
 
+std::uint64_t next_same_process_plan_cache_generation() {
+    static std::atomic<std::uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 template <int MaxTransferTasks>
 struct SameProcessPlanCache {
+    const std::uint64_t generation =
+        next_same_process_plan_cache_generation();
     std::mutex mutex;
     int next_victim = 0;
     CachedPlanEntry<MaxTransferTasks> entries[kPlanCacheEntries] = {};
+};
+
+template <int MaxTransferTasks>
+struct ThreadLocalPlanEntry {
+    const SameProcessPlanCache<MaxTransferTasks>* owner = nullptr;
+    std::uint64_t owner_generation = 0;
+    CachedPlanEntry<MaxTransferTasks> entry{};
 };
 
 template <int MaxTransferTasks, typename Builder>
@@ -157,8 +172,30 @@ oo_status_t get_or_build_cached_same_process_plan(
     const TransferPlanRequestKey& key,
     TransferPlan<MaxTransferTasks>** out_plan,
     Builder&& builder) {
-    if (cache == nullptr || key.world_size <= 0) {
+    if (cache == nullptr ||
+        out_plan == nullptr ||
+        key.world_size <= 0) {
         return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_plan = nullptr;
+
+    /*
+     * Logical plans do not contain rank-local pointers. The first warmup launch
+     * copies the selected plan into submitting-thread storage; subsequent ranks
+     * and measured iterations with the same shape avoid the shared cache lock.
+     *
+     * A generation protects against allocator address reuse after a group/cache
+     * is destroyed and another one is created at the same address.
+     */
+    static thread_local ThreadLocalPlanEntry<MaxTransferTasks> local{};
+
+    if (local.owner == cache &&
+        local.owner_generation == cache->generation &&
+        local.entry.valid &&
+        same_request_key(local.entry.key, key)) {
+        *out_plan = &local.entry.plan;
+        return OO_SUCCESS;
     }
 
     std::lock_guard<std::mutex> lock(cache->mutex);
@@ -168,7 +205,10 @@ oo_status_t get_or_build_cached_same_process_plan(
             cache->entries[i];
 
         if (entry.valid && same_request_key(entry.key, key)) {
-            *out_plan = &entry.plan;
+            local.owner = cache;
+            local.owner_generation = cache->generation;
+            local.entry = entry;
+            *out_plan = &local.entry.plan;
             return OO_SUCCESS;
         }
     }
@@ -203,7 +243,10 @@ oo_status_t get_or_build_cached_same_process_plan(
     }
 
     entry.valid = true;
-    *out_plan = &entry.plan;
+    local.owner = cache;
+    local.owner_generation = cache->generation;
+    local.entry = entry;
+    *out_plan = &local.entry.plan;
     return OO_SUCCESS;
 }
 

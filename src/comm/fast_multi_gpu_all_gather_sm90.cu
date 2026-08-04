@@ -477,12 +477,8 @@ cudaError_t launch_fast_multi_gpu_all_gather(
         return cudaErrorInvalidConfiguration;
     }
 
-    cudaError_t error = cudaSetDevice(launch.local_device);
-    if (error != cudaSuccess) {
-        return error;
-    }
-
-    error = configure_fast_all_gather_kernel_once(launch.local_device);
+    cudaError_t error =
+        configure_fast_all_gather_kernel_once(launch.local_device);
     if (error != cudaSuccess) {
         return error;
     }
@@ -517,10 +513,12 @@ cudaError_t launch_fast_multi_gpu_all_gather(
             scratch.counter,
             counter_base);
 
+#if !defined(NDEBUG) || defined(OOVERLAP_DEBUG_CUDA_LAUNCH_CHECKS)
     error = cudaGetLastError();
     if (error != cudaSuccess) {
         return error;
     }
+#endif
 
     *scratch.last_value = counter_final;
     return cudaSuccess;

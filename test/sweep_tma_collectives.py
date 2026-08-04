@@ -82,14 +82,16 @@ DEFAULT_COLLECTIVES = (
 
 # Edit this list or pass --cta-candidates. Each tuple gets a fresh process.
 DEFAULT_CTA_CANDIDATES = (
-    # (3, 1),
-    # (6, 2),
-    # (9, 3),
-    # (12, 4),
-    # (15, 5),
-    # (18, 6),
-    # (24, 8),
-    # (27, 9),
+    (3, 1),
+    (6, 2),
+    (9, 3),
+    (12, 4),
+    (15, 5),
+    (18, 6),
+    (21, 7),
+    (24, 8),
+    (27, 9),
+
     (1, 1),
 (2, 2),
 (3, 3),
@@ -101,6 +103,8 @@ DEFAULT_CTA_CANDIDATES = (
 (9, 9),
 (10, 10),
 (12, 12),
+(15, 15),
+(18, 18),
 )
 
 ENV_MAX_CTAS = "OOVERLAP_MAX_CTAS"

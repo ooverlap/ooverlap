@@ -284,7 +284,16 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
                 cta_barrier_entry_target,
                 cta_barrier_final_target);
 
+#if !defined(NDEBUG) || defined(OOVERLAP_DEBUG_CUDA_LAUNCH_CHECKS)
+    /*
+     * Keep immediate launch-error validation in debug builds. Release builds
+     * surface launch and asynchronous execution failures at the caller's final
+     * stream/event synchronization, avoiding a CUDA runtime call per rank.
+     */
     return cudaGetLastError();
+#else
+    return cudaSuccess;
+#endif
 }
 
 

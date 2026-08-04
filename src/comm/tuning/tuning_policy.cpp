@@ -59,6 +59,13 @@ struct SelectionCacheKey {
     int max_ctas_per_reduce_task = 0;
 };
 
+struct RuntimeLaunchCaps {
+    bool has_max_ctas = false;
+    int max_ctas = 0;
+    bool has_max_ctas_per_reduce_task = false;
+    int max_ctas_per_reduce_task = 0;
+};
+
 struct SelectionCacheKeyHash {
     size_t operator()(const SelectionCacheKey& key) const {
         size_t h = std::hash<int>{}(key.collective);
@@ -148,6 +155,26 @@ bool parse_positive_int_env(
 
     *out = static_cast<int>(value);
     return true;
+}
+
+const RuntimeLaunchCaps& runtime_launch_caps() {
+    /*
+     * Tuning environment variables are process setup, not per-collective
+     * inputs. Parse them once so every rank does not repeat getenv/strtol in
+     * the launch path.
+     */
+    static const RuntimeLaunchCaps caps = [] {
+        RuntimeLaunchCaps value{};
+        value.has_max_ctas =
+            parse_positive_int_env(kEnvMaxCtas, &value.max_ctas);
+        value.has_max_ctas_per_reduce_task =
+            parse_positive_int_env(
+                kEnvMaxCtasPerReduceTask,
+                &value.max_ctas_per_reduce_task);
+        return value;
+    }();
+
+    return caps;
 }
 
 bool json_number_as_double(
@@ -737,15 +764,7 @@ LaunchConfig select_launch_config_for_collective(
     int world_size,
     size_t bytes,
     TuningPreference preference) {
-    int env_max_ctas = 0;
-    const bool has_max_ctas =
-        parse_positive_int_env(kEnvMaxCtas, &env_max_ctas);
-
-    int env_max_ctas_per_reduce_task = 0;
-    const bool has_max_ctas_per_reduce_task =
-        parse_positive_int_env(
-            kEnvMaxCtasPerReduceTask,
-            &env_max_ctas_per_reduce_task);
+    const RuntimeLaunchCaps& caps = runtime_launch_caps();
 
     const SelectionCacheKey cache_key =
         make_selection_cache_key(
@@ -753,13 +772,30 @@ LaunchConfig select_launch_config_for_collective(
             world_size,
             bytes,
             preference,
-            has_max_ctas,
-            env_max_ctas,
-            has_max_ctas_per_reduce_task,
-            env_max_ctas_per_reduce_task);
+            caps.has_max_ctas,
+            caps.max_ctas,
+            caps.has_max_ctas_per_reduce_task,
+            caps.max_ctas_per_reduce_task);
+
+    /*
+     * The benchmark prepares a fixed collective shape during warmup. Preserve
+     * the global cache for cross-thread reuse, but let the submitting thread
+     * reuse its prepared selection without taking the cache mutex.
+     */
+    static thread_local bool local_cache_valid = false;
+    static thread_local SelectionCacheKey local_cache_key{};
+    static thread_local LaunchConfig local_cached{};
+
+    if (local_cache_valid &&
+        SelectionCacheKeyEqual{}(local_cache_key, cache_key)) {
+        return local_cached;
+    }
 
     LaunchConfig cached{};
     if (selection_cache_lookup(cache_key, &cached)) {
+        local_cache_key = cache_key;
+        local_cached = cached;
+        local_cache_valid = true;
         return cached;
     }
 
@@ -769,10 +805,10 @@ LaunchConfig select_launch_config_for_collective(
     LaunchConfig selected =
         fallback_config(
             collective,
-            has_max_ctas,
-            env_max_ctas,
-            has_max_ctas_per_reduce_task,
-            env_max_ctas_per_reduce_task);
+            caps.has_max_ctas,
+            caps.max_ctas,
+            caps.has_max_ctas_per_reduce_task,
+            caps.max_ctas_per_reduce_task);
 
     if (policy.loaded &&
         !policy.points.empty() &&
@@ -789,10 +825,10 @@ LaunchConfig select_launch_config_for_collective(
             LaunchConfig candidate =
                 config_from_policy_point(
                     *point,
-                    has_max_ctas,
-                    env_max_ctas,
-                    has_max_ctas_per_reduce_task,
-                    env_max_ctas_per_reduce_task);
+                    caps.has_max_ctas,
+                    caps.max_ctas,
+                    caps.has_max_ctas_per_reduce_task,
+                    caps.max_ctas_per_reduce_task);
 
             if (launch_config_valid(candidate)) {
                 selected = candidate;
@@ -801,6 +837,9 @@ LaunchConfig select_launch_config_for_collective(
     }
 
     selection_cache_store(cache_key, selected);
+    local_cache_key = cache_key;
+    local_cached = selected;
+    local_cache_valid = true;
     return selected;
 }
 

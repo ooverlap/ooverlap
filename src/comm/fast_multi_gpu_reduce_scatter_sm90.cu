@@ -516,12 +516,7 @@ cudaError_t launch_fast_multi_gpu_reduce_scatter_typed(
         return cudaErrorInvalidConfiguration;
     }
 
-    cudaError_t error = cudaSetDevice(launch.local_device);
-    if (error != cudaSuccess) {
-        return error;
-    }
-
-    error =
+    cudaError_t error =
         configure_fast_reduce_scatter_kernel_once<ReduceOp>(
             launch.local_device);
     if (error != cudaSuccess) {
@@ -558,10 +553,12 @@ cudaError_t launch_fast_multi_gpu_reduce_scatter_typed(
             scratch.counter,
             counter_base);
 
+#if !defined(NDEBUG) || defined(OOVERLAP_DEBUG_CUDA_LAUNCH_CHECKS)
     error = cudaGetLastError();
     if (error != cudaSuccess) {
         return error;
     }
+#endif
 
     *scratch.last_value = counter_final;
     return cudaSuccess;

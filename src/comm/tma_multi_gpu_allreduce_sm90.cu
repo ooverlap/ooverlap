@@ -1,7 +1,5 @@
 #include "comm/tma_multi_gpu_allreduce_sm90.h"
 
-#include "ooverlap/system/runtime_utils.cuh"
-
 #include "comm/kernels/multi_gpu_ready_signal.cuh"
 #include "comm/kernels/multi_gpu_window_task_executor.cuh"
 #include "comm/params.h"
@@ -427,8 +425,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
             num_blocks,
             window_plan);
     #endif
-
-    system::runtime::set_device(launch.local_device);
 
     const cudaError_t launch_error =
         comm::kernels::dispatch_multi_gpu_window_task_executor_by_value_sm90<
