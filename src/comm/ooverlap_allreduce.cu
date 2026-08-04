@@ -90,7 +90,7 @@ oo_status_t allreduce_impl(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    ooverlap::comm::api::CollectiveLaunchState launch{};
+    ooverlap::comm::api::CollectiveLaunchState launch;
 
     if (prebound_rank_buffers != nullptr) {
         status =

@@ -485,8 +485,6 @@ oo_status_t ensure_ipc_legacy_collective_buffers_registered(
     }
 
     try {
-        cudaSetDevice(node->device);
-
         const oo_group::ipc_import_key local_key =
             make_ipc_import_key(local);
 
@@ -617,6 +615,15 @@ oo_status_t ensure_ipc_legacy_collective_buffers_registered(
 oo_status_t register_ipc_collective_buffers(
     oo_node_t* node,
     oo_buffer_t* local) {
+    if (node == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const cudaError_t error = cudaSetDevice(node->device);
+    if (error != cudaSuccess) {
+        return cuda_to_status(error);
+    }
+
     return ensure_ipc_legacy_collective_buffers_registered(
         node,
         local);
@@ -654,6 +661,13 @@ oo_status_t prepare_fast_allreduce_launch(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
+    const cudaError_t set_device_error =
+        cudaSetDevice(node->device);
+
+    if (set_device_error != cudaSuccess) {
+        return cuda_to_status(set_device_error);
+    }
+
     if (prebound_rank_buffers != nullptr) {
         if (prebound_rank_buffer_count != group->num_devices ||
             prebound_rank_buffers[node->rank] != local) {
@@ -672,13 +686,6 @@ oo_status_t prepare_fast_allreduce_launch(
         }
     } else {
         group->collective_buffers[node->rank] = local;
-    }
-
-    const cudaError_t set_device_error =
-        cudaSetDevice(node->device);
-
-    if (set_device_error != cudaSuccess) {
-        return cuda_to_status(set_device_error);
     }
 
     oo_ready_signal& local_ready_slot =
@@ -841,6 +848,15 @@ oo_status_t prepare_collective_launch_impl(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
+    {
+        const cudaError_t err =
+            cudaSetDevice(node->device);
+
+        if (err != cudaSuccess) {
+            return cuda_to_status(err);
+        }
+    }
+
     /*
      * OOVERLAP_IPC_LEGACY_BUFFER_PREPARE_PATCH:
      *
@@ -884,15 +900,6 @@ oo_status_t prepare_collective_launch_impl(
 
     int* local_device_ready_base =
         reinterpret_cast<int*>(local_signal.ptr);
-
-    {
-        const cudaError_t err =
-            cudaSetDevice(node->device);
-
-        if (err != cudaSuccess) {
-            return cuda_to_status(err);
-        }
-    }
 
     /*
      * The mapped device alias is resolved once when the group creates the

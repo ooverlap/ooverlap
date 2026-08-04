@@ -428,12 +428,10 @@ private:
  *   - one matched collective sequence per IPC group
  *
  * Important lifetime rule:
- *   The returned TransferPlan pointer is valid until the next IPC plan cache
- *   miss overwrites the single shared arena.  This is fine for the current public
- *   path because the transfer plan is consumed immediately to lower/enqueue the
- *   window plan before the next collective starts.  If we later allow multiple
- *   outstanding host-side collective preparations, use multiple shared slots or
- *   ref-counted epochs.
+ *   Each collective type owns a separate shared arena. The returned TransferPlan
+ *   pointer is valid until the next cache miss for that same collective type.
+ *   This is fine for the current public path because the transfer plan is consumed
+ *   immediately to lower/enqueue the window plan before the next collective starts.
  */
 constexpr std::uint32_t kIpcSharedPlanMagic = 0x4f4f5053u; // "OOPS"
 constexpr std::uint32_t kIpcSharedPlanVersion = 1u;
@@ -496,9 +494,17 @@ std::string sanitize_ipc_plan_key_component(const char* key) {
     return out;
 }
 
-std::string make_ipc_plan_shm_name(const char* broker_key) {
+std::string make_ipc_plan_shm_name(
+    const char* broker_key,
+    const char* arena_suffix) {
+    if (arena_suffix == nullptr || arena_suffix[0] == '\0') {
+        throw std::runtime_error("IPC plan arena: suffix is empty");
+    }
+
     std::string name = "/ooverlap_ipc_plan_";
     name += sanitize_ipc_plan_key_component(broker_key);
+    name += "_";
+    name += arena_suffix;
 
     if (name.size() >= 240) {
         throw std::runtime_error("IPC plan arena: shm name too long");
@@ -525,8 +531,9 @@ public:
     IpcSharedPlanMapping(
         const char* broker_key,
         int local_rank,
-        int world_size)
-        : shm_name_(make_ipc_plan_shm_name(broker_key)),
+        int world_size,
+        const char* arena_suffix)
+        : shm_name_(make_ipc_plan_shm_name(broker_key, arena_suffix)),
           local_rank_(local_rank),
           world_size_(world_size) {
         if (local_rank_ < 0 ||
@@ -826,7 +833,21 @@ public:
         const char* broker_key,
         int local_rank,
         int world_size)
-        : mapping_(broker_key, local_rank, world_size) {}
+        : allreduce_mapping_(
+              broker_key,
+              local_rank,
+              world_size,
+              "allreduce"),
+          reduce_scatter_mapping_(
+              broker_key,
+              local_rank,
+              world_size,
+              "reduce_scatter"),
+          all_gather_mapping_(
+              broker_key,
+              local_rank,
+              world_size,
+              "all_gather") {}
 
     oo_status_t get_allreduce_transfer_plan(
         oo_node_t* node,
@@ -858,10 +879,10 @@ public:
 
         return get_or_build_shared_ipc_plan_direct(
             &cache_mutex_,
-            &cache_valid_,
-            &cached_key_,
+            &allreduce_cache_valid_,
+            &allreduce_cached_key_,
             node,
-            mapping_.arena(),
+            allreduce_mapping_.arena(),
             CollectivePlanFor::AllReduce,
             key,
             out_plan,
@@ -915,10 +936,10 @@ public:
 
         return get_or_build_shared_ipc_plan_direct(
             &cache_mutex_,
-            &cache_valid_,
-            &cached_key_,
+            &reduce_scatter_cache_valid_,
+            &reduce_scatter_cached_key_,
             node,
-            mapping_.arena(),
+            reduce_scatter_mapping_.arena(),
             CollectivePlanFor::ReduceScatter,
             key,
             out_plan,
@@ -971,10 +992,10 @@ public:
 
         return get_or_build_shared_ipc_plan_direct(
             &cache_mutex_,
-            &cache_valid_,
-            &cached_key_,
+            &all_gather_cache_valid_,
+            &all_gather_cached_key_,
             node,
-            mapping_.arena(),
+            all_gather_mapping_.arena(),
             CollectivePlanFor::AllGather,
             key,
             out_plan,
@@ -999,18 +1020,21 @@ public:
     }
 
 private:
-    IpcSharedPlanMapping mapping_;
+    IpcSharedPlanMapping allreduce_mapping_;
+    IpcSharedPlanMapping reduce_scatter_mapping_;
+    IpcSharedPlanMapping all_gather_mapping_;
 
-    /*
-     * Single-slot cache metadata for the single shared arena payload.
-     *
-     * Do not keep separate per-collective cached entries here unless the shared
-     * arena grows separate payload slots.  With one payload, only the most recent
-     * plan can be valid.
-     */
+    /* Preserve the existing per-process serialization across collective types. */
     std::mutex cache_mutex_;
-    bool cache_valid_ = false;
-    TransferPlanRequestKey cached_key_{};
+
+    bool allreduce_cache_valid_ = false;
+    TransferPlanRequestKey allreduce_cached_key_{};
+
+    bool reduce_scatter_cache_valid_ = false;
+    TransferPlanRequestKey reduce_scatter_cached_key_{};
+
+    bool all_gather_cache_valid_ = false;
+    TransferPlanRequestKey all_gather_cached_key_{};
 };
 
 

@@ -29,7 +29,7 @@ oo_status_t reduce_scatter_impl(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    ooverlap::comm::api::CollectiveLaunchState launch{};
+    ooverlap::comm::api::CollectiveLaunchState launch;
 
     oo_status_t status = OO_SUCCESS;
 
