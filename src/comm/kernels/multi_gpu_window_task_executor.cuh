@@ -22,6 +22,8 @@ namespace ooverlap {
 namespace comm {
 namespace kernels {
 
+/* OOVERLAP_CHUNK_ONLY_THREAD0_WINDOW_PIPELINE_V1 */
+
 /*
  * OOVERLAP_ALL_COLLECTIVES_PLAN_BY_VALUE_V1
  *
@@ -36,8 +38,7 @@ template <
     int MaxTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 __global__ void multi_gpu_window_task_executor_kernel_sm90(
     const __grid_constant__
         comm::plan::WindowTaskExecutorPlan<MaxTasks> plan,
@@ -52,8 +53,7 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         ChunkBytes,
         StageDepth,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes>;
+        LoadFillDepth>;
 
     static_assert(FillDepth > 0, "FillDepth must be > 0");
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
@@ -89,8 +89,7 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         MaxPeers,
         uint4,
         TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-        LoadFillDepth,
-        SmallTaskBytes>(
+        LoadFillDepth>(
             plan.tasks,
             plan.total_tasks,
             plan.tasks_per_cta,
@@ -254,8 +253,7 @@ template <
     int MaxTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 cudaError_t launch_multi_gpu_window_task_executor_sm90(
     const comm::plan::WindowTaskExecutorPlan<MaxTasks>& window_plan,
     int num_blocks,
@@ -279,8 +277,7 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
         MaxTasks,
         MaxPeers,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes><<<
+        LoadFillDepth><<<
             num_blocks,
             threads,
             dynamic_shared_bytes,
@@ -304,8 +301,7 @@ template <
     int MaxTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 void configure_multi_gpu_window_task_executor_once(
     int device,
     const char* error_prefix) {
@@ -313,14 +309,12 @@ void configure_multi_gpu_window_task_executor_once(
         ChunkBytes,
         StageDepth,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes>;
+        LoadFillDepth>;
 
     static_assert(FillDepth > 0, "FillDepth must be > 0");
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     if (device < 0 || device >= 32) {
         throw std::runtime_error("invalid device");
@@ -374,8 +368,7 @@ void configure_multi_gpu_window_task_executor_once(
                     MaxTasks,
                     MaxPeers,
                     FillDepth,
-                    LoadFillDepth,
-                    SmallTaskBytes>,
+                    LoadFillDepth>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(dynamic_smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
@@ -390,8 +383,7 @@ void configure_multi_gpu_window_task_executor_once(
                 MaxTasks,
                 MaxPeers,
                 FillDepth,
-                LoadFillDepth,
-                SmallTaskBytes>,
+                LoadFillDepth>,
             cudaFuncAttributePreferredSharedMemoryCarveout,
             100),
         "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
@@ -409,8 +401,7 @@ template <
     int MaxSourceTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
     const comm::plan::WindowTaskExecutorPlan<MaxSourceTasks>& window_plan,
     int num_blocks,
@@ -455,8 +446,7 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
         ByValueMaxTasks,
         MaxPeers,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes>(
+        LoadFillDepth>(
             device,
             error_prefix);
 
@@ -467,8 +457,7 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
         ByValueMaxTasks,
         MaxPeers,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes>(
+        LoadFillDepth>(
             by_value_plan,
             num_blocks,
             threads,
@@ -490,8 +479,7 @@ template <
     int MaxSourceTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
     const comm::plan::WindowTaskExecutorPlan<MaxSourceTasks>& window_plan,
     int num_blocks,
@@ -521,8 +509,7 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
             MaxSourceTasks,
             MaxPeers,
             FillDepth,
-            LoadFillDepth,
-            SmallTaskBytes>(
+            LoadFillDepth>(
                 window_plan,
                 num_blocks,
                 threads,
@@ -548,8 +535,7 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
             MaxSourceTasks,
             MaxPeers,
             FillDepth,
-            LoadFillDepth,
-            SmallTaskBytes>(
+            LoadFillDepth>(
                 window_plan,
                 num_blocks,
                 threads,
@@ -575,8 +561,7 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
             MaxSourceTasks,
             MaxPeers,
             FillDepth,
-            LoadFillDepth,
-            SmallTaskBytes>(
+            LoadFillDepth>(
                 window_plan,
                 num_blocks,
                 threads,
@@ -602,8 +587,7 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
             MaxSourceTasks,
             MaxPeers,
             FillDepth,
-            LoadFillDepth,
-            SmallTaskBytes>(
+            LoadFillDepth>(
                 window_plan,
                 num_blocks,
                 threads,

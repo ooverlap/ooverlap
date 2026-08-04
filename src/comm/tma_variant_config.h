@@ -2,19 +2,19 @@
 
 #include "ooverlap/sync/sync.cuh"
 
-#include "comm/params.h"
-
 #include <cstddef>
 
 namespace ooverlap {
 namespace comm {
 
+/* OOVERLAP_CHUNK_ONLY_THREAD0_WINDOW_PIPELINE_V1 */
+
+
 template <
     int ChunkBytes,
     int StageDepth,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 struct TmaPipelineVariant {
     static_assert(ChunkBytes >= 16, "ChunkBytes must be >= 16");
     static_assert((ChunkBytes % 16) == 0, "ChunkBytes must be 16-byte aligned");
@@ -24,7 +24,6 @@ struct TmaPipelineVariant {
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
     static_assert(FillDepth + LoadFillDepth <= StageDepth,
                   "FillDepth + LoadFillDepth must be <= StageDepth");
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     static constexpr int chunk_bytes = ChunkBytes;
     static constexpr int stage_depth = StageDepth;
@@ -36,7 +35,6 @@ struct TmaPipelineVariant {
     static constexpr int stage_gap = FillDepth;
     static constexpr int fill_depth = FillDepth;
     static constexpr int load_fill_depth = LoadFillDepth;
-    static constexpr int small_task_bytes = SmallTaskBytes;
 
     static constexpr int barrier_count = StageDepth;
 
@@ -51,13 +49,8 @@ struct TmaPipelineVariant {
             ? reduce_shared_bytes
             : copy_shared_bytes;
 
-    static constexpr size_t small_task_shared_bytes =
-        static_cast<size_t>(SmallTaskBytes);
-
     static constexpr size_t dynamic_shared_bytes =
-        (pipeline_shared_bytes > small_task_shared_bytes)
-            ? pipeline_shared_bytes
-            : small_task_shared_bytes;
+        pipeline_shared_bytes;
 
     static constexpr size_t static_shared_bytes =
         static_cast<size_t>(barrier_count) *

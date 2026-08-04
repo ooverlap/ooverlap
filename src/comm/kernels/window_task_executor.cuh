@@ -14,6 +14,8 @@ namespace ooverlap {
 namespace comm {
 namespace kernels {
 
+/* OOVERLAP_CHUNK_ONLY_THREAD0_WINDOW_PIPELINE_V1 */
+
 __device__ __forceinline__ void wait_until_cta_barrier_counter_at_least(
     unsigned int* counter,
     unsigned int target) {
@@ -73,8 +75,7 @@ template <
     int MaxPeers,
     typename FastCopyVecT = uint4,
     int FastCopyUnroll = TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
+    int LoadFillDepth = FillDepth>
 __device__ __forceinline__ void execute_window_task(
     const task::WindowTask& task,
     unsigned char* shared_raw,
@@ -90,7 +91,6 @@ __device__ __forceinline__ void execute_window_task(
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
     static_assert(FastCopyUnroll > 0, "FastCopyUnroll must be > 0");
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     switch (task.op) {
         case task::WindowTaskOp::ReduceTMA:
@@ -99,8 +99,7 @@ __device__ __forceinline__ void execute_window_task(
                 FillDepth,
                 ChunkBytes,
                 ReduceApply,
-                LoadFillDepth,
-                SmallTaskBytes>(
+                LoadFillDepth>(
                     task.payload.window.src,
                     task.payload.window.dst,
                     task.payload.window.total_bytes,
@@ -116,8 +115,7 @@ __device__ __forceinline__ void execute_window_task(
                 StageDepth,
                 FillDepth,
                 ChunkBytes,
-                LoadFillDepth,
-                SmallTaskBytes>(
+                LoadFillDepth>(
                     task.payload.window.src,
                     task.payload.window.dst,
                     task.payload.window.total_bytes,
@@ -133,8 +131,7 @@ __device__ __forceinline__ void execute_window_task(
                 StageDepth,
                 FillDepth,
                 ChunkBytes,
-                LoadFillDepth,
-                SmallTaskBytes>(
+                LoadFillDepth>(
                     task.payload.fanout.src,
                     task.payload.fanout.fanout_dsts,
                     static_cast<int>(
@@ -153,8 +150,7 @@ __device__ __forceinline__ void execute_window_task(
                 FillDepth,
                 ChunkBytes,
                 ReduceApply,
-                LoadFillDepth,
-                SmallTaskBytes>(
+                LoadFillDepth>(
                     task.payload.fanout.src,
                     task.payload.fanout.fanout_dsts,
                     task.payload.fanout.fanout_reduce_scope,
@@ -262,8 +258,7 @@ template <
     int MaxPeers,
     typename FastCopyVecT = uint4,
     int FastCopyUnroll = TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
+    int LoadFillDepth = FillDepth>
 __device__ __forceinline__ void execute_window_task_stripe(
     const task::WindowTask* tasks,
     int total_tasks,
@@ -282,7 +277,6 @@ __device__ __forceinline__ void execute_window_task_stripe(
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
     static_assert(FastCopyUnroll > 0, "FastCopyUnroll must be > 0");
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     if (tasks == nullptr ||
         total_tasks <= 0 ||
@@ -318,8 +312,7 @@ __device__ __forceinline__ void execute_window_task_stripe(
             MaxPeers,
             FastCopyVecT,
             FastCopyUnroll,
-            LoadFillDepth,
-            SmallTaskBytes>(
+            LoadFillDepth>(
                 task,
                 shared_raw,
                 barriers,
