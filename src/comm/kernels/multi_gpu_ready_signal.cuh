@@ -101,6 +101,19 @@ inline MultiGpuReadySignalPlan<MaxPeers> make_multi_gpu_ready_signal_plan(
     return plan;
 }
 
+__device__ __forceinline__ void store_ready_signal_volatile(
+    int* ready_signal,
+    int collective_epoch) {
+    if (ready_signal == nullptr) {
+        return;
+    }
+
+    volatile int* ready =
+        reinterpret_cast<volatile int*>(ready_signal);
+
+    ready[0] = collective_epoch;
+}
+
 __device__ __forceinline__ void publish_ready_signal_store_release(
     int* ready_signal,
     int collective_epoch) {
@@ -113,17 +126,16 @@ __device__ __forceinline__ void publish_ready_signal_store_release(
      *   owner rank writes ready[owner_rank]
      *   all peers only read that slot
      *
-     * This avoids atomic RMW on the fast path.  The system fence after the
-     * volatile store keeps the published epoch visible outside the writer GPU.
+     * This avoids atomic RMW on the fast path. The system fence orders prior
+     * work before publishing the epoch outside the writer GPU.
      */
 #if defined(__CUDA_ARCH__)
     __threadfence_system();
 #endif
 
-    volatile int* ready =
-        reinterpret_cast<volatile int*>(ready_signal);
-
-    ready[0] = collective_epoch;
+    store_ready_signal_volatile(
+        ready_signal,
+        collective_epoch);
 }
 
 __device__ __forceinline__ void publish_ready_signal_atomic_max(
@@ -210,13 +222,44 @@ __device__ __forceinline__ void distributed_ready_rendezvous_for_cta(
     const int first_peer = static_cast<int>(blockIdx.x);
     const int peer_stride = static_cast<int>(gridDim.x);
 
-    for (int peer_idx = first_peer;
-         peer_idx < ready_plan.peer_count;
-         peer_idx += peer_stride) {
-        publish_ready_signal(
-            ready_plan.peer_publish_signals[peer_idx],
-            ready_value,
-            ready_plan.protocol);
+    const bool batch_store_release =
+        ready_plan.protocol ==
+            MultiGpuReadySignalProtocol::DeviceMemoryStoreRelease ||
+        ready_plan.protocol ==
+            MultiGpuReadySignalProtocol::HostMappedStoreRelease;
+
+    if (batch_store_release) {
+        /*
+         * CTA 0 publishes every receiver-local inbox after one system fence.
+         * Waiting remains striped across CTAs, so peers are still observed in
+         * parallel without paying one full system fence per peer publication.
+         */
+        if (blockIdx.x == 0 && ready_plan.peer_count > 0) {
+#if defined(__CUDA_ARCH__)
+            __threadfence_system();
+#endif
+
+            for (int peer_idx = 0;
+                 peer_idx < ready_plan.peer_count;
+                 ++peer_idx) {
+                store_ready_signal_volatile(
+                    ready_plan.peer_publish_signals[peer_idx],
+                    ready_value);
+            }
+        }
+    } else {
+        /*
+         * Preserve the existing distributed fallback for AtomicMax and
+         * Disabled protocols.
+         */
+        for (int peer_idx = first_peer;
+             peer_idx < ready_plan.peer_count;
+             peer_idx += peer_stride) {
+            publish_ready_signal(
+                ready_plan.peer_publish_signals[peer_idx],
+                ready_value,
+                ready_plan.protocol);
+        }
     }
 
     for (int peer_idx = first_peer;
