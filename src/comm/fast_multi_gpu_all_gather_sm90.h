@@ -15,7 +15,7 @@ namespace ooverlap {
  * peers. The budget therefore applies to the local partition, not to the full
  * gathered tensor.
  */
-constexpr int kFastAllGatherMaxCtas = 6;
+constexpr int kFastAllGatherMaxCtas = 3;
 
 static_assert(
     TMA_TWO_GPU_PEER_SMALL_TASK_BYTES > 0,
