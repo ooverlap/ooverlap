@@ -185,6 +185,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER="$REPO_ROOT/test/benchmark_vllm_paperlike.py"
 PLOTTER="$REPO_ROOT/test/plot_vllm_sweeps.py"
+ORDER_AGGREGATOR="$REPO_ROOT/test/aggregate_vllm_backend_orders.py"
 OUT_ROOT=""
 WORKLOAD=""
 TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp4_policy.json}"
@@ -202,6 +203,7 @@ command -v bash >/dev/null 2>&1 || fail "bash was not found"
 command -v tee >/dev/null 2>&1 || fail "tee was not found"
 [[ -f "$DRIVER" ]] || fail "vLLM benchmark driver not found: $DRIVER"
 [[ -f "$PLOTTER" ]] || fail "vLLM sweep plotter not found: $PLOTTER"
+[[ -f "$ORDER_AGGREGATOR" ]] || fail "vLLM backend-order aggregator not found: $ORDER_AGGREGATOR"
 
 resolve_runtime_env_file() {
   local candidate=""
@@ -371,6 +373,14 @@ run_plot() {
   "$PYTHON_BIN" "$PLOTTER" "${args[@]}"
 }
 
+run_backend_order_aggregate() {
+  "$PYTHON_BIN" "$ORDER_AGGREGATOR" \
+    --root "$OUT_ROOT/backend_orders" \
+    --baseline-backend "$BASELINE_BACKEND" \
+    --target-backend ooverlap \
+    --comparison-backends "$BACKENDS"
+}
+
 run_backend_orders() {
   local order_count="${#BACKEND_ORDERS[@]}"
   local array_index
@@ -391,6 +401,9 @@ run_backend_orders() {
 
     if [[ "$MODE" == "run" ]]; then
       run_batch "$backend_order" "$order_root"
+      # Keep a usable combined report after every completed order. This also
+      # makes partial multi-hour evaluations immediately inspectable.
+      run_backend_order_aggregate
       run_plot "$order_root"
 
       if (( order_index < order_count )); then
@@ -405,6 +418,10 @@ run_backend_orders() {
       run_plot "$order_root"
     fi
   done
+
+  if [[ "$MODE" == "plot" ]]; then
+    run_backend_order_aggregate
+  fi
 }
 
 run_workload() {
