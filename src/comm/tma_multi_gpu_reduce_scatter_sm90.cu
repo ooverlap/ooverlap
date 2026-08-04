@@ -26,32 +26,6 @@ namespace {
 
 constexpr int kDefaultMaxCtasPerReduceTask = 8;
 
-int max_ctas_per_reduce_task_from_env() {
-    static const int value = [] {
-        const char* text =
-            std::getenv("OOVERLAP_MAX_CTAS_PER_REDUCE_TASK");
-
-        if (text == nullptr || text[0] == '\0') {
-            return kDefaultMaxCtasPerReduceTask;
-        }
-
-        char* end = nullptr;
-        const long parsed = std::strtol(text, &end, 10);
-
-        if (end == text || *end != '\0' || parsed <= 0) {
-            return kDefaultMaxCtasPerReduceTask;
-        }
-
-        if (parsed > comm::task::kWindowTaskMaxCtas) {
-            return comm::task::kWindowTaskMaxCtas;
-        }
-
-        return static_cast<int>(parsed);
-    }();
-
-    return value;
-}
-
 template <int MaxPeers>
 bool validate_reduce_scatter_launch(
     const comm::api::CollectiveLaunchState& launch) {
@@ -188,7 +162,6 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
             launch.ready_signal_poll_sleep_cycles_by_channel[device_ready_channel]);
 
 
-    /* OOVERLAP_ALL_COLLECTIVES_PLAN_BY_VALUE_V1 */
     static thread_local
         comm::plan::WindowTaskExecutorPlan<MaxLoweringTasks> window_plan;
 

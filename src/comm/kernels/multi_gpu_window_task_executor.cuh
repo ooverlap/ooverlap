@@ -66,6 +66,7 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
 
     __shared__ sync::semaphore barriers[Variant::barrier_count];
 
+
     if (cta_barrier_counter != nullptr) {
         const int entry_ready_value =
             collective_epoch * comm::plan::kReadySignalPhaseStride;

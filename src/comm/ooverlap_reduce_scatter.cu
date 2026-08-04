@@ -4,6 +4,7 @@
 #include "comm/plan/transfer_plan_distribution.h"
 #include "comm/tuning/tuning_policy.h"
 #include "comm/tma_multi_gpu_reduce_scatter_sm90.h"
+#include "ooverlap/comm.h"
 
 namespace {
 

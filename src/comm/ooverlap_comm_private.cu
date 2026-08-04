@@ -50,40 +50,6 @@ oo_status_t cuda_to_status(cudaError_t error) {
     return OO_ERROR_CUDA;
 }
 
-oo_status_t resolve_host_mapped_ready_ptr_for_current_device(
-    oo_ready_signal& signal,
-    int** out) {
-    if (out == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    *out = nullptr;
-
-    if (signal.kind != oo_ready_signal_kind::owned_host_mapped) {
-        *out = reinterpret_cast<int*>(signal.ptr);
-        return OO_SUCCESS;
-    }
-
-    if (signal.owned_host_ptr == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    void* device_ptr = nullptr;
-
-    const cudaError_t err =
-        cudaHostGetDevicePointer(
-            &device_ptr,
-            signal.owned_host_ptr,
-            0);
-
-    if (err != cudaSuccess) {
-        return cuda_to_status(err);
-    }
-
-    *out = reinterpret_cast<int*>(device_ptr);
-    return OO_SUCCESS;
-}
-
 oo_status_t checked_element_bytes(
     size_t count,
     oo_dtype_t dtype,
@@ -928,16 +894,13 @@ oo_status_t prepare_collective_launch_impl(
         }
     }
 
-    int* local_host_ready_signal = nullptr;
-
-    status =
-        resolve_host_mapped_ready_ptr_for_current_device(
-            local_host_signal,
-            &local_host_ready_signal);
-
-    if (status != OO_SUCCESS) {
-        return status;
-    }
+    /*
+     * The mapped device alias is resolved once when the group creates the
+     * host-ready slot. Reuse it for every collective instead of entering the
+     * CUDA runtime once per signal, per rank, per invocation.
+     */
+    int* local_host_ready_signal =
+        reinterpret_cast<int*>(local_host_signal.ptr);
 
     out->local_ptr =
         reinterpret_cast<void*>(
@@ -1050,16 +1013,8 @@ oo_status_t prepare_collective_launch_impl(
         out->peer_ready_signals_by_channel
             [peer_idx][kOoReadySignalChannelDeviceMemory] =
                 peer_device_ready_base + kOoReadySignalLegacySlot;
-        int* peer_host_ready_signal = nullptr;
-
-        status =
-            resolve_host_mapped_ready_ptr_for_current_device(
-                peer_host_signal,
-                &peer_host_ready_signal);
-
-        if (status != OO_SUCCESS) {
-            return status;
-        }
+        int* peer_host_ready_signal =
+            reinterpret_cast<int*>(peer_host_signal.ptr);
 
         out->peer_ready_signals_by_channel
             [peer_idx][kOoReadySignalChannelHostMapped] =
