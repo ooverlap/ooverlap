@@ -42,7 +42,6 @@ template <
 __global__ void multi_gpu_window_task_executor_kernel_sm90(
     const __grid_constant__
         comm::plan::WindowTaskExecutorPlan<MaxTasks> plan,
-    int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     unsigned int* cta_barrier_counter,
@@ -86,7 +85,6 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         FillDepth,
         Variant::chunk_bytes,
         ReduceApply,
-        MaxPeers,
         uint4,
         TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
         LoadFillDepth>(
@@ -96,9 +94,6 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
             static_cast<int>(blockIdx.x),
             shared_raw,
             barriers,
-            local_ready_signal,
-            ready_plan,
-            collective_epoch,
             cta_barrier_counter);
 
     if (cta_barrier_counter != nullptr) {
@@ -260,7 +255,6 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
     int threads,
     size_t dynamic_shared_bytes,
     cudaStream_t stream,
-    int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     unsigned int* cta_barrier_counter = nullptr,
@@ -283,7 +277,6 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
             dynamic_shared_bytes,
             stream>>>(
                 window_plan,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 cta_barrier_counter,
@@ -409,7 +402,6 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
     size_t dynamic_shared_bytes,
     cudaStream_t stream,
     int device,
-    int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     const char* error_prefix,
@@ -463,7 +455,6 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
             threads,
             dynamic_shared_bytes,
             stream,
-            local_ready_signal,
             ready_plan,
             collective_epoch,
             cta_barrier_counter,
@@ -487,7 +478,6 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
     size_t dynamic_shared_bytes,
     cudaStream_t stream,
     int device,
-    int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     const char* error_prefix,
@@ -516,7 +506,6 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
                 dynamic_shared_bytes,
                 stream,
                 device,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 error_prefix,
@@ -542,7 +531,6 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
                 dynamic_shared_bytes,
                 stream,
                 device,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 error_prefix,
@@ -568,7 +556,6 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
                 dynamic_shared_bytes,
                 stream,
                 device,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 error_prefix,
@@ -594,7 +581,6 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
                 dynamic_shared_bytes,
                 stream,
                 device,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 error_prefix,

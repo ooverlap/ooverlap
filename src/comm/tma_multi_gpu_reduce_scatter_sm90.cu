@@ -187,63 +187,6 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
                 launch.ready_signal_protocol_by_channel[device_ready_channel]),
             launch.ready_signal_poll_sleep_cycles_by_channel[device_ready_channel]);
 
-    comm::plan::ReadySignalBinding<MaxRanks> ready_binding{};
-    ready_binding.epoch = launch.collective_epoch;
-
-    bool has_ready_binding = false;
-
-    for (int channel = 0;
-         channel < comm::plan::kReadySignalChannelCount;
-         ++channel) {
-        ready_binding.local_ready_signal_by_channel[channel] =
-            launch.local_ready_signal_by_channel[channel];
-        ready_binding.protocol_by_channel[channel] =
-            launch.ready_signal_protocol_by_channel[channel];
-
-        if (launch.local_ready_signal_by_channel[channel] != nullptr) {
-            has_ready_binding = true;
-        }
-    }
-
-    ready_binding.local_ready_signal =
-        launch.local_ready_signal;
-    ready_binding.protocol =
-        launch.ready_signal_protocol_by_channel
-            [::kOoReadySignalChannelDeviceMemory];
-
-    if (launch.rank >= 0 && launch.rank < MaxRanks) {
-        ready_binding.ready_signal_by_rank[launch.rank] =
-            launch.local_ready_signal;
-        for (int channel = 0;
-             channel < comm::plan::kReadySignalChannelCount;
-             ++channel) {
-            ready_binding.ready_signal_by_rank_channel[launch.rank][channel] =
-                launch.local_ready_signal_by_channel[channel];
-        }
-    }
-
-    for (int peer_idx = 0; peer_idx < ready_plan.peer_count; ++peer_idx) {
-        const int peer_rank = launch.peer_ranks[peer_idx];
-
-        if (peer_rank >= 0 && peer_rank < MaxRanks) {
-            ready_binding.ready_signal_by_rank[peer_rank] =
-                ready_plan.peer_ready_signals[peer_idx];
-            for (int channel = 0;
-                 channel < comm::plan::kReadySignalChannelCount;
-                 ++channel) {
-                ready_binding.ready_signal_by_rank_channel
-                    [peer_rank][channel] =
-                        launch.peer_ready_signals_by_channel[peer_idx][channel];
-            }
-        }
-    }
-
-    const bool use_ready_binding =
-        has_ready_binding &&
-        launch.collective_epoch > 0;
-
-    const comm::plan::ReadySignalBinding<MaxRanks>* ready_binding_ptr =
-        use_ready_binding ? &ready_binding : nullptr;
 
     /* OOVERLAP_ALL_COLLECTIVES_PLAN_BY_VALUE_V1 */
     static thread_local
@@ -288,8 +231,6 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
                 launch_config,
                 &window_plan,
                 &num_blocks,
-                0,
-                ready_binding_ptr,
                 lowering_options);
 
     if (!plan_ok) {
@@ -345,7 +286,6 @@ cudaError_t launch_reduce_scatter_rank_variant_sm90(
             Variant::dynamic_shared_bytes,
             stream,
             launch.local_device,
-            launch.local_ready_signal,
             ready_plan,
             launch.collective_epoch,
             "tma_multi_gpu_reduce_scatter(by-value): requested shared memory exceeds opt-in limit",

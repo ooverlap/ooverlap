@@ -116,16 +116,8 @@ const char* debug_window_task_op_name(
             return "CopyTMA";
         case comm::task::WindowTaskOp::CopyFast:
             return "CopyFast";
-        case comm::task::WindowTaskOp::ReadyPublish:
-            return "ReadyPublish";
-        case comm::task::WindowTaskOp::ReadyWait:
-            return "ReadyWait";
-        case comm::task::WindowTaskOp::ReadyPublishWait:
-            return "ReadyPublishWait";
         case comm::task::WindowTaskOp::Barrier:
             return "Barrier";
-        case comm::task::WindowTaskOp::FinalPeerRendezvous:
-            return "FinalPeerRendezvous";
         default:
             return "Unknown";
     }
@@ -205,21 +197,6 @@ void debug_print_window_task_plan(
                         task.payload.fanout.window_chunks);
                     break;
 
-                case comm::task::WindowTaskOp::ReadyPublish:
-                case comm::task::WindowTaskOp::ReadyWait:
-                case comm::task::WindowTaskOp::ReadyPublishWait:
-                    std::fprintf(
-                        stderr,
-                        " ready_signal=%p ready_wait_signal=%p ready_epoch=%d ready_protocol=%d ready_wait_epoch=%d ready_owner_cta=%d",
-                        static_cast<void*>(
-                            task.payload.ready.ready_signal),
-                        static_cast<const void*>(
-                            task.payload.ready.ready_wait_signal),
-                        task.payload.ready.ready_epoch,
-                        task.payload.ready.ready_protocol,
-                        task.payload.ready.ready_wait_epoch,
-                        task.payload.ready.ready_owner_cta);
-                    break;
 
                 case comm::task::WindowTaskOp::Barrier:
                     std::fprintf(
@@ -229,13 +206,6 @@ void debug_print_window_task_plan(
                             task.payload.barrier_target));
                     break;
 
-                case comm::task::WindowTaskOp::FinalPeerRendezvous:
-                    std::fprintf(
-                        stderr,
-                        " ready_phase=%u",
-                        static_cast<unsigned int>(
-                            task.payload.ready_phase));
-                    break;
 
                 case comm::task::WindowTaskOp::None:
                 default:
@@ -375,63 +345,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
                 launch.ready_signal_protocol_by_channel[device_ready_channel]),
             launch.ready_signal_poll_sleep_cycles_by_channel[device_ready_channel]);
 
-    comm::plan::ReadySignalBinding<MaxRanks> ready_binding{};
-    ready_binding.epoch = launch.collective_epoch;
-
-    bool has_ready_binding = false;
-
-    for (int channel = 0;
-         channel < comm::plan::kReadySignalChannelCount;
-         ++channel) {
-        ready_binding.local_ready_signal_by_channel[channel] =
-            launch.local_ready_signal_by_channel[channel];
-        ready_binding.protocol_by_channel[channel] =
-            launch.ready_signal_protocol_by_channel[channel];
-
-        if (launch.local_ready_signal_by_channel[channel] != nullptr) {
-            has_ready_binding = true;
-        }
-    }
-
-    ready_binding.local_ready_signal =
-        launch.local_ready_signal;
-    ready_binding.protocol =
-        launch.ready_signal_protocol_by_channel
-            [::kOoReadySignalChannelDeviceMemory];
-
-    if (launch.rank >= 0 && launch.rank < MaxRanks) {
-        ready_binding.ready_signal_by_rank[launch.rank] =
-            launch.local_ready_signal;
-        for (int channel = 0;
-             channel < comm::plan::kReadySignalChannelCount;
-             ++channel) {
-            ready_binding.ready_signal_by_rank_channel[launch.rank][channel] =
-                launch.local_ready_signal_by_channel[channel];
-        }
-    }
-
-    for (int peer_idx = 0; peer_idx < ready_plan.peer_count; ++peer_idx) {
-        const int peer_rank = launch.peer_ranks[peer_idx];
-
-        if (peer_rank >= 0 && peer_rank < MaxRanks) {
-            ready_binding.ready_signal_by_rank[peer_rank] =
-                ready_plan.peer_ready_signals[peer_idx];
-            for (int channel = 0;
-                 channel < comm::plan::kReadySignalChannelCount;
-                 ++channel) {
-                ready_binding.ready_signal_by_rank_channel
-                    [peer_rank][channel] =
-                        launch.peer_ready_signals_by_channel[peer_idx][channel];
-            }
-        }
-    }
-
-    const bool use_ready_binding =
-        has_ready_binding &&
-        launch.collective_epoch > 0;
-
-    const comm::plan::ReadySignalBinding<MaxRanks>* ready_binding_ptr =
-        use_ready_binding ? &ready_binding : nullptr;
 
     /*
      * OOVERLAP_ALL_COLLECTIVES_PLAN_BY_VALUE_V1
@@ -482,8 +395,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
                 launch_config,
                 &window_plan,
                 &num_blocks,
-                0,
-                ready_binding_ptr,
                 lowering_options);
 
     if (!plan_ok) {
@@ -534,7 +445,6 @@ cudaError_t launch_allreduce_rank_variant_sm90(
                 Variant::dynamic_shared_bytes,
                 stream,
                 launch.local_device,
-                launch.local_ready_signal,
                 ready_plan,
                 launch.collective_epoch,
                 "tma_multi_gpu_allreduce(by-value): requested shared memory exceeds opt-in limit",

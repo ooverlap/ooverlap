@@ -35,15 +35,9 @@ enum class WindowTaskOp : std::uint8_t {
     /* Fast global-memory copy task.src -> task.dst. */
     CopyFast = 4,
 
-    /* Ready-signal operations. */
-    ReadyPublish = 8,
-    ReadyWait = 9,
-    ReadyPublishWait = 10,
-
-    CopyTMAFanout = 11,
-    ReduceTMAFanout = 12,
-    Barrier = 13,
-    FinalPeerRendezvous = 14,
+    CopyTMAFanout = 5,
+    ReduceTMAFanout = 6,
+    Barrier = 7,
 };
 
 struct WindowTaskWindowPayload {
@@ -67,21 +61,11 @@ struct WindowTaskFanoutPayload {
         [TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS];
 };
 
-struct WindowTaskReadyPayload {
-    int* ready_signal;
-    const int* ready_wait_signal;
-    int ready_epoch;
-    int ready_protocol;
-    int ready_wait_epoch;
-    int ready_owner_cta;
-};
 
 union WindowTaskPayload {
     WindowTaskWindowPayload window;
     WindowTaskFanoutPayload fanout;
-    WindowTaskReadyPayload ready;
     std::uint32_t barrier_target;
-    std::uint32_t ready_phase;
 
     __host__ __device__ constexpr WindowTaskPayload()
         : window{} {}
@@ -130,16 +114,6 @@ __host__ __device__ __forceinline__ WindowTask make_barrier_task(
     return task;
 }
 
-__host__ __device__ __forceinline__ WindowTask
-make_final_peer_rendezvous_task(
-    std::uint32_t ready_phase,
-    bool terminal = false) {
-    WindowTask task{};
-    task.op = WindowTaskOp::FinalPeerRendezvous;
-    task.terminal = terminal;
-    task.payload.ready_phase = ready_phase;
-    return task;
-}
 
 __host__ __device__ __forceinline__ WindowTask make_window_task(
     WindowTaskOp op,
@@ -329,70 +303,10 @@ __host__ __device__ __forceinline__ WindowTask make_copy_fast_task(
         terminal);
 }
 
-__host__ __device__ __forceinline__ WindowTask make_ready_publish_task(
-    int* ready_signal,
-    int epoch,
-    int protocol,
-    bool terminal = false) {
-    WindowTask task{};
-    task.op = WindowTaskOp::ReadyPublish;
-    task.terminal = terminal;
-    task.payload.ready = WindowTaskReadyPayload{};
-    task.payload.ready.ready_signal = ready_signal;
-    task.payload.ready.ready_epoch = epoch;
-    task.payload.ready.ready_protocol = protocol;
-    return task;
-}
-
-__host__ __device__ __forceinline__ WindowTask make_ready_wait_task(
-    const int* ready_signal,
-    int epoch,
-    bool terminal = false) {
-    WindowTask task{};
-    task.op = WindowTaskOp::ReadyWait;
-    task.terminal = terminal;
-    task.payload.ready = WindowTaskReadyPayload{};
-    task.payload.ready.ready_signal =
-        const_cast<int*>(ready_signal);
-    task.payload.ready.ready_epoch = epoch;
-    return task;
-}
-
-/* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH */
-__host__ __device__ __forceinline__ WindowTask make_ready_publish_wait_task(
-    int* publish_signal,
-    int publish_epoch,
-    int publish_protocol,
-    const int* wait_signal,
-    int wait_epoch,
-    int owner_cta,
-    bool terminal = false) {
-    WindowTask task{};
-    task.op = WindowTaskOp::ReadyPublishWait;
-    task.terminal = terminal;
-    task.payload.ready = WindowTaskReadyPayload{};
-    task.payload.ready.ready_signal = publish_signal;
-    task.payload.ready.ready_epoch = publish_epoch;
-    task.payload.ready.ready_protocol = publish_protocol;
-    task.payload.ready.ready_wait_signal = wait_signal;
-    task.payload.ready.ready_wait_epoch = wait_epoch;
-    task.payload.ready.ready_owner_cta = owner_cta;
-    return task;
-}
 
 __host__ __device__ __forceinline__ bool window_task_has_work(
     const WindowTask& task) {
     switch (task.op) {
-        case WindowTaskOp::ReadyPublishWait:
-            return task.payload.ready.ready_signal != nullptr &&
-                   task.payload.ready.ready_epoch > 0 &&
-                   task.payload.ready.ready_wait_signal != nullptr &&
-                   task.payload.ready.ready_wait_epoch > 0;
-
-        case WindowTaskOp::ReadyPublish:
-        case WindowTaskOp::ReadyWait:
-            return task.payload.ready.ready_signal != nullptr &&
-                   task.payload.ready.ready_epoch > 0;
 
         case WindowTaskOp::CopyTMAFanout:
         case WindowTaskOp::ReduceTMAFanout:
@@ -412,9 +326,6 @@ __host__ __device__ __forceinline__ bool window_task_has_work(
                    task.payload.window.window_chunks > 0 &&
                    task.payload.window.begin_window <
                        task.payload.window.end_window;
-
-        case WindowTaskOp::FinalPeerRendezvous:
-            return task.payload.ready_phase > 0;
 
         case WindowTaskOp::Barrier:
             return task.payload.barrier_target > 0;
