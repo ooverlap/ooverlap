@@ -69,8 +69,8 @@ fi
 # while this range is known to complete on the same installation.
 LATENCY_BYTES="1K,2K,4K,8K,16K,32K,64K,128K,256K,512K"
 BANDWIDTH_BYTES="1M,2M,4M,8M,16M,32M,64M,128M,256M,512M"
-ITERS="150"
-WARMUP="20"
+ITERS="250"
+WARMUP="50"
 RING_SIZE="16"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

@@ -11,7 +11,7 @@ namespace ooverlap {
 
 constexpr size_t kFastAllreduceMaxBytes =
     static_cast<size_t>(TMA_TWO_GPU_PEER_SMALL_TASK_BYTES) *
-    static_cast<size_t>(8);
+    static_cast<size_t>(6);
 
 static_assert(
     TMA_TWO_GPU_PEER_SMALL_TASK_BYTES > 0,

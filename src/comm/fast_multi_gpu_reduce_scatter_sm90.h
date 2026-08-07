@@ -15,7 +15,7 @@ namespace ooverlap {
  * actually sends. Reduce-scatter skips its locally owned shard, so the
  * full input can be larger than ChunkBytes * MaxCtas.
  */
-constexpr int kFastReduceScatterMaxCtas = 6;
+constexpr int kFastReduceScatterMaxCtas = 1;
 
 static_assert(
     TMA_TWO_GPU_PEER_SMALL_TASK_BYTES > 0,
@@ -131,6 +131,7 @@ inline bool fast_reduce_scatter_eligible(
              static_cast<size_t>(TMA_TWO_GPU_PEER_SMALL_TASK_BYTES) - 1) /
             static_cast<size_t>(TMA_TWO_GPU_PEER_SMALL_TASK_BYTES);
 
+
         if (ctas == 0 ||
             ctas > static_cast<size_t>(kFastReduceScatterMaxCtas) ||
             total_ctas > kFastReduceScatterMaxCtas -
@@ -140,7 +141,7 @@ inline bool fast_reduce_scatter_eligible(
 
         total_ctas += static_cast<int>(ctas);
     }
-
+    
     return total_ctas > 0 &&
            total_ctas <= kFastReduceScatterMaxCtas;
 }

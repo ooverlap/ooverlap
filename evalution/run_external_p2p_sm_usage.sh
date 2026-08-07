@@ -4,6 +4,7 @@ set -euo pipefail
 usage() {
   echo "Usage: $0 {2|4} {AR|RS|AG} NUMEL [NUMEL ...]" >&2
   echo "Example: $0 4 AG 65536 2097152 16777216 67108864" >&2
+  echo "CTA tuning: OOVERLAP_MAX_CTAS=6 OOVERLAP_MAX_CTAS_PER_REDUCE_TASK=3 $0 4 AG 2097152" >&2
   exit 2
 }
 
@@ -32,18 +33,23 @@ esac
 case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
-    OOVERLAP_CTAS="8"
-    MAX_CTAS_PER_REDUCE_TASK="8"
+    DEFAULT_OOVERLAP_CTAS="8"
+    DEFAULT_MAX_CTAS_PER_REDUCE_TASK="8"
     ;;
   4)
     DEVICES="0,1,2,3"
-    OOVERLAP_CTAS="9"
-    MAX_CTAS_PER_REDUCE_TASK="3"
+    DEFAULT_OOVERLAP_CTAS="1"
+    DEFAULT_MAX_CTAS_PER_REDUCE_TASK="1"
     ;;
   *)
     usage
     ;;
 esac
+
+# A single-size invocation can override these values for manual tuning without
+# editing the script. Multi-size invocations use the same values for every size.
+OOVERLAP_CTAS="${OOVERLAP_MAX_CTAS:-$DEFAULT_OOVERLAP_CTAS}"
+MAX_CTAS_PER_REDUCE_TASK="${OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:-$DEFAULT_MAX_CTAS_PER_REDUCE_TASK}"
 
 for numel in "${NUMELS[@]}"; do
   [[ "$numel" =~ ^[1-9][0-9]*$ ]] || {
@@ -69,10 +75,7 @@ TIMING_WARMUP="${TIMING_WARMUP:-20}"
 PROFILE_TO_TIMING_COOLDOWN_SECONDS="${PROFILE_TO_TIMING_COOLDOWN_SECONDS:-10}"
 NCCL_SO="$REPO_ROOT/build/third_party/nccl/lib/libnccl.so.2"
 
-OUT_DIR="$REPO_ROOT/results/evalution/external_p2p/sm_usage/tp${WORLD_SIZE}/unres/${COLLECTIVE}"
-SM_FILE="$OUT_DIR/sm_usage.txt"
-TIMING_FILE="$OUT_DIR/timing_speedup.txt"
-SUMMARY_FILE="$OUT_DIR/sm_usage_speedup.txt"
+OUT_ROOT="$REPO_ROOT/results/evalution/external_p2p/sm_usage/tp${WORLD_SIZE}/unres"
 
 [[ -f "$DRIVER" ]] || {
   echo "error: benchmark driver not found: $DRIVER" >&2
@@ -122,7 +125,9 @@ LOCAL_PRELOAD="$NCCL_SO"
 
 for pair in \
   "ITERS:$ITERS" \
-  "TIMING_ITERS:$TIMING_ITERS"; do
+  "TIMING_ITERS:$TIMING_ITERS" \
+  "OOVERLAP_MAX_CTAS:$OOVERLAP_CTAS" \
+  "OOVERLAP_MAX_CTAS_PER_REDUCE_TASK:$MAX_CTAS_PER_REDUCE_TASK"; do
   if ! [[ "${pair#*:}" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: ${pair%%:*} must be a positive integer; got: ${pair#*:}" >&2
     exit 2
@@ -225,9 +230,17 @@ run_local_tma_env() {
 
 write_common_metadata() {
   local output_kind="$1"
+  local numel_value="$2"
+  local bytes_value="$3"
+  local size_label="$4"
+  local result_dir="$5"
   echo "# output=$output_kind"
   echo "# collective=$COLLECTIVE"
   echo "# collective_argument=$COLLECTIVE_ARG"
+  echo "# numel=$numel_value"
+  echo "# message_bytes=$bytes_value"
+  echo "# message_size=$size_label"
+  echo "# result_directory=$result_dir"
   echo "# world_size=$WORLD_SIZE"
   echo "# devices=$DEVICES"
   echo "# dtype=fp16"
@@ -285,22 +298,61 @@ print(f"{baseline / ooverlap:.6f}")
 PY
 }
 
-mkdir -p "$OUT_DIR"
+format_size_label() {
+  local bytes="$1"
 
-{
-  write_common_metadata "average active SM usage from nsys GPU metrics"
-  printf "numel\tbytes\tooverlap_avg_gpu_median_active_sms\tnccl_avg_gpu_median_active_sms\tnccl_symmetric_avg_gpu_median_active_sms\tnccl_tma_avg_gpu_median_active_sms\n"
-} > "$SM_FILE"
+  if ((bytes % (1024 * 1024 * 1024) == 0)); then
+    printf '%dGB\n' "$((bytes / (1024 * 1024 * 1024)))"
+  elif ((bytes % (1024 * 1024) == 0)); then
+    printf '%dMB\n' "$((bytes / (1024 * 1024)))"
+  elif ((bytes % 1024 == 0)); then
+    printf '%dKB\n' "$((bytes / 1024))"
+  else
+    printf '%dB\n' "$bytes"
+  fi
+}
 
-{
-  write_common_metadata "unprofiled latency and T-CCL speedup"
-  printf "numel\tbytes\tooverlap_ms\tnccl_ms\tnccl_symmetric_ms\tnccl_tma_ms\tooverlap_speedup_over_nccl\tooverlap_speedup_over_nccl_symmetric\tooverlap_speedup_over_nccl_tma\n"
-} > "$TIMING_FILE"
+size_output_dir() {
+  local numel="$1"
+  local bytes=$((numel * 2))
+  local size_label
+  size_label="$(format_size_label "$bytes")"
+  printf '%s/%s_%s\n' "$OUT_ROOT" "$COLLECTIVE" "$size_label"
+}
 
-{
-  write_common_metadata "paper table input: SM usage plus unprofiled latency and speedup"
-  printf "numel\tbytes\tooverlap_avg_gpu_median_active_sms\tnccl_avg_gpu_median_active_sms\tnccl_symmetric_avg_gpu_median_active_sms\tnccl_tma_avg_gpu_median_active_sms\tooverlap_ms\tnccl_ms\tnccl_symmetric_ms\tnccl_tma_ms\tooverlap_speedup_over_nccl\tooverlap_speedup_over_nccl_symmetric\tooverlap_speedup_over_nccl_tma\n"
-} > "$SUMMARY_FILE"
+for numel in "${NUMELS[@]}"; do
+  bytes=$((numel * 2))
+  size_label="$(format_size_label "$bytes")"
+  out_dir="$(size_output_dir "$numel")"
+  sm_file="$out_dir/sm_usage.txt"
+  timing_file="$out_dir/timing_speedup.txt"
+  summary_file="$out_dir/sm_usage_speedup.txt"
+
+  mkdir -p "$out_dir"
+
+  {
+    write_common_metadata \
+      "average active SM usage from nsys GPU metrics" \
+      "$numel" "$bytes" "$size_label" "$out_dir"
+    printf "numel\tbytes\tooverlap_avg_gpu_median_active_sms\tnccl_avg_gpu_median_active_sms\tnccl_symmetric_avg_gpu_median_active_sms\tnccl_tma_avg_gpu_median_active_sms\n"
+  } > "$sm_file"
+
+  {
+    write_common_metadata \
+      "unprofiled latency and T-CCL speedup" \
+      "$numel" "$bytes" "$size_label" "$out_dir"
+    printf "numel\tbytes\tooverlap_ms\tnccl_ms\tnccl_symmetric_ms\tnccl_tma_ms\tooverlap_speedup_over_nccl\tooverlap_speedup_over_nccl_symmetric\tooverlap_speedup_over_nccl_tma\n"
+  } > "$timing_file"
+
+  {
+    write_common_metadata \
+      "paper table input: SM usage plus unprofiled latency and speedup" \
+      "$numel" "$bytes" "$size_label" "$out_dir"
+    printf "numel\tbytes\tooverlap_avg_gpu_median_active_sms\tnccl_avg_gpu_median_active_sms\tnccl_symmetric_avg_gpu_median_active_sms\tnccl_tma_avg_gpu_median_active_sms\tooverlap_ms\tnccl_ms\tnccl_symmetric_ms\tnccl_tma_ms\tooverlap_speedup_over_nccl\tooverlap_speedup_over_nccl_symmetric\tooverlap_speedup_over_nccl_tma\n"
+  } > "$summary_file"
+
+  echo "[evalution] configured result directory: $out_dir"
+done
 
 cd "$REPO_ROOT"
 
@@ -311,8 +363,11 @@ echo "[evalution] phase=sm_usage begin"
 echo "[evalution] all nsys profiling completes before unprofiled timing begins"
 
 for numel in "${NUMELS[@]}"; do
+  out_dir="$(size_output_dir "$numel")"
+  sm_file="$out_dir/sm_usage.txt"
+
   for backend in "${PROFILE_BACKENDS[@]}"; do
-    report="$OUT_DIR/${backend}_numel${numel}"
+    report="$out_dir/${backend}_numel${numel}"
     selected_backend="$backend"
 
     if [[ "$backend" == "nccl_tma" ]]; then
@@ -382,7 +437,7 @@ for numel in "${NUMELS[@]}"; do
     "${SM_RESULT[ooverlap:$numel]}" \
     "${SM_RESULT[nccl:$numel]}" \
     "${SM_RESULT[nccl_symmetric:$numel]}" \
-    "${SM_RESULT[nccl_tma:$numel]}" | tee -a "$SM_FILE"
+    "${SM_RESULT[nccl_tma:$numel]}" | tee -a "$sm_file"
 done
 
 echo "[evalution] phase=sm_usage complete"
@@ -392,8 +447,11 @@ sleep "$PROFILE_TO_TIMING_COOLDOWN_SECONDS"
 echo "[evalution] phase=timing begin"
 
 for numel in "${NUMELS[@]}"; do
-  default_log="$OUT_DIR/timing_default_numel${numel}.log"
-  tma_log="$OUT_DIR/timing_nccl_tma_numel${numel}.log"
+  out_dir="$(size_output_dir "$numel")"
+  timing_file="$out_dir/timing_speedup.txt"
+  summary_file="$out_dir/sm_usage_speedup.txt"
+  default_log="$out_dir/timing_default_numel${numel}.log"
+  tma_log="$out_dir/timing_nccl_tma_numel${numel}.log"
 
   echo "[evalution] phase=timing collective=$COLLECTIVE backends=ooverlap,nccl,nccl_symmetric numel=$numel"
   run_default_env \
@@ -440,7 +498,7 @@ for numel in "${NUMELS[@]}"; do
     "$nccl_tma_ms" \
     "$speedup_nccl" \
     "$speedup_nccl_symmetric" \
-    "$speedup_nccl_tma" | tee -a "$TIMING_FILE"
+    "$speedup_nccl_tma" | tee -a "$timing_file"
 
   printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
     "$numel" \
@@ -455,10 +513,11 @@ for numel in "${NUMELS[@]}"; do
     "$nccl_tma_ms" \
     "$speedup_nccl" \
     "$speedup_nccl_symmetric" \
-    "$speedup_nccl_tma" | tee -a "$SUMMARY_FILE"
+    "$speedup_nccl_tma" | tee -a "$summary_file"
 done
 
 echo "[evalution] phase=timing complete"
-echo "[evalution] wrote SM usage: $SM_FILE"
-echo "[evalution] wrote timing/speedup: $TIMING_FILE"
-echo "[evalution] wrote combined paper table input: $SUMMARY_FILE"
+for numel in "${NUMELS[@]}"; do
+  out_dir="$(size_output_dir "$numel")"
+  echo "[evalution] wrote size result directory: $out_dir"
+done
