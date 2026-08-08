@@ -1,0 +1,180 @@
+diff --git a/include/cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp b/include/cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp
+index f244fafaa45b1663f01a6f61335240b45ea831a5..7e125e5eba59193e56166b248db03f23d2a43bd0 100644
+--- a/include/cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp
++++ b/include/cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp
+@@ -46,6 +46,7 @@
+ #include "cutlass/detail/layout.hpp"
+ #include "cutlass/detail/helper_macros.hpp"
+ #include "cutlass/trace.h"
++#include "cutlass/arch/memory.h"
+ 
+ #include "cute/tensor.hpp"
+ #include "cutlass/cuda_host_adapter.hpp"
+@@ -131,6 +132,33 @@ public:
+   static_assert(cute::rank(StrideC{}) == 3, "StrideC must be rank-3: [M, N, L]");
+   static_assert(cute::rank(StrideD{}) == 3, "StrideD must be rank-3: [M, N, L]");
+ 
++  // HERE
++  struct OoverlapCoopSignal {
++    int* MM = nullptr;
++    int* cseg = nullptr;
++    int* debug = nullptr;
++  
++    int num_segments = 0;
++    int tile = -1;
++    int expected = 1;
++  
++    bool if_monitor = false;
++  
++    CUTLASS_DEVICE
++    bool enabled() const {
++      return MM != nullptr &&
++             cseg != nullptr &&
++             num_segments > 0 &&
++             tile >= 0 &&
++             expected > 0;
++    }
++  };
++
++  struct OoverlapPendingCoopSignal {
++    OoverlapCoopSignal sig;
++    bool valid = false;
++  };
++
+ private:
+   constexpr static bool is_source_supported = not cute::is_void_v<ElementC>;
+   constexpr static bool is_destination_supported = not cute::is_void_v<ElementD>;
+@@ -416,6 +444,66 @@ public:
+     return fusion_callbacks.is_producer_load_needed();
+   }
+ 
++  // HERE
++  CUTLASS_DEVICE
++  void ooverlap_signal_done_(OoverlapCoopSignal const& sig) {
++    if (!sig.enabled()) {
++      return;
++    }
++  
++    int* tile_done = sig.MM + sig.num_segments;
++  
++    if (sig.debug != nullptr) {
++      atomicAdd(&sig.debug[sig.tile], 1);
++    }
++  
++    int old = atomicAdd(&tile_done[sig.tile], 1);
++ 
++    if (old == sig.expected - 1) {
++      __threadfence();
++    
++      int seg = 0;
++      int running = 0;
++      int tile_num = 0;
++    
++      for (int s = 0; s < sig.num_segments; ++s) {
++        int next = running + sig.cseg[s];
++    
++        if (sig.tile >= running && sig.tile < next) {
++          seg = s;
++        }
++    
++        running = next;
++      }
++    
++      tile_num = running;
++    
++      atomicAdd(&sig.MM[seg], 1);
++    
++      if (sig.if_monitor) {
++        int* monitor_counter =
++            sig.MM + sig.num_segments + tile_num;
++    
++        int* monitor_order = monitor_counter + 1;
++    
++        int global_order = atomicAdd(monitor_counter, 1);
++    
++        cutlass::arch::global_store<int, sizeof(int)>(
++            global_order,
++            reinterpret_cast<void*>(monitor_order + sig.tile),
++            true);
++      }
++    }
++  }
++  
++  CUTLASS_DEVICE
++  void ooverlap_complete_stage_(int stage) {
++    if (ooverlap_pending_[stage].valid) {
++      ooverlap_signal_done_(ooverlap_pending_[stage].sig);
++      ooverlap_pending_[stage].valid = false;
++    }
++  }
++
+   template<
+     class ProblemShapeMNKL,
+     class TileShapeMNK,
+@@ -544,7 +632,8 @@ public:
+       TiledMma tiled_mma,
+       int thread_idx,
+       TensorStorage& shared_tensors,
+-      int subtile_idx=-1) {
++      int subtile_idx=-1,
++      OoverlapCoopSignal ooverlap_signal = {}) {
+     using namespace cute;
+     using ElementAccumulator = typename AccEngine::value_type;
+     using ElementCompute_ = typename epilogue::fusion::FusionCallbacksTraits<FusionCallbacks>::ElementCompute;
+@@ -748,13 +837,30 @@ public:
+       if (issue_tma_store) {
+         store_pipeline.producer_commit(store_pipe_producer_state);
+       }
++
++      // HERE: remember which tile owns this TMA store stage
++      int issued_stage = store_pipe_producer_state.index();
++      if (ooverlap_signal.enabled() &&
++          issue_tma_store &&
++          ((thread_idx & 31) == 0)) {
++        ooverlap_pending_[issued_stage].sig = ooverlap_signal;
++        ooverlap_pending_[issued_stage].valid = true;
++      }
++
+       ++store_pipe_producer_state;
+       ++issued_stores;
+ 
+       // Wait for the next smem buffer to be available
++      int stage_to_reuse = store_pipe_producer_state.index();
+       if (issue_tma_store) {
+         store_pipeline.producer_acquire(store_pipe_producer_state);
+       }
++
++      // HERE: stage reuse means the older TMA store on that stage is complete
++      if (issue_tma_store && ((thread_idx & 31) == 0)) {
++        ooverlap_complete_stage_(stage_to_reuse);
++      }
++
+       synchronize();
+ 
+       if constexpr (ReuseSmemC) {
+@@ -924,6 +1030,15 @@ public:
+       StorePipelineState store_pipe_producer_state) {
+     // wait for all TMA stores to complete
+     store_pipeline.producer_tail(store_pipe_producer_state);
++
++    // HERE: final drain completes any remaining cooperative signal stages
++    if ((threadIdx.x & 31) == 0) {
++      CUTLASS_PRAGMA_UNROLL
++      for (int stage = 0; stage < StorePipeline::Stages; ++stage) {
++        ooverlap_complete_stage_(stage);
++      }
++    }
++
+     // reset store counter
+     issued_stores = 0;
+ 
+@@ -946,6 +1061,9 @@ private:
+   Params const& params;
+   FusionCallbacks fusion_callbacks;
+   int issued_stores = 0;
++
++  // HERE
++  OoverlapPendingCoopSignal ooverlap_pending_[StorePipeline::Stages];
+ };
+ 
+ 
