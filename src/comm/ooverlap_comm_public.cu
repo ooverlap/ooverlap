@@ -302,6 +302,37 @@ oo_status_t enable_group_peer_access_all_to_all(oo_group_t* group) {
     return OO_SUCCESS;
 }
 
+bool topology_is_all_peer_to_peer(
+    const ooverlap::topology::Topology& topology,
+    int world_size) {
+    if (world_size <= 0 ||
+        topology.nodes.size() != static_cast<size_t>(world_size)) {
+        return false;
+    }
+
+    for (int src_rank = 0; src_rank < world_size; ++src_rank) {
+        for (int dst_rank = 0; dst_rank < world_size; ++dst_rank) {
+            if (src_rank == dst_rank) {
+                continue;
+            }
+
+            const ooverlap::topology::Link* link =
+                topology.link_by_ordinals(
+                    src_rank,
+                    dst_rank);
+
+            if (link == nullptr ||
+                !link->cuda_peer_access_supported ||
+                !link->safe_for_direct_copy ||
+                !link->safe_for_tma_reduce) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 oo_status_t initialize_group_topology(
     oo_group_t* group,
     bool enable_peer_access_in_discovery,
@@ -330,9 +361,14 @@ oo_status_t initialize_group_topology(
                 options);
 
         group->topology_valid = true;
+        group->is_all_peer_to_peer =
+            topology_is_all_peer_to_peer(
+                group->topology,
+                group->num_devices);
         return OO_SUCCESS;
     } catch (...) {
         group->topology_valid = false;
+        group->is_all_peer_to_peer = false;
         group->topology = ooverlap::topology::Topology{};
         return ooverlap::comm::api::exception_to_status();
     }
@@ -419,7 +455,7 @@ oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
         cudaError_t err =
             cudaMalloc(
                 &signal,
-                sizeof(int));
+                kOoReadySignalBytes);
 
         if (err != cudaSuccess) {
             destroy_group_ready_signals(group);
@@ -430,7 +466,7 @@ oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
             cudaMemset(
                 signal,
                 0,
-                sizeof(int));
+                kOoReadySignalBytes);
 
         if (err != cudaSuccess) {
             cudaFree(signal);
@@ -442,8 +478,8 @@ oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
             group->ready_signal_slots[rank];
 
         slot.ptr = signal;
-        slot.bytes = sizeof(int);
-        slot.mapped_bytes = sizeof(int);
+        slot.bytes = kOoReadySignalBytes;
+        slot.mapped_bytes = kOoReadySignalBytes;
         slot.owner_rank = rank;
         slot.owner_device = device;
         slot.kind = oo_ready_signal_kind::owned_legacy;
@@ -459,7 +495,7 @@ oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
         err =
             cudaHostAlloc(
                 &host_signal,
-                sizeof(int),
+                kOoReadySignalBytes,
                 cudaHostAllocMapped | cudaHostAllocPortable);
 
         if (err != cudaSuccess) {
@@ -467,7 +503,7 @@ oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
             return ooverlap::comm::api::cuda_to_status(err);
         }
 
-        *reinterpret_cast<int*>(host_signal) = 0;
+        std::memset(host_signal, 0, kOoReadySignalBytes);
 
         err =
             cudaHostGetDevicePointer(
@@ -485,8 +521,8 @@ oo_status_t allocate_same_process_cuda_ready_signals(oo_group_t* group) {
             group->host_ready_signal_slots[rank];
 
         host_slot.ptr = host_device_signal;
-        host_slot.bytes = sizeof(int);
-        host_slot.mapped_bytes = sizeof(int);
+        host_slot.bytes = kOoReadySignalBytes;
+        host_slot.mapped_bytes = kOoReadySignalBytes;
         host_slot.owner_rank = rank;
         host_slot.owner_device = device;
         host_slot.kind = oo_ready_signal_kind::owned_host_mapped;
@@ -518,18 +554,18 @@ oo_status_t allocate_ipc_ready_signals(oo_group_t* group) {
 
     ooverlap::system::runtime::set_device(local_device);
     ooverlap::system::runtime::check_cuda(
-        cudaMalloc(&local_signal, sizeof(int)),
+        cudaMalloc(&local_signal, kOoReadySignalBytes),
         "cudaMalloc(ipc ready signal)");
     ooverlap::system::runtime::check_cuda(
-        cudaMemset(local_signal, 0, sizeof(int)),
+        cudaMemset(local_signal, 0, kOoReadySignalBytes),
         "cudaMemset(ipc ready signal)");
 
     ooverlap::system::legacy_peer_buffer_descriptor local_desc =
         ooverlap::system::export_legacy_peer_buffer(
             local_signal,
-            sizeof(int),
+            kOoReadySignalBytes,
             local_device,
-            sizeof(int));
+            kOoReadySignalBytes);
 
     std::vector<ooverlap::system::legacy_peer_buffer_descriptor> descs(
         static_cast<size_t>(world_size));
@@ -546,8 +582,8 @@ oo_status_t allocate_ipc_ready_signals(oo_group_t* group) {
 
         if (r == rank) {
             slot.ptr = local_signal;
-            slot.bytes = sizeof(int);
-            slot.mapped_bytes = sizeof(int);
+            slot.bytes = kOoReadySignalBytes;
+            slot.mapped_bytes = kOoReadySignalBytes;
             slot.owner_rank = r;
             slot.owner_device = local_device;
             slot.kind = oo_ready_signal_kind::owned_legacy;

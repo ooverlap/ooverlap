@@ -1,7 +1,5 @@
 #include "comm/tma_multi_gpu_all_gather_sm90.h"
 
-#include "ooverlap/system/runtime_utils.cuh"
-
 #include "comm/kernels/multi_gpu_ready_signal.cuh"
 #include "comm/kernels/multi_gpu_window_task_executor.cuh"
 #include "comm/params.h"
@@ -44,6 +42,8 @@ bool validate_all_gather_launch(
         const int peer_rank = launch.peer_ranks[peer_idx];
 
         if (launch.peer_ptrs[peer_idx] == nullptr ||
+            launch.peer_publish_signals[peer_idx] == nullptr ||
+            launch.local_wait_signals[peer_idx] == nullptr ||
             peer_rank < 0 ||
             peer_rank >= launch.world_size ||
             peer_rank == launch.rank ||
@@ -91,7 +91,7 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         DummyReduceOp>;
 
     constexpr int MaxLoweringTasks =
-        comm::plan::kTmaMultiGpuAllGatherMaxWindowTasks;
+        comm::plan::kTmaMultiGpuByValueMaxWindowTasks;
     constexpr int MaxPeers =
         comm::plan::kTmaMultiGpuAllGatherMaxPeers;
 
@@ -155,74 +155,41 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         comm::kernels::make_multi_gpu_ready_signal_plan<MaxPeers>(
             launch.peer_count,
             launch.peer_ready_signals,
+            launch.peer_publish_signals,
+            launch.local_wait_signals,
             static_cast<comm::kernels::MultiGpuReadySignalProtocol>(
                 launch.ready_signal_protocol_by_channel[device_ready_channel]),
             launch.ready_signal_poll_sleep_cycles_by_channel[device_ready_channel]);
 
-    comm::plan::ReadySignalBinding<MaxRanks> ready_binding{};
-    ready_binding.epoch = launch.collective_epoch;
-
-    bool has_ready_binding = false;
-
-    for (int channel = 0;
-         channel < comm::plan::kReadySignalChannelCount;
-         ++channel) {
-        ready_binding.local_ready_signal_by_channel[channel] =
-            launch.local_ready_signal_by_channel[channel];
-        ready_binding.protocol_by_channel[channel] =
-            launch.ready_signal_protocol_by_channel[channel];
-
-        if (launch.local_ready_signal_by_channel[channel] != nullptr) {
-            has_ready_binding = true;
-        }
-    }
-
-    ready_binding.local_ready_signal =
-        launch.local_ready_signal;
-    ready_binding.protocol =
-        launch.ready_signal_protocol_by_channel
-            [::kOoReadySignalChannelDeviceMemory];
-
-    if (launch.rank >= 0 && launch.rank < MaxRanks) {
-        ready_binding.ready_signal_by_rank[launch.rank] =
-            launch.local_ready_signal;
-        for (int channel = 0;
-             channel < comm::plan::kReadySignalChannelCount;
-             ++channel) {
-            ready_binding.ready_signal_by_rank_channel[launch.rank][channel] =
-                launch.local_ready_signal_by_channel[channel];
-        }
-    }
-
-    for (int peer_idx = 0; peer_idx < ready_plan.peer_count; ++peer_idx) {
-        const int peer_rank = launch.peer_ranks[peer_idx];
-
-        if (peer_rank >= 0 && peer_rank < MaxRanks) {
-            ready_binding.ready_signal_by_rank[peer_rank] =
-                ready_plan.peer_ready_signals[peer_idx];
-            for (int channel = 0;
-                 channel < comm::plan::kReadySignalChannelCount;
-                 ++channel) {
-                ready_binding.ready_signal_by_rank_channel
-                    [peer_rank][channel] =
-                        launch.peer_ready_signals_by_channel[peer_idx][channel];
-            }
-        }
-    }
-
-
-    const bool use_ready_binding =
-        has_ready_binding &&
-        launch.collective_epoch > 0;
-
-    const comm::plan::ReadySignalBinding<MaxRanks>* ready_binding_ptr =
-        use_ready_binding ? &ready_binding : nullptr;
 
     /* OOVERLAP_ALL_COLLECTIVES_PLAN_BY_VALUE_V1 */
     static thread_local
         comm::plan::WindowTaskExecutorPlan<MaxLoweringTasks> window_plan;
 
+    comm::kernels::CtaBarrierScratch cta_barrier_scratch{};
+
+    const cudaError_t cta_barrier_scratch_error =
+        comm::kernels::get_cached_cta_barrier_scratch(
+            launch.local_device,
+            launch.plan_scratch_index,
+            &cta_barrier_scratch);
+
+    if (cta_barrier_scratch_error != cudaSuccess ||
+        cta_barrier_scratch.counter == nullptr ||
+        cta_barrier_scratch.last_value == nullptr) {
+        return cta_barrier_scratch_error != cudaSuccess
+            ? cta_barrier_scratch_error
+            : cudaErrorInvalidValue;
+    }
+
     int num_blocks = 0;
+
+    const unsigned int cta_barrier_base =
+        *cta_barrier_scratch.last_value;
+
+    comm::plan::lowering_detail::LoweringPassOptions lowering_options{};
+    /* Lower relative barrier targets; rebase after CTA count is known. */
+    lowering_options.cta_barrier_start = 0u;
 
     const bool plan_ok =
         comm::plan::lower_transfer_plan_for_rank<
@@ -235,8 +202,7 @@ cudaError_t launch_all_gather_rank_variant_sm90(
                 launch_config,
                 &window_plan,
                 &num_blocks,
-                0,
-                ready_binding_ptr);
+                lowering_options);
 
     if (!plan_ok) {
         return cudaErrorInvalidValue;
@@ -246,9 +212,35 @@ cudaError_t launch_all_gather_rank_variant_sm90(
         return cudaSuccess;
     }
 
-    system::runtime::set_device(launch.local_device);
+    const unsigned int cta_barrier_entry_target =
+        cta_barrier_base + static_cast<unsigned int>(num_blocks);
 
-    return comm::kernels::dispatch_multi_gpu_window_task_executor_by_value_sm90<
+    if (!comm::kernels::rebase_cta_barrier_targets(
+            &window_plan,
+            cta_barrier_entry_target)) {
+        return cudaErrorInvalidValue;
+    }
+
+    unsigned int cta_barrier_final_value =
+        cta_barrier_entry_target;
+    const int first_stripe_tasks =
+        window_plan.tasks_per_cta < window_plan.total_tasks
+            ? window_plan.tasks_per_cta
+            : window_plan.total_tasks;
+
+    for (int i = 0; i < first_stripe_tasks; ++i) {
+        if (window_plan.tasks[i].op ==
+            comm::task::WindowTaskOp::Barrier) {
+            cta_barrier_final_value =
+                window_plan.tasks[i].payload.barrier_target;
+        }
+    }
+
+    cta_barrier_final_value +=
+        static_cast<unsigned int>(num_blocks);
+
+    const cudaError_t launch_error =
+        comm::kernels::dispatch_multi_gpu_window_task_executor_by_value_sm90<
         ReduceApply,
         ChunkBytes,
         StageDepth,
@@ -262,10 +254,21 @@ cudaError_t launch_all_gather_rank_variant_sm90(
             Variant::dynamic_shared_bytes,
             stream,
             launch.local_device,
-            launch.local_ready_signal,
             ready_plan,
             launch.collective_epoch,
-            "tma_multi_gpu_all_gather(by-value): requested shared memory exceeds opt-in limit");
+            "tma_multi_gpu_all_gather(by-value): requested shared memory exceeds opt-in limit",
+            cta_barrier_scratch.counter,
+            cta_barrier_entry_target,
+            cta_barrier_final_value);
+
+    if (launch_error != cudaSuccess) {
+        return launch_error;
+    }
+
+    *cta_barrier_scratch.last_value =
+        cta_barrier_final_value;
+
+    return cudaSuccess;
 }
 
 template <

@@ -21,14 +21,11 @@ namespace ooverlap {
 namespace comm {
 namespace pipeline {
 
+/* OOVERLAP_CHUNK_ONLY_THREAD0_WINDOW_PIPELINE_V1 */
+
 struct ChunkRange {
     int begin = 0;
     int end = 0;
-};
-
-struct ByteRange {
-    size_t begin = 0;
-    size_t bytes = 0;
 };
 
 template <size_t ChunkBytes>
@@ -282,42 +279,6 @@ __device__ __forceinline__ void publish_remaining_windows(
     }
 }
 
-template <size_t ChunkBytes>
-__host__ __device__ __forceinline__ bool chunk_range_is_16b_bulk_aligned(
-    size_t total_bytes,
-    int begin_chunk,
-    int end_chunk) {
-    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-
-    if ((ChunkBytes % 16) != 0) {
-        return false;
-    }
-
-    if (begin_chunk >= end_chunk || total_bytes == 0) {
-        return false;
-    }
-
-    const size_t begin_byte =
-        chunk_offset_bytes<ChunkBytes>(begin_chunk);
-
-    if (begin_byte >= total_bytes) {
-        return false;
-    }
-
-    const size_t raw_end_byte =
-        chunk_offset_bytes<ChunkBytes>(end_chunk);
-
-    const size_t end_byte =
-        comm::utils::min_sz(raw_end_byte, total_bytes);
-
-    if (begin_byte >= end_byte) {
-        return false;
-    }
-
-    return ((begin_byte & static_cast<size_t>(15)) == 0) &&
-           ((end_byte & static_cast<size_t>(15)) == 0);
-}
-
 /*
  * FillDepth stays as the apply-side async depth for compatibility.
  * LoadFillDepth is the load-side warm-ahead depth.
@@ -325,173 +286,6 @@ __host__ __device__ __forceinline__ bool chunk_range_is_16b_bulk_aligned(
  */
 
 
-template <size_t ChunkBytes>
-__host__ __device__ __forceinline__ ByteRange byte_range_for_window_range(
-    int begin_window,
-    int end_window,
-    size_t total_bytes,
-    int window_chunks) {
-    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-
-    ByteRange range{};
-
-    if (begin_window >= end_window ||
-        window_chunks <= 0 ||
-        total_bytes == 0) {
-        return range;
-    }
-
-    const size_t begin =
-        static_cast<size_t>(begin_window) *
-        static_cast<size_t>(window_chunks) *
-        static_cast<size_t>(ChunkBytes);
-
-    const size_t end =
-        static_cast<size_t>(end_window) *
-        static_cast<size_t>(window_chunks) *
-        static_cast<size_t>(ChunkBytes);
-
-    range.begin = comm::utils::min_sz(begin, total_bytes);
-
-    const size_t clamped_end =
-        comm::utils::min_sz(end, total_bytes);
-
-    range.bytes =
-        range.begin < clamped_end ? clamped_end - range.begin : 0;
-
-    return range;
-}
-
-__device__ __forceinline__ PipelineStage make_stage_for_byte_range(
-    const unsigned char* src_base,
-    unsigned char* dst_base,
-    size_t begin_byte,
-    size_t byte_count,
-    unsigned char* shared_raw,
-    sync::semaphore* barrier) {
-    return make_pipeline_stage(
-        make_pipeline_chunk(
-            src_base + begin_byte,
-            dst_base + begin_byte,
-            byte_count),
-        shared_raw,
-        barrier);
-}
-
-
-__host__ __device__ __forceinline__ bool byte_range_is_16b_bulk_aligned(
-    size_t begin_byte,
-    size_t byte_count) {
-    if (byte_count == 0) {
-        return false;
-    }
-
-    const size_t end_byte =
-        begin_byte + byte_count;
-
-    return ((begin_byte & static_cast<size_t>(15)) == 0) &&
-           ((end_byte & static_cast<size_t>(15)) == 0);
-}
-
-template <typename Apply>
-__device__ __forceinline__ void run_byte_range_single_tma_16b_aligned_thread0(
-    const void* src_base,
-    void* dst_base,
-    size_t begin_byte,
-    size_t byte_count,
-    unsigned char* shared_raw,
-    sync::semaphore* barriers) {
-
-    if (threadIdx.x != 0) {
-        return;
-    }
-
-    if (byte_count == 0) {
-        return;
-    }
-
-    const unsigned char* src_bytes =
-        reinterpret_cast<const unsigned char*>(src_base);
-
-    unsigned char* dst_bytes =
-        reinterpret_cast<unsigned char*>(dst_base);
-
-    PipelineTMALoad load{};
-    Apply apply{};
-
-    PipelineStage stage =
-        make_stage_for_byte_range(
-            src_bytes,
-            dst_bytes,
-            begin_byte,
-            byte_count,
-            shared_raw,
-            &barriers[0]);
-
-    load.issue(&stage);
-    load.wait_ready(&stage);
-
-    apply.issue_bulk(&stage);
-    apply.wait_complete();
-}
-
-template <typename Apply>
-__device__ void run_byte_range_single_tma(
-    const void* src_base,
-    void* dst_base,
-    size_t begin_byte,
-    size_t byte_count,
-    unsigned char* shared_raw,
-    sync::semaphore* barriers) {
-    if (byte_count == 0) {
-        return;
-    }
-
-    if (byte_range_is_16b_bulk_aligned(begin_byte, byte_count)) {
-        run_byte_range_single_tma_16b_aligned_thread0<Apply>(
-            src_base,
-            dst_base,
-            begin_byte,
-            byte_count,
-            shared_raw,
-            barriers);
-        return;
-    }
-
-    const unsigned char* src_bytes =
-        reinterpret_cast<const unsigned char*>(src_base);
-
-    unsigned char* dst_bytes =
-        reinterpret_cast<unsigned char*>(dst_base);
-
-    PipelineTMALoad load{};
-    Apply apply{};
-
-    PipelineStage stage =
-        make_stage_for_byte_range(
-            src_bytes,
-            dst_bytes,
-            begin_byte,
-            byte_count,
-            shared_raw,
-            &barriers[0]);
-
-    if (threadIdx.x == 0) {
-        load.issue(&stage);
-        load.wait_ready(&stage);
-        apply.issue_bulk(&stage);
-    }
-
-    apply.finish_tail(&stage);
-
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        apply.wait_complete();
-    }
-
-    __syncthreads();
-}
 
 __device__ __forceinline__ void publish_window_range_ready(
     int* window_ready_flags,
@@ -514,13 +308,14 @@ __device__ __forceinline__ void publish_window_range_ready(
     }
 }
 
+
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
     typename Apply,
     int LoadFillDepth = FillDepth>
-__device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
+__device__ __forceinline__ void run_chunk_range(
     const void* src_base,
     void* dst_base,
     size_t total_bytes,
@@ -534,6 +329,8 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+    static_assert((ChunkBytes % 16) == 0,
+                  "ChunkBytes must be 16-byte aligned");
 
     if (threadIdx.x != 0) {
         return;
@@ -628,158 +425,6 @@ __device__ __forceinline__ void run_chunk_range_16b_aligned_thread0(
     apply.wait_complete();
 }
 
-template <
-    int StageDepth,
-    int FillDepth,
-    size_t ChunkBytes,
-    typename Apply,
-    int LoadFillDepth = FillDepth>
-__device__ void run_chunk_range(
-    const void* src_base,
-    void* dst_base,
-    size_t total_bytes,
-    int begin_chunk,
-    int end_chunk,
-    unsigned char* shared_raw,
-    sync::semaphore* barriers) {
-    static_assert(StageDepth > 0, "StageDepth must be > 0");
-    static_assert(FillDepth > 0, "FillDepth must be > 0");
-    static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
-    static_assert(LoadFillDepth + FillDepth <= StageDepth,
-                  "LoadFillDepth + FillDepth must be <= StageDepth");
-    static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-
-    if (begin_chunk >= end_chunk || total_bytes == 0) {
-        return;
-    }
-
-    if (chunk_range_is_16b_bulk_aligned<ChunkBytes>(
-            total_bytes,
-            begin_chunk,
-            end_chunk)) {
-        run_chunk_range_16b_aligned_thread0<
-            StageDepth,
-            FillDepth,
-            ChunkBytes,
-            Apply,
-            LoadFillDepth>(
-                src_base,
-                dst_base,
-                total_bytes,
-                begin_chunk,
-                end_chunk,
-                shared_raw,
-                barriers);
-        return;
-    }
-
-    const unsigned char* src_bytes =
-        reinterpret_cast<const unsigned char*>(src_base);
-
-    unsigned char* dst_bytes =
-        reinterpret_cast<unsigned char*>(dst_base);
-
-    PipelineTMALoad load{};
-    Apply apply{};
-
-    const int total_range_chunks =
-        end_chunk - begin_chunk;
-
-    for (int warm = 0; warm < LoadFillDepth; ++warm) {
-        if (warm >= total_range_chunks) {
-            break;
-        }
-
-        const int abs_chunk =
-            begin_chunk + warm;
-
-        PipelineStage stage =
-            make_stage_for_abs_chunk<ChunkBytes>(
-                src_bytes,
-                dst_bytes,
-                total_bytes,
-                abs_chunk,
-                warm,
-                shared_raw,
-                barriers);
-
-        if (threadIdx.x == 0) {
-            load.issue(&stage);
-        }
-
-        __syncthreads();
-    }
-
-    for (int iter = 0; iter < total_range_chunks; ++iter) {
-        const int abs_chunk =
-            begin_chunk + iter;
-
-        const int cur_slot =
-            iter % StageDepth;
-
-        PipelineStage cur_stage =
-            make_stage_for_abs_chunk<ChunkBytes>(
-                src_bytes,
-                dst_bytes,
-                total_bytes,
-                abs_chunk,
-                cur_slot,
-                shared_raw,
-                barriers);
-
-        if (threadIdx.x == 0) {
-            load.wait_ready(&cur_stage);
-        }
-
-        __syncthreads();
-
-        const int future_iter =
-            iter + LoadFillDepth;
-
-        if (future_iter < total_range_chunks) {
-            const int future_abs_chunk =
-                begin_chunk + future_iter;
-
-            const int future_slot =
-                future_iter % StageDepth;
-
-            PipelineStage future_stage =
-                make_stage_for_abs_chunk<ChunkBytes>(
-                    src_bytes,
-                    dst_bytes,
-                    total_bytes,
-                    future_abs_chunk,
-                    future_slot,
-                    shared_raw,
-                    barriers);
-
-            if (threadIdx.x == 0) {
-                if (future_iter >= StageDepth) {
-                    apply.wait_before_stage_reuse();
-                }
-
-                load.issue(&future_stage);
-            }
-        }
-
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            apply.issue_bulk(&cur_stage);
-        }
-
-        apply.finish_tail(&cur_stage);
-
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        apply.wait_complete();
-    }
-
-    __syncthreads();
-}
-
 
 // -----------------------------------------------------------------------------
 // TMA fanout window pipeline
@@ -852,21 +497,6 @@ __device__ __forceinline__ int clamp_fanout_dst_count(int dst_count) {
     return dst_count > MaxFanoutDsts ? MaxFanoutDsts : dst_count;
 }
 
-__device__ __forceinline__ PipelineStage make_fanout_stage_for_byte_range(
-    const unsigned char* src_base,
-    size_t begin_byte,
-    size_t byte_count,
-    unsigned char* shared_raw,
-    sync::semaphore* barrier) {
-    return make_pipeline_stage(
-        make_pipeline_chunk(
-            src_base + begin_byte,
-            nullptr,
-            byte_count),
-        shared_raw,
-        barrier);
-}
-
 template <typename ReduceApply>
 __device__ __forceinline__ void issue_reduce_fanout_nofence(
     const ReduceApply& apply,
@@ -891,135 +521,12 @@ __device__ __forceinline__ void issue_reduce_fanout_nofence(
     }
 }
 
-__device__ __forceinline__ void run_byte_range_single_tma_copy_fanout_16b_aligned_thread0(
-    const void* src_base,
-    void* const* fanout_dsts,
-    int fanout_dst_count,
-    size_t begin_byte,
-    size_t byte_count,
-    unsigned char* shared_raw,
-    sync::semaphore* barriers) {
-    if (threadIdx.x != 0) {
-        return;
-    }
-
-    const int dst_count =
-        clamp_fanout_dst_count<TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS>(
-            fanout_dst_count);
-
-    if (src_base == nullptr ||
-        fanout_dsts == nullptr ||
-        byte_count == 0 ||
-        dst_count <= 0 ||
-        !byte_range_is_16b_bulk_aligned(begin_byte, byte_count)) {
-        return;
-    }
-
-    const unsigned char* src_bytes =
-        reinterpret_cast<const unsigned char*>(src_base);
-
-    PipelineStage stage =
-        make_fanout_stage_for_byte_range(
-            src_bytes,
-            begin_byte,
-            byte_count,
-            shared_raw,
-            &barriers[0]);
-
-    PipelineTMALoad load{};
-    load.issue(&stage);
-
-    void* range_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
-
-    for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
-        range_dsts[dst_idx] =
-            fanout_dsts[dst_idx] != nullptr
-                ? reinterpret_cast<unsigned char*>(fanout_dsts[dst_idx]) +
-                    begin_byte
-                : nullptr;
-    }
-
-    load.wait_ready(&stage);
-
-    tma::store_async_fanout_array_op_nofence(
-        stage.smem,
-        static_cast<uint32_t>(byte_count),
-        range_dsts,
-        dst_count);
-    tma::store_commit_group();
-    tma::store_async_wait<0>();
-}
-
-template <typename ReduceApply>
-__device__ __forceinline__ void run_byte_range_single_tma_reduce_fanout_16b_aligned_thread0(
-    const void* src_base,
-    void* const* fanout_dsts,
-    const uint8_t* fanout_reduce_scope,
-    int fanout_dst_count,
-    size_t begin_byte,
-    size_t byte_count,
-    unsigned char* shared_raw,
-    sync::semaphore* barriers) {
-    if (threadIdx.x != 0) {
-        return;
-    }
-
-    const int dst_count =
-        clamp_fanout_dst_count<TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS>(
-            fanout_dst_count);
-
-    if (src_base == nullptr ||
-        fanout_dsts == nullptr ||
-        byte_count == 0 ||
-        dst_count <= 0 ||
-        !byte_range_is_16b_bulk_aligned(begin_byte, byte_count)) {
-        return;
-    }
-
-    const unsigned char* src_bytes =
-        reinterpret_cast<const unsigned char*>(src_base);
-
-    PipelineStage stage =
-        make_fanout_stage_for_byte_range(
-            src_bytes,
-            begin_byte,
-            byte_count,
-            shared_raw,
-            &barriers[0]);
-
-    PipelineTMALoad load{};
-    ReduceApply apply{};
-
-    load.issue(&stage);
-
-    void* range_dsts[TMA_TWO_GPU_PEER_MAX_FANOUT_DSTS] = {};
-
-    for (int dst_idx = 0; dst_idx < dst_count; ++dst_idx) {
-        range_dsts[dst_idx] =
-            fanout_dsts[dst_idx] != nullptr
-                ? reinterpret_cast<unsigned char*>(fanout_dsts[dst_idx]) +
-                    begin_byte
-                : nullptr;
-    }
-
-    load.wait_ready(&stage);
-
-    issue_reduce_fanout_nofence(
-        apply,
-        &stage,
-        range_dsts,
-        fanout_reduce_scope,
-        dst_count);
-    apply.commit();
-    apply.wait_complete();
-}
-
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
     int LoadFillDepth = FillDepth>
-__device__ __forceinline__ void run_chunk_range_tma_copy_fanout_16b_aligned_thread0(
+__device__ __forceinline__ void run_chunk_range_tma_copy_fanout(
     const void* src_base,
     void* const* fanout_dsts,
     int fanout_dst_count,
@@ -1161,7 +668,7 @@ template <
     size_t ChunkBytes,
     typename ReduceApply,
     int LoadFillDepth = FillDepth>
-__device__ __forceinline__ void run_chunk_range_tma_reduce_fanout_16b_aligned_thread0(
+__device__ __forceinline__ void run_chunk_range_tma_reduce_fanout(
     const void* src_base,
     void* const* fanout_dsts,
     const uint8_t* fanout_reduce_scope,
@@ -1300,13 +807,13 @@ __device__ __forceinline__ void run_chunk_range_tma_reduce_fanout_16b_aligned_th
     apply.wait_complete();
 }
 
+
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
-__device__ void copy_window_range_tma_fanout(
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void copy_window_range_tma_fanout(
     const void* src_base,
     void* const* fanout_dsts,
     int fanout_dst_count,
@@ -1322,31 +829,11 @@ __device__ void copy_window_range_tma_fanout(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
+    static_assert((ChunkBytes % 16) == 0,
+                  "ChunkBytes must be 16-byte aligned");
 
-    if (SmallTaskBytes > 0) {
-        const ByteRange byte_range =
-            byte_range_for_window_range<ChunkBytes>(
-                begin_window,
-                end_window,
-                total_bytes,
-                window_chunks);
-
-        if (byte_range.bytes > 0 &&
-            byte_range.bytes <= static_cast<size_t>(SmallTaskBytes) &&
-            byte_range_is_16b_bulk_aligned(
-                byte_range.begin,
-                byte_range.bytes)) {
-            run_byte_range_single_tma_copy_fanout_16b_aligned_thread0(
-                src_base,
-                fanout_dsts,
-                fanout_dst_count,
-                byte_range.begin,
-                byte_range.bytes,
-                shared_raw,
-                barriers);
-            return;
-        }
+    if (threadIdx.x != 0) {
+        return;
     }
 
     const int total_chunks =
@@ -1363,18 +850,7 @@ __device__ void copy_window_range_tma_fanout(
         return;
     }
 
-    /*
-     * First pass: only support pure bulk-aligned fanout.  Tail handling for
-     * fanout copy/reduce can be added later if needed.
-     */
-    if (!chunk_range_is_16b_bulk_aligned<ChunkBytes>(
-            total_bytes,
-            chunks.begin,
-            chunks.end)) {
-        return;
-    }
-
-    run_chunk_range_tma_copy_fanout_16b_aligned_thread0<
+    run_chunk_range_tma_copy_fanout<
         StageDepth,
         FillDepth,
         ChunkBytes,
@@ -1389,14 +865,14 @@ __device__ void copy_window_range_tma_fanout(
             barriers);
 }
 
+
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
     typename ReduceApply,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
-__device__ void reduce_window_range_tma_fanout(
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void reduce_window_range_tma_fanout(
     const void* src_base,
     void* const* fanout_dsts,
     const uint8_t* fanout_reduce_scope,
@@ -1413,33 +889,11 @@ __device__ void reduce_window_range_tma_fanout(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
+    static_assert((ChunkBytes % 16) == 0,
+                  "ChunkBytes must be 16-byte aligned");
 
-    if (SmallTaskBytes > 0) {
-        const ByteRange byte_range =
-            byte_range_for_window_range<ChunkBytes>(
-                begin_window,
-                end_window,
-                total_bytes,
-                window_chunks);
-
-        if (byte_range.bytes > 0 &&
-            byte_range.bytes <= static_cast<size_t>(SmallTaskBytes) &&
-            byte_range_is_16b_bulk_aligned(
-                byte_range.begin,
-                byte_range.bytes)) {
-            run_byte_range_single_tma_reduce_fanout_16b_aligned_thread0<
-                ReduceApply>(
-                    src_base,
-                    fanout_dsts,
-                    fanout_reduce_scope,
-                    fanout_dst_count,
-                    byte_range.begin,
-                    byte_range.bytes,
-                    shared_raw,
-                    barriers);
-            return;
-        }
+    if (threadIdx.x != 0) {
+        return;
     }
 
     const int total_chunks =
@@ -1456,18 +910,7 @@ __device__ void reduce_window_range_tma_fanout(
         return;
     }
 
-    /*
-     * First pass: only support pure bulk-aligned fanout.  Tail handling for
-     * reduce fanout is more delicate because scalar tails are not TMA atomics.
-     */
-    if (!chunk_range_is_16b_bulk_aligned<ChunkBytes>(
-            total_bytes,
-            chunks.begin,
-            chunks.end)) {
-        return;
-    }
-
-    run_chunk_range_tma_reduce_fanout_16b_aligned_thread0<
+    run_chunk_range_tma_reduce_fanout<
         StageDepth,
         FillDepth,
         ChunkBytes,
@@ -1485,14 +928,14 @@ __device__ void reduce_window_range_tma_fanout(
 }
 
 
+
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
     typename Apply,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
-__device__ void run_window_range(
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void run_window_range(
     const void* src_base,
     void* dst_base,
     size_t total_bytes,
@@ -1501,27 +944,8 @@ __device__ void run_window_range(
     int window_chunks,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
-
-    if (SmallTaskBytes > 0) {
-        const ByteRange byte_range =
-            byte_range_for_window_range<ChunkBytes>(
-                begin_window,
-                end_window,
-                total_bytes,
-                window_chunks);
-
-        if (byte_range.bytes > 0 &&
-            byte_range.bytes <= static_cast<size_t>(SmallTaskBytes)) {
-            run_byte_range_single_tma<Apply>(
-                src_base,
-                dst_base,
-                byte_range.begin,
-                byte_range.bytes,
-                shared_raw,
-                barriers);
-            return;
-        }
+    if (threadIdx.x != 0) {
+        return;
     }
 
     const int total_chunks =
@@ -1549,14 +973,14 @@ __device__ void run_window_range(
             barriers);
 }
 
+
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
     typename ReduceApply,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
-__device__ void run_window_range_signal(
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void run_window_range_signal(
     const void* src_base,
     void* dst_base,
     size_t total_bytes,
@@ -1573,36 +997,11 @@ __device__ void run_window_range_signal(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+    static_assert((ChunkBytes % 16) == 0,
+                  "ChunkBytes must be 16-byte aligned");
 
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
-
-    if (SmallTaskBytes > 0) {
-        const ByteRange byte_range =
-            byte_range_for_window_range<ChunkBytes>(
-                begin_window,
-                end_window,
-                total_bytes,
-                window_chunks);
-
-        if (byte_range.bytes > 0 &&
-            byte_range.bytes <= static_cast<size_t>(SmallTaskBytes)) {
-            run_byte_range_single_tma<ReduceApply>(
-                src_base,
-                dst_base,
-                byte_range.begin,
-                byte_range.bytes,
-                shared_raw,
-                barriers);
-
-            publish_window_range_ready(
-                window_ready_flags,
-                begin_window,
-                end_window,
-                ready_window_base);
-
-            __syncthreads();
-            return;
-        }
+    if (threadIdx.x != 0) {
+        return;
     }
 
     const int total_chunks =
@@ -1658,11 +1057,7 @@ __device__ void run_window_range_signal(
                 shared_raw,
                 barriers);
 
-        if (threadIdx.x == 0) {
-            load.issue(&stage);
-        }
-
-        __syncthreads();
+        load.issue(&stage);
     }
 
     for (int iter = 0; iter < total_range_chunks; ++iter) {
@@ -1682,11 +1077,7 @@ __device__ void run_window_range_signal(
                 shared_raw,
                 barriers);
 
-        if (threadIdx.x == 0) {
-            load.wait_ready(&cur_stage);
-        }
-
-        __syncthreads();
+        load.wait_ready(&cur_stage);
 
         const int future_iter =
             iter + LoadFillDepth;
@@ -1708,45 +1099,36 @@ __device__ void run_window_range_signal(
                     shared_raw,
                     barriers);
 
-            if (threadIdx.x == 0) {
-                if (future_iter >= StageDepth) {
-                    apply.wait_before_stage_reuse();
+            if (future_iter >= StageDepth) {
+                apply.wait_before_stage_reuse();
 
-                    const int safe_completed_chunk_exclusive =
-                        chunks.begin + (iter - FillDepth + 1);
+                const int safe_completed_chunk_exclusive =
+                    chunks.begin + (iter - FillDepth + 1);
 
-                    advance_window_signal_cursor(
-                        &signal_cursor,
-                        safe_completed_chunk_exclusive);
-                }
-
-                load.issue(&future_stage);
+                advance_window_signal_cursor(
+                    &signal_cursor,
+                    safe_completed_chunk_exclusive);
             }
+
+            load.issue(&future_stage);
         }
 
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            apply.issue_bulk(&cur_stage);
-        }
-
-        apply.finish_tail(&cur_stage);
-
-        __syncthreads();
+        apply.issue_bulk(&cur_stage);
     }
 
-    if (threadIdx.x == 0) {
-        apply.wait_complete();
-        publish_remaining_windows(&signal_cursor);
-    }
-
-    __syncthreads();
+    apply.wait_complete();
+    publish_remaining_windows(&signal_cursor);
 }
+
 
 __device__ __forceinline__ void wait_window_signal_for_window(
     const int* window_ready_flags,
     int window_idx,
     int ready_window_base) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
     if (window_ready_flags == nullptr) {
         return;
     }
@@ -1757,21 +1139,17 @@ __device__ __forceinline__ void wait_window_signal_for_window(
     const int* window_ready =
         flag_idx >= 0 ? window_ready_flags + flag_idx : nullptr;
 
-    if (threadIdx.x == 0) {
-        wait_window_ready(window_ready);
-    }
-
-    __syncthreads();
+    wait_window_ready(window_ready);
 }
+
 
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
     typename Apply,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
-__device__ void run_window_range_after_ready(
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void run_window_range_after_ready(
     const void* src_base,
     void* dst_base,
     size_t total_bytes,
@@ -1788,43 +1166,17 @@ __device__ void run_window_range_after_ready(
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
+    static_assert((ChunkBytes % 16) == 0,
+                  "ChunkBytes must be 16-byte aligned");
+
+    if (threadIdx.x != 0) {
+        return;
+    }
 
     if (begin_window >= end_window ||
         window_chunks <= 0 ||
         total_bytes == 0) {
         return;
-    }
-
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
-
-    if (SmallTaskBytes > 0) {
-        const ByteRange byte_range =
-            byte_range_for_window_range<ChunkBytes>(
-                begin_window,
-                end_window,
-                total_bytes,
-                window_chunks);
-
-        if (byte_range.bytes > 0 &&
-            byte_range.bytes <= static_cast<size_t>(SmallTaskBytes)) {
-            for (int window_idx = begin_window;
-                 window_idx < end_window;
-                 ++window_idx) {
-                wait_window_signal_for_window(
-                    window_ready_flags,
-                    window_idx,
-                    ready_window_base);
-            }
-
-            run_byte_range_single_tma<Apply>(
-                src_base,
-                dst_base,
-                byte_range.begin,
-                byte_range.bytes,
-                shared_raw,
-                barriers);
-            return;
-        }
     }
 
     const int total_chunks =
@@ -1885,11 +1237,7 @@ __device__ void run_window_range_after_ready(
                 shared_raw,
                 barriers);
 
-        if (threadIdx.x == 0) {
-            load.issue(&stage);
-        }
-
-        __syncthreads();
+        load.issue(&stage);
     }
 
     for (int iter = 0; iter < total_range_chunks; ++iter) {
@@ -1909,11 +1257,7 @@ __device__ void run_window_range_after_ready(
                 shared_raw,
                 barriers);
 
-        if (threadIdx.x == 0) {
-            load.wait_ready(&cur_stage);
-        }
-
-        __syncthreads();
+        load.wait_ready(&cur_stage);
 
         const int future_iter =
             iter + LoadFillDepth;
@@ -1947,40 +1291,26 @@ __device__ void run_window_range_after_ready(
                     shared_raw,
                     barriers);
 
-            if (threadIdx.x == 0) {
-                if (future_iter >= StageDepth) {
-                    apply.wait_before_stage_reuse();
-                }
-
-                load.issue(&future_stage);
+            if (future_iter >= StageDepth) {
+                apply.wait_before_stage_reuse();
             }
+
+            load.issue(&future_stage);
         }
 
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            apply.issue_bulk(&cur_stage);
-        }
-
-        apply.finish_tail(&cur_stage);
-
-        __syncthreads();
+        apply.issue_bulk(&cur_stage);
     }
 
-    if (threadIdx.x == 0) {
-        apply.wait_complete();
-    }
-
-    __syncthreads();
+    apply.wait_complete();
 }
+
 
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
-__device__ void copy_window_range_tma_signal(
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void copy_window_range_tma_signal(
     const void* src_base,
     void* dst_base,
     size_t total_bytes,
@@ -1991,6 +1321,10 @@ __device__ void copy_window_range_tma_signal(
     int ready_window_base,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
     using CopyApply =
         PipelineTMACopy<StageDepth, FillDepth>;
 
@@ -1999,8 +1333,7 @@ __device__ void copy_window_range_tma_signal(
         FillDepth,
         ChunkBytes,
         CopyApply,
-        LoadFillDepth,
-        SmallTaskBytes>(
+        LoadFillDepth>(
             src_base,
             dst_base,
             total_bytes,
@@ -2013,14 +1346,14 @@ __device__ void copy_window_range_tma_signal(
             barriers);
 }
 
+
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
     typename ReduceApply,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
-__device__ void reduce_window_range_tma_after_ready(
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void reduce_window_range_tma_after_ready(
     const void* src_base,
     void* dst_base,
     size_t total_bytes,
@@ -2031,13 +1364,16 @@ __device__ void reduce_window_range_tma_after_ready(
     int ready_window_base,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
     run_window_range_after_ready<
         StageDepth,
         FillDepth,
         ChunkBytes,
         ReduceApply,
-        LoadFillDepth,
-        SmallTaskBytes>(
+        LoadFillDepth>(
             src_base,
             dst_base,
             total_bytes,
@@ -2050,13 +1386,13 @@ __device__ void reduce_window_range_tma_after_ready(
             barriers);
 }
 
+
 template <
     int StageDepth,
     int FillDepth,
     size_t ChunkBytes,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
-__device__ void copy_window_range_tma(
+    int LoadFillDepth = FillDepth>
+__device__ __forceinline__ void copy_window_range_tma(
     const void* src_base,
     void* dst_base,
     size_t total_bytes,
@@ -2065,6 +1401,10 @@ __device__ void copy_window_range_tma(
     int window_chunks,
     unsigned char* shared_raw,
     sync::semaphore* barriers) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
     using CopyApply =
         PipelineTMACopy<StageDepth, FillDepth>;
 
@@ -2073,8 +1413,7 @@ __device__ void copy_window_range_tma(
         FillDepth,
         ChunkBytes,
         CopyApply,
-        LoadFillDepth,
-        SmallTaskBytes>(
+        LoadFillDepth>(
             src_base,
             dst_base,
             total_bytes,

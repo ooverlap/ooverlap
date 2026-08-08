@@ -36,10 +36,21 @@ struct CollectiveLaunchState {
     int peer_count = 0;
 
     /*
-     * Legacy single-channel fields.  These mirror the DeviceMemory channel.
+     * Legacy single-channel fields. These keep slot 0 for planner-generated
+     * ReadyPublish/ReadyWait tasks.
      */
     int* local_ready_signal = nullptr;
     const int* peer_ready_signals[kMaxPublicPeers] = {};
+
+    /*
+     * Fixed prologue/epilogue rendezvous pointers.
+     *
+     * peer_publish_signals[i] is a receiver-local inbox slot on peer i and is
+     * written remotely exactly once per phase by this rank.
+     * local_wait_signals[i] is this rank's local inbox slot for peer i.
+     */
+    int* peer_publish_signals[kMaxPublicPeers] = {};
+    const int* local_wait_signals[kMaxPublicPeers] = {};
 
     /*
      * Channel-aware ready pointers/protocols.  The planner chooses a logical
@@ -76,6 +87,28 @@ struct CollectiveLaunchState {
     int plan_scratch_index = 0;
 
     size_t dtype_size = 0;
+    size_t bytes = 0;
+};
+
+/*
+ * Minimal launch state for the small direct all-reduce path. This contains
+ * only the local/peer data pointers and the existing device ready signals.
+ * It intentionally has no topology plan, logical task, window, chunk,
+ * staging, or lowering state.
+ */
+struct FastAllreduceLaunchState {
+    void* local_ptr = nullptr;
+    void* peer_ptrs[kMaxPublicPeers] = {};
+
+    int* peer_publish_signals[kMaxPublicPeers] = {};
+    const int* local_wait_signals[kMaxPublicPeers] = {};
+
+    int peer_count = 0;
+    int rank = -1;
+    int world_size = 0;
+    int local_device = -1;
+    int collective_epoch = 0;
+
     size_t bytes = 0;
 };
 
@@ -123,6 +156,19 @@ oo_status_t register_ipc_collective_buffers(
     oo_buffer_t* local);
 
 /*
+ * Resolve only the direct local/peer pointers and the device ready signals
+ * needed by the small all-reduce kernel.
+ */
+oo_status_t prepare_fast_allreduce_launch(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* prebound_rank_buffers,
+    int prebound_rank_buffer_count,
+    size_t offset_bytes,
+    size_t bytes,
+    FastAllreduceLaunchState* out);
+
+/*
  * Build a rank-local collective launch state from the group-owned current
  * collective buffer registry.
  *
@@ -153,6 +199,41 @@ oo_status_t prepare_collective_launch_prebound(
     size_t count,
     oo_dtype_t dtype,
     CollectiveLaunchState* out);
+
+/*
+ * Internal benchmark launchers. Each call receives one immutable, complete
+ * rank-indexed buffer row, avoiding mutation of group->collective_buffers while
+ * ranks for the same logical collective are being enqueued.
+ */
+oo_status_t allreduce_prebound_tuned(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream);
+
+oo_status_t reduce_scatter_prebound_tuned(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_reduce_op_t op,
+    oo_tuning_mode_t tuning_mode,
+    oo_tensor_slice_t* out_slice,
+    cudaStream_t stream);
+
+oo_status_t all_gather_prebound_tuned(
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    size_t count,
+    oo_dtype_t dtype,
+    oo_tuning_mode_t tuning_mode,
+    cudaStream_t stream);
 
 } // namespace api
 } // namespace comm

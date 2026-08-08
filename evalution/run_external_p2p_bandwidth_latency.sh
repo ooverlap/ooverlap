@@ -69,8 +69,9 @@ fi
 # while this range is known to complete on the same installation.
 LATENCY_BYTES="1K,2K,4K,8K,16K,32K,64K,128K,256K,512K"
 BANDWIDTH_BYTES="1M,2M,4M,8M,16M,32M,64M,128M,256M,512M"
-ITERS="150"
-WARMUP="20"
+ITERS="250"
+WARMUP="50"
+RING_SIZE="16"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
@@ -130,12 +131,15 @@ echo "[evalution] tuning_policy=$TUNING_POLICY_LABEL"
 echo "[evalution] latency_bytes=$LATENCY_BYTES"
 echo "[evalution] bandwidth_bytes=$BANDWIDTH_BYTES"
 echo "[evalution] iters=$ITERS warmup=$WARMUP"
+echo "[evalution] timing=batched-ring ring_size=$RING_SIZE"
 echo "[evalution] output=${OUT_PREFIX}.txt"
 
 # Use one worker invocation for the full fixed experiment. This intentionally
 # matches the command shape verified to complete on the target machine.
+OOVERLAP_BENCH_RING_SIZE="$RING_SIZE" \
 "$PYTHON_BIN" "$DRIVER" \
   --mode bench \
+  --use-ring-for-all-metrics \
   --collective all \
   --metric all \
   --ctas "$OOVERLAP_MAX_CTAS" \

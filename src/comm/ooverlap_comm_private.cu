@@ -50,40 +50,6 @@ oo_status_t cuda_to_status(cudaError_t error) {
     return OO_ERROR_CUDA;
 }
 
-oo_status_t resolve_host_mapped_ready_ptr_for_current_device(
-    oo_ready_signal& signal,
-    int** out) {
-    if (out == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    *out = nullptr;
-
-    if (signal.kind != oo_ready_signal_kind::owned_host_mapped) {
-        *out = reinterpret_cast<int*>(signal.ptr);
-        return OO_SUCCESS;
-    }
-
-    if (signal.owned_host_ptr == nullptr) {
-        return OO_ERROR_INVALID_ARGUMENT;
-    }
-
-    void* device_ptr = nullptr;
-
-    const cudaError_t err =
-        cudaHostGetDevicePointer(
-            &device_ptr,
-            signal.owned_host_ptr,
-            0);
-
-    if (err != cudaSuccess) {
-        return cuda_to_status(err);
-    }
-
-    *out = reinterpret_cast<int*>(device_ptr);
-    return OO_SUCCESS;
-}
-
 oo_status_t checked_element_bytes(
     size_t count,
     oo_dtype_t dtype,
@@ -519,8 +485,6 @@ oo_status_t ensure_ipc_legacy_collective_buffers_registered(
     }
 
     try {
-        cudaSetDevice(node->device);
-
         const oo_group::ipc_import_key local_key =
             make_ipc_import_key(local);
 
@@ -651,9 +615,159 @@ oo_status_t ensure_ipc_legacy_collective_buffers_registered(
 oo_status_t register_ipc_collective_buffers(
     oo_node_t* node,
     oo_buffer_t* local) {
+    if (node == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const cudaError_t error = cudaSetDevice(node->device);
+    if (error != cudaSuccess) {
+        return cuda_to_status(error);
+    }
+
     return ensure_ipc_legacy_collective_buffers_registered(
         node,
         local);
+}
+
+
+oo_status_t prepare_fast_allreduce_launch(
+    oo_node_t* node,
+    oo_buffer_t* local,
+    oo_buffer_t* const* prebound_rank_buffers,
+    int prebound_rank_buffer_count,
+    size_t offset_bytes,
+    size_t bytes,
+    FastAllreduceLaunchState* out) {
+    if (out == nullptr) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out = FastAllreduceLaunchState{};
+
+    if (node == nullptr ||
+        node->group == nullptr ||
+        local == nullptr ||
+        local->ptr == nullptr ||
+        bytes == 0) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    oo_group_t* group = node->group;
+
+    if (node->rank < 0 ||
+        node->rank >= group->num_devices ||
+        group->num_devices < 2 ||
+        group->num_devices - 1 > kMaxPublicPeers) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    const cudaError_t set_device_error =
+        cudaSetDevice(node->device);
+
+    if (set_device_error != cudaSuccess) {
+        return cuda_to_status(set_device_error);
+    }
+
+    if (prebound_rank_buffers != nullptr) {
+        if (prebound_rank_buffer_count != group->num_devices ||
+            prebound_rank_buffers[node->rank] != local) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+    } else if (
+        group->bootstrap_kind ==
+            oo_group_bootstrap_kind::multiprocess_ipc) {
+        const oo_status_t status =
+            ensure_ipc_legacy_collective_buffers_registered(
+                node,
+                local);
+
+        if (status != OO_SUCCESS) {
+            return status;
+        }
+    } else {
+        group->collective_buffers[node->rank] = local;
+    }
+
+    oo_ready_signal& local_ready_slot =
+        group->ready_signal_slots[node->rank];
+
+    if (local_ready_slot.ptr == nullptr ||
+        local_ready_slot.bytes < kOoReadySignalBytes) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    int* local_ready_base =
+        reinterpret_cast<int*>(local_ready_slot.ptr);
+
+    int peer_idx = 0;
+
+    for (int rank = 0; rank < group->num_devices; ++rank) {
+        oo_buffer_t* buffer =
+            prebound_rank_buffers != nullptr
+                ? prebound_rank_buffers[rank]
+                : group->collective_buffers[rank];
+
+        if (buffer == nullptr ||
+            buffer->ptr == nullptr ||
+            buffer->group != group ||
+            buffer->owner_rank != rank ||
+            buffer->owner_device != group->devices[rank] ||
+            offset_bytes > buffer->bytes ||
+            bytes > buffer->bytes - offset_bytes) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        void* logical_ptr =
+            reinterpret_cast<void*>(
+                reinterpret_cast<std::uint8_t*>(buffer->ptr) +
+                offset_bytes);
+
+        if ((reinterpret_cast<std::uintptr_t>(logical_ptr) &
+             static_cast<std::uintptr_t>(15)) != 0) {
+            return OO_ERROR_UNSUPPORTED;
+        }
+
+        oo_ready_signal& ready_signal =
+            group->ready_signal_slots[rank];
+
+        if (ready_signal.ptr == nullptr ||
+            ready_signal.bytes < kOoReadySignalBytes) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (rank == node->rank) {
+            out->local_ptr = logical_ptr;
+            continue;
+        }
+
+        int* peer_ready_base =
+            reinterpret_cast<int*>(ready_signal.ptr);
+
+        out->peer_ptrs[peer_idx] = logical_ptr;
+        out->peer_publish_signals[peer_idx] =
+            peer_ready_base +
+            kOoReadySignalInboxBaseSlot +
+            node->rank;
+        out->local_wait_signals[peer_idx] =
+            local_ready_base +
+            kOoReadySignalInboxBaseSlot +
+            rank;
+        ++peer_idx;
+    }
+
+    if (out->local_ptr == nullptr ||
+        peer_idx != group->num_devices - 1) {
+        return OO_ERROR_INVALID_ARGUMENT;
+    }
+
+    out->peer_count = peer_idx;
+    out->rank = node->rank;
+    out->world_size = group->num_devices;
+    out->local_device = node->device;
+    out->collective_epoch = ++node->collective_epoch;
+    out->bytes = bytes;
+
+    return OO_SUCCESS;
 }
 
 
@@ -734,6 +848,15 @@ oo_status_t prepare_collective_launch_impl(
         return OO_ERROR_INVALID_ARGUMENT;
     }
 
+    {
+        const cudaError_t err =
+            cudaSetDevice(node->device);
+
+        if (err != cudaSuccess) {
+            return cuda_to_status(err);
+        }
+    }
+
     /*
      * OOVERLAP_IPC_LEGACY_BUFFER_PREPARE_PATCH:
      *
@@ -770,25 +893,21 @@ oo_status_t prepare_collective_launch_impl(
     oo_ready_signal& local_host_signal =
         group->host_ready_signal_slots[node->rank];
 
-    {
-        const cudaError_t err =
-            cudaSetDevice(node->device);
-
-        if (err != cudaSuccess) {
-            return cuda_to_status(err);
-        }
+    if (local_signal.ptr == nullptr ||
+        local_signal.bytes < kOoReadySignalBytes) {
+        return OO_ERROR_INVALID_ARGUMENT;
     }
 
-    int* local_host_ready_signal = nullptr;
+    int* local_device_ready_base =
+        reinterpret_cast<int*>(local_signal.ptr);
 
-    status =
-        resolve_host_mapped_ready_ptr_for_current_device(
-            local_host_signal,
-            &local_host_ready_signal);
-
-    if (status != OO_SUCCESS) {
-        return status;
-    }
+    /*
+     * The mapped device alias is resolved once when the group creates the
+     * host-ready slot. Reuse it for every collective instead of entering the
+     * CUDA runtime once per signal, per rank, per invocation.
+     */
+    int* local_host_ready_signal =
+        reinterpret_cast<int*>(local_host_signal.ptr);
 
     out->local_ptr =
         reinterpret_cast<void*>(
@@ -813,11 +932,13 @@ oo_status_t prepare_collective_launch_impl(
     out->bytes = bytes;
     out->collective_epoch = ++node->collective_epoch;
     out->local_ready_signal =
-        reinterpret_cast<int*>(local_signal.ptr);
+        local_device_ready_base + kOoReadySignalLegacySlot;
     out->local_ready_signal_by_channel[kOoReadySignalChannelDeviceMemory] =
-        reinterpret_cast<int*>(local_signal.ptr);
+        local_device_ready_base + kOoReadySignalLegacySlot;
     out->local_ready_signal_by_channel[kOoReadySignalChannelHostMapped] =
-        local_host_ready_signal;
+        local_host_ready_signal != nullptr
+            ? local_host_ready_signal + kOoReadySignalLegacySlot
+            : nullptr;
     out->ready_signal_protocol_by_channel[kOoReadySignalChannelDeviceMemory] = 0;
     out->ready_signal_protocol_by_channel[kOoReadySignalChannelHostMapped] = 2;
     out->ready_signal_poll_sleep_cycles_by_channel
@@ -878,25 +999,35 @@ oo_status_t prepare_collective_launch_impl(
         oo_ready_signal& peer_host_signal =
             group->host_ready_signal_slots[rank];
 
+        if (peer_signal.ptr == nullptr ||
+            peer_signal.bytes < kOoReadySignalBytes) {
+            return OO_ERROR_INVALID_ARGUMENT;
+        }
+
+        int* peer_device_ready_base =
+            reinterpret_cast<int*>(peer_signal.ptr);
+
         out->peer_ready_signals[peer_idx] =
-            reinterpret_cast<const int*>(peer_signal.ptr);
+            peer_device_ready_base + kOoReadySignalLegacySlot;
+        out->peer_publish_signals[peer_idx] =
+            peer_device_ready_base +
+            kOoReadySignalInboxBaseSlot +
+            node->rank;
+        out->local_wait_signals[peer_idx] =
+            local_device_ready_base +
+            kOoReadySignalInboxBaseSlot +
+            rank;
         out->peer_ready_signals_by_channel
             [peer_idx][kOoReadySignalChannelDeviceMemory] =
-                reinterpret_cast<const int*>(peer_signal.ptr);
-        int* peer_host_ready_signal = nullptr;
-
-        status =
-            resolve_host_mapped_ready_ptr_for_current_device(
-                peer_host_signal,
-                &peer_host_ready_signal);
-
-        if (status != OO_SUCCESS) {
-            return status;
-        }
+                peer_device_ready_base + kOoReadySignalLegacySlot;
+        int* peer_host_ready_signal =
+            reinterpret_cast<int*>(peer_host_signal.ptr);
 
         out->peer_ready_signals_by_channel
             [peer_idx][kOoReadySignalChannelHostMapped] =
-                reinterpret_cast<const int*>(peer_host_ready_signal);
+                peer_host_ready_signal != nullptr
+                    ? peer_host_ready_signal + kOoReadySignalLegacySlot
+                    : nullptr;
 
         peer_idx += 1;
     }

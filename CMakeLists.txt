@@ -37,6 +37,22 @@ option(OOVERLAP_BUILD_LEGACY_OVERLAP "Build legacy overlap/NCCL/Torch integratio
 option(OOVERLAP_BUILD_RMSNORM "Build RMSNorm helpers" ${OOVERLAP_BUILD_PYTHON})
 option(OOVERLAP_BUILD_TORCH_COLLECTIVES "Build minimal PyTorch wrapper for public ooverlap collectives" OFF)
 option(OOVERLAP_USE_BUNDLED_NCCL "Build and link NCCL from src/third-party/nccl" ON)
+option(OOVERLAP_ENABLE_CUDA_LTO
+  "Enable CUDA device link-time optimization for ooverlap CUDA targets"
+  ON)
+
+if(OOVERLAP_ENABLE_CUDA_LTO)
+  # Compilation emits lto_90a IR in ooverlap_force_sm90a(). Apply -dlto only
+  # to the device-link phase; passing it to compilation conflicts with this
+  # project's explicit --generate-code flags.
+  add_link_options(
+    "$<DEVICE_LINK:-dlto>"
+    "$<DEVICE_LINK:--gpu-architecture=sm_90a>"
+  )
+  message(STATUS "ooverlap CUDA device LTO: enabled")
+else()
+  message(STATUS "ooverlap CUDA device LTO: disabled")
+endif()
 
 unset(CMAKE_CUDA_ARCHITECTURES CACHE)
 set(CMAKE_CUDA_ARCHITECTURES OFF CACHE STRING "Disable default CUDA arch flags" FORCE)

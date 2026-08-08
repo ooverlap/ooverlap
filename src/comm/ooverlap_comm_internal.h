@@ -25,6 +25,20 @@ enum class oo_ready_signal_channel : int {
 };
 
 constexpr int kOoReadySignalChannelCount = 2;
+
+/*
+ * Slot 0 preserves the existing planner ReadyPublish/ReadyWait protocol.
+ * Slots [1, 1 + kOoMaxLocalDevices) are receiver-local inboxes indexed by
+ * sender rank. Fixed kernel prologues/epilogues remotely write those inboxes
+ * and poll only local memory.
+ */
+constexpr int kOoReadySignalLegacySlot = 0;
+constexpr int kOoReadySignalInboxBaseSlot = 1;
+constexpr int kOoReadySignalSlotsPerRank =
+    kOoReadySignalInboxBaseSlot + kOoMaxLocalDevices;
+constexpr size_t kOoReadySignalBytes =
+    static_cast<size_t>(kOoReadySignalSlotsPerRank) * sizeof(int);
+
 constexpr int kOoReadySignalChannelDeviceMemory =
     static_cast<int>(oo_ready_signal_channel::device_memory);
 constexpr int kOoReadySignalChannelHostMapped =
@@ -282,6 +296,14 @@ struct oo_group {
      * + logical transfer planning.
      */
     bool topology_valid = false;
+
+    /*
+     * True only when every directed GPU pair supports validated direct
+     * peer load/store access and direct TMA reduction. The small all-reduce
+     * kernel requires this all-to-all property and never uses SHM staging.
+     */
+    bool is_all_peer_to_peer = false;
+
     ooverlap::topology::Topology topology{};
 
     /*

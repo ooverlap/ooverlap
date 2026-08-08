@@ -49,13 +49,6 @@ template <int DstMaxTasks, int SrcMaxTasks>
 __host__ __forceinline__ bool window_task_executor_plan_pack(
     const WindowTaskExecutorPlan<SrcMaxTasks>& source,
     WindowTaskExecutorPlan<DstMaxTasks>* destination) {
-    if (destination == nullptr ||
-        source.total_tasks < 0 ||
-        source.total_tasks > SrcMaxTasks ||
-        source.total_tasks > DstMaxTasks ||
-        source.tasks_per_cta < 0) {
-        return false;
-    }
 
     destination->total_tasks = source.total_tasks;
     destination->tasks_per_cta = source.tasks_per_cta;

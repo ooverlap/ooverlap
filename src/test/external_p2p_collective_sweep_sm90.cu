@@ -1,5 +1,6 @@
 #include "test/external_p2p_collective_sweep_sm90.h"
 
+#include "comm/ooverlap_comm_private.h"
 #include "ooverlap/comm.h"
 #include "ooverlap/system/runtime_utils.cuh"
 #include "ooverlap/testing/checks.cuh"
@@ -14,13 +15,17 @@
 #include <nccl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -72,6 +77,111 @@ struct SizeBuffers {
 struct TimingEvents {
     std::vector<cudaEvent_t> starts;
     std::vector<cudaEvent_t> stops;
+};
+
+/*
+ * Benchmark-only persistent host workers for same-process multi-GPU launch.
+ * Workers spin between submissions so CUDA event timing does not absorb an OS
+ * condition-variable wakeup on every collective. Stop them before NCCL timing.
+ */
+class ParallelRankSubmission {
+public:
+    explicit ParallelRankSubmission(std::size_t rank_count)
+        : errors_(rank_count) {
+        if (rank_count == 0) {
+            throw std::invalid_argument(
+                "ParallelRankSubmission requires at least one rank");
+        }
+
+        workers_.reserve(rank_count);
+        try {
+            for (std::size_t rank = 0; rank < rank_count; ++rank) {
+                workers_.emplace_back(
+                    [this, rank]() { worker_loop(rank); });
+            }
+        } catch (...) {
+            stop();
+            throw;
+        }
+    }
+
+    ~ParallelRankSubmission() {
+        stop();
+    }
+
+    ParallelRankSubmission(const ParallelRankSubmission&) = delete;
+    ParallelRankSubmission& operator=(const ParallelRankSubmission&) = delete;
+
+    void run(std::function<void(std::size_t)> job) {
+        if (!job) {
+            throw std::invalid_argument(
+                "ParallelRankSubmission job must be non-empty");
+        }
+        if (stop_.load(std::memory_order_acquire)) {
+            throw std::logic_error(
+                "ParallelRankSubmission has already been stopped");
+        }
+
+        for (std::exception_ptr& error : errors_) {
+            error = nullptr;
+        }
+
+        job_ = std::move(job);
+        completed_.store(0, std::memory_order_relaxed);
+        generation_.fetch_add(1, std::memory_order_release);
+
+        while (completed_.load(std::memory_order_acquire) != workers_.size()) {
+        }
+
+        for (const std::exception_ptr& error : errors_) {
+            if (error != nullptr) {
+                std::rethrow_exception(error);
+            }
+        }
+    }
+
+    void stop() noexcept {
+        stop_.store(true, std::memory_order_release);
+        for (std::thread& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+private:
+    void worker_loop(std::size_t rank) {
+        std::uint64_t seen_generation = 0;
+
+        for (;;) {
+            if (stop_.load(std::memory_order_acquire)) {
+                return;
+            }
+
+            const std::uint64_t generation =
+                generation_.load(std::memory_order_acquire);
+            if (generation == seen_generation) {
+                continue;
+            }
+
+            seen_generation = generation;
+
+            try {
+                job_(rank);
+            } catch (...) {
+                errors_[rank] = std::current_exception();
+            }
+
+            completed_.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::vector<std::exception_ptr> errors_;
+    std::function<void(std::size_t)> job_;
+    std::atomic<std::uint64_t> generation_{0};
+    std::atomic<std::size_t> completed_{0};
+    std::atomic<bool> stop_{false};
 };
 
 void validate_devices(const std::vector<int>& devices) {
@@ -367,6 +477,94 @@ void launch_ooverlap_once(
             ctx.streams[rank],
             label.c_str());
     }
+}
+
+void launch_ooverlap_prebound_once_for_rank(
+    TestCollective collective,
+    oo_node_t* node,
+    oo_buffer_t* const* rank_buffers,
+    int rank_buffer_count,
+    std::size_t numel,
+    cudaStream_t stream,
+    const char* label) {
+    if (collective == TestCollective::AllReduce) {
+        testing::check_oo(
+            comm::api::allreduce_prebound_tuned(
+                node,
+                rank_buffers,
+                rank_buffer_count,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                OO_TUNING_BEST_PERFORMANCE,
+                stream),
+            label);
+        return;
+    }
+
+    if (collective == TestCollective::ReduceScatter) {
+        oo_tensor_slice_t slice{};
+        testing::check_oo(
+            comm::api::reduce_scatter_prebound_tuned(
+                node,
+                rank_buffers,
+                rank_buffer_count,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_REDUCE_SUM,
+                OO_TUNING_BEST_PERFORMANCE,
+                &slice,
+                stream),
+            label);
+        return;
+    }
+
+    if (collective == TestCollective::AllGather) {
+        testing::check_oo(
+            comm::api::all_gather_prebound_tuned(
+                node,
+                rank_buffers,
+                rank_buffer_count,
+                numel,
+                OO_DTYPE_FLOAT16,
+                OO_TUNING_BEST_PERFORMANCE,
+                stream),
+            label);
+        return;
+    }
+
+    throw std::invalid_argument("unsupported collective");
+}
+
+void launch_ooverlap_prebound_once(
+    TestCollective collective,
+    const SweepContext& ctx,
+    const SizeBuffers& buffers,
+    std::size_t numel,
+    ParallelRankSubmission& rank_submission) {
+    if (ctx.nodes.size() != buffers.ooverlap_buffers.size() ||
+        ctx.nodes.size() != ctx.streams.size()) {
+        throw std::invalid_argument(
+            "launch_ooverlap_prebound_once: size mismatch");
+    }
+
+    oo_buffer_t* const* rank_buffers =
+        buffers.ooverlap_buffers.data();
+    const int rank_buffer_count =
+        static_cast<int>(buffers.ooverlap_buffers.size());
+
+    rank_submission.run([&](std::size_t rank) {
+        const std::string label =
+            "external ring ooverlap rank" + std::to_string(rank);
+        launch_ooverlap_prebound_once_for_rank(
+            collective,
+            ctx.nodes[rank],
+            rank_buffers,
+            rank_buffer_count,
+            numel,
+            ctx.streams[rank],
+            label.c_str());
+    });
 }
 
 void launch_nccl_once(
@@ -756,6 +954,11 @@ std::map<std::string, double> run_one_size_ring(
         allocate_size_buffer_ring(ctx, numel_arg, bytes, ring_size);
 
     try {
+        ParallelRankSubmission rank_submission(ctx.devices.size());
+        rank_submission.run([&](std::size_t rank) {
+            system::runtime::set_device(ctx.devices[rank]);
+        });
+
         const auto prepare_ooverlap_ring = [&]() {
             for (const SizeBuffers& slot : ring) {
                 prepare_work_buffers(
@@ -770,11 +973,12 @@ std::map<std::string, double> run_one_size_ring(
             for (int i = 0; i < count; ++i) {
                 const SizeBuffers& slot =
                     ring[static_cast<std::size_t>(i) % ring.size()];
-                launch_ooverlap_once(
+                launch_ooverlap_prebound_once(
                     collective,
                     ctx,
                     slot,
-                    numel);
+                    numel,
+                    rank_submission);
             }
         };
 
@@ -803,7 +1007,12 @@ std::map<std::string, double> run_one_size_ring(
                 bytes,
                 "sync external ring ooverlap verification reset");
             testing::reset_ready_signals(ctx.group);
-            launch_ooverlap_once(collective, ctx, slot, numel);
+            launch_ooverlap_prebound_once(
+                collective,
+                ctx,
+                slot,
+                numel,
+                rank_submission);
             sync_streams(
                 ctx.devices,
                 ctx.streams,
@@ -816,6 +1025,8 @@ std::map<std::string, double> run_one_size_ring(
                 numel_arg,
                 verify);
         }
+
+        rank_submission.stop();
 
         const auto prepare_nccl_ring = [&]() {
             for (const SizeBuffers& slot : ring) {

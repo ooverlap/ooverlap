@@ -22,6 +22,8 @@ namespace ooverlap {
 namespace comm {
 namespace kernels {
 
+/* OOVERLAP_CHUNK_ONLY_THREAD0_WINDOW_PIPELINE_V1 */
+
 /*
  * OOVERLAP_ALL_COLLECTIVES_PLAN_BY_VALUE_V1
  *
@@ -36,23 +38,21 @@ template <
     int MaxTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 __global__ void multi_gpu_window_task_executor_kernel_sm90(
     const __grid_constant__
         comm::plan::WindowTaskExecutorPlan<MaxTasks> plan,
-    int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     unsigned int* cta_barrier_counter,
-    unsigned int cta_barrier_start) {
+    unsigned int cta_barrier_entry_target,
+    unsigned int cta_barrier_final_target) {
 
     using Variant = comm::TmaPipelineVariant<
         ChunkBytes,
         StageDepth,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes>;
+        LoadFillDepth>;
 
     static_assert(FillDepth > 0, "FillDepth must be > 0");
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
@@ -66,36 +66,20 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
 
     __shared__ sync::semaphore barriers[Variant::barrier_count];
 
+
     if (cta_barrier_counter != nullptr) {
-        if (threadIdx.x == 0) {
-            if (blockIdx.x == 0) {
-                const int entry_ready_value =
-                    collective_epoch * comm::plan::kReadySignalPhaseStride;
+        const int entry_ready_value =
+            collective_epoch * comm::plan::kReadySignalPhaseStride;
 
-                publish_ready_signal(
-                    local_ready_signal,
-                    entry_ready_value,
-                    ready_plan.protocol);
+        distributed_ready_rendezvous_for_cta(
+            ready_plan,
+            entry_ready_value);
 
-                for (int peer_idx = 0;
-                     peer_idx < ready_plan.peer_count;
-                     ++peer_idx) {
-                    wait_until_ready_signal_at_least(
-                        ready_plan.peer_ready_signals[peer_idx],
-                        entry_ready_value,
-                        ready_plan.poll_sleep_cycles);
-                }
-
-                advance_cta_barrier_counter(cta_barrier_counter, 1u);
-            } else {
-                wait_until_cta_barrier_counter_at_least(
-                    cta_barrier_counter,
-                    cta_barrier_start);
-            }
-        }
-
-        __syncthreads();
+        arrive_and_wait_cta_barrier(
+            cta_barrier_counter,
+            cta_barrier_entry_target);
     }
+
 
     execute_window_task_stripe<
         Variant::stage_depth,
@@ -104,8 +88,7 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
         ReduceApply,
         uint4,
         TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-        LoadFillDepth,
-        SmallTaskBytes>(
+        LoadFillDepth>(
             plan.tasks,
             plan.total_tasks,
             plan.tasks_per_cta,
@@ -113,6 +96,21 @@ __global__ void multi_gpu_window_task_executor_kernel_sm90(
             shared_raw,
             barriers,
             cta_barrier_counter);
+
+    if (cta_barrier_counter != nullptr) {
+
+        arrive_and_wait_cta_barrier(
+            cta_barrier_counter,
+            cta_barrier_final_target);
+
+        const int final_ready_value =
+            collective_epoch * comm::plan::kReadySignalPhaseStride +
+            (comm::plan::kReadySignalPhaseStride - 1);
+
+        distributed_ready_rendezvous_for_cta(
+            ready_plan,
+            final_ready_value);
+    }
 }
 
 
@@ -159,6 +157,34 @@ struct CtaBarrierScratch {
     unsigned int* counter = nullptr;
     unsigned int* last_value = nullptr;
 };
+
+template <int MaxTasks>
+inline bool rebase_cta_barrier_targets(
+    comm::plan::WindowTaskExecutorPlan<MaxTasks>* plan,
+    unsigned int offset) {
+    if (plan == nullptr ||
+        plan->total_tasks < 0 ||
+        plan->total_tasks > MaxTasks) {
+        return false;
+    }
+
+    for (int i = 0; i < plan->total_tasks; ++i) {
+        if (plan->tasks[i].op != comm::task::WindowTaskOp::Barrier) {
+            continue;
+        }
+
+        const unsigned int target =
+            plan->tasks[i].payload.barrier_target;
+
+        if (target > ~0u - offset) {
+            return false;
+        }
+
+        plan->tasks[i].payload.barrier_target = target + offset;
+    }
+
+    return true;
+}
 
 inline cudaError_t get_cached_cta_barrier_scratch(
     int device,
@@ -223,19 +249,18 @@ template <
     int MaxTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 cudaError_t launch_multi_gpu_window_task_executor_sm90(
     const comm::plan::WindowTaskExecutorPlan<MaxTasks>& window_plan,
     int num_blocks,
     int threads,
     size_t dynamic_shared_bytes,
     cudaStream_t stream,
-    int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     unsigned int* cta_barrier_counter = nullptr,
-    unsigned int cta_barrier_start = 0u) {
+    unsigned int cta_barrier_entry_target = 0u,
+    unsigned int cta_barrier_final_target = 0u) {
     if (num_blocks <= 0 || threads <= 0) {
         return cudaSuccess;
     }
@@ -247,20 +272,28 @@ cudaError_t launch_multi_gpu_window_task_executor_sm90(
         MaxTasks,
         MaxPeers,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes><<<
+        LoadFillDepth><<<
             num_blocks,
             threads,
             dynamic_shared_bytes,
             stream>>>(
                 window_plan,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
 
+#if !defined(NDEBUG) || defined(OOVERLAP_DEBUG_CUDA_LAUNCH_CHECKS)
+    /*
+     * Keep immediate launch-error validation in debug builds. Release builds
+     * surface launch and asynchronous execution failures at the caller's final
+     * stream/event synchronization, avoiding a CUDA runtime call per rank.
+     */
     return cudaGetLastError();
+#else
+    return cudaSuccess;
+#endif
 }
 
 
@@ -271,8 +304,7 @@ template <
     int MaxTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 void configure_multi_gpu_window_task_executor_once(
     int device,
     const char* error_prefix) {
@@ -280,14 +312,12 @@ void configure_multi_gpu_window_task_executor_once(
         ChunkBytes,
         StageDepth,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes>;
+        LoadFillDepth>;
 
     static_assert(FillDepth > 0, "FillDepth must be > 0");
     static_assert(LoadFillDepth > 0, "LoadFillDepth must be > 0");
     static_assert(LoadFillDepth + FillDepth <= StageDepth,
                   "LoadFillDepth + FillDepth must be <= StageDepth");
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     if (device < 0 || device >= 32) {
         throw std::runtime_error("invalid device");
@@ -341,8 +371,7 @@ void configure_multi_gpu_window_task_executor_once(
                     MaxTasks,
                     MaxPeers,
                     FillDepth,
-                    LoadFillDepth,
-                    SmallTaskBytes>,
+                    LoadFillDepth>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(dynamic_smem_bytes)),
             "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
@@ -357,8 +386,7 @@ void configure_multi_gpu_window_task_executor_once(
                 MaxTasks,
                 MaxPeers,
                 FillDepth,
-                LoadFillDepth,
-                SmallTaskBytes>,
+                LoadFillDepth>,
             cudaFuncAttributePreferredSharedMemoryCarveout,
             100),
         "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
@@ -376,8 +404,7 @@ template <
     int MaxSourceTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
     const comm::plan::WindowTaskExecutorPlan<MaxSourceTasks>& window_plan,
     int num_blocks,
@@ -385,12 +412,12 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
     size_t dynamic_shared_bytes,
     cudaStream_t stream,
     int device,
-    int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     const char* error_prefix,
     unsigned int* cta_barrier_counter = nullptr,
-    unsigned int cta_barrier_start = 0u) {
+    unsigned int cta_barrier_entry_target = 0u,
+    unsigned int cta_barrier_final_target = 0u) {
     using ByValuePlan =
         comm::plan::WindowTaskExecutorPlan<ByValueMaxTasks>;
 
@@ -421,8 +448,7 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
         ByValueMaxTasks,
         MaxPeers,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes>(
+        LoadFillDepth>(
             device,
             error_prefix);
 
@@ -433,18 +459,17 @@ cudaError_t pack_configure_launch_multi_gpu_window_task_executor_sm90(
         ByValueMaxTasks,
         MaxPeers,
         FillDepth,
-        LoadFillDepth,
-        SmallTaskBytes>(
+        LoadFillDepth>(
             by_value_plan,
             num_blocks,
             threads,
             dynamic_shared_bytes,
             stream,
-            local_ready_signal,
             ready_plan,
             collective_epoch,
             cta_barrier_counter,
-            cta_barrier_start);
+            cta_barrier_entry_target,
+            cta_barrier_final_target);
 }
 
 
@@ -455,8 +480,7 @@ template <
     int MaxSourceTasks,
     int MaxPeers,
     int FillDepth = StageDepth / 2,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = TMA_TWO_GPU_PEER_SMALL_TASK_BYTES>
+    int LoadFillDepth = FillDepth>
 cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
     const comm::plan::WindowTaskExecutorPlan<MaxSourceTasks>& window_plan,
     int num_blocks,
@@ -464,12 +488,12 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
     size_t dynamic_shared_bytes,
     cudaStream_t stream,
     int device,
-    int* local_ready_signal,
     MultiGpuReadySignalPlan<MaxPeers> ready_plan,
     int collective_epoch,
     const char* error_prefix,
     unsigned int* cta_barrier_counter = nullptr,
-    unsigned int cta_barrier_start = 0u) {
+    unsigned int cta_barrier_entry_target = 0u,
+    unsigned int cta_barrier_final_target = 0u) {
     if (window_plan.total_tasks < 0 ||
         window_plan.total_tasks > MaxSourceTasks) {
         return cudaErrorInvalidConfiguration;
@@ -485,20 +509,19 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
             MaxSourceTasks,
             MaxPeers,
             FillDepth,
-            LoadFillDepth,
-            SmallTaskBytes>(
+            LoadFillDepth>(
                 window_plan,
                 num_blocks,
                 threads,
                 dynamic_shared_bytes,
                 stream,
                 device,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 error_prefix,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
     }
 
     if (window_plan.total_tasks <=
@@ -511,20 +534,19 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
             MaxSourceTasks,
             MaxPeers,
             FillDepth,
-            LoadFillDepth,
-            SmallTaskBytes>(
+            LoadFillDepth>(
                 window_plan,
                 num_blocks,
                 threads,
                 dynamic_shared_bytes,
                 stream,
                 device,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 error_prefix,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
     }
 
     if (window_plan.total_tasks <=
@@ -537,20 +559,19 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
             MaxSourceTasks,
             MaxPeers,
             FillDepth,
-            LoadFillDepth,
-            SmallTaskBytes>(
+            LoadFillDepth>(
                 window_plan,
                 num_blocks,
                 threads,
                 dynamic_shared_bytes,
                 stream,
                 device,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 error_prefix,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
     }
 
     if (window_plan.total_tasks <=
@@ -563,20 +584,19 @@ cudaError_t dispatch_multi_gpu_window_task_executor_by_value_sm90(
             MaxSourceTasks,
             MaxPeers,
             FillDepth,
-            LoadFillDepth,
-            SmallTaskBytes>(
+            LoadFillDepth>(
                 window_plan,
                 num_blocks,
                 threads,
                 dynamic_shared_bytes,
                 stream,
                 device,
-                local_ready_signal,
                 ready_plan,
                 collective_epoch,
                 error_prefix,
                 cta_barrier_counter,
-                cta_barrier_start);
+                cta_barrier_entry_target,
+                cta_barrier_final_target);
     }
 
     return cudaErrorInvalidConfiguration;

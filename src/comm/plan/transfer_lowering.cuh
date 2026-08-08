@@ -15,44 +15,6 @@ namespace comm {
 namespace plan {
 
 /*
- * Launch-time ready-signal binding.
- *
- * TransferPlan remains pointer-free/cacheable. ReadyPublish/ReadyWait
- * TransferTasks only describe logical ready ranks. The actual ready-signal
- * pointers, epoch, and protocol are supplied here at lowering time by the
- * enqueue path. WindowTask ready waits use a fixed 64-cycle sleep.
- */
-template <int MaxRanks>
-struct ReadySignalBinding {
-    /*
-     * Channel-aware fields. New code should fill these.
-     */
-    int* local_ready_signal_by_channel[kReadySignalChannelCount] = {};
-    const int* ready_signal_by_rank_channel
-        [MaxRanks][kReadySignalChannelCount] = {};
-    int protocol_by_channel[kReadySignalChannelCount] = {};
-
-    /*
-     * Compatibility fields for old launchers. These are interpreted as the
-     * DeviceMemory channel when the channel-aware entries are null.
-     */
-    int* local_ready_signal = nullptr;
-    const int* ready_signal_by_rank[MaxRanks] = {};
-    int epoch = 0;
-    int protocol = 0;
-};
-
-__host__ __device__ __forceinline__ bool valid_ready_signal_channel(
-    int channel) {
-    return channel >= 0 && channel < kReadySignalChannelCount;
-}
-
-__host__ __device__ __forceinline__ bool valid_ready_signal_phase(
-    int ready_phase) {
-    return ready_phase >= 0 && ready_phase < kReadySignalPhaseStride;
-}
-
-/*
  * Rank-local pointer binding.
  *
  * Each process/rank fills this using its own pointer view. For multiprocess
@@ -213,6 +175,29 @@ __host__ __device__ __forceinline__ bool transfer_task_is_ready(
            task.op == TransferOp::ReadyWait;
 }
 
+
+/*
+ * The general kernel owns the only rank rendezvous used by the direct research
+ * path: phase 0 in its prologue and the fixed completion phase in its epilogue.
+ * Logical planners may keep emitting a leading phase-0 ready-task prefix, but
+ * lowering does not materialize that prefix as WindowTasks.
+ *
+ * A ready task after executable work, a nonzero phase, or a non-DeviceMemory
+ * channel is a real dependency (for example staged/island synchronization or
+ * out-of-place initialization ordering). Reject that plan instead of silently
+ * moving or dropping the dependency.
+ */
+__host__ __device__ __forceinline__ bool
+transfer_ready_task_is_kernel_prologue(
+    const TransferTask& task,
+    int current_rank) {
+    return transfer_task_is_ready(task) &&
+           task.executor_rank == current_rank &&
+           task.ready_phase == 0 &&
+           task.ready_channel ==
+               static_cast<int>(ReadySignalChannel::DeviceMemory);
+}
+
 __host__ __device__ __forceinline__ bool transfer_task_is_barrier(
     const TransferTask& task) {
     return task.op == TransferOp::Barrier;
@@ -226,174 +211,6 @@ __host__ __device__ __forceinline__ bool transfer_task_is_windowed(
            task.op == TransferOp::ReduceFanout;
 }
 
-inline bool lower_ready_transfer_task_to_window_task(
-    const TransferTask& transfer,
-    const ReadySignalBinding<16>* /* unused */) {
-    /*
-     * Placeholder overload intentionally not used.
-     *
-     * The real implementation is templated below. This function only prevents
-     * accidental non-templated declarations from being introduced elsewhere.
-     */
-    (void)transfer;
-    return false;
-}
-
-template <int MaxRanks>
-inline bool lower_ready_transfer_task_to_window_task(
-    const TransferTask& transfer,
-    const ReadySignalBinding<MaxRanks>& ready,
-    task::WindowTask* out) {
-    if (out == nullptr ||
-        ready.epoch <= 0 ||
-        transfer.executor_rank < 0 ||
-        transfer.ready_rank < 0 ||
-        transfer.ready_rank >= MaxRanks ||
-        !valid_ready_signal_channel(transfer.ready_channel) ||
-        !valid_ready_signal_phase(transfer.ready_phase)) {
-        return false;
-    }
-
-    const int channel = transfer.ready_channel;
-    const int ready_value =
-        ready.epoch * kReadySignalPhaseStride + transfer.ready_phase;
-
-    int* local_signal =
-        ready.local_ready_signal_by_channel[channel];
-
-    const int* peer_signal =
-        ready.ready_signal_by_rank_channel[transfer.ready_rank][channel];
-
-    int protocol =
-        ready.protocol_by_channel[channel];
-
-    /*
-     * Backward compatibility for old single-channel launchers.
-     */
-    if (channel == static_cast<int>(ReadySignalChannel::DeviceMemory)) {
-        if (local_signal == nullptr) {
-            local_signal = ready.local_ready_signal;
-        }
-
-        if (peer_signal == nullptr) {
-            peer_signal = ready.ready_signal_by_rank[transfer.ready_rank];
-        }
-
-        if (protocol == 0) {
-            protocol = ready.protocol;
-        }
-    }
-
-    if (transfer.op == TransferOp::ReadyPublish) {
-        if (local_signal == nullptr) {
-            return false;
-        }
-
-        *out =
-            task::make_ready_publish_task(
-                local_signal,
-                ready_value,
-                protocol,
-                transfer.terminal);
-
-        return true;
-    }
-
-    if (transfer.op == TransferOp::ReadyWait) {
-        if (peer_signal == nullptr) {
-            return false;
-        }
-
-        *out =
-            task::make_ready_wait_task(
-                peer_signal,
-                ready_value,
-                transfer.terminal);
-
-        return true;
-    }
-
-    return false;
-}
-
-
-/* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: lower consecutive ReadyPublish + ReadyWait into one task. */
-template <int MaxRanks>
-inline bool lower_ready_publish_wait_transfer_tasks_to_window_task(
-    const TransferTask& publish,
-    const TransferTask& wait,
-    const ReadySignalBinding<MaxRanks>& ready,
-    int owner_cta,
-    task::WindowTask* out) {
-    if (out == nullptr ||
-        ready.epoch <= 0 ||
-        publish.op != TransferOp::ReadyPublish ||
-        wait.op != TransferOp::ReadyWait ||
-        publish.executor_rank != wait.executor_rank ||
-        publish.executor_rank < 0 ||
-        publish.ready_rank < 0 ||
-        publish.ready_rank >= MaxRanks ||
-        wait.ready_rank < 0 ||
-        wait.ready_rank >= MaxRanks ||
-        !valid_ready_signal_channel(publish.ready_channel) ||
-        !valid_ready_signal_channel(wait.ready_channel) ||
-        !valid_ready_signal_phase(publish.ready_phase) ||
-        !valid_ready_signal_phase(wait.ready_phase)) {
-        return false;
-    }
-
-    const int publish_channel = publish.ready_channel;
-    const int wait_channel = wait.ready_channel;
-
-    int* publish_signal =
-        ready.local_ready_signal_by_channel[publish_channel];
-
-    int publish_protocol =
-        ready.protocol_by_channel[publish_channel];
-
-    const int* wait_signal =
-        ready.ready_signal_by_rank_channel[wait.ready_rank][wait_channel];
-
-    /*
-     * Backward compatibility for old single-channel launchers.
-     */
-    if (publish_channel == static_cast<int>(ReadySignalChannel::DeviceMemory)) {
-        if (publish_signal == nullptr) {
-            publish_signal = ready.local_ready_signal;
-        }
-
-        if (publish_protocol == 0) {
-            publish_protocol = ready.protocol;
-        }
-    }
-
-    if (wait_channel == static_cast<int>(ReadySignalChannel::DeviceMemory)) {
-        if (wait_signal == nullptr) {
-            wait_signal = ready.ready_signal_by_rank[wait.ready_rank];
-        }
-    }
-
-    if (publish_signal == nullptr || wait_signal == nullptr) {
-        return false;
-    }
-
-    const int publish_value =
-        ready.epoch * kReadySignalPhaseStride + publish.ready_phase;
-    const int wait_value =
-        ready.epoch * kReadySignalPhaseStride + wait.ready_phase;
-
-    *out =
-        task::make_ready_publish_wait_task(
-            publish_signal,
-            publish_value,
-            publish_protocol,
-            wait_signal,
-            wait_value,
-            owner_cta,
-            wait.terminal);
-
-    return true;
-}
 
 inline task::WindowTaskOp select_copy_window_op(
     const TransferTask& transfer) {
@@ -601,15 +418,6 @@ struct LoweringPassOptions {
     bool enable_window_passes = true;
 
     /*
-     * Merge consecutive ReadyPublish + ReadyWait into one WindowTask.
-     *
-     * Only one CTA performs the publish. All CTAs wait on the peer ready signal.
-     * Multiple merged pairs are assigned owner CTAs round-robin to avoid putting
-     * every publish on CTA 0.
-     */
-    bool enable_ready_publish_wait_merge = true;
-
-    /*
      * Assign independent TransferOp::Reduce tasks to contiguous CTA groups.
      * The all-reduce launcher enables this and supplies the group-size limit.
      */
@@ -634,11 +442,6 @@ struct LoweringContext {
     int world_size = 0;
 
     const comm::LaunchConfig* launch_config = nullptr;
-    const ReadySignalBinding<MaxRanks>* ready_binding = nullptr;
-
-    bool lower_ready_tasks = false;
-    int reserved_prefix_tasks_per_cta = 0;
-
     LoweringPassOptions options{};
 };
 
@@ -646,8 +449,6 @@ template <int MaxRanks, int MaxStagingSlots>
 inline bool make_lowering_context(
     const RankPointerBinding<MaxRanks, MaxStagingSlots>& binding,
     const comm::LaunchConfig& launch_config,
-    int reserved_prefix_tasks_per_cta,
-    const ReadySignalBinding<MaxRanks>* ready_binding,
     const LoweringPassOptions& options,
     LoweringContext<MaxRanks>* out) {
     if (out == nullptr ||
@@ -657,7 +458,6 @@ inline bool make_lowering_context(
         binding.world_size > MaxRanks ||
         launch_config.max_ctas <= 0 ||
         launch_config.max_ctas > task::kWindowTaskMaxCtas ||
-        reserved_prefix_tasks_per_cta < 0 ||
         (options.enable_reduce_cta_groups &&
          (options.max_ctas_per_reduce_task <= 0 ||
           options.max_ctas_per_reduce_task > task::kWindowTaskMaxCtas))) {
@@ -668,11 +468,6 @@ inline bool make_lowering_context(
     ctx.current_rank = binding.current_rank;
     ctx.world_size = binding.world_size;
     ctx.launch_config = &launch_config;
-    ctx.ready_binding = ready_binding;
-    ctx.lower_ready_tasks =
-        ready_binding != nullptr &&
-        ready_binding->epoch > 0;
-    ctx.reserved_prefix_tasks_per_cta = reserved_prefix_tasks_per_cta;
     ctx.options = options;
 
     *out = ctx;
@@ -684,8 +479,6 @@ struct RankTransferTaskBuffer {
     static_assert(MaxTransferTasks > 0, "MaxTransferTasks must be > 0");
 
     int count;
-    int ready_count;
-    int ready_pair_count;
     int barrier_count;
     int window_count;
     int max_end_window;
@@ -714,8 +507,6 @@ inline void rank_transfer_task_buffer_reset(
      * call.
      */
     buffer->count = 0;
-    buffer->ready_count = 0;
-    buffer->ready_pair_count = 0;
     buffer->barrier_count = 0;
     buffer->window_count = 0;
     buffer->max_end_window = 0;
@@ -736,14 +527,6 @@ inline bool rank_transfer_task_buffer_push(
 }
 
 
-inline bool transfer_tasks_are_mergeable_ready_publish_wait_pair(
-    const TransferTask& publish,
-    const TransferTask& wait) {
-    return publish.op == TransferOp::ReadyPublish &&
-           wait.op == TransferOp::ReadyWait &&
-           publish.executor_rank == wait.executor_rank &&
-           !publish.terminal;
-}
 
 template <int MaxTransferTasks>
 inline bool recompute_rank_transfer_task_stats(
@@ -754,8 +537,6 @@ inline bool recompute_rank_transfer_task_stats(
         return false;
     }
 
-    buffer->ready_count = 0;
-    buffer->ready_pair_count = 0;
     buffer->barrier_count = 0;
     buffer->window_count = 0;
     buffer->max_end_window = 0;
@@ -769,18 +550,7 @@ inline bool recompute_rank_transfer_task_stats(
         }
 
         if (transfer_task_is_ready(transfer)) {
-            ++buffer->ready_count;
-
-            if (i + 1 < buffer->count &&
-                transfer_tasks_are_mergeable_ready_publish_wait_pair(
-                    buffer->tasks[i],
-                    buffer->tasks[i + 1])) {
-                ++buffer->ready_count;
-                ++buffer->ready_pair_count;
-                ++i;
-            }
-
-            continue;
+            return false;
         }
 
         if (!transfer_task_is_windowed(transfer)) {
@@ -810,6 +580,8 @@ inline bool collect_rank_transfer_tasks(
 
     rank_transfer_task_buffer_reset(out);
 
+    bool saw_executable_task = false;
+
     for (int i = 0; i < transfer_plan.total_tasks; ++i) {
         const TransferTask& transfer = transfer_plan.tasks[i];
 
@@ -822,6 +594,8 @@ inline bool collect_rank_transfer_tasks(
         }
 
         if (transfer_task_is_barrier(transfer)) {
+            saw_executable_task = true;
+
             if (!rank_transfer_task_buffer_push(out, transfer)) {
                 return false;
             }
@@ -830,16 +604,16 @@ inline bool collect_rank_transfer_tasks(
         }
 
         if (transfer_task_is_ready(transfer)) {
-            if (!ctx.lower_ready_tasks) {
-                continue;
-            }
-
-            if (!rank_transfer_task_buffer_push(out, transfer)) {
+            if (saw_executable_task ||
+                !transfer_ready_task_is_kernel_prologue(
+                    transfer,
+                    ctx.current_rank)) {
                 return false;
             }
-
             continue;
         }
+
+        saw_executable_task = true;
 
         if (!transfer_task_is_windowed(transfer)) {
             return false;
@@ -881,10 +655,7 @@ inline bool pass_validate_transfer_tasks(
         }
 
         if (transfer_task_is_ready(transfer)) {
-            if (!ctx.lower_ready_tasks) {
-                return false;
-            }
-            continue;
+            return false;
         }
 
         if (!transfer_task_is_windowed(transfer)) {
@@ -895,90 +666,6 @@ inline bool pass_validate_transfer_tasks(
     return true;
 }
 
-template <int MaxTransferTasks, int MaxRanks>
-inline bool pass_drop_disabled_ready_tasks(
-    const LoweringContext<MaxRanks>& ctx,
-    RankTransferTaskBuffer<MaxTransferTasks>* tasks) {
-    if (tasks == nullptr) {
-        return false;
-    }
-
-    if (ctx.lower_ready_tasks) {
-        return true;
-    }
-
-    int write = 0;
-    for (int read = 0; read < tasks->count; ++read) {
-        const TransferTask& transfer = tasks->tasks[read];
-        if (transfer_task_is_ready(transfer)) {
-            continue;
-        }
-        tasks->tasks[write++] = transfer;
-    }
-
-    /*
-     * Do not clear stale tail entries. tasks->count is the only valid length,
-     * and downstream code never reads tasks[write..old_count).
-     */
-    tasks->count = write;
-    return recompute_rank_transfer_task_stats(tasks);
-}
-
-template <int MaxTransferTasks, int MaxRanks>
-inline bool pass_drop_hardcoded_entry_ready_tasks(
-    const LoweringContext<MaxRanks>& ctx,
-    RankTransferTaskBuffer<MaxTransferTasks>* tasks) {
-    if (tasks == nullptr) {
-        return false;
-    }
-
-    if (!ctx.lower_ready_tasks || tasks->count <= 0) {
-        return true;
-    }
-
-    const int device_channel =
-        static_cast<int>(ReadySignalChannel::DeviceMemory);
-
-    /*
-     * OOVERLAP_HARDCODED_ENTRY_READY_RENDEZVOUS_PATCH:
-     *
-     * The executor kernel now performs the complete phase-0 DeviceMemory entry
-     * rendezvous before execute_window_task_stripe(): one local publish followed
-     * by waits for every peer in ready_plan. Remove every matching task from the
-     * initial contiguous ready-task prefix, not just the first publish/wait pair.
-     *
-     * Preserve HostMapped tasks, nonzero phases, and all ready tasks that occur
-     * after the entry prefix. Those may express staged/island dependencies that
-     * are not handled by the kernel's direct-device entry rendezvous.
-     */
-    int write = 0;
-    bool in_entry_ready_prefix = true;
-
-    for (int read = 0; read < tasks->count; ++read) {
-        const TransferTask& transfer = tasks->tasks[read];
-
-        if (in_entry_ready_prefix && transfer_task_is_ready(transfer)) {
-            const bool handled_by_kernel_entry_rendezvous =
-                transfer.executor_rank == ctx.current_rank &&
-                transfer.ready_phase == 0 &&
-                transfer.ready_channel == device_channel &&
-                (transfer.op == TransferOp::ReadyPublish ||
-                 transfer.op == TransferOp::ReadyWait);
-
-            if (handled_by_kernel_entry_rendezvous) {
-                continue;
-            }
-        } else {
-            in_entry_ready_prefix = false;
-        }
-
-        tasks->tasks[write++] = transfer;
-    }
-
-    tasks->count = write;
-
-    return recompute_rank_transfer_task_stats(tasks);
-}
 
 template <int MaxTransferTasks, int MaxRanks>
 inline bool pass_placeholder_optimize_transfer_tasks(
@@ -986,7 +673,6 @@ inline bool pass_placeholder_optimize_transfer_tasks(
     RankTransferTaskBuffer<MaxTransferTasks>* tasks) {
     /*
      * TODO examples:
-     * - remove redundant ReadyWait/ReadyPublish pairs
      * - coalesce adjacent Copy tasks with same src/dst/transport/caps
      * - coalesce adjacent Reduce tasks with same src/dst/transport/caps
      * - split or reshape staging tasks
@@ -1011,13 +697,6 @@ inline bool run_transfer_task_lowering_passes(
         return false;
     }
 
-    if (!pass_drop_disabled_ready_tasks(ctx, tasks)) {
-        return false;
-    }
-
-    if (!pass_drop_hardcoded_entry_ready_tasks(ctx, tasks)) {
-        return false;
-    }
 
     if (!pass_placeholder_optimize_transfer_tasks(ctx, tasks)) {
         return false;
@@ -1120,12 +799,7 @@ inline bool barrier_follows_full_cta_reduce(
     int barrier_task_index,
     const LoweringContext<MaxRanks>& ctx,
     int launched_ctas) {
-    int producer_index = barrier_task_index - 1;
-
-    while (producer_index >= 0 &&
-           transfer_task_is_ready(tasks.tasks[producer_index])) {
-        --producer_index;
-    }
+    const int producer_index = barrier_task_index - 1;
 
     if (producer_index < 0) {
         return false;
@@ -1173,35 +847,22 @@ inline bool compute_lowering_shape(
     LoweringShape shape{};
     shape.max_end_window = tasks.max_end_window;
 
-    if (tasks.ready_count == 0 &&
-        tasks.barrier_count == 0 &&
+    if (tasks.barrier_count == 0 &&
         tasks.window_count == 0) {
         *out = shape;
         return true;
     }
 
-    const int merged_ready_task_savings =
-        ctx.options.enable_ready_publish_wait_merge
-            ? tasks.ready_pair_count
-            : 0;
 
     shape.tasks_per_cta =
-        tasks.ready_count +
         tasks.barrier_count +
-        tasks.window_count -
-        merged_ready_task_savings;
+        tasks.window_count;
 
     if (shape.tasks_per_cta <= 0 || shape.tasks_per_cta > MaxWindowTasks) {
         return false;
     }
 
-    /*
-     * reserved_prefix_tasks_per_cta is kept only for compatibility with the
-     * temporary launcher-side ready prepend path. New code should pass zero
-     * here and use ready_binding.
-     */
-    shape.capacity_tasks_per_cta =
-        shape.tasks_per_cta + ctx.reserved_prefix_tasks_per_cta;
+    shape.capacity_tasks_per_cta = shape.tasks_per_cta;
 
     if (shape.capacity_tasks_per_cta <= 0 ||
         shape.capacity_tasks_per_cta > MaxWindowTasks) {
@@ -1288,7 +949,6 @@ inline bool emit_window_plan_from_rank_tasks(
                 : comm::utils::WindowRange{0, 0};
 
         int task_idx = cta_idx * shape.tasks_per_cta;
-        int ready_pair_index = 0;
         int reduce_task_index = 0;
         int active_barrier_index = 0;
 
@@ -1316,72 +976,6 @@ inline bool emit_window_plan_from_rank_tasks(
                 continue;
             }
 
-            if (transfer_task_is_ready(transfer)) {
-                if (!ctx.lower_ready_tasks || ctx.ready_binding == nullptr) {
-                    continue;
-                }
-
-                if (ctx.options.enable_ready_publish_wait_merge &&
-                    i + 1 < rank_tasks.count &&
-                    transfer_tasks_are_mergeable_ready_publish_wait_pair(
-                        rank_tasks.tasks[i],
-                        rank_tasks.tasks[i + 1])) {
-                    const int owner_cta =
-                        shape.cta_count > 0
-                            ? (ready_pair_index % shape.cta_count)
-                            : 0;
-                
-                    task::WindowTask ready_task{};
-                
-                    if (cta_idx == owner_cta) {
-                        if (!lower_ready_publish_wait_transfer_tasks_to_window_task(
-                                rank_tasks.tasks[i],
-                                rank_tasks.tasks[i + 1],
-                                *ctx.ready_binding,
-                                owner_cta,
-                                &ready_task)) {
-                            out_window_plan->total_tasks = 0;
-                            out_window_plan->tasks_per_cta = 0;
-                            *out_num_blocks = 0;
-                            return false;
-                        }
-                    } else {
-                        /*
-                         * Non-owner CTAs only wait on the peer signal. They must not publish
-                         * to the same local ready slot.
-                         */
-                        if (!lower_ready_transfer_task_to_window_task(
-                                rank_tasks.tasks[i + 1],
-                                *ctx.ready_binding,
-                                &ready_task)) {
-                            out_window_plan->total_tasks = 0;
-                            out_window_plan->tasks_per_cta = 0;
-                            *out_num_blocks = 0;
-                            return false;
-                        }
-                    }
-                
-                    out_window_plan->tasks[task_idx++] = ready_task;
-                    ++ready_pair_index;
-                    ++i;
-                    continue;
-                } 
-
-                task::WindowTask ready_task{};
-
-                if (!lower_ready_transfer_task_to_window_task(
-                        transfer,
-                        *ctx.ready_binding,
-                        &ready_task)) {
-                    out_window_plan->total_tasks = 0;
-                    out_window_plan->tasks_per_cta = 0;
-                    *out_num_blocks = 0;
-                    return false;
-                }
-
-                out_window_plan->tasks[task_idx++] = ready_task;
-                continue;
-            }
 
             comm::utils::WindowRange task_cta_range = cta_range;
             task::WindowTaskCtaMask cta_mask = task::kWindowTaskAllCtas;
@@ -1517,6 +1111,13 @@ inline bool emit_window_plan_from_rank_tasks(
             window_task.cta_mask = cta_mask;
             out_window_plan->tasks[task_idx++] = window_task;
         }
+
+        if (task_idx != (cta_idx + 1) * shape.tasks_per_cta) {
+            out_window_plan->total_tasks = 0;
+            out_window_plan->tasks_per_cta = 0;
+            *out_num_blocks = 0;
+            return false;
+        }
     }
 
     out_window_plan->tasks_per_cta = shape.tasks_per_cta;
@@ -1574,9 +1175,7 @@ inline bool pass_placeholder_optimize_window_plan(
     int* num_blocks) {
     /*
      * TODO examples:
-     * - select CopyTMASignal / CopyFastAfterSignal / ReduceTMAAfterSignal
      * - merge adjacent WindowTasks inside each CTA stripe
-     * - remove redundant ReadyWait/ReadyPublish after lowering
      * - validate terminal task position
      * - compact stripes only if executor contract changes accordingly
      */
@@ -1611,7 +1210,7 @@ inline bool run_window_plan_lowering_passes(
     return pass_validate_window_plan_shape(ctx, *plan, *num_blocks);
 }
 
-/* OOVERLAP_READY_PUBLISH_WAIT_MERGE_PATCH: lowering changes active. */
+/* Logical ready tasks are consumed by the fixed kernel rendezvous. */
 } // namespace lowering_detail
 
 template <
@@ -1625,8 +1224,6 @@ bool lower_transfer_plan_for_rank(
     const comm::LaunchConfig& launch_config,
     WindowTaskExecutorPlan<MaxWindowTasks>* out_window_plan,
     int* out_num_blocks,
-    int reserved_prefix_tasks_per_cta = 0,
-    const ReadySignalBinding<MaxRanks>* ready_binding = nullptr,
     const lowering_detail::LoweringPassOptions& pass_options =
         lowering_detail::LoweringPassOptions{}) {
     if (out_window_plan == nullptr || out_num_blocks == nullptr) {
@@ -1642,8 +1239,6 @@ bool lower_transfer_plan_for_rank(
     if (!lowering_detail::make_lowering_context(
             binding,
             launch_config,
-            reserved_prefix_tasks_per_cta,
-            ready_binding,
             pass_options,
             &ctx)) {
         return false;

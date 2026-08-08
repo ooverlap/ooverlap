@@ -409,7 +409,13 @@ def run_worker(request_path: Path, output_path: Path) -> None:
         sleep(5)
         sizes_bytes = [int(value) for value in job["sizes_bytes"]]
         numels = [bytes_to_numel(value) for value in sizes_bytes]
-        use_ring = job["metric_set"] == "bandwidth"
+        use_ring = (
+            job["mode"] == "bench"
+            and (
+                bool(request.get("use_ring_for_all_metrics", False))
+                or job["metric_set"] == "bandwidth"
+            )
+        )
         key = (
             use_ring,
             job["collective"],
@@ -477,6 +483,7 @@ def run_cta_worker(
     nccl_cta_limit: int | None,
     max_ctas_per_reduce_task: int | None,
     tuning_policy: Path | None,
+    use_ring_for_all_metrics: bool,
     jobs: list[dict[str, Any]],
     devices: list[int],
     run_id: str,
@@ -501,6 +508,7 @@ def run_cta_worker(
                 "cta_limit": cta_limit,
                 "nccl_cta_limit": nccl_cta_limit,
                 "max_ctas_per_reduce_task": max_ctas_per_reduce_task,
+                "use_ring_for_all_metrics": use_ring_for_all_metrics,
                 "devices": devices,
                 "jobs": [job],
             }
@@ -876,6 +884,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--verify", action="store_true")
     parser.add_argument(
+        "--use-ring-for-all-metrics",
+        action="store_true",
+        help=(
+            "use the batched rotating-buffer benchmark for latency jobs as "
+            "well as bandwidth jobs"
+        ),
+    )
+    parser.add_argument(
         "--devices",
         default=None,
         help="comma-separated device ids, for example 0,1,2,3",
@@ -961,6 +977,14 @@ def main() -> None:
         f"{tuning_policy if tuning_policy is not None else 'inherited/default'}"
     )
     print(f"[info] jobs={len(jobs)} iters={args.iters} warmup={args.warmup}")
+    print(
+        "[info] benchmark_timing="
+        + (
+            "batched-ring-all-metrics"
+            if args.use_ring_for_all_metrics
+            else "isolated-latency/batched-ring-bandwidth"
+        )
+    )
     print("[info] no plotting; saving CSV, JSONL, and tab-separated text")
 
     all_rows: list[dict[str, Any]] = []
@@ -971,6 +995,7 @@ def main() -> None:
                 nccl_cta_limit,
                 max_ctas_per_reduce_task,
                 tuning_policy,
+                bool(args.use_ring_for_all_metrics),
                 jobs,
                 devices,
                 run_id,

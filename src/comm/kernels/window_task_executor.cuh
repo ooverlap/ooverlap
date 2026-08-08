@@ -5,7 +5,6 @@
 #include "comm/pipeline/window_pipeline.cuh"
 #include "comm/plan/window_plan.cuh"
 #include "comm/tma_variant_config.h"
-#include "comm/kernels/multi_gpu_ready_signal.cuh"
 
 #include <cuda/atomic>
 
@@ -13,24 +12,28 @@ namespace ooverlap {
 namespace comm {
 namespace kernels {
 
+/* OOVERLAP_CHUNK_ONLY_THREAD0_WINDOW_PIPELINE_V1 */
+
 __device__ __forceinline__ void wait_until_cta_barrier_counter_at_least(
     unsigned int* counter,
     unsigned int target) {
-    if (counter == nullptr || target == 0) {
+
+    if (threadIdx.x != 0) {
         return;
     }
 
     cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
 
     while (state.load(cuda::memory_order_acquire) < target) {
-        __nanosleep(64);
+        __nanosleep(16);
     }
 }
 
 __device__ __forceinline__ void advance_cta_barrier_counter(
     unsigned int* counter,
     unsigned int increment) {
-    if (counter == nullptr || increment == 0) {
+
+    if (threadIdx.x != 0) {
         return;
     }
 
@@ -41,16 +44,13 @@ __device__ __forceinline__ void advance_cta_barrier_counter(
 __device__ __forceinline__ void arrive_and_wait_cta_barrier(
     unsigned int* counter,
     unsigned int target) {
-    if (counter == nullptr || target == 0) {
-        return;
-    }
 
     if (threadIdx.x == 0) {
         cuda::atomic_ref<unsigned int, cuda::thread_scope_device> state(*counter);
         state.fetch_add(1u, cuda::memory_order_acq_rel);
 
         while (state.load(cuda::memory_order_acquire) < target) {
-            __nanosleep(64);
+            __nanosleep(16);
         }
     }
 }
@@ -72,8 +72,7 @@ template <
     typename ReduceApply,
     typename FastCopyVecT = uint4,
     int FastCopyUnroll = TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
+    int LoadFillDepth = FillDepth>
 __device__ __forceinline__ void execute_window_task(
     const task::WindowTask& task,
     unsigned char* shared_raw,
@@ -86,7 +85,6 @@ __device__ __forceinline__ void execute_window_task(
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
     static_assert(FastCopyUnroll > 0, "FastCopyUnroll must be > 0");
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     switch (task.op) {
         case task::WindowTaskOp::ReduceTMA:
@@ -95,8 +93,7 @@ __device__ __forceinline__ void execute_window_task(
                 FillDepth,
                 ChunkBytes,
                 ReduceApply,
-                LoadFillDepth,
-                SmallTaskBytes>(
+                LoadFillDepth>(
                     task.payload.window.src,
                     task.payload.window.dst,
                     task.payload.window.total_bytes,
@@ -112,8 +109,7 @@ __device__ __forceinline__ void execute_window_task(
                 StageDepth,
                 FillDepth,
                 ChunkBytes,
-                LoadFillDepth,
-                SmallTaskBytes>(
+                LoadFillDepth>(
                     task.payload.window.src,
                     task.payload.window.dst,
                     task.payload.window.total_bytes,
@@ -129,8 +125,7 @@ __device__ __forceinline__ void execute_window_task(
                 StageDepth,
                 FillDepth,
                 ChunkBytes,
-                LoadFillDepth,
-                SmallTaskBytes>(
+                LoadFillDepth>(
                     task.payload.fanout.src,
                     task.payload.fanout.fanout_dsts,
                     static_cast<int>(
@@ -149,8 +144,7 @@ __device__ __forceinline__ void execute_window_task(
                 FillDepth,
                 ChunkBytes,
                 ReduceApply,
-                LoadFillDepth,
-                SmallTaskBytes>(
+                LoadFillDepth>(
                     task.payload.fanout.src,
                     task.payload.fanout.fanout_dsts,
                     task.payload.fanout.fanout_reduce_scope,
@@ -164,39 +158,6 @@ __device__ __forceinline__ void execute_window_task(
                     barriers);
             return;
 
-        case task::WindowTaskOp::ReadyPublish:
-            if (threadIdx.x == 0) {
-                publish_ready_signal(
-                    task.payload.ready.ready_signal,
-                    task.payload.ready.ready_epoch,
-                    static_cast<MultiGpuReadySignalProtocol>(
-                        task.payload.ready.ready_protocol));
-            }
-            return;
-
-        case task::WindowTaskOp::ReadyWait:
-            if (threadIdx.x == 0) {
-                wait_until_ready_signal_at_least(
-                    task.payload.ready.ready_signal,
-                    task.payload.ready.ready_epoch,
-                    64);
-            }
-            return;
-
-        case task::WindowTaskOp::ReadyPublishWait:
-            if (threadIdx.x == 0) {
-                publish_then_wait_ready_signal_for_cta(
-                    static_cast<int>(blockIdx.x),
-                    task.payload.ready.ready_owner_cta,
-                    task.payload.ready.ready_signal,
-                    task.payload.ready.ready_epoch,
-                    static_cast<MultiGpuReadySignalProtocol>(
-                        task.payload.ready.ready_protocol),
-                    task.payload.ready.ready_wait_signal,
-                    task.payload.ready.ready_wait_epoch,
-                    64);
-            }
-            return;
 
         case task::WindowTaskOp::Barrier:
             arrive_and_wait_cta_barrier(
@@ -223,7 +184,7 @@ __device__ __forceinline__ void execute_window_task(
  * are ordered for that CTA.
  *
  * Tasks in different CTA stripes are independent unless the lowered plan adds
- * explicit ready-signal or barrier tasks.
+ * explicit barrier tasks.
  *
  * This is deliberately not a work-stealing queue.
  */
@@ -234,8 +195,7 @@ template <
     typename ReduceApply,
     typename FastCopyVecT = uint4,
     int FastCopyUnroll = TMA_TWO_GPU_PEER_FAST_COPY_UNROLL,
-    int LoadFillDepth = FillDepth,
-    int SmallTaskBytes = 0>
+    int LoadFillDepth = FillDepth>
 __device__ __forceinline__ void execute_window_task_stripe(
     const task::WindowTask* tasks,
     int total_tasks,
@@ -251,7 +211,6 @@ __device__ __forceinline__ void execute_window_task_stripe(
                   "LoadFillDepth + FillDepth must be <= StageDepth");
     static_assert(ChunkBytes > 0, "ChunkBytes must be > 0");
     static_assert(FastCopyUnroll > 0, "FastCopyUnroll must be > 0");
-    static_assert(SmallTaskBytes >= 0, "SmallTaskBytes must be >= 0");
 
     if (tasks == nullptr ||
         total_tasks <= 0 ||
@@ -266,49 +225,40 @@ __device__ __forceinline__ void execute_window_task_stripe(
         return;
     }
 
-    for (int local_task = 0; local_task < tasks_per_cta; ++local_task) {
-        const int task_idx = base + local_task;
+    if (threadIdx.x == 0) {
+        for (int local_task = 0; local_task < tasks_per_cta; ++local_task) {
+            const int task_idx = base + local_task;
 
-        if (task_idx >= total_tasks) {
-            return;
+            if (task_idx >= total_tasks) {
+                return;
+            }
+
+            const task::WindowTask task = tasks[task_idx];
+
+            if (!task::window_task_runs_on_cta(task, cta_idx)) {
+                continue;
+            }
+
+            execute_window_task<
+                StageDepth,
+                FillDepth,
+                ChunkBytes,
+                ReduceApply,
+                FastCopyVecT,
+                FastCopyUnroll,
+                LoadFillDepth>(
+                    task,
+                    shared_raw,
+                    barriers,
+                    cta_barrier_counter);
+
+            if (task.terminal) {
+                break;
+            }
         }
-
-        const task::WindowTask task = tasks[task_idx];
-
-        if (!task::window_task_runs_on_cta(task, cta_idx)) {
-            continue;
-        }
-
-        execute_window_task<
-            StageDepth,
-            FillDepth,
-            ChunkBytes,
-            ReduceApply,
-            FastCopyVecT,
-            FastCopyUnroll,
-            LoadFillDepth,
-            SmallTaskBytes>(
-                task,
-                shared_raw,
-                barriers,
-                cta_barrier_counter);
-
-        if (task.terminal) {
-            return;
-        }
-
-        /*
-         * The fast aligned TMA path in run_chunk_range is intentionally
-         * thread0-only and has no internal __syncthreads().
-         *
-         * Keep one task-boundary barrier so nonzero threads do not start a
-         * later full-CTA task, for example CopyFast, before thread 0 has
-         * completed the previous TMA task.
-         *
-         * This replaces many per-chunk barriers with one barrier per task.
-         */
-        __syncthreads();
     }
+
+    __syncthreads();
 }
 
 } // namespace kernels
