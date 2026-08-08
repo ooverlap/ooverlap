@@ -29,7 +29,6 @@ case "$COLLECTIVE_ARG" in
     ;;
 esac
 
-# Match the unrestricted settings in run_external_p2p_bandwidth_latency.sh.
 case "$WORLD_SIZE" in
   2)
     DEVICES="0,1"
