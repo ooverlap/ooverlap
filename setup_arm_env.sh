@@ -334,6 +334,11 @@ prepare_repository() {
     git -C "$ROOT_DIR" submodule update --init --recursive
   fi
 
+  local cutlass_patch_script="$ROOT_DIR/scripts/apply_cutlass_patch.sh"
+  [[ -f "$cutlass_patch_script" ]] || \
+    die "CUTLASS patch helper was not found: $cutlass_patch_script"
+  bash "$cutlass_patch_script"
+
   local json_header="$ROOT_DIR/src/third-party/nlohmann_json/include/nlohmann/json.hpp"
   [[ -f "$json_header" ]] || \
     die "nlohmann/json.hpp is missing after submodule initialization: $json_header"

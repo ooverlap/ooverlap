@@ -95,7 +95,7 @@ check_system_toolchain() {
   local missing=()
   local tool
 
-  for tool in "$PYTHON_BOOTSTRAP" cmake curl c++; do
+  for tool in "$PYTHON_BOOTSTRAP" cmake curl c++ git; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
 
@@ -251,6 +251,22 @@ print("NCCL:", torch.cuda.nccl.version())
 PY
 }
 
+prepare_repository() {
+  [[ -f "$ROOT_DIR/CMakeLists.txt" ]] || \
+    die "CMakeLists.txt was not found in $ROOT_DIR"
+
+  if [[ -d "$ROOT_DIR/.git" ]]; then
+    log "Initializing all Git submodules"
+    git -C "$ROOT_DIR" submodule sync --recursive
+    git -C "$ROOT_DIR" submodule update --init --recursive
+  fi
+
+  local cutlass_patch_script="$ROOT_DIR/scripts/apply_cutlass_patch.sh"
+  [[ -f "$cutlass_patch_script" ]] || \
+    die "CUTLASS patch helper was not found: $cutlass_patch_script"
+  bash "$cutlass_patch_script"
+}
+
 setup_nccl_paths() {
   NCCL_PKG_DIR="$($PYTHON_BIN - <<'PY'
 from pathlib import Path
@@ -332,6 +348,7 @@ main() {
   setup_cuda_toolchain
   setup_local_environment
   install_python_packages
+  prepare_repository
   setup_nccl_paths
   build_ooverlap
   write_runtime_env
