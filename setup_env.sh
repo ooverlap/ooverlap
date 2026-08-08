@@ -95,7 +95,7 @@ check_system_toolchain() {
   local missing=()
   local tool
 
-  for tool in "$PYTHON_BOOTSTRAP" cmake curl c++ git; do
+  for tool in "$PYTHON_BOOTSTRAP" cmake c++ git; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
 
@@ -226,21 +226,10 @@ install_python_packages() {
     setuptools wheel cmake numpy setuptools_scm setuptools_rust matplotlib \
     "vllm==$VLLM_VER"
 
-  local vllm_communicators_dir
-  vllm_communicators_dir="$($PYTHON_BIN - <<'PY'
-from pathlib import Path
-import vllm
-print(Path(vllm.__file__).resolve().parent / "distributed" / "device_communicators")
-PY
-)"
-
-  curl -fsSL \
-    https://raw.githubusercontent.com/ooverlap/vllm/refs/heads/oo-force-allreduce-backends/vllm/distributed/device_communicators/cuda_communicator.py \
-    -o "$vllm_communicators_dir/cuda_communicator.py"
-
-  curl -fsSL \
-    https://raw.githubusercontent.com/ooverlap/vllm/refs/heads/oo-force-allreduce-backends/vllm/distributed/device_communicators/ooverlap_all_reduce.py \
-    -o "$vllm_communicators_dir/ooverlap_all_reduce.py"
+  local vllm_override_script="$ROOT_DIR/scripts/apply_vllm_overrides.sh"
+  [[ -f "$vllm_override_script" ]] || \
+    die "vLLM override helper was not found: $vllm_override_script"
+  bash "$vllm_override_script" "$PYTHON_BIN"
 
   "$PYTHON_BIN" - <<'PY'
 import torch, vllm

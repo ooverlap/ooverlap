@@ -143,7 +143,7 @@ check_system_toolchain() {
   local missing=()
   local tool
 
-  for tool in "$PYTHON_BOOTSTRAP" cmake curl c++ gcc g++ git file readlink make; do
+  for tool in "$PYTHON_BOOTSTRAP" cmake c++ gcc g++ git file readlink make; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
 
@@ -307,21 +307,10 @@ if not torch_config.is_file():
     raise SystemExit("PyTorch is missing TorchConfig.cmake")
 PY
 
-  local vllm_communicators_dir
-  vllm_communicators_dir="$($PYTHON_BIN - <<'PY'
-from pathlib import Path
-import vllm
-print(Path(vllm.__file__).resolve().parent / "distributed" / "device_communicators")
-PY
-)"
-
-  curl -fsSL \
-    https://raw.githubusercontent.com/ooverlap/vllm/refs/heads/oo-force-allreduce-backends/vllm/distributed/device_communicators/cuda_communicator.py \
-    -o "$vllm_communicators_dir/cuda_communicator.py"
-
-  curl -fsSL \
-    https://raw.githubusercontent.com/ooverlap/vllm/refs/heads/oo-force-allreduce-backends/vllm/distributed/device_communicators/ooverlap_all_reduce.py \
-    -o "$vllm_communicators_dir/ooverlap_all_reduce.py"
+  local vllm_override_script="$ROOT_DIR/scripts/apply_vllm_overrides.sh"
+  [[ -f "$vllm_override_script" ]] || \
+    die "vLLM override helper was not found: $vllm_override_script"
+  bash "$vllm_override_script" "$PYTHON_BIN"
 }
 
 prepare_repository() {
