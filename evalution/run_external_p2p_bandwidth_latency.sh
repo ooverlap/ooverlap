@@ -33,9 +33,9 @@ case "$WORLD_SIZE:$CTA_MODE" in
     ;;
   2:res)
     DEVICES="0,1"
-    OOVERLAP_MAX_CTAS="4"
-    NCCL_MAX_CTAS="4"
-    MAX_CTAS_PER_REDUCE_TASK="4"
+    OOVERLAP_MAX_CTAS="8"
+    NCCL_MAX_CTAS="8"
+    MAX_CTAS_PER_REDUCE_TASK="8"
     ;;
   4:unres)
     DEVICES="0,1,2,3"
@@ -77,7 +77,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DRIVER="$REPO_ROOT/test/test_external_p2p_collective_sweep.py"
 PLOTTER="$REPO_ROOT/test/plot_external_p2p_collective.py"
-TUNING_POLICY="$REPO_ROOT/results/policies/tp4_policy.json"
+TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp${WORLD_SIZE}_policy.json}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 OUT_DIR="$REPO_ROOT/results/evalution/external_p2p/tp${WORLD_SIZE}/${CTA_MODE}"

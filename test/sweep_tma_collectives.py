@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Tune Ooverlap CTA limits and generate tma_collective_policy.json.
+"""Tune Ooverlap CTA limits and generate a TP-specific tuning policy.
 
 The parent process launches one fresh worker process for each
 (max_ctas, max_ctas_per_reduce_task) candidate. A worker loads the extension
@@ -126,9 +126,9 @@ def default_work_dir() -> Path:
     return repo_root() / "results" / "tma_collective_cta_tuning"
 
 
-def default_policy_path() -> Path:
-    # This matches the runtime loader's default relative path.
-    return repo_root() / "tma_collective_policy.json"
+def default_policy_path(world_size: int) -> Path:
+    # Keep T0 output aligned with the evaluation wrappers.
+    return repo_root() / "results" / "policies" / f"tp{world_size}_policy.json"
 
 
 def load_extension(path: Path):
@@ -801,7 +801,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--policy-out",
         type=Path,
-        default=default_policy_path(),
+        default=None,
     )
     parser.add_argument(
         "--pretty-policy",
@@ -836,6 +836,10 @@ def validate_cli(args: argparse.Namespace) -> None:
 def main() -> int:
     parser = build_argument_parser()
     args = parser.parse_args()
+
+    if not args.worker and args.policy_out is None:
+        args.policy_out = default_policy_path(len(args.devices))
+
     validate_cli(args)
 
     if args.worker:

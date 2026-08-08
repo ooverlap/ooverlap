@@ -6,8 +6,9 @@ set -euo pipefail
 # One paper-evaluation benchmark for vLLM:
 #   output throughput versus the maximum number of active sequences
 #
-# Workload:
-#   input=1024, output=128, max_num_seqs=1,2,4,8,16,32,64
+# Workloads:
+#   conversation: input=1024, output=128, max_num_seqs=1,2,4,8,16,32,64
+#   decode-heavy: input=512, output=1024, max_num_seqs=1,2,4,8,16,32,64
 #
 # Isolation:
 #   all permutations of the configured three backends, process-group cleanup,
@@ -188,14 +189,18 @@ PLOTTER="$REPO_ROOT/test/plot_vllm_sweeps.py"
 ORDER_AGGREGATOR="$REPO_ROOT/test/aggregate_vllm_backend_orders.py"
 OUT_ROOT=""
 WORKLOAD=""
-TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp4_policy.json}"
-
-if [[ "$MODE" != "plot" ]]; then
-  [[ -f "$TUNING_POLICY" ]] || fail "ooverlap tuning policy not found: $TUNING_POLICY"
-fi
+TUNING_POLICY_OVERRIDE="${OOVERLAP_TUNING_POLICY:-}"
+TUNING_POLICY="${TUNING_POLICY_OVERRIDE:-$REPO_ROOT/results/policies/tp${WORLD_SIZE}_policy.json}"
 
 if [[ -f "$TUNING_POLICY" ]]; then
   TUNING_POLICY="$(cd -- "$(dirname -- "$TUNING_POLICY")" && pwd)/$(basename -- "$TUNING_POLICY")"
+elif [[ "$MODE" != "plot" && -n "$TUNING_POLICY_OVERRIDE" ]]; then
+  fail "explicit OOVERLAP_TUNING_POLICY does not exist: $TUNING_POLICY"
+elif [[ "$MODE" != "plot" ]]; then
+  echo "[evalution] warning: tuning policy not found: $TUNING_POLICY; continuing with runtime fallback" >&2
+  TUNING_POLICY=""
+else
+  TUNING_POLICY=""
 fi
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail "Python executable not found: $PYTHON_BIN"
@@ -285,7 +290,9 @@ common_driver_args+=(--rr-capacity-bytes "$RR_CAPACITY_BYTES")
 common_driver_args+=(--env "VLLM_OOVERLAP_AG_DTYPE=$AG_DTYPE")
 common_driver_args+=(--env "VLLM_OOVERLAP_AG_SLOTS=$AG_SLOTS")
 common_driver_args+=(--env "VLLM_OOVERLAP_AG_CAPACITY_BYTES=$AG_CAPACITY_BYTES")
-common_driver_args+=(--env "OOVERLAP_TUNING_POLICY=$TUNING_POLICY")
+if [[ -n "$TUNING_POLICY" ]]; then
+  common_driver_args+=(--env "OOVERLAP_TUNING_POLICY=$TUNING_POLICY")
+fi
 common_driver_args+=(--env "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 common_driver_args+=(--env "TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE")
 common_driver_args+=(--env "NCCL_NET_PLUGIN=$NCCL_NET_PLUGIN")
@@ -436,11 +443,11 @@ run_workload() {
 case "$MODE" in
   run)
     preflight
-    #run_workload "qwen_1024_128" "realistic-conversation:1024:128"
+    run_workload "qwen_1024_128" "realistic-conversation:1024:128"
     run_workload "qwen_512_1024" "long-decode:512:1024"
     ;;
   plot)
-    #run_workload "qwen_1024_128" "realistic-conversation:1024:128"
+    run_workload "qwen_1024_128" "realistic-conversation:1024:128"
     run_workload "qwen_512_1024" "long-decode:512:1024"
     ;;
 esac

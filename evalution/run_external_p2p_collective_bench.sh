@@ -85,10 +85,6 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 }
 
 TUNING_POLICY="${OOVERLAP_TUNING_POLICY:-$REPO_ROOT/results/policies/tp${WORLD_SIZE}_policy.json}"
-if [[ ! -f "$TUNING_POLICY" &&
-      -f "$REPO_ROOT/results/policies/tp4_policy.json" ]]; then
-  TUNING_POLICY="$REPO_ROOT/results/policies/tp4_policy.json"
-fi
 
 if (( LOCAL_TMA )); then
   MODE="local-tma"
