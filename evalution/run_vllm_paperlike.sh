@@ -217,13 +217,7 @@ resolve_runtime_env_file() {
     printf '%s\n' "$OOTMP/ooverlap_vllm_env.sh"
     return
   fi
-  for candidate in /local/tmp.*/"${USER:-}"/ooverlap_vllm_env.sh; do
-    if [[ -f "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
-  fail "could not find ooverlap_vllm_env.sh; run setup_env.sh or set OOVERLAP_VLLM_ENV_FILE"
+  fail "could not find ooverlap_vllm_env.sh; source the generated runtime env or set OOVERLAP_VLLM_ENV_FILE"
 }
 
 RUNTIME_ENV_FILE="$(resolve_runtime_env_file)"

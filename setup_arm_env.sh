@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Complete Arrhenius GH200 environment for ooverlap + vLLM.
+# ARM64/GH200 environment for ooverlap + vLLM.
 #
 # Usage:
-#   CLEAN_VENV=1 CLEAN_BUILD=1 ./setup_env_arrhenius.sh ../venv
+#   CLEAN_VENV=1 CLEAN_BUILD=1 ./setup_arm_env.sh ../venv
+#
+# Optional machine-specific modules and paths are read from the gitignored
+# modules_folders.txt file. Copy modules_folders.example.txt to customize it.
 #
 # Later:
 #   source ../ooverlap-env/ooverlap_vllm_env.sh
@@ -21,12 +24,10 @@ SKIP_MODULES="${SKIP_MODULES:-0}"
 PYTHON_BOOTSTRAP="${PYTHON_BOOTSTRAP:-python3}"
 MODULES_LOADED=0
 VENV_PATH_ARG=""
-
-ARRHENIUS_MODULES=(
-  GPU/buildtool-easybuild/5.2.1-hpca3ef7d197
-  GPU/buildenv-gcccuda/2026.03-cu13.0
-  GPU/Python/3.13.5-bare-gcc-2025b-eb
-)
+LOCAL_CONFIG="${OOVERLAP_LOCAL_CONFIG:-$ROOT_DIR/modules_folders.txt}"
+LOCAL_MODULES=()
+LOCAL_TMP_ROOT="${LOCAL_TMP_ROOT:-}"
+CUDADEVRT_HINT="${OOVERLAP_CUDADEVRT_HINT:-}"
 
 log() { printf '[info] %s\n' "$*"; }
 warn() { printf '[warning] %s\n' "$*" >&2; }
@@ -39,6 +40,44 @@ on_error() {
   exit "$status"
 }
 trap on_error ERR
+
+load_local_config() {
+  [[ -f "$LOCAL_CONFIG" ]] || {
+    log "Local config not found: $LOCAL_CONFIG; using the current environment"
+    return
+  }
+
+  local line kind value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    kind="${line%%[[:space:]]*}"
+    value="${line#"$kind"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    [[ -n "$value" ]] || die "Missing value for '$kind' in $LOCAL_CONFIG"
+
+    case "$kind" in
+      module)
+        LOCAL_MODULES+=("$value")
+        ;;
+      local_tmp_root)
+        [[ -n "$LOCAL_TMP_ROOT" ]] || LOCAL_TMP_ROOT="$value"
+        ;;
+      cudadevrt_hint)
+        [[ -n "$CUDADEVRT_HINT" ]] || CUDADEVRT_HINT="$value"
+        ;;
+      *)
+        die "Unknown directive '$kind' in $LOCAL_CONFIG"
+        ;;
+    esac
+  done < "$LOCAL_CONFIG"
+
+  if [[ -n "$CUDADEVRT_HINT" ]]; then
+    export OOVERLAP_CUDADEVRT_HINT="$CUDADEVRT_HINT"
+  fi
+}
 
 initialize_modules() {
   if command -v module >/dev/null 2>&1; then
@@ -76,14 +115,14 @@ initialize_modules() {
 
 parse_args() {
   if (( $# > 1 )); then
-    die "Usage: ./setup_env_arrhenius.sh [venv-path]"
+    die "Usage: ./setup_arm_env.sh [venv-path]"
   fi
   VENV_PATH_ARG="${1:-}"
 }
 
-load_arrhenius_modules() {
-  if [[ "$SKIP_MODULES" == "1" ]]; then
-    log "Skipping environment modules"
+load_environment_modules() {
+  if [[ "$SKIP_MODULES" == "1" || ${#LOCAL_MODULES[@]} -eq 0 ]]; then
+    log "No local modules requested; using the current system toolchain"
     return
   fi
 
@@ -91,7 +130,7 @@ load_arrhenius_modules() {
   module --force purge
 
   local name
-  for name in "${ARRHENIUS_MODULES[@]}"; do
+  for name in "${LOCAL_MODULES[@]}"; do
     log "Loading module: $name"
     module load "$name"
   done
@@ -179,6 +218,8 @@ setup_local_environment() {
     else
       VENV_DIR="$(realpath -m "$PWD/$VENV_PATH_ARG")"
     fi
+  elif [[ -n "$LOCAL_TMP_ROOT" ]]; then
+    VENV_DIR="$LOCAL_TMP_ROOT/${USER:-user}/$VENV_NAME"
   else
     VENV_DIR="$HOME/$VENV_NAME"
   fi
@@ -390,7 +431,7 @@ write_runtime_env() {
       printf '%s\n' '  done'
       printf '%s\n' 'fi'
       printf '%s\n' 'module --force purge'
-      for name in "${ARRHENIUS_MODULES[@]}"; do
+      for name in "${LOCAL_MODULES[@]}"; do
         printf 'module load %q\n' "$name"
       done
     fi
@@ -424,7 +465,8 @@ write_runtime_env() {
 
 main() {
   parse_args "$@"
-  load_arrhenius_modules
+  load_local_config
+  load_environment_modules
   check_system_toolchain
   setup_cuda_toolchain
   setup_local_environment

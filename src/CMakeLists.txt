@@ -63,7 +63,7 @@ find_library(OOVERLAP_CUDADEVRT_LIBRARY
     ${CUDAToolkit_ROOT_DIR}/targets/x86_64-linux/lib
     ${CUDAToolkit_ROOT_DIR}/lib64
     ${CUDAToolkit_ROOT_DIR}/lib
-    /apps/Common/software/CUDA/12.4.0/targets/x86_64-linux/lib
+    ENV OOVERLAP_CUDADEVRT_HINT
     /usr/local/cuda/targets/x86_64-linux/lib
     /usr/local/cuda/lib64
     /usr/local/cuda/lib

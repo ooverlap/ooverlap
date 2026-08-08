@@ -1,0 +1,14 @@
+# Copy this file to modules_folders.txt and customize it for the local machine.
+#
+# modules_folders.txt is ignored by Git.
+
+# Environment modules:
+# module compiler/module
+# module cuda/module
+# module python/module
+
+# Optional local scratch directory:
+# local_tmp_root /path/to/local/storage
+
+# Optional directory containing libcudadevrt.a:
+# cudadevrt_hint /path/to/cuda/lib

@@ -2,8 +2,11 @@
 set -Eeuo pipefail
 
 # Run with:
-#   bash ./setup_env.sh                    # Vera: use /local/tmp.*
-#   bash ./setup_env.sh /path/to/venv      # Other machines: use this venv
+#   bash ./setup_env.sh
+#   bash ./setup_env.sh /path/to/venv
+#
+# Optional machine-specific modules and paths are read from the gitignored
+# modules_folders.txt file. Copy modules_folders.example.txt to customize it.
 # Then activate later with the env file printed at the end.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,21 +20,51 @@ SKIP_MODULES="${SKIP_MODULES:-0}"
 PYTHON_BOOTSTRAP="${PYTHON_BOOTSTRAP:-python3}"
 MODULES_LOADED=0
 VENV_PATH_ARG=""
-
-VERA_MODULES=(
-  foss/2025b
-  CUDA/13.3.0
-  Ninja/1.13.0-GCCcore-14.3.0
-  Python/3.13.5-GCCcore-14.3.0
-  protobuf/31.1-GCCcore-14.3.0
-  numactl/2.0.19-GCCcore-14.3.0
-  FFmpeg/7.1.2-GCCcore-14.3.0
-  Rust/1.88.0-GCCcore-14.3.0
-  nodejs/22.17.1-GCCcore-14.3.0
-)
+LOCAL_CONFIG="${OOVERLAP_LOCAL_CONFIG:-$ROOT_DIR/modules_folders.txt}"
+LOCAL_MODULES=()
+LOCAL_TMP_ROOT="${LOCAL_TMP_ROOT:-}"
+CUDADEVRT_HINT="${OOVERLAP_CUDADEVRT_HINT:-}"
 
 log() { printf '[info] %s\n' "$*"; }
 die() { printf '[error] %s\n' "$*" >&2; exit 1; }
+
+load_local_config() {
+  [[ -f "$LOCAL_CONFIG" ]] || {
+    log "Local config not found: $LOCAL_CONFIG; using the current environment"
+    return
+  }
+
+  local line kind value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    kind="${line%%[[:space:]]*}"
+    value="${line#"$kind"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    [[ -n "$value" ]] || die "Missing value for '$kind' in $LOCAL_CONFIG"
+
+    case "$kind" in
+      module)
+        LOCAL_MODULES+=("$value")
+        ;;
+      local_tmp_root)
+        [[ -n "$LOCAL_TMP_ROOT" ]] || LOCAL_TMP_ROOT="$value"
+        ;;
+      cudadevrt_hint)
+        [[ -n "$CUDADEVRT_HINT" ]] || CUDADEVRT_HINT="$value"
+        ;;
+      *)
+        die "Unknown directive '$kind' in $LOCAL_CONFIG"
+        ;;
+    esac
+  done < "$LOCAL_CONFIG"
+
+  if [[ -n "$CUDADEVRT_HINT" ]]; then
+    export OOVERLAP_CUDADEVRT_HINT="$CUDADEVRT_HINT"
+  fi
+}
 
 parse_args() {
   if (( $# > 1 )); then
@@ -41,14 +74,17 @@ parse_args() {
   VENV_PATH_ARG="${1:-}"
 }
 
-load_vera_modules() {
-  if [[ "$SKIP_MODULES" == "1" ]] || ! command -v module >/dev/null 2>&1; then
-    log "Environment modules unavailable or disabled; checking system toolchain"
+load_environment_modules() {
+  if [[ "$SKIP_MODULES" == "1" || ${#LOCAL_MODULES[@]} -eq 0 ]]; then
+    log "No local modules requested; checking the current system toolchain"
     return
   fi
 
+  command -v module >/dev/null 2>&1 || \
+    die "Local config requests modules, but the environment-modules command is unavailable"
+
   module purge
-  module load "${VERA_MODULES[@]}"
+  module load "${LOCAL_MODULES[@]}"
   module list
   MODULES_LOADED=1
 }
@@ -123,20 +159,6 @@ setup_cuda_toolchain() {
   log "CUDA: $CUDA_HOME"
 }
 
-pick_vera_tmp() {
-  local path
-
-  while read -r path; do
-    [[ -d "$path" && -w "$path" ]] && { printf '%s\n' "$path"; return; }
-  done < <(df -P | awk '$6 ~ /^\/local\/tmp\./ {print $6}')
-
-  while read -r path; do
-    [[ -d "$path" && -w "$path" ]] && { printf '%s\n' "$path"; return; }
-  done < <(find /local -maxdepth 1 -type d -name 'tmp.*' 2>/dev/null | sort)
-
-  die 'No writable /local/tmp.* directory found; pass a venv path as the first argument'
-}
-
 setup_local_environment() {
   if [[ -n "$VENV_PATH_ARG" ]]; then
     if [[ "$VENV_PATH_ARG" == /* ]]; then
@@ -144,16 +166,19 @@ setup_local_environment() {
     else
       VENV_DIR="$PWD/$VENV_PATH_ARG"
     fi
+  elif [[ -n "$LOCAL_TMP_ROOT" ]]; then
+    VENV_DIR="$LOCAL_TMP_ROOT/${USER:-user}/$VENV_NAME"
   else
-    LOCAL_TMP_ROOT="${LOCAL_TMP_ROOT:-$(pick_vera_tmp)}"
-    VENV_DIR="$LOCAL_TMP_ROOT/$USER/$VENV_NAME"
+    VENV_DIR="$HOME/$VENV_NAME"
   fi
 
   if [[ -z "${OOTMP:-}" ]]; then
     if [[ -n "$VENV_PATH_ARG" ]]; then
       OOTMP="$(dirname "$VENV_DIR")/ooverlap-env"
-    else
+    elif [[ -n "$LOCAL_TMP_ROOT" ]]; then
       OOTMP="$(dirname "$VENV_DIR")"
+    else
+      OOTMP="$HOME/ooverlap-env"
     fi
   fi
 
@@ -275,7 +300,7 @@ write_runtime_env() {
     local name
     if [[ "$MODULES_LOADED" == "1" ]]; then
       printf '%s\n' 'module purge'
-      for name in "${VERA_MODULES[@]}"; do
+      for name in "${LOCAL_MODULES[@]}"; do
         printf 'module load %q\n' "$name"
       done
     fi
@@ -301,7 +326,8 @@ write_runtime_env() {
 
 main() {
   parse_args "$@"
-  load_vera_modules
+  load_local_config
+  load_environment_modules
   check_system_toolchain
   setup_cuda_toolchain
   setup_local_environment
